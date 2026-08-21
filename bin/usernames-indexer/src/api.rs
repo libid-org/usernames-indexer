@@ -1,7 +1,13 @@
 //! The read API. Resolution answers exactly what the contract's resolvers
 //! answer, from the projections; search is the one thing the chain cannot do.
 
-use std::str::FromStr;
+use std::{
+    str::FromStr,
+    sync::{
+        Arc,
+        OnceLock,
+    },
+};
 
 use alloy::primitives::{
     Address,
@@ -46,13 +52,22 @@ pub struct AppState {
     store: ChainStore,
     /// The watched contract, echoed in `/v1/status`.
     contract: Address,
+    /// Set once the first committed window has been observed. Within a
+    /// process lifetime the fact never un-happens — the only wipe (prepare)
+    /// runs before the API starts — so after the first success the sync gate
+    /// is a memory read instead of a query per request.
+    synced: Arc<OnceLock<()>>,
 }
 
 impl AppState {
     /// State for one deployment: the chain the store is scoped to is the
     /// chain this API serves.
     pub fn new(store: ChainStore, contract: Address) -> Self {
-        Self { store, contract }
+        Self {
+            store,
+            contract,
+            synced: Arc::new(OnceLock::new()),
+        }
     }
 }
 
@@ -167,8 +182,14 @@ fn reject_nul(raw: &str, what: &str) -> Result<(), ApiError> {
 /// committed a window would serve authoritative-looking 404s for names that
 /// are bound on chain. Refuse to answer until the first window landed.
 async fn ensure_synced(state: &AppState) -> Result<(), ApiError> {
+    if state.synced.get().is_some() {
+        return Ok(());
+    }
     match state.store.cursor().await? {
-        Some(_) => Ok(()),
+        Some(_) => {
+            let _ = state.synced.set(());
+            Ok(())
+        }
         None => Err(ApiError::not_synced()),
     }
 }

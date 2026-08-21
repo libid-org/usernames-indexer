@@ -6,26 +6,19 @@
 //! legitimate reason. Everything past that check panics on failure, so a
 //! broken migration cannot masquerade as "no database around".
 
+mod common;
+
 use alloy::primitives::{
     Address,
     B256,
 };
-use axum::{
-    body::Body,
-    http::{
-        Request,
-        StatusCode,
-    },
-};
-use http_body_util::BodyExt;
+use axum::http::StatusCode;
 use sqlx::PgPool;
 use tokio::sync::{
     Mutex,
     MutexGuard,
 };
-use tower::ServiceExt;
 use usernames_indexer::{
-    api,
     db::{
         self,
         ChainStore,
@@ -121,21 +114,7 @@ fn retire(platform: B256, handle: &str, owner: Address) -> NamesEvent {
 }
 
 async fn get(store: &ChainStore, path: &str) -> (StatusCode, serde_json::Value) {
-    let state = api::AppState::new(store.clone(), addr(0xCC));
-    let response = api::router(state)
-        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
-        .await
-        .expect("request");
-    let status = response.status();
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("body")
-        .to_bytes();
-    let value = serde_json::from_slice(&bytes)
-        .unwrap_or_else(|_| serde_json::json!(String::from_utf8_lossy(&bytes)));
-    (status, value)
+    common::get(store, addr(0xCC), path).await
 }
 
 #[tokio::test]

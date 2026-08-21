@@ -67,30 +67,56 @@ impl<P: Provider> Indexer<P> {
     }
 
     /// Where a fresh scan starts: the override, the cached detection, or a
-    /// new binary search (cached for next time).
-    async fn resolve_start_block(&self) -> u64 {
+    /// new binary search. `None` means the RPC failed mid-detection — the
+    /// caller retries next cycle instead of committing to a guess. Only a
+    /// genuine detection is cached: a cached fallback would outlive the
+    /// failure that produced it and pin this deployment to genesis scans
+    /// forever.
+    async fn resolve_start_block(&self) -> Option<u64> {
         if let Some(block) = self.config.start_block {
-            return block;
+            return Some(block);
         }
         match self.store.deploy_block(self.config.contract).await {
-            Ok(Some(block)) => return block,
+            Ok(Some(block)) => return Some(block),
             Ok(None) => {}
             Err(e) => warn!(%e, "failed to read the cached deployment block"),
         }
-        let block = chain::detect_start_block(
-            &self.provider,
-            self.config.contract,
-            "IdentityNames",
-        )
-        .await;
-        if let Err(e) = self
-            .store
-            .set_deploy_block(self.config.contract, block)
+        let latest = match self.provider.get_block_number().await {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(%e, "no latest block for deployment detection; retrying next cycle");
+                return None;
+            }
+        };
+        match chain::find_deployment_block(&self.provider, self.config.contract, latest)
             .await
         {
-            warn!(%e, "failed to cache the deployment block");
+            Ok(Some(block)) => {
+                info!(block, "detected contract deployment block");
+                if let Err(e) = self
+                    .store
+                    .set_deploy_block(self.config.contract, block)
+                    .await
+                {
+                    warn!(%e, "failed to cache the deployment block");
+                }
+                Some(block)
+            }
+            Ok(None) => {
+                // Absence is an answer, but not one worth caching: the
+                // contract may simply not be deployed yet. Scanning from
+                // genesis is slow but never wrong, and the next fresh cycle
+                // re-checks.
+                warn!(
+                    "the contract has no code at the chain head; scanning from genesis"
+                );
+                Some(0)
+            }
+            Err(e) => {
+                warn!(%e, "deployment detection failed on RPC; retrying next cycle");
+                None
+            }
         }
-        block
     }
 
     /// One chunk: fetch, decode, apply, commit — cursor included. An error
@@ -166,7 +192,13 @@ impl<P: Provider> Indexer<P> {
 
             let from_block = match self.store.cursor().await {
                 Ok(Some(cursor)) => cursor + 1,
-                Ok(None) => self.resolve_start_block().await,
+                Ok(None) => match self.resolve_start_block().await {
+                    Some(block) => block,
+                    None => {
+                        sleep_or_cancel(&cancel, self.config.poll_interval_secs).await;
+                        continue;
+                    }
+                },
                 Err(e) => {
                     warn!(%e, "failed to read the cursor");
                     sleep_or_cancel(&cancel, self.config.poll_interval_secs).await;

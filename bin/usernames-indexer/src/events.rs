@@ -155,21 +155,57 @@ impl NamesEvent {
     }
 }
 
+/// Why a log from the watched contract could not be decoded. Distinct from
+/// `decode`'s `Ok(None)` — an unknown topic is legal and survivable, while
+/// these are not: a caller must fail the window on them, because skipping a
+/// log the contract really emitted would silently fork the read model from
+/// the chain.
+#[derive(Debug)]
+pub enum DecodeError {
+    /// The RPC returned a log without a field every mined log carries.
+    MissingField(&'static str),
+    /// A known topic whose payload did not decode.
+    Payload {
+        /// The event the topic names.
+        event: &'static str,
+        /// The decoder's reason.
+        source: alloy::sol_types::Error,
+    },
+}
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingField(field) => write!(f, "log without a {field}"),
+            Self::Payload { event, source } => write!(f, "{event}: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MissingField(_) => None,
+            Self::Payload { source, .. } => Some(source),
+        }
+    }
+}
+
 /// Decode one log from the contract. `Ok(None)` is a topic this indexer does
 /// not know — legal, because an upgraded contract may emit new events before
 /// this build learns them. A log that names a known topic but fails to decode
 /// is an error: skipping it would silently fork the read model from the chain.
-pub fn decode(log: &Log) -> Result<Option<(NamesEvent, LogPosition)>, String> {
+pub fn decode(log: &Log) -> Result<Option<(NamesEvent, LogPosition)>, DecodeError> {
     let position = LogPosition {
         block_number: log
             .block_number
-            .ok_or_else(|| "log without a block number".to_string())?,
+            .ok_or(DecodeError::MissingField("block number"))?,
         log_index: log
             .log_index
-            .ok_or_else(|| "log without a log index".to_string())?,
+            .ok_or(DecodeError::MissingField("log index"))?,
         tx_hash: log
             .transaction_hash
-            .ok_or_else(|| "log without a transaction hash".to_string())?,
+            .ok_or(DecodeError::MissingField("transaction hash"))?,
     };
     let Some(&topic0) = log.topic0() else {
         return Ok(None);
@@ -178,7 +214,10 @@ pub fn decode(log: &Log) -> Result<Option<(NamesEvent, LogPosition)>, String> {
     let event = if topic0 == IdentityNames::IdentityBound::SIGNATURE_HASH {
         let ev = log
             .log_decode::<IdentityNames::IdentityBound>()
-            .map_err(|e| format!("IdentityBound: {e}"))?;
+            .map_err(|e| DecodeError::Payload {
+                event: "IdentityBound",
+                source: e,
+            })?;
         let d = ev.inner.data;
         NamesEvent::IdentityBound {
             owner: d.owner,
@@ -194,7 +233,10 @@ pub fn decode(log: &Log) -> Result<Option<(NamesEvent, LogPosition)>, String> {
     } else if topic0 == IdentityNames::HandleRetired::SIGNATURE_HASH {
         let ev = log
             .log_decode::<IdentityNames::HandleRetired>()
-            .map_err(|e| format!("HandleRetired: {e}"))?;
+            .map_err(|e| DecodeError::Payload {
+                event: "HandleRetired",
+                source: e,
+            })?;
         let d = ev.inner.data;
         NamesEvent::HandleRetired {
             platform_id: d.platformId,
@@ -204,7 +246,10 @@ pub fn decode(log: &Log) -> Result<Option<(NamesEvent, LogPosition)>, String> {
     } else if topic0 == IdentityNames::NameUnpublished::SIGNATURE_HASH {
         let ev = log
             .log_decode::<IdentityNames::NameUnpublished>()
-            .map_err(|e| format!("NameUnpublished: {e}"))?;
+            .map_err(|e| DecodeError::Payload {
+                event: "NameUnpublished",
+                source: e,
+            })?;
         let d = ev.inner.data;
         NamesEvent::NameUnpublished {
             owner: d.owner,
@@ -213,14 +258,20 @@ pub fn decode(log: &Log) -> Result<Option<(NamesEvent, LogPosition)>, String> {
     } else if topic0 == IdentityNames::PlatformConfigured::SIGNATURE_HASH {
         let ev = log
             .log_decode::<IdentityNames::PlatformConfigured>()
-            .map_err(|e| format!("PlatformConfigured: {e}"))?;
+            .map_err(|e| DecodeError::Payload {
+                event: "PlatformConfigured",
+                source: e,
+            })?;
         NamesEvent::PlatformConfigured {
             platform_id: ev.inner.data.platformId,
         }
     } else if topic0 == IdentityNames::VerifierConfigured::SIGNATURE_HASH {
         let ev = log
             .log_decode::<IdentityNames::VerifierConfigured>()
-            .map_err(|e| format!("VerifierConfigured: {e}"))?;
+            .map_err(|e| DecodeError::Payload {
+                event: "VerifierConfigured",
+                source: e,
+            })?;
         let d = ev.inner.data;
         NamesEvent::VerifierConfigured {
             platform_id: d.platformId,
@@ -231,7 +282,10 @@ pub fn decode(log: &Log) -> Result<Option<(NamesEvent, LogPosition)>, String> {
     } else if topic0 == IdentityNames::VerifierRetired::SIGNATURE_HASH {
         let ev = log
             .log_decode::<IdentityNames::VerifierRetired>()
-            .map_err(|e| format!("VerifierRetired: {e}"))?;
+            .map_err(|e| DecodeError::Payload {
+                event: "VerifierRetired",
+                source: e,
+            })?;
         let d = ev.inner.data;
         NamesEvent::VerifierRetired {
             platform_id: d.platformId,
@@ -240,7 +294,10 @@ pub fn decode(log: &Log) -> Result<Option<(NamesEvent, LogPosition)>, String> {
     } else if topic0 == IdentityNames::LatestVersionChanged::SIGNATURE_HASH {
         let ev = log
             .log_decode::<IdentityNames::LatestVersionChanged>()
-            .map_err(|e| format!("LatestVersionChanged: {e}"))?;
+            .map_err(|e| DecodeError::Payload {
+                event: "LatestVersionChanged",
+                source: e,
+            })?;
         let d = ev.inner.data;
         NamesEvent::LatestVersionChanged {
             platform_id: d.platformId,
