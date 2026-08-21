@@ -1,0 +1,23 @@
+# Local development stack: one Postgres the indexer and its tests share.
+#
+# The indexer itself is run with `cargo run` against this database; a
+# containerized indexer service is added once there is an image to run.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: usernames
+      POSTGRES_USER: usernames
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-usernames_dev}
+    ports:
+      - "127.0.0.1:55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U usernames -d usernames"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
