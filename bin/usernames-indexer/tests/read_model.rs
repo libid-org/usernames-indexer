@@ -47,13 +47,17 @@ async fn test_store() -> Option<(ChainStore, PgPool, MutexGuard<'static, ()>)> {
         .run(&pool)
         .await
         .expect("migrations failed");
+    // Scoped to this suite's chain, like the anvil suite scopes to its own:
+    // neither depends on cargo happening to run test binaries sequentially.
     for table in db::PROJECTION_TABLES {
-        sqlx::query(&format!("TRUNCATE names.{table}"))
+        sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
+            .bind(CHAIN)
             .execute(&pool)
             .await
-            .expect("truncate failed");
+            .expect("cleanup failed");
     }
-    sqlx::query("DELETE FROM names.chain_metadata")
+    sqlx::query("DELETE FROM names.chain_metadata WHERE chain_id = $1")
+        .bind(CHAIN)
         .execute(&pool)
         .await
         .expect("metadata cleanup failed");
@@ -333,10 +337,12 @@ async fn replay_converges_instead_of_duplicating() {
     apply(&store, 1, event.clone()).await;
     apply(&store, 1, event).await;
 
-    let journal: i64 = sqlx::query_scalar("SELECT count(*) FROM names.events")
-        .fetch_one(&pool)
-        .await
-        .expect("count");
+    let journal: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM names.events WHERE chain_id = $1")
+            .bind(CHAIN)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
     assert_eq!(journal, 1);
     let (status, body) = get(&store, "/v1/resolve/handle/x/alice_1").await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -473,4 +479,33 @@ async fn platform_and_verifier_events_land_in_ops_tables() {
     .await
     .expect("verifier row");
     assert!(retired);
+}
+
+#[tokio::test]
+async fn unconfigured_platform_and_impossible_text_name_their_codes() {
+    let Some((store, _pool, _guard)) = test_store().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let x = nodes::Platform::from_key("x").unwrap().id();
+    apply(&store, 1, bind(addr(0xA1), x, "111", "alice_1", 1000, true)).await;
+
+    // A platform id the chain never configured is a different fact than an
+    // unclaimed handle — the contract's UnknownPlatform revert versus its
+    // zero-address answer — and the code says which, on both resolve paths.
+    let foreign = B256::repeat_byte(7);
+    let (status, body) =
+        get(&store, &format!("/v1/resolve/handle/{foreign}/alice_1")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "platform_not_configured", "{body}");
+    let (status, body) = get(&store, &format!("/v1/resolve/id/{foreign}/111")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "platform_not_configured", "{body}");
+
+    // Text X's rules can never hold (an interior space) mirrors the
+    // contract's deliberate zero-address answer: "no such handle can exist",
+    // a 404 with its own code — not "you asked wrong".
+    let (status, body) = get(&store, "/v1/resolve/handle/x/a%20b").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "handle_impossible", "{body}");
 }
