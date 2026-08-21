@@ -83,6 +83,21 @@ from the deployment block. The re-index is the migration. Changing
 `IDENTITY_NAMES_ADDRESS` triggers the same per-chain replay, because the old
 contract's bindings are not the new contract's bindings.
 
+## Deploying
+
+Every push to `main` and every `v*.*.*` tag publishes a linux/amd64 image to
+`ghcr.io/libid-org/usernames-indexer` (`:main`, `:latest`, `:<version>`,
+`:sha-<commit>`); PRs build the image without pushing so packaging cannot
+rot. The container binds `0.0.0.0:8080` and is configured entirely through
+the environment (table above). Probes: `GET /health` for liveness; for
+readiness gate on `GET /v1/status` — the resolve endpoints answer 503 by
+design until the first window lands. The API sends permissive CORS for GET,
+so a browser UI (handle.link) can call it directly from any origin.
+
+`docker compose up -d --build` runs the full stack locally against the
+compose Postgres — set `RPC_URL` and `IDENTITY_NAMES_ADDRESS` in `.env`
+first.
+
 ## Caveats worth knowing
 
 - **`PlatformConfigured` re-keying**: reconfiguring a platform's rules on

@@ -30,6 +30,10 @@ use sqlx::{
     PgPool,
     Row,
 };
+use tower_http::cors::{
+    Any,
+    CorsLayer,
+};
 
 use crate::{
     db,
@@ -59,6 +63,13 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/resolve/id/{platform}/{user_id}", get(resolve_id))
         .route("/v1/resolve/address/{address}", get(resolve_address))
         .route("/v1/search", get(search))
+        // A read-only public resolver: any origin may GET. This is what lets
+        // a browser UI (handle.link) call the API cross-origin at all.
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([axum::http::Method::GET]),
+        )
         .with_state(state)
 }
 

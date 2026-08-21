@@ -1,8 +1,24 @@
 # Local development stack: one Postgres the indexer and its tests share.
 #
-# The indexer itself is run with `cargo run` against this database; a
-# containerized indexer service is added once there is an image to run.
+# `docker compose up -d postgres` for the database alone (cargo run against
+# it); `docker compose up -d --build` for the full containerized stack —
+# indexer included, configured through the environment or a .env file.
 services:
+  indexer:
+    build: .
+    environment:
+      DATABASE_URL: postgres://usernames:${POSTGRES_PASSWORD:-usernames_dev}@postgres:5432/usernames
+      RPC_URL: ${RPC_URL:?set RPC_URL}
+      IDENTITY_NAMES_ADDRESS: ${IDENTITY_NAMES_ADDRESS:?set IDENTITY_NAMES_ADDRESS}
+      CHAIN_ID: ${CHAIN_ID:-}
+      CONFIRMATIONS: ${CONFIRMATIONS:-5}
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
   postgres:
     image: postgres:16
     environment:
