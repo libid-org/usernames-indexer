@@ -9,7 +9,10 @@
 //! contract keys its own storage by, so replaying a window — after a crash,
 //! or after a version-bump re-index — converges instead of duplicating.
 
-use alloy::primitives::Address;
+use alloy::primitives::{
+    Address,
+    B256,
+};
 use sqlx::{
     PgPool,
     Postgres,
@@ -26,7 +29,10 @@ use crate::{
         LogPosition,
         NamesEvent,
     },
-    nodes,
+    nodes::{
+        self,
+        NormalizedHandle,
+    },
 };
 
 /// Bump on any change to what the indexer writes. A mismatch at startup
@@ -152,12 +158,6 @@ impl ChainStore {
     /// The chain this store is scoped to.
     pub fn chain_id(&self) -> i64 {
         self.chain_id
-    }
-
-    /// The shared pool, for the read queries that have not yet moved onto
-    /// this type.
-    pub(crate) fn pool(&self) -> &PgPool {
-        &self.pool
     }
 
     async fn get_metadata(&self, key: &str) -> Result<Option<String>, sqlx::Error> {
@@ -713,5 +713,256 @@ impl Window {
         }
 
         Ok(true)
+    }
+}
+
+// ─── The read side ──────────────────────────────────────────────────────────
+// The same store the writer uses answers the API's queries, so all SQL —
+// and the join shapes the projections were designed for — lives in one
+// module. Handlers translate HTTP to these calls and rows to JSON; they do
+// not own queries.
+
+/// One `names.handles` row joined with the id it points back at: everything
+/// `resolveHandle` answers from.
+#[derive(sqlx::FromRow)]
+pub struct HandleRow {
+    /// The normalized handle, as the chain emitted it.
+    pub handle: String,
+    /// The storage key the chain filed this handle under.
+    pub handle_node: Vec<u8>,
+    /// The wallet, or `None` after retirement — the contract's `address(0)`.
+    pub owner: Option<Vec<u8>>,
+    /// The proof-freshness watermark, kept even through retirement.
+    pub observed_at: i64,
+    /// The proof version; 0 after retirement, like the contract.
+    pub version: i64,
+    /// The account id node this handle points back at (`idOfHandle`).
+    pub id_node: Vec<u8>,
+    /// The plaintext account id behind that node, when it was ever bound.
+    pub user_id: Option<String>,
+    /// The wallet that account id currently resolves to.
+    pub id_owner: Option<Vec<u8>>,
+}
+
+impl HandleRow {
+    /// Mirrors `resolvePair`: the account id this handle points back at
+    /// still resolves to the same wallet.
+    pub fn id_agrees(&self) -> bool {
+        match &self.owner {
+            Some(owner) => self.id_owner.as_deref() == Some(owner.as_slice()),
+            None => false,
+        }
+    }
+}
+
+/// One `names.ids` row joined with the handle node it points at and the
+/// published mapping: everything `resolveId` and the reverse display answer
+/// from.
+#[derive(sqlx::FromRow)]
+pub struct IdentityRow {
+    /// The platform the account lives on.
+    pub platform_id: Vec<u8>,
+    /// The plaintext account id, byte-verbatim as the chain keys it.
+    pub user_id: String,
+    /// The storage key the chain filed this account under.
+    pub id_node: Vec<u8>,
+    /// The wallet that proved the account.
+    pub owner: Vec<u8>,
+    /// The proof-freshness watermark.
+    pub observed_at: i64,
+    /// The proof version.
+    pub version: i64,
+    /// The handle node this account last proved (`handleOfId`).
+    pub handle_node: Vec<u8>,
+    /// The handle string at that node, when the node was ever bound.
+    pub handle: Option<String>,
+    /// The wallet the handle node currently resolves to.
+    pub handle_owner: Option<Vec<u8>>,
+    /// The id node the handle currently points back at.
+    pub handle_id_node: Option<Vec<u8>>,
+    /// Whether a published row exists for (owner, platform, handle).
+    pub published: bool,
+}
+
+impl IdentityRow {
+    /// The `handleOfId`/`idOfHandle` round trip, written once: the stored
+    /// handle string is presentable only while the node still points back at
+    /// this id and still resolves to this wallet. Otherwise the account
+    /// renamed or was overtaken, and showing the stale string would
+    /// mis-route a payment.
+    pub fn handle_still_owned(&self) -> bool {
+        self.handle_owner.as_deref() == Some(self.owner.as_slice())
+            && self.handle_id_node.as_deref() == Some(self.id_node.as_slice())
+    }
+
+    /// The handle to present, when it is still this account's.
+    pub fn presentable_handle(&self) -> Option<&str> {
+        if self.handle_still_owned() {
+            self.handle.as_deref()
+        } else {
+            None
+        }
+    }
+
+    /// Whether this is the wallet's displayed name on the platform — only
+    /// while the handle is still the account's.
+    pub fn displayed(&self) -> bool {
+        self.published && self.handle_still_owned()
+    }
+}
+
+/// One search hit: a live handle, its owner, and the id it pairs with.
+#[derive(sqlx::FromRow)]
+pub struct SearchRow {
+    /// The platform the handle lives on.
+    pub platform_id: Vec<u8>,
+    /// The normalized handle.
+    pub handle: String,
+    /// The wallet it resolves to (retired handles never match).
+    pub owner: Vec<u8>,
+    /// The account id behind it, when bound.
+    pub user_id: Option<String>,
+    /// Whether the owner displays this handle.
+    pub published: bool,
+}
+
+/// Escape LIKE metacharacters so query text matches itself.
+fn escape_like(raw: &str) -> String {
+    raw.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+impl ChainStore {
+    /// Whether the chain ever configured this platform — the difference
+    /// between the contract's `UnknownPlatform` revert and its zero-address
+    /// answer.
+    pub async fn platform_wired(&self, platform_id: B256) -> Result<bool, sqlx::Error> {
+        let row: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM names.platforms WHERE chain_id = $1 AND platform_id = $2",
+        )
+        .bind(self.chain_id)
+        .bind(platform_id.as_slice())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    /// The row `resolveHandle` answers from, by the platform and the
+    /// chain-normalized handle. Demanding [`NormalizedHandle`] keeps a raw
+    /// query string — which would never match a stored row — out of the SQL.
+    pub async fn resolve_handle(
+        &self,
+        platform_id: B256,
+        handle: &NormalizedHandle,
+    ) -> Result<Option<HandleRow>, sqlx::Error> {
+        sqlx::query_as(
+            r#"SELECT h.handle, h.handle_node, h.owner, h.observed_at,
+                      h.version, h.id_node,
+                      i.user_id, i.owner AS id_owner
+               FROM names.handles h
+               LEFT JOIN names.ids i
+                 ON i.chain_id = h.chain_id AND i.id_node = h.id_node
+               WHERE h.chain_id = $1 AND h.platform_id = $2 AND h.handle = $3"#,
+        )
+        .bind(self.chain_id)
+        .bind(platform_id.as_slice())
+        .bind(handle.as_str())
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// The row `resolveId` answers from. The id is matched byte-verbatim,
+    /// exactly as the chain keys it.
+    pub async fn resolve_id(
+        &self,
+        platform_id: B256,
+        user_id: &str,
+    ) -> Result<Option<IdentityRow>, sqlx::Error> {
+        sqlx::query_as(
+            r#"SELECT i.platform_id, i.user_id, i.id_node, i.owner,
+                      i.observed_at, i.version, i.handle_node,
+                      h.handle, h.owner AS handle_owner, h.id_node AS handle_id_node,
+                      (p.handle IS NOT NULL) AS published
+               FROM names.ids i
+               LEFT JOIN names.handles h
+                 ON h.chain_id = i.chain_id AND h.handle_node = i.handle_node
+               LEFT JOIN names.published p
+                 ON p.chain_id = i.chain_id AND p.owner = i.owner
+                    AND p.platform_id = i.platform_id AND p.handle = h.handle
+               WHERE i.chain_id = $1 AND i.platform_id = $2 AND i.user_id = $3"#,
+        )
+        .bind(self.chain_id)
+        .bind(platform_id.as_slice())
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Every identity a wallet proved — `primaryOf`'s reverse display,
+    /// platform by platform.
+    pub async fn identities_of(
+        &self,
+        owner: Address,
+    ) -> Result<Vec<IdentityRow>, sqlx::Error> {
+        sqlx::query_as(
+            r#"SELECT i.platform_id, i.user_id, i.id_node, i.owner,
+                      i.observed_at, i.version, i.handle_node,
+                      h.handle, h.owner AS handle_owner, h.id_node AS handle_id_node,
+                      (p.handle IS NOT NULL) AS published
+               FROM names.ids i
+               LEFT JOIN names.handles h
+                 ON h.chain_id = i.chain_id AND h.handle_node = i.handle_node
+               LEFT JOIN names.published p
+                 ON p.chain_id = i.chain_id AND p.owner = i.owner
+                    AND p.platform_id = i.platform_id AND p.handle = h.handle
+               WHERE i.chain_id = $1 AND i.owner = $2
+               ORDER BY i.platform_id, i.user_id"#,
+        )
+        .bind(self.chain_id)
+        .bind(owner.as_slice())
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Live handles matching a folded partial query: exact first, then
+    /// prefix, then substring, then trigram-fuzzy. LIKE-escaping is this
+    /// method's problem, not the caller's — it exists so the query text
+    /// matches itself, which is SQL knowledge.
+    pub async fn search_handles(
+        &self,
+        platform_id: Option<B256>,
+        folded_query: &str,
+        limit: i64,
+    ) -> Result<Vec<SearchRow>, sqlx::Error> {
+        let like = escape_like(folded_query);
+        sqlx::query_as(
+            r#"SELECT h.platform_id, h.handle, h.owner, i.user_id,
+                      (p.handle IS NOT NULL) AS published
+               FROM names.handles h
+               LEFT JOIN names.ids i
+                 ON i.chain_id = h.chain_id AND i.id_node = h.id_node
+               LEFT JOIN names.published p
+                 ON p.chain_id = h.chain_id AND p.owner = h.owner
+                    AND p.platform_id = h.platform_id AND p.handle = h.handle
+               WHERE h.chain_id = $1
+                 AND h.owner IS NOT NULL
+                 AND ($2::bytea IS NULL OR h.platform_id = $2)
+                 AND (h.handle LIKE '%' || $3 || '%' ESCAPE '\'
+                      OR h.handle % $4)
+               ORDER BY (h.handle = $4) DESC,
+                        (h.handle LIKE $3 || '%' ESCAPE '\') DESC,
+                        (h.handle LIKE '%' || $3 || '%' ESCAPE '\') DESC,
+                        similarity(h.handle, $4) DESC,
+                        h.handle ASC
+               LIMIT $5"#,
+        )
+        .bind(self.chain_id)
+        .bind(platform_id.as_ref().map(|p| p.as_slice().to_vec()))
+        .bind(&like)
+        .bind(folded_query)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
     }
 }
