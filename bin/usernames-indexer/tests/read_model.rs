@@ -96,7 +96,10 @@ fn bind(
     NamesEvent::IdentityBound {
         owner,
         id_node: nodes::id_node(platform, user_id),
-        handle_node: nodes::handle_node(platform, handle),
+        handle_node: nodes::handle_node(
+            platform,
+            &nodes::NormalizedHandle::from_chain(handle),
+        ),
         platform_id: platform,
         user_id: user_id.into(),
         handle: handle.into(),
@@ -109,7 +112,10 @@ fn bind(
 fn retire(platform: B256, handle: &str, owner: Address) -> NamesEvent {
     NamesEvent::HandleRetired {
         platform_id: platform,
-        handle_node: nodes::handle_node(platform, handle),
+        handle_node: nodes::handle_node(
+            platform,
+            &nodes::NormalizedHandle::from_chain(handle),
+        ),
         owner,
     }
 }
@@ -138,7 +144,7 @@ async fn bind_resolves_all_three_directions() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::platform_id_for_key("x").unwrap();
+    let x = nodes::Platform::from_key("x").unwrap().id();
     let alice = addr(0xA1);
     apply(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
 
@@ -172,7 +178,7 @@ async fn rename_retires_the_previous_handle() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::platform_id_for_key("x").unwrap();
+    let x = nodes::Platform::from_key("x").unwrap().id();
     let alice = addr(0xA1);
     apply(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
     // The contract emits the retirement before the new bind in the same tx.
@@ -208,7 +214,7 @@ async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::platform_id_for_key("x").unwrap();
+    let x = nodes::Platform::from_key("x").unwrap().id();
     let (alice, bob) = (addr(0xA1), addr(0xB2));
     // Alice holds the handle, renames her platform account, re-proves under
     // the same handle... then the platform recycles the name to Bob's
@@ -237,7 +243,7 @@ async fn publish_flag_is_the_post_state() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::platform_id_for_key("x").unwrap();
+    let x = nodes::Platform::from_key("x").unwrap().id();
     let alice = addr(0xA1);
     apply(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
     // A later bind that reports published=false clears the display name.
@@ -270,8 +276,8 @@ async fn search_ranks_exact_prefix_substring() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::platform_id_for_key("x").unwrap();
-    let github = nodes::platform_id_for_key("github").unwrap();
+    let x = nodes::Platform::from_key("x").unwrap().id();
+    let github = nodes::Platform::from_key("github").unwrap().id();
     apply(&store, 1, bind(addr(1), x, "1", "ali", 1000, false)).await;
     apply(&store, 2, bind(addr(2), x, "2", "alice_1", 1000, true)).await;
     apply(&store, 3, bind(addr(3), x, "3", "malice", 1000, false)).await;
@@ -339,7 +345,7 @@ async fn replay_converges_instead_of_duplicating() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::platform_id_for_key("x").unwrap();
+    let x = nodes::Platform::from_key("x").unwrap().id();
     let alice = addr(0xA1);
     let event = bind(alice, x, "111", "alice_1", 1000, true);
     apply(&store, 1, event.clone()).await;
@@ -396,7 +402,7 @@ async fn nul_bytes_neither_stall_the_indexer_nor_crash_the_api() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::platform_id_for_key("x").unwrap();
+    let x = nodes::Platform::from_key("x").unwrap().id();
     // An adversarial platform emits a userId with a NUL byte. The window must
     // apply — lossily, loudly — rather than stall the chain forever behind a
     // value Postgres cannot store.
@@ -429,7 +435,7 @@ async fn platform_and_verifier_events_land_in_ops_tables() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::platform_id_for_key("x").unwrap();
+    let x = nodes::Platform::from_key("x").unwrap().id();
     apply(&store, 1, NamesEvent::PlatformConfigured { platform_id: x }).await;
     apply(
         &store,

@@ -141,8 +141,8 @@ async fn indexes_a_real_chain_end_to_end() {
         .expect("deploy");
     let deploy_block = provider.get_block_number().await.expect("block");
 
-    let x = nodes::platform_id_for_key("x").unwrap();
-    let google = nodes::platform_id_for_key("google").unwrap();
+    let x = nodes::Platform::from_key("x").unwrap().id();
+    let google = nodes::Platform::from_key("google").unwrap().id();
     let alice = Address::repeat_byte(0xA1);
     let verifier = Address::repeat_byte(0xEE);
 
@@ -173,7 +173,7 @@ async fn indexes_a_real_chain_end_to_end() {
     mock.emitIdentityBound(
         alice,
         nodes::id_node(x, "111"),
-        nodes::handle_node(x, "alice_1"),
+        nodes::handle_node(x, &nodes::NormalizedHandle::from_chain("alice_1")),
         x,
         "111".into(),
         "alice_1".into(),
@@ -187,17 +187,21 @@ async fn indexes_a_real_chain_end_to_end() {
     .watch()
     .await
     .unwrap();
-    mock.emitHandleRetired(x, nodes::handle_node(x, "alice_1"), alice)
-        .send()
-        .await
-        .unwrap()
-        .watch()
-        .await
-        .unwrap();
+    mock.emitHandleRetired(
+        x,
+        nodes::handle_node(x, &nodes::NormalizedHandle::from_chain("alice_1")),
+        alice,
+    )
+    .send()
+    .await
+    .unwrap()
+    .watch()
+    .await
+    .unwrap();
     mock.emitIdentityBound(
         alice,
         nodes::id_node(x, "111"),
-        nodes::handle_node(x, "alice_2"),
+        nodes::handle_node(x, &nodes::NormalizedHandle::from_chain("alice_2")),
         x,
         "111".into(),
         "alice_2".into(),
@@ -214,7 +218,10 @@ async fn indexes_a_real_chain_end_to_end() {
     mock.emitIdentityBound(
         alice,
         nodes::id_node(google, "999"),
-        nodes::handle_node(google, "a.b+tag@example.com"),
+        nodes::handle_node(
+            google,
+            &nodes::NormalizedHandle::from_chain("a.b+tag@example.com"),
+        ),
         google,
         "999".into(),
         "a.b+tag@example.com".into(),

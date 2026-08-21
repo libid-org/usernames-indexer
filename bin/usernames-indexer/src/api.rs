@@ -113,30 +113,8 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// A platform named by its short key ('x') or its 0x-hex 32-byte id. The key
-/// form also carries this build's normalization rules; the hex form indexes
-/// fine but string queries run un-normalized.
-struct PlatformRef {
-    id: B256,
-    key: Option<&'static str>,
-}
-
-fn parse_platform(raw: &str) -> Result<PlatformRef, ApiError> {
-    if let Some(id) = nodes::platform_id_for_key(raw) {
-        return Ok(PlatformRef {
-            id,
-            key: Some(nodes::KNOWN_PLATFORMS[&id]),
-        });
-    }
-    if let Ok(id) = B256::from_str(raw) {
-        return Ok(PlatformRef {
-            id,
-            key: nodes::KNOWN_PLATFORMS.get(&id).copied(),
-        });
-    }
-    Err(ApiError::bad_request(format!(
-        "unknown platform {raw:?}: use x, github, google, or a 0x-hex platform id"
-    )))
+fn parse_platform(raw: &str) -> Result<nodes::Platform, ApiError> {
+    nodes::Platform::parse(raw).map_err(|e| ApiError::bad_request(e.to_string()))
 }
 
 /// Postgres cannot compare TEXT holding a NUL byte, and no stored value ever
@@ -164,13 +142,13 @@ async fn ensure_synced(state: &AppState) -> Result<(), ApiError> {
 /// the contract's `UnknownPlatform` revert and its zero-address answer.
 async fn platform_wired(
     state: &AppState,
-    platform: &PlatformRef,
+    platform: &nodes::Platform,
 ) -> Result<bool, ApiError> {
     let row: Option<i64> = sqlx::query_scalar(
         "SELECT 1 FROM names.platforms WHERE chain_id = $1 AND platform_id = $2",
     )
     .bind(state.store.chain_id())
-    .bind(platform.id.as_slice())
+    .bind(platform.id().as_slice())
     .fetch_optional(state.store.pool())
     .await?;
     Ok(row.is_some())
@@ -252,19 +230,14 @@ async fn resolve_handle(
     // Normalize the way the chain did before it keyed the handle. Text the
     // platform could never hold mirrors the contract's `resolveHandle`,
     // which deliberately answers the zero address for it — a 404, not a 400:
-    // "nobody holds this", not "you asked wrong". A platform this build has
-    // no rules for is queried as given — its handles were still stored
-    // normalized, the caller just has to supply that form.
-    let normalized = match platform.key.and_then(libid_identity::Rules::for_platform) {
-        Some(rules) => match libid_identity::normalize(&handle, rules) {
-            Ok(normalized) => normalized,
-            Err(e) => {
-                return Err(ApiError::not_found(format!(
-                    "no handle can exist on this platform for this text: {e}"
-                )));
-            }
-        },
-        None => handle,
+    // "nobody holds this", not "you asked wrong".
+    let normalized = match platform.normalize_query(&handle) {
+        Ok(normalized) => normalized,
+        Err(e) => {
+            return Err(ApiError::not_found(format!(
+                "no handle can exist on this platform for this text: {e}"
+            )));
+        }
     };
 
     let row = sqlx::query(
@@ -277,8 +250,8 @@ async fn resolve_handle(
            WHERE h.chain_id = $1 AND h.platform_id = $2 AND h.handle = $3"#,
     )
     .bind(state.store.chain_id())
-    .bind(platform.id.as_slice())
-    .bind(&normalized)
+    .bind(platform.id().as_slice())
+    .bind(normalized.as_str())
     .fetch_optional(state.store.pool())
     .await?;
 
@@ -291,20 +264,24 @@ async fn resolve_handle(
                 "this platform is not configured on this chain",
             ));
         }
-        return Err(ApiError::not_found(format!("{normalized:?} is not bound")));
+        return Err(ApiError::not_found(format!(
+            "{:?} is not bound",
+            normalized.as_str()
+        )));
     };
     let owner: Option<Vec<u8>> = row.try_get("owner")?;
     let Some(owner) = owner else {
         return Err(ApiError::not_found(format!(
-            "{normalized:?} was retired: its account proved a different handle"
+            "{:?} was retired: its account proved a different handle",
+            normalized.as_str()
         )));
     };
     let id_owner: Option<Vec<u8>> = row.try_get("id_owner")?;
     let id_node: Option<Vec<u8>> = row.try_get("id_node")?;
 
     Ok(Json(HandleResolution {
-        platform: platform.key,
-        platform_id: platform.id.to_string(),
+        platform: platform.key(),
+        platform_id: platform.id().to_string(),
         handle: row.try_get("handle")?,
         handle_node: b256_from_db(row.try_get::<Vec<u8>, _>("handle_node")?.as_slice()),
         owner: address_from_db(&owner),
@@ -358,7 +335,7 @@ async fn resolve_id(
            WHERE i.chain_id = $1 AND i.platform_id = $2 AND i.user_id = $3"#,
     )
     .bind(state.store.chain_id())
-    .bind(platform.id.as_slice())
+    .bind(platform.id().as_slice())
     .bind(&user_id)
     .fetch_optional(state.store.pool())
     .await?;
@@ -385,8 +362,8 @@ async fn resolve_id(
     let handle: Option<String> = row.try_get("handle")?;
 
     Ok(Json(IdResolution {
-        platform: platform.key,
-        platform_id: platform.id.to_string(),
+        platform: platform.key(),
+        platform_id: platform.id().to_string(),
         user_id: row.try_get("user_id")?,
         id_node: b256_from_db(&id_node),
         owner: address_from_db(&owner),
@@ -463,7 +440,7 @@ async fn resolve_address(
             && handle_id_node.as_deref() == Some(id_node.as_slice());
         let handle: Option<String> = row.try_get("handle")?;
         identities.push(AddressIdentity {
-            platform: nodes::KNOWN_PLATFORMS.get(&platform_id).copied(),
+            platform: nodes::Platform::key_of(platform_id),
             platform_id: platform_id.to_string(),
             user_id: row.try_get("user_id")?,
             handle: if resolves { handle } else { None },
@@ -511,15 +488,6 @@ struct SearchResults {
     hits: Vec<SearchHit>,
 }
 
-/// Fold a search query the way normalization would, without refusing partial
-/// input: trim spaces, strip one leading `@`, lowercase A-Z. A partial handle
-/// cannot pass shape checks, so full normalization is deliberately not run.
-fn fold_query(raw: &str) -> String {
-    let trimmed = raw.trim_matches(' ');
-    let stripped = trimmed.strip_prefix('@').unwrap_or(trimmed);
-    stripped.to_ascii_lowercase()
-}
-
 /// Escape LIKE metacharacters so the query text matches itself.
 fn escape_like(raw: &str) -> String {
     raw.replace('\\', "\\\\")
@@ -535,7 +503,7 @@ async fn search(
 ) -> Result<Json<SearchResults>, ApiError> {
     reject_nul(&params.q, "q")?;
     ensure_synced(&state).await?;
-    let query = fold_query(&params.q);
+    let query = nodes::fold_search_query(&params.q);
     if query.is_empty() {
         return Err(ApiError::bad_request("q must be nonempty"));
     }
@@ -545,7 +513,7 @@ async fn search(
         .as_deref()
         .map(parse_platform)
         .transpose()?
-        .map(|p| p.id);
+        .map(|p| p.id());
     let like = escape_like(&query);
 
     let rows = sqlx::query(
@@ -582,7 +550,7 @@ async fn search(
         let platform_id =
             B256::from_slice(row.try_get::<Vec<u8>, _>("platform_id")?.as_slice());
         hits.push(SearchHit {
-            platform: nodes::KNOWN_PLATFORMS.get(&platform_id).copied(),
+            platform: nodes::Platform::key_of(platform_id),
             platform_id: platform_id.to_string(),
             handle: row.try_get("handle")?,
             owner: address_from_db(row.try_get::<Vec<u8>, _>("owner")?.as_slice()),

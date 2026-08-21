@@ -479,7 +479,11 @@ impl Window {
                 if nodes::id_node(*platform_id, user_id) != *id_node {
                     error!(%id_node, user_id, "recomputed idNode disagrees with the emitted topic");
                 }
-                if nodes::handle_node(*platform_id, handle) != *handle_node {
+                if nodes::handle_node(
+                    *platform_id,
+                    &nodes::NormalizedHandle::from_chain(handle),
+                ) != *handle_node
+                {
                     error!(%handle_node, handle, "recomputed handleNode disagrees with the emitted topic");
                 }
 
@@ -611,7 +615,7 @@ impl Window {
             }
 
             NamesEvent::PlatformConfigured { platform_id } => {
-                let key = nodes::KNOWN_PLATFORMS.get(platform_id).copied();
+                let key = nodes::Platform::key_of(*platform_id);
                 let reconfigured: bool = sqlx::query_scalar(
                     r#"INSERT INTO names.platforms
                            (chain_id, platform_id, platform_key, configured_count, last_configured_block)
@@ -690,7 +694,7 @@ impl Window {
                 platform_id,
                 version,
             } => {
-                let key = nodes::KNOWN_PLATFORMS.get(platform_id).copied();
+                let key = nodes::Platform::key_of(*platform_id);
                 sqlx::query(
                     r#"INSERT INTO names.platforms
                            (chain_id, platform_id, platform_key, latest_version)
