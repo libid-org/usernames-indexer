@@ -60,7 +60,7 @@ async fn test_store() -> Option<(ChainStore, PgPool, MutexGuard<'static, ()>)> {
             .await
             .expect("truncate failed");
     }
-    sqlx::query("DELETE FROM names.pipeline_metadata")
+    sqlx::query("DELETE FROM names.chain_metadata")
         .execute(&pool)
         .await
         .expect("metadata cleanup failed");
