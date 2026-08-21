@@ -29,7 +29,10 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use usernames_indexer::{
     api,
-    db,
+    db::{
+        self,
+        ChainStore,
+    },
     indexer,
     nodes,
 };
@@ -73,15 +76,11 @@ sol! {
 const CHAIN: u64 = 43117;
 
 async fn get(
-    pool: &sqlx::PgPool,
+    store: &ChainStore,
     contract: Address,
     path: &str,
 ) -> (StatusCode, serde_json::Value) {
-    let state = api::AppState {
-        pool: pool.clone(),
-        chain_id: CHAIN as i64,
-        contract,
-    };
+    let state = api::AppState::new(store.clone(), contract);
     let response = api::router(state)
         .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
         .await
@@ -114,16 +113,10 @@ async fn indexes_a_real_chain_end_to_end() {
     }
 
     let pool = db::connect_and_migrate(&url).await.expect("database");
+    let store = ChainStore::new(pool.clone(), CHAIN as i64);
     // A previous run of this test left rows under this chain id; the loop
     // must start from a clean slate to make block-number assertions exact.
-    for table in [
-        "events",
-        "ids",
-        "handles",
-        "published",
-        "platforms",
-        "verifiers",
-    ] {
+    for table in db::PROJECTION_TABLES {
         sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
             .bind(CHAIN as i64)
             .execute(&pool)
@@ -251,22 +244,19 @@ async fn indexes_a_real_chain_end_to_end() {
     let cancel = CancellationToken::new();
     let config = indexer::IndexerConfig {
         contract: *mock.address(),
-        chain_id: CHAIN as i64,
         confirmations: 0,
         poll_interval_secs: 1,
         max_block_range: 2,
         start_block: None,
     };
-    let task = tokio::spawn(indexer::run(
-        pool.clone(),
-        provider.clone(),
-        config,
-        cancel.clone(),
-    ));
+    let task = tokio::spawn(
+        indexer::Indexer::new(store.clone(), provider.clone(), config)
+            .run(cancel.clone()),
+    );
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        let cursor = db::get_cursor(&pool, CHAIN as i64).await.expect("cursor");
+        let cursor = store.cursor().await.expect("cursor");
         if cursor.is_some_and(|c| c >= latest) {
             break;
         }
@@ -280,26 +270,24 @@ async fn indexes_a_real_chain_end_to_end() {
     let _ = task.await;
 
     // Detection ran once and its answer was cached — and it is the right one.
-    let cached = db::get_deploy_block(&pool, CHAIN as i64, *mock.address())
-        .await
-        .expect("metadata");
+    let cached = store.deploy_block(*mock.address()).await.expect("metadata");
     assert_eq!(cached, Some(deploy_block), "cached deployment block");
 
     let contract = *mock.address();
 
     // alice_1 retired, alice_2 resolves, and the id followed the rename.
-    let (status, _) = get(&pool, contract, "/v1/resolve/handle/x/alice_1").await;
+    let (status, _) = get(&store, contract, "/v1/resolve/handle/x/alice_1").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let (status, body) = get(&pool, contract, "/v1/resolve/handle/x/alice_2").await;
+    let (status, body) = get(&store, contract, "/v1/resolve/handle/x/alice_2").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["owner"], alice.to_string().as_str());
     assert_eq!(body["idAgrees"], true);
-    let (_, body) = get(&pool, contract, "/v1/resolve/id/x/111").await;
+    let (_, body) = get(&store, contract, "/v1/resolve/id/x/111").await;
     assert_eq!(body["handle"], "alice_2");
 
     // The Google identity resolves through the URL-encoded raw form.
     let (status, body) = get(
-        &pool,
+        &store,
         contract,
         "/v1/resolve/handle/google/A.B%2Btag%40Example.COM",
     )
@@ -310,14 +298,14 @@ async fn indexes_a_real_chain_end_to_end() {
 
     // Reverse: both identities, neither displayed (x was unpublished, google
     // never was).
-    let (_, body) = get(&pool, contract, &format!("/v1/resolve/address/{alice}")).await;
+    let (_, body) = get(&store, contract, &format!("/v1/resolve/address/{alice}")).await;
     let identities = body["identities"].as_array().unwrap();
     assert_eq!(identities.len(), 2, "{body}");
     assert!(identities.iter().all(|i| i["published"] == false), "{body}");
     assert!(identities.iter().all(|i| i["resolves"] == true), "{body}");
 
     // Search sees the current handle, not the retired one.
-    let (_, body) = get(&pool, contract, "/v1/search?q=alice&platform=x").await;
+    let (_, body) = get(&store, contract, "/v1/search?q=alice&platform=x").await;
     let handles: Vec<&str> = body["hits"]
         .as_array()
         .unwrap()
@@ -327,7 +315,7 @@ async fn indexes_a_real_chain_end_to_end() {
     assert_eq!(handles, ["alice_2"], "{body}");
 
     // Ops tables filled from the admin events.
-    let (_, body) = get(&pool, contract, "/v1/status").await;
+    let (_, body) = get(&store, contract, "/v1/status").await;
     assert!(
         body["lastIndexedBlock"]
             .as_u64()
