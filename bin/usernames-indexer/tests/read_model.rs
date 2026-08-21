@@ -367,6 +367,28 @@ async fn replay_converges_instead_of_duplicating() {
 }
 
 #[tokio::test]
+async fn unclaimed_names_on_a_configured_platform_are_coded_404s() {
+    let Some((store, _pool, _guard)) = test_store().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let x = nodes::Platform::from_key("x").unwrap().id();
+    // The platform row EXISTS — this is the branch the absent-platform test
+    // cannot reach, and the one that shipped a decode 500: the wired check
+    // read `SELECT 1` (INT4 on the wire) as i64, so it failed exactly when
+    // a row was found.
+    apply(&store, 1, NamesEvent::PlatformConfigured { platform_id: x }).await;
+
+    let (status, body) = get(&store, "/v1/resolve/handle/x/zzz").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "handle_not_bound", "{body}");
+
+    let (status, body) = get(&store, "/v1/resolve/id/x/999999").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "id_not_bound", "{body}");
+}
+
+#[tokio::test]
 async fn api_refuses_to_answer_before_the_first_window() {
     let Some((store, _pool, _guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");

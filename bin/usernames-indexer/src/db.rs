@@ -866,14 +866,18 @@ impl ChainStore {
     /// between the contract's `UnknownPlatform` revert and its zero-address
     /// answer.
     pub async fn platform_wired(&self, platform_id: B256) -> Result<bool, sqlx::Error> {
-        let row: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM names.platforms WHERE chain_id = $1 AND platform_id = $2",
+        // EXISTS, not `SELECT 1`: a bare literal is INT4 on the wire, and
+        // decoding it as i64 fails exactly when a row IS found — so the
+        // check passed for unconfigured platforms and 500'd for configured
+        // ones, which is how it escaped every absent-platform test.
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM names.platforms
+              WHERE chain_id = $1 AND platform_id = $2)",
         )
         .bind(self.chain_id)
         .bind(platform_id.as_slice())
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.is_some())
+        .fetch_one(&self.pool)
+        .await
     }
 
     /// The row `resolveHandle` answers from, by the platform and the
