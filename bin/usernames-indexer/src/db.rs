@@ -124,9 +124,12 @@ impl From<sqlx::Error> for ApplyError {
 ///
 /// It is also a witness: [`ChainStore::prepare`] takes `&WriterLease`, so the
 /// check-clear-stamp sequence cannot be run without holding the lock that
-/// makes it safe.
+/// makes it safe. The lease remembers which chain it locks, and `prepare`
+/// verifies the match, so a lease from one store cannot vouch for another.
 pub struct WriterLease {
     _conn: sqlx::pool::PoolConnection<Postgres>,
+    /// The chain whose advisory lock this connection holds.
+    chain_id: i64,
 }
 
 /// All persistence for one chain: the pool and the chain id fused, so chain
@@ -192,7 +195,10 @@ impl ChainStore {
                 .execute(&mut *conn)
                 .await?;
         }
-        Ok(WriterLease { _conn: conn })
+        Ok(WriterLease {
+            _conn: conn,
+            chain_id: self.chain_id,
+        })
     }
 
     /// Clear and rescan this chain when this build writes a different shape
@@ -206,11 +212,22 @@ impl ChainStore {
     /// The lease parameter is the safety argument in the signature: without
     /// the chain's writer lock, the check-clear-stamp sequence could race a
     /// still-running older instance.
+    ///
+    /// A lease for a DIFFERENT chain is a hard panic, not a debug assert:
+    /// proceeding would clear this chain's rows without the lock that makes
+    /// the clear safe — a data-destroying race — and this runs once at
+    /// startup, where crashing is cheap and the bug is a miswired process,
+    /// not bad input.
     pub async fn prepare(
         &self,
-        _writer: &WriterLease,
+        writer: &WriterLease,
         contract: Address,
     ) -> Result<(), sqlx::Error> {
+        assert_eq!(
+            writer.chain_id, self.chain_id,
+            "writer lease locks chain {}, but this store prepares chain {}",
+            writer.chain_id, self.chain_id
+        );
         let version = self.get_metadata(SCHEMA_VERSION_KEY).await?;
         let known_contract = self.get_metadata(CONTRACT_KEY).await?;
         let contract_now = contract.to_string().to_lowercase();

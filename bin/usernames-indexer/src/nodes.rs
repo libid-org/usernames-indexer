@@ -25,8 +25,10 @@ use libid_identity::handle_vectors::{
     PLATFORM_X_DOMAIN,
 };
 
-/// keccak256 of a platform's domain string is its id.
-pub fn platform_id(domain: &str) -> B256 {
+/// keccak256 of a platform's domain string is its id. Private on purpose:
+/// [`Platform`] is the one entry point for naming platforms, so a caller
+/// cannot conjure an id from a domain the registry does not know.
+fn platform_id(domain: &str) -> B256 {
     keccak256(domain.as_bytes())
 }
 
