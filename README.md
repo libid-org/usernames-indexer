@@ -56,6 +56,14 @@ platform id. With a known key, the handle in the path is normalized exactly
 the way the chain normalized it before keying (`libid-identity`); `{userId}`
 is always matched byte-verbatim, because the contract never normalizes ids.
 
+Errors share one envelope — `{ "error": { "code", "message" } }`. The `code`
+is stable and machine-readable; the prose is for humans and may be reworded.
+Resolution 404s distinguish `handle_not_bound`, `handle_retired`,
+`id_not_bound`, `platform_not_configured`, and `handle_impossible` (text the
+platform could never hold); `not_synced` is the 503 before the first window;
+bad input is `invalid_platform`, `invalid_address`, or `invalid_argument`;
+`internal` is a 500.
+
 ## Read model
 
 Schema `names`, all tables keyed by `chain_id` (one process follows one

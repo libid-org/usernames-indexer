@@ -78,51 +78,87 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-struct ApiError(StatusCode, String);
-
-impl ApiError {
-    fn not_found(msg: impl Into<String>) -> Self {
-        Self(StatusCode::NOT_FOUND, msg.into())
-    }
-
-    fn bad_request(msg: impl Into<String>) -> Self {
-        Self(StatusCode::BAD_REQUEST, msg.into())
-    }
+/// One error shape for the whole API: a status, a stable code, and prose.
+/// The code is the machine-readable half of the contract — a UI that renders
+/// "retired" differently from "never claimed" branches on it, not on English
+/// sentences that may be reworded.
+struct ApiError {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+    /// The operator-facing cause, logged when the response renders and never
+    /// serialized to the client.
+    source: Option<sqlx::Error>,
 }
 
 impl ApiError {
+    fn not_found(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code,
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code,
+            message: message.into(),
+            source: None,
+        }
+    }
+
     fn not_synced() -> Self {
-        Self(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "the indexer has not finished a first window on this chain yet".into(),
-        )
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "not_synced",
+            message: "the indexer has not finished a first window on this chain yet"
+                .into(),
+            source: None,
+        }
     }
 }
 
 impl From<sqlx::Error> for ApiError {
+    // A pure conversion: the logging happens where the error is handled
+    // (IntoResponse), not as a side effect of the type change.
     fn from(e: sqlx::Error) -> Self {
-        tracing::error!(%e, "query failed");
-        Self(StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal",
+            message: "internal error".into(),
+            source: Some(e),
+        }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(serde_json::json!({ "error": self.1 }))).into_response()
+        if let Some(e) = &self.source {
+            tracing::error!(%e, "query failed");
+        }
+        let body = serde_json::json!({
+            "error": { "code": self.code, "message": self.message }
+        });
+        (self.status, Json(body)).into_response()
     }
 }
 
 fn parse_platform(raw: &str) -> Result<nodes::Platform, ApiError> {
-    nodes::Platform::parse(raw).map_err(|e| ApiError::bad_request(e.to_string()))
+    nodes::Platform::parse(raw)
+        .map_err(|e| ApiError::bad_request("invalid_platform", e.to_string()))
 }
 
 /// Postgres cannot compare TEXT holding a NUL byte, and no stored value ever
 /// holds one, so refuse it at the edge instead of turning it into a 500.
 fn reject_nul(raw: &str, what: &str) -> Result<(), ApiError> {
     if raw.contains('\0') {
-        return Err(ApiError::bad_request(format!(
-            "{what} must not contain a NUL byte"
-        )));
+        return Err(ApiError::bad_request(
+            "invalid_argument",
+            format!("{what} must not contain a NUL byte"),
+        ));
     }
     Ok(())
 }
@@ -138,8 +174,9 @@ async fn ensure_synced(state: &AppState) -> Result<(), ApiError> {
 }
 
 fn parse_address(raw: &str) -> Result<Address, ApiError> {
-    Address::from_str(raw)
-        .map_err(|_| ApiError::bad_request(format!("{raw:?} is not an address")))
+    Address::from_str(raw).map_err(|_| {
+        ApiError::bad_request("invalid_address", format!("{raw:?} is not an address"))
+    })
 }
 
 fn address_from_db(bytes: &[u8]) -> String {
@@ -217,9 +254,10 @@ async fn resolve_handle(
     let normalized = match platform.normalize_query(&handle) {
         Ok(normalized) => normalized,
         Err(e) => {
-            return Err(ApiError::not_found(format!(
-                "no handle can exist on this platform for this text: {e}"
-            )));
+            return Err(ApiError::not_found(
+                "handle_impossible",
+                format!("no handle can exist on this platform for this text: {e}"),
+            ));
         }
     };
 
@@ -233,20 +271,24 @@ async fn resolve_handle(
         // an unclaimed handle.
         if !state.store.platform_wired(platform.id()).await? {
             return Err(ApiError::not_found(
+                "platform_not_configured",
                 "this platform is not configured on this chain",
             ));
         }
-        return Err(ApiError::not_found(format!(
-            "{:?} is not bound",
-            normalized.as_str()
-        )));
+        return Err(ApiError::not_found(
+            "handle_not_bound",
+            format!("{:?} is not bound", normalized.as_str()),
+        ));
     };
     let id_agrees = row.id_agrees();
     let Some(owner) = row.owner else {
-        return Err(ApiError::not_found(format!(
-            "{:?} was retired: its account proved a different handle",
-            normalized.as_str()
-        )));
+        return Err(ApiError::not_found(
+            "handle_retired",
+            format!(
+                "{:?} was retired: its account proved a different handle",
+                normalized.as_str()
+            ),
+        ));
     };
 
     Ok(Json(HandleResolution {
@@ -295,10 +337,14 @@ async fn resolve_id(
     let Some(row) = row else {
         if !state.store.platform_wired(platform.id()).await? {
             return Err(ApiError::not_found(
+                "platform_not_configured",
                 "this platform is not configured on this chain",
             ));
         }
-        return Err(ApiError::not_found(format!("{user_id:?} is not bound")));
+        return Err(ApiError::not_found(
+            "id_not_bound",
+            format!("{user_id:?} is not bound"),
+        ));
     };
 
     Ok(Json(IdResolution {
@@ -405,7 +451,10 @@ async fn search(
     ensure_synced(&state).await?;
     let query = nodes::fold_search_query(&params.q);
     if query.is_empty() {
-        return Err(ApiError::bad_request("q must be nonempty"));
+        return Err(ApiError::bad_request(
+            "invalid_argument",
+            "q must be nonempty",
+        ));
     }
     let limit = params.limit.unwrap_or(10).clamp(1, 50);
     let platform_id = params

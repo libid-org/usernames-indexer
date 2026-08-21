@@ -187,6 +187,9 @@ async fn rename_retires_the_previous_handle() {
 
     let (status, body) = get(&store, "/v1/resolve/handle/x/alice_1").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    // The code is the machine-readable half: a UI renders "retired"
+    // differently from "never claimed" without parsing prose.
+    assert_eq!(body["error"]["code"], "handle_retired", "{body}");
 
     let (status, body) = get(&store, "/v1/resolve/handle/x/alice_2").await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -388,6 +391,7 @@ async fn api_refuses_to_answer_before_the_first_window() {
     // authoritative-looking "not bound".
     let (status, body) = get(&store, "/v1/resolve/handle/x/alice_1").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["code"], "not_synced", "{body}");
     let (status, _) = get(&store, "/v1/search?q=ali").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     // Status still answers — it is how a caller learns the sync state.
@@ -423,8 +427,9 @@ async fn nul_bytes_neither_stall_the_indexer_nor_crash_the_api() {
     assert_eq!(stored, "evil\u{fffd}id");
 
     // And a NUL in a query is a 400, not a 500.
-    let (status, _) = get(&store, "/v1/resolve/id/x/evil%00id").await;
+    let (status, body) = get(&store, "/v1/resolve/id/x/evil%00id").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid_argument", "{body}");
     let (status, _) = get(&store, "/v1/search?q=evil%00").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
