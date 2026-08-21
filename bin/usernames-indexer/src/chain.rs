@@ -8,38 +8,35 @@ use alloy::{
         Filter,
         Log,
     },
-};
-use tracing::{
-    info,
-    warn,
+    transports::TransportError,
 };
 
 /// Binary search for the block at which a contract was deployed: the first
-/// block where `eth_getCode` returns non-empty bytecode. `None` when the
-/// contract has no code at `latest_block` or the RPC fails mid-search.
+/// block where `eth_getCode` returns non-empty bytecode. `Ok(None)` means the
+/// contract has no code at `latest_block` — absence is an answer. An RPC
+/// failure is an `Err`, kept apart so a transient flake cannot masquerade as
+/// "not deployed" and end up cached as if it were a fact.
 ///
 /// Cost: about log2(latest_block) RPC calls (~26 for 50M blocks).
 pub async fn find_deployment_block(
     provider: &impl Provider,
     address: Address,
     latest_block: u64,
-) -> Option<u64> {
+) -> Result<Option<u64>, TransportError> {
     let code = provider
         .get_code_at(address)
         .block_id(BlockNumberOrTag::Number(latest_block).into())
-        .await
-        .ok()?;
+        .await?;
     if code.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let code_at_zero = provider
         .get_code_at(address)
         .block_id(BlockNumberOrTag::Number(0).into())
-        .await
-        .ok()?;
+        .await?;
     if !code_at_zero.is_empty() {
-        return Some(0);
+        return Ok(Some(0));
     }
 
     let mut lo: u64 = 0;
@@ -49,49 +46,14 @@ pub async fn find_deployment_block(
         let code = provider
             .get_code_at(address)
             .block_id(BlockNumberOrTag::Number(mid).into())
-            .await
-            .ok()?;
+            .await?;
         if code.is_empty() {
             lo = mid + 1;
         } else {
             hi = mid;
         }
     }
-    Some(lo)
-}
-
-/// The deployment block, or 0 when detection fails — scanning from genesis is
-/// slow but never wrong.
-pub async fn detect_start_block(
-    provider: &impl Provider,
-    address: Address,
-    label: &str,
-) -> u64 {
-    let latest = match provider.get_block_number().await {
-        Ok(n) => n,
-        Err(e) => {
-            warn!(%e, contract = label, "no latest block for deployment detection, falling back to 0");
-            return 0;
-        }
-    };
-
-    match find_deployment_block(provider, address, latest).await {
-        Some(block) => {
-            info!(
-                block,
-                contract = label,
-                "detected contract deployment block"
-            );
-            block
-        }
-        None => {
-            warn!(
-                contract = label,
-                "could not detect deployment block, falling back to 0"
-            );
-            0
-        }
-    }
+    Ok(Some(lo))
 }
 
 /// One `eth_getLogs` window, inclusive on both ends. The caller sizes windows
@@ -102,7 +64,7 @@ pub async fn fetch_logs(
     filter: &Filter,
     from: u64,
     to: u64,
-) -> Result<Vec<Log>, alloy::transports::TransportError> {
+) -> Result<Vec<Log>, TransportError> {
     let f = filter
         .clone()
         .from_block(BlockNumberOrTag::Number(from))

@@ -2,7 +2,7 @@
 //! API, and either one dying takes the process down so the supervisor
 //! restarts both.
 
-use std::str::FromStr;
+use std::net::SocketAddr;
 
 use alloy::{
     primitives::Address,
@@ -35,9 +35,11 @@ pub struct Config {
     #[arg(long, env = "RPC_URL")]
     pub rpc_url: Url,
 
-    /// The IdentityNames ERC1967 proxy address.
+    /// The IdentityNames ERC1967 proxy address. Typed as an address so
+    /// garbage is a usage error before anything connects, not a mid-startup
+    /// failure.
     #[arg(long, env = "IDENTITY_NAMES_ADDRESS")]
-    pub identity_names_address: String,
+    pub identity_names_address: Address,
 
     /// Refuse to start unless the RPC reports this chain id. Optional, but a
     /// deployment that sets it cannot silently index the wrong chain.
@@ -62,7 +64,7 @@ pub struct Config {
 
     /// Address the read API listens on.
     #[arg(long, env = "LISTEN_ADDR", default_value = "127.0.0.1:8080")]
-    pub listen_addr: String,
+    pub listen_addr: SocketAddr,
 }
 
 /// Parse the environment, connect everything, and run until ctrl-c.
@@ -76,8 +78,7 @@ pub async fn run() -> anyhow::Result<()> {
         .init();
 
     let config = Config::parse();
-    let contract = Address::from_str(&config.identity_names_address)
-        .map_err(|_| anyhow::anyhow!("IDENTITY_NAMES_ADDRESS is not an address"))?;
+    let contract = config.identity_names_address;
 
     let provider: RootProvider = RootProvider::new_http(config.rpc_url.clone());
     let reported = provider.get_chain_id().await?;
@@ -112,7 +113,7 @@ pub async fn run() -> anyhow::Result<()> {
     let indexer_task = tokio::spawn(indexer.run(cancel.clone()));
 
     let state = api::AppState::new(store, contract);
-    let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
+    let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
     info!(addr = %config.listen_addr, "read API listening");
     let api_cancel = cancel.clone();
     let api_task = tokio::spawn(async move {

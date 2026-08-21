@@ -364,16 +364,36 @@ fn sanitize(value: &str, what: &str) -> String {
     }
 }
 
-fn sanitize_json(value: &mut serde_json::Value) {
+/// Scrub NUL bytes anywhere in a JSON payload, reporting whether anything
+/// was replaced — so the caller can log the loss as loudly as the projection
+/// columns do, instead of the journal being scrubbed in silence.
+fn sanitize_json(value: &mut serde_json::Value) -> bool {
     match value {
         serde_json::Value::String(s) => {
             if s.contains('\0') {
                 *s = s.replace('\0', "\u{fffd}");
+                true
+            } else {
+                false
             }
         }
-        serde_json::Value::Array(items) => items.iter_mut().for_each(sanitize_json),
-        serde_json::Value::Object(map) => map.values_mut().for_each(sanitize_json),
-        _ => {}
+        // Deliberately exhaustive: every element must be scrubbed, so no
+        // short-circuiting combinator fits here.
+        serde_json::Value::Array(items) => {
+            let mut lossy = false;
+            for item in items {
+                lossy |= sanitize_json(item);
+            }
+            lossy
+        }
+        serde_json::Value::Object(map) => {
+            let mut lossy = false;
+            for item in map.values_mut() {
+                lossy |= sanitize_json(item);
+            }
+            lossy
+        }
+        _ => false,
     }
 }
 
@@ -424,7 +444,12 @@ impl Window {
         let tx = &mut self.tx;
 
         let mut payload = event.payload();
-        sanitize_json(&mut payload);
+        if sanitize_json(&mut payload) {
+            error!(
+                kind = event.kind(),
+                "journal payload contained a NUL byte; stored with U+FFFD in its place"
+            );
+        }
         let journaled = sqlx::query(
             r#"INSERT INTO names.events (chain_id, block_number, log_index, tx_hash, kind, payload)
                VALUES ($1, $2, $3, $4, $5, $6)

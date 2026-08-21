@@ -37,7 +37,7 @@ Configuration is flags or environment (a `.env` file is read first):
 | `CONFIRMATIONS` | `5` | Blocks behind the head to stay (shallow-reorg protection) |
 | `POLL_INTERVAL_SECS` | `5` | Poll cadence, and the retry delay after a failure |
 | `MAX_BLOCK_RANGE` | `10000` | Largest `eth_getLogs` window |
-| `START_BLOCK` | unset | Where a FRESH scan starts — consulted only when no cursor exists (new database, or right after a re-index). Unset means the deployment block is found by binary search over `eth_getCode` and cached |
+| `START_BLOCK` | unset | Where a FRESH scan starts — consulted only when no cursor exists (new database, or right after a re-index). Unset means the deployment block is found by binary search over `eth_getCode`; only a successful detection is cached, and an RPC failure mid-search retries next cycle |
 | `LISTEN_ADDR` | `127.0.0.1:8080` | Read-API listen address |
 
 ## API
