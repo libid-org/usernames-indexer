@@ -91,34 +91,27 @@ pub async fn run() -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("chain id {reported} does not fit in a BIGINT"))?;
 
     let pool = db::connect_and_migrate(&config.database_url).await?;
+    let store = db::ChainStore::new(pool, chain_id);
     // The writer lease outlives everything below: as long as this process
-    // may write the chain, no other instance may. prepare_chain runs under
-    // it, so a version-bump replay cannot race a still-running older pod.
-    let _chain_lock = db::acquire_chain_lock(&pool, chain_id).await?;
-    db::prepare_chain(&pool, chain_id, contract).await?;
+    // may write the chain, no other instance may. prepare runs under it —
+    // the lease is a parameter there, so a version-bump replay cannot race a
+    // still-running older pod.
+    let writer = store.acquire_writer().await?;
+    store.prepare(&writer, contract).await?;
 
     let cancel = CancellationToken::new();
 
     let indexer_config = indexer::IndexerConfig {
         contract,
-        chain_id,
         confirmations: config.confirmations,
         poll_interval_secs: config.poll_interval_secs,
         max_block_range: config.max_block_range,
         start_block: config.start_block,
     };
-    let indexer_task = tokio::spawn(indexer::run(
-        pool.clone(),
-        provider,
-        indexer_config,
-        cancel.clone(),
-    ));
+    let indexer = indexer::Indexer::new(store.clone(), provider, indexer_config);
+    let indexer_task = tokio::spawn(indexer.run(cancel.clone()));
 
-    let state = api::AppState {
-        pool,
-        chain_id,
-        contract,
-    };
+    let state = api::AppState::new(store, contract);
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     info!(addr = %config.listen_addr, "read API listening");
     let api_cancel = cancel.clone();

@@ -26,29 +26,35 @@ use serde::{
     Deserialize,
     Serialize,
 };
-use sqlx::{
-    PgPool,
-    Row,
-};
+use sqlx::Row;
 use tower_http::cors::{
     Any,
     CorsLayer,
 };
 
 use crate::{
-    db,
+    db::{
+        self,
+        ChainStore,
+    },
     nodes,
 };
 
 /// What every handler needs.
 #[derive(Clone)]
 pub struct AppState {
-    /// The shared read pool.
-    pub pool: PgPool,
-    /// The chain this deployment serves.
-    pub chain_id: i64,
+    /// The chain-scoped store every query goes through.
+    store: ChainStore,
     /// The watched contract, echoed in `/v1/status`.
-    pub contract: Address,
+    contract: Address,
+}
+
+impl AppState {
+    /// State for one deployment: the chain the store is scoped to is the
+    /// chain this API serves.
+    pub fn new(store: ChainStore, contract: Address) -> Self {
+        Self { store, contract }
+    }
 }
 
 /// The router, ready to serve.
@@ -148,7 +154,7 @@ fn reject_nul(raw: &str, what: &str) -> Result<(), ApiError> {
 /// committed a window would serve authoritative-looking 404s for names that
 /// are bound on chain. Refuse to answer until the first window landed.
 async fn ensure_synced(state: &AppState) -> Result<(), ApiError> {
-    match db::get_cursor(&state.pool, state.chain_id).await? {
+    match state.store.cursor().await? {
         Some(_) => Ok(()),
         None => Err(ApiError::not_synced()),
     }
@@ -163,9 +169,9 @@ async fn platform_wired(
     let row: Option<i64> = sqlx::query_scalar(
         "SELECT 1 FROM names.platforms WHERE chain_id = $1 AND platform_id = $2",
     )
-    .bind(state.chain_id)
+    .bind(state.store.chain_id())
     .bind(platform.id.as_slice())
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.store.pool())
     .await?;
     Ok(row.is_some())
 }
@@ -203,15 +209,15 @@ struct Status {
 }
 
 async fn status(State(state): State<AppState>) -> Result<Json<Status>, ApiError> {
-    let last = db::get_cursor(&state.pool, state.chain_id).await?;
-    let head = db::get_chain_head(&state.pool, state.chain_id).await?;
+    let last = state.store.cursor().await?;
+    let head = state.store.chain_head().await?;
     Ok(Json(Status {
-        chain_id: state.chain_id,
+        chain_id: state.store.chain_id(),
         contract: state.contract.to_string(),
         last_indexed_block: last,
         chain_head_block: head,
         lag_blocks: head.map(|h| h.saturating_sub(last.unwrap_or(0))),
-        last_window_error: db::get_window_error(&state.pool, state.chain_id).await?,
+        last_window_error: state.store.window_error().await?,
         indexer_version: db::INDEXER_VERSION,
     }))
 }
@@ -270,10 +276,10 @@ async fn resolve_handle(
              ON i.chain_id = h.chain_id AND i.id_node = h.id_node
            WHERE h.chain_id = $1 AND h.platform_id = $2 AND h.handle = $3"#,
     )
-    .bind(state.chain_id)
+    .bind(state.store.chain_id())
     .bind(platform.id.as_slice())
     .bind(&normalized)
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.store.pool())
     .await?;
 
     let Some(row) = row else {
@@ -351,10 +357,10 @@ async fn resolve_id(
                 AND p.platform_id = i.platform_id AND p.handle = h.handle
            WHERE i.chain_id = $1 AND i.platform_id = $2 AND i.user_id = $3"#,
     )
-    .bind(state.chain_id)
+    .bind(state.store.chain_id())
     .bind(platform.id.as_slice())
     .bind(&user_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(state.store.pool())
     .await?;
 
     let Some(row) = row else {
@@ -441,9 +447,9 @@ async fn resolve_address(
            WHERE i.chain_id = $1 AND i.owner = $2
            ORDER BY i.platform_id, i.user_id"#,
     )
-    .bind(state.chain_id)
+    .bind(state.store.chain_id())
     .bind(address.as_slice())
-    .fetch_all(&state.pool)
+    .fetch_all(state.store.pool())
     .await?;
 
     let mut identities = Vec::with_capacity(rows.len());
@@ -563,12 +569,12 @@ async fn search(
                     h.handle ASC
            LIMIT $5"#,
     )
-    .bind(state.chain_id)
+    .bind(state.store.chain_id())
     .bind(platform_id.as_ref().map(|p| p.as_slice().to_vec()))
     .bind(&like)
     .bind(&query)
     .bind(limit)
-    .fetch_all(&state.pool)
+    .fetch_all(state.store.pool())
     .await?;
 
     let mut hits = Vec::with_capacity(rows.len());
