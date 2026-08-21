@@ -2859,9 +2859,9 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libid-contracts"
-version = "0.5.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b65fe10a6b20d68419e1f4b0033c73e1459bf03faea41ca80fc349d17c721f2d"
+checksum = "be42e6b2836d626be1897180bb9b13622e090b528cba5e9bc60cf695fff296b6"
 dependencies = [
  "alloy",
  "include_dir",
@@ -2873,8 +2873,9 @@ dependencies = [
 
 [[package]]
 name = "libid-identity"
-version = "0.5.0"
-source = "git+https://github.com/libid-org/libid-contracts?branch=rust-identity-crate#b802d7d448ca3829e15fcda5e58c69b540c30044"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62de3861fdedff71a230a6ec03ea08aa56ef4ef24aadd0bf0517361b9c684800"
 
 [[package]]
 name = "libm"
@@ -3825,7 +3826,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4626,10 +4627,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
