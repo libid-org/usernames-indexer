@@ -123,8 +123,8 @@ async fn indexes_a_real_chain_end_to_end() {
             .await
             .expect("cleanup");
     }
-    sqlx::query("DELETE FROM names.pipeline_metadata WHERE key LIKE '%' || $1 || '%'")
-        .bind(CHAIN.to_string())
+    sqlx::query("DELETE FROM names.chain_metadata WHERE chain_id = $1")
+        .bind(CHAIN as i64)
         .execute(&pool)
         .await
         .expect("metadata cleanup");

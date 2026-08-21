@@ -53,30 +53,18 @@ pub const PROJECTION_TABLES: &[&str] = &[
     "verifiers",
 ];
 
-fn schema_version_key(chain_id: i64) -> String {
-    format!("indexer_schema_version:{chain_id}")
-}
+// The chain_metadata keys. Chain scoping is the table's chain_id column;
+// only the deployment-block cache still carries anything in its key.
+const SCHEMA_VERSION_KEY: &str = "schema_version";
+const CONTRACT_KEY: &str = "contract";
+const CURSOR_KEY: &str = "cursor";
+const HEAD_KEY: &str = "head";
+const WINDOW_ERROR_KEY: &str = "window_error";
 
-fn contract_key(chain_id: i64) -> String {
-    format!("contract:{chain_id}")
-}
-
-fn cursor_key(chain_id: i64) -> String {
-    format!("indexer_last_block:{chain_id}")
-}
-
-fn head_key(chain_id: i64) -> String {
-    format!("chain_head:{chain_id}")
-}
-
-fn window_error_key(chain_id: i64) -> String {
-    format!("last_window_error:{chain_id}")
-}
-
-fn deploy_block_key(chain_id: i64, contract: Address) -> String {
+fn deploy_block_key(contract: Address) -> String {
     // The address is part of the key: repointing the indexer at a different
     // contract must not inherit the old contract's deployment block.
-    format!("deploy_block:{chain_id}:{contract}")
+    format!("deploy_block:{contract}")
 }
 
 /// Connect and bring the schema current.
@@ -161,17 +149,22 @@ impl ChainStore {
     }
 
     async fn get_metadata(&self, key: &str) -> Result<Option<String>, sqlx::Error> {
-        sqlx::query_scalar("SELECT value FROM names.pipeline_metadata WHERE key = $1")
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await
+        sqlx::query_scalar(
+            "SELECT value FROM names.chain_metadata WHERE chain_id = $1 AND key = $2",
+        )
+        .bind(self.chain_id)
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await
     }
 
     async fn set_metadata(&self, key: &str, value: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"INSERT INTO names.pipeline_metadata (key, value) VALUES ($1, $2)
-               ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"#,
+            r#"INSERT INTO names.chain_metadata (chain_id, key, value)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (chain_id, key) DO UPDATE SET value = EXCLUDED.value"#,
         )
+        .bind(self.chain_id)
         .bind(key)
         .bind(value)
         .execute(&self.pool)
@@ -218,10 +211,8 @@ impl ChainStore {
         _writer: &WriterLease,
         contract: Address,
     ) -> Result<(), sqlx::Error> {
-        let version = self
-            .get_metadata(&schema_version_key(self.chain_id))
-            .await?;
-        let known_contract = self.get_metadata(&contract_key(self.chain_id)).await?;
+        let version = self.get_metadata(SCHEMA_VERSION_KEY).await?;
+        let known_contract = self.get_metadata(CONTRACT_KEY).await?;
         let contract_now = contract.to_string().to_lowercase();
         let version_ok = version.as_deref() == Some(INDEXER_VERSION);
         let contract_ok = known_contract.as_deref() == Some(contract_now.as_str());
@@ -243,27 +234,28 @@ impl ChainStore {
                 .execute(&mut *tx)
                 .await?;
         }
-        for key in [
-            cursor_key(self.chain_id),
-            head_key(self.chain_id),
-            window_error_key(self.chain_id),
-        ] {
-            sqlx::query("DELETE FROM names.pipeline_metadata WHERE key = $1")
-                .bind(key)
-                .execute(&mut *tx)
-                .await?;
-        }
+        // Everything the chain accumulated goes, by column, so a key added
+        // later is cleared by default instead of surviving a replay because
+        // this list forgot it. The one deliberate carve-out is the
+        // deployment-block cache: it is keyed by contract, and eth_getCode
+        // history does not change shape with the read model.
+        sqlx::query(
+            r#"DELETE FROM names.chain_metadata
+               WHERE chain_id = $1 AND key NOT LIKE 'deploy_block:%'"#,
+        )
+        .bind(self.chain_id)
+        .execute(&mut *tx)
+        .await?;
         for (key, value) in [
-            (
-                schema_version_key(self.chain_id),
-                INDEXER_VERSION.to_string(),
-            ),
-            (contract_key(self.chain_id), contract_now),
+            (SCHEMA_VERSION_KEY, INDEXER_VERSION.to_string()),
+            (CONTRACT_KEY, contract_now),
         ] {
             sqlx::query(
-                r#"INSERT INTO names.pipeline_metadata (key, value) VALUES ($1, $2)
-                   ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"#,
+                r#"INSERT INTO names.chain_metadata (chain_id, key, value)
+                   VALUES ($1, $2, $3)
+                   ON CONFLICT (chain_id, key) DO UPDATE SET value = EXCLUDED.value"#,
             )
+            .bind(self.chain_id)
             .bind(key)
             .bind(value)
             .execute(&mut *tx)
@@ -282,17 +274,14 @@ impl ChainStore {
     /// gap between this and the cursor as lag. Best effort, outside any
     /// window.
     pub async fn set_chain_head(&self, head: u64) {
-        if let Err(e) = self
-            .set_metadata(&head_key(self.chain_id), &head.to_string())
-            .await
-        {
+        if let Err(e) = self.set_metadata(HEAD_KEY, &head.to_string()).await {
             warn!(%e, "failed to record the chain head");
         }
     }
 
     /// The chain head as last observed by the indexer loop.
     pub async fn chain_head(&self) -> Result<Option<u64>, sqlx::Error> {
-        let value = self.get_metadata(&head_key(self.chain_id)).await?;
+        let value = self.get_metadata(HEAD_KEY).await?;
         Ok(value.and_then(|v| v.parse().ok()))
     }
 
@@ -301,15 +290,15 @@ impl ChainStore {
     /// effort.
     pub async fn set_window_error(&self, error: Option<&str>) {
         let result = match error {
-            Some(msg) => {
-                self.set_metadata(&window_error_key(self.chain_id), msg)
-                    .await
-            }
-            None => sqlx::query("DELETE FROM names.pipeline_metadata WHERE key = $1")
-                .bind(window_error_key(self.chain_id))
-                .execute(&self.pool)
-                .await
-                .map(|_| ()),
+            Some(msg) => self.set_metadata(WINDOW_ERROR_KEY, msg).await,
+            None => sqlx::query(
+                "DELETE FROM names.chain_metadata WHERE chain_id = $1 AND key = $2",
+            )
+            .bind(self.chain_id)
+            .bind(WINDOW_ERROR_KEY)
+            .execute(&self.pool)
+            .await
+            .map(|_| ()),
         };
         if let Err(e) = result {
             warn!(%e, "failed to record the window error state");
@@ -318,12 +307,12 @@ impl ChainStore {
 
     /// The last window failure, if the most recent window failed.
     pub async fn window_error(&self) -> Result<Option<String>, sqlx::Error> {
-        self.get_metadata(&window_error_key(self.chain_id)).await
+        self.get_metadata(WINDOW_ERROR_KEY).await
     }
 
     /// The last fully-processed block, if any window ever committed.
     pub async fn cursor(&self) -> Result<Option<u64>, sqlx::Error> {
-        let value = self.get_metadata(&cursor_key(self.chain_id)).await?;
+        let value = self.get_metadata(CURSOR_KEY).await?;
         Ok(value.and_then(|v| v.parse().ok()))
     }
 
@@ -333,9 +322,7 @@ impl ChainStore {
         &self,
         contract: Address,
     ) -> Result<Option<u64>, sqlx::Error> {
-        let value = self
-            .get_metadata(&deploy_block_key(self.chain_id, contract))
-            .await?;
+        let value = self.get_metadata(&deploy_block_key(contract)).await?;
         Ok(value.and_then(|v| v.parse().ok()))
     }
 
@@ -346,11 +333,8 @@ impl ChainStore {
         contract: Address,
         block: u64,
     ) -> Result<(), sqlx::Error> {
-        self.set_metadata(
-            &deploy_block_key(self.chain_id, contract),
-            &block.to_string(),
-        )
-        .await
+        self.set_metadata(&deploy_block_key(contract), &block.to_string())
+            .await
     }
 
     /// Open a poll window. Everything applied through it commits atomically
@@ -412,10 +396,12 @@ impl Window {
     /// not at all.
     pub async fn commit(mut self, through_block: u64) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"INSERT INTO names.pipeline_metadata (key, value) VALUES ($1, $2)
-               ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"#,
+            r#"INSERT INTO names.chain_metadata (chain_id, key, value)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (chain_id, key) DO UPDATE SET value = EXCLUDED.value"#,
         )
-        .bind(cursor_key(self.chain_id))
+        .bind(self.chain_id)
+        .bind(CURSOR_KEY)
         .bind(through_block.to_string())
         .execute(&mut *self.tx)
         .await?;
