@@ -14,10 +14,8 @@ anyhow = "1"
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
-libid-contracts = "0.5"
-# TODO(release): switch to a crates.io version once libid-contracts cuts a
-# release carrying the crate — https://github.com/libid-org/libid-contracts/pull/6.
-libid-identity = { git = "https://github.com/libid-org/libid-contracts", branch = "rust-identity-crate" }
+libid-contracts = "0.6"
+libid-identity = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono"] }
