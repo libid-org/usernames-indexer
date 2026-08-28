@@ -135,6 +135,18 @@ to `mirror`.
 The id-derived name is mirror-only regardless: `IdentityNames` exposes no
 getter keyed by `idNode`, only the event.
 
+**Tested against the real resolver.** `bin/usernames-api/tests/end_to_end.rs`
+deploys `HandleResolver` on anvil and walks the protocol as a wallet does:
+`resolve` reverts `OffchainLookup`, the revert is decoded, the gateway signs
+the answer in process, and `resolveWithProof` on chain turns it back into an
+address. A second case signs with a key the resolver does not trust and
+asserts the contract's own `UntrustedSigner` — so the passing case proves the
+chain checked something rather than that something returned bytes.
+
+Regenerating the resolver bytecode the test deploys is described in
+[`contracts/README.md`](contracts/README.md); a drifted copy is a test that
+passes against a resolver nobody deploys.
+
 **Not yet answerable: the id-derived name.** The design writes it as
 `<idNode as 64 hex>._id.handles.link`, and 64 characters is one past the DNS
 label ceiling of RFC 1035, so no standard client can encode it — ethers'
