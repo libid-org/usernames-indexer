@@ -18,7 +18,7 @@ use tokio::sync::{
     Mutex,
     MutexGuard,
 };
-use usernames_indexer::{
+use usernames_core::{
     db::{
         self,
         ChainStore,

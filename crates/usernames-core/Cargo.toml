@@ -1,0 +1,28 @@
+[package]
+name = "usernames-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The read model, event decoding and indexing loop behind the usernames indexer and its read API."
+publish = false
+
+[dependencies]
+alloy.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+libid-contracts.workspace = true
+libid-identity.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+alloy = { workspace = true, features = ["node-bindings", "signer-local"] }
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

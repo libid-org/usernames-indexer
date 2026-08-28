@@ -74,6 +74,17 @@ pub async fn connect_and_migrate(database_url: &str) -> anyhow::Result<PgPool> {
     Ok(pool)
 }
 
+/// Connect without touching the schema.
+///
+/// For the read API, which owns nothing here. Migrating is a write, and the
+/// writer is the indexer: two processes racing `sqlx::migrate!` on a fresh
+/// database is a deadlock waiting to be reported as a startup flake. A reader
+/// that starts before the schema exists fails its first query and gets
+/// restarted, which is the right outcome and a visible one.
+pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
+    Ok(PgPool::connect(database_url).await?)
+}
+
 /// Why applying an event failed. Distinct from [`sqlx::Error`] because not
 /// every failure is the database's: a chain value that does not fit a BIGINT
 /// is this indexer's limit, and blaming the driver for it would send an
