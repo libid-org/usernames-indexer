@@ -28,5 +28,7 @@ sqlx.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+alloy = { workspace = true, features = ["signer-local", "node-bindings"] }
 http-body-util = "0.1"
+sqlx.workspace = true
 tower = { version = "0.5", features = ["util"] }
