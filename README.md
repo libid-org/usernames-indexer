@@ -78,6 +78,71 @@ platform could never hold); `not_synced` is the 503 before the first window;
 bad input is `invalid_platform`, `invalid_address`, or `invalid_argument`;
 `internal` is a 500.
 
+## ENS gateway
+
+`usernames-api` also serves the ERC-3668 endpoint behind
+[`HandleResolver`](https://github.com/libid-org/libid-contracts/blob/main/solidity/contracts/ens/HandleResolver.sol),
+so a name in an X bio resolves in a wallet that has never heard of libID. It is
+mounted only when `ENS_SIGNER_KEY` is set; unset, the route is absent rather
+than present and failing.
+
+```
+GET /{sender}/{data}.json   ->  { "data": "0x…" }
+```
+
+The resolver reverts `OffchainLookup` carrying this endpoint, the client fetches
+the blob, and a second `eth_call` hands it back to `resolveWithProof`, which
+verifies the signature and returns the record. Both on-chain halves are `view`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ENS_SIGNER_KEY` | unset | The signing key, hex. Setting it mounts the route |
+| `ENS_RESOLVER_ADDRESS` | — | Required with a key. An answer is bound to one resolver by its signature; a request naming another is refused rather than signed, or this becomes a signing oracle for any contract that asks |
+| `ENS_CHAINS` | this process's chain | Which chains to answer for, and their labels: `3735928814:eden,8453:base` |
+| `ENS_SOURCE` | `mirror` | `mirror` reads the indexed model; `chain` reads `IdentityNames` over RPC |
+| `ENS_RPC_URLS` | — | Required with `ENS_SOURCE=chain`: `3735928814=http://…,8453=https://…` |
+| `ENS_TTL_SECS` | `300` | How long an answer stays good; the resolver enforces it |
+| `ENS_MAX_LAG_BLOCKS` | `32` | How far behind the chain the mirror may be and still assert anything |
+
+**Null is an answer; stale is not.** A name nobody holds gets a *signed* null —
+a wallet has to trust "nobody holds this" as much as it trusts an address, or
+every unclaimed name looks like an outage. A mirror further behind than
+`ENS_MAX_LAG_BLOCKS` gets an *unsigned* 503 instead, so the client falls through
+to the next endpoint in the resolver's `urls`. Signing a null from a stale
+mirror would assert the absence of a binding that may already exist.
+
+**One gateway, several chains — and a refusal for the rest.** The resolver
+carries ONE `urls` list for every query it can answer; it cannot route by coin
+type. ERC-3668 has the client walk that list until something succeeds, and a
+signed null is a success — so a gateway that signed null for chains it does not
+serve would end the walk and deny a binding the next endpoint existed to serve.
+
+So `ENS_CHAINS` is a set, and the answers divide three ways: an address or a
+signed null for a chain in the set, a signed null for a coin type naming no EVM
+chain at all, and an unsigned 503 for an EVM chain outside the set. Only the
+last lets the walk continue, which is exactly when it should.
+
+**Where answers come from.** `ENS_SOURCE=mirror` reads the indexed model —
+cheap, and as of the indexer's last committed window, which is what
+`ENS_MAX_LAG_BLOCKS` guards. `ENS_SOURCE=chain` reads `IdentityNames` over RPC:
+current rather than as-of-last-window, so the lag gate stops applying, at the
+cost of an `eth_call` per query and a trust dependency on the endpoint. The
+mirror is the default because it needs no further configuration and because it
+answers from a model kept `CONFIRMATIONS` blocks deep, which a call at the head
+is not — a binding created and then reorged away is visible to `chain` and not
+to `mirror`.
+
+The id-derived name is mirror-only regardless: `IdentityNames` exposes no
+getter keyed by `idNode`, only the event.
+
+**Not yet answerable: the id-derived name.** The design writes it as
+`<idNode as 64 hex>._id.handles.link`, and 64 characters is one past the DNS
+label ceiling of RFC 1035, so no standard client can encode it — ethers'
+`dnsEncode` refuses above 63. The parse and the `byId` lookup are implemented
+and tested; what is missing is a name shape that fits, and choosing one
+(two labels, or a shorter alphabet) is a change to the design rather than to
+this code.
+
 ## Read model
 
 Schema `names`, all tables keyed by `chain_id` (one process follows one

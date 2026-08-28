@@ -67,10 +67,18 @@ fn deploy_block_key(contract: Address) -> String {
     format!("deploy_block:{contract}")
 }
 
+/// The migrations, embedded at compile time.
+///
+/// Exposed because `sqlx::migrate!` resolves its path against the crate that
+/// invokes it, so anything outside this crate — a test in either binary —
+/// would have to spell a relative path back to here and would break the day
+/// the layout moves.
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
 /// Connect and bring the schema current.
 pub async fn connect_and_migrate(database_url: &str) -> anyhow::Result<PgPool> {
     let pool = PgPool::connect(database_url).await?;
-    sqlx::migrate!("./migrations").run(&pool).await?;
+    MIGRATOR.run(&pool).await?;
     Ok(pool)
 }
 
@@ -911,6 +919,36 @@ impl ChainStore {
         .bind(self.chain_id)
         .bind(platform_id.as_slice())
         .bind(handle.as_str())
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// The same row, found by the storage key rather than by `(platform, id)`.
+    ///
+    /// For the id-derived ENS name, which carries `idNode` itself: the chain
+    /// already derived it from the platform id and the account id, so asking
+    /// for those again would let a caller state a platform that disagrees with
+    /// the node. There is no honest way to resolve that disagreement, so the
+    /// node is the only thing asked for.
+    pub async fn resolve_by_id_node(
+        &self,
+        id_node: B256,
+    ) -> Result<Option<IdentityRow>, sqlx::Error> {
+        sqlx::query_as(
+            r#"SELECT i.platform_id, i.user_id, i.id_node, i.owner,
+                      i.observed_at, i.version, i.handle_node,
+                      h.handle, h.owner AS handle_owner, h.id_node AS handle_id_node,
+                      (p.handle IS NOT NULL) AS published
+               FROM names.ids i
+               LEFT JOIN names.handles h
+                 ON h.chain_id = i.chain_id AND h.handle_node = i.handle_node
+               LEFT JOIN names.published p
+                 ON p.chain_id = i.chain_id AND p.owner = i.owner
+                    AND p.platform_id = i.platform_id AND p.handle = h.handle
+               WHERE i.chain_id = $1 AND i.id_node = $2"#,
+        )
+        .bind(self.chain_id)
+        .bind(id_node.as_slice())
         .fetch_optional(&self.pool)
         .await
     }
