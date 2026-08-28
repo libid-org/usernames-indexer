@@ -67,6 +67,7 @@ fn deploy_block_key(contract: Address) -> String {
     format!("deploy_block:{contract}")
 }
 
+/// Connect and bring the schema current.
 /// The migrations, embedded at compile time.
 ///
 /// Exposed because `sqlx::migrate!` resolves its path against the crate that
@@ -763,6 +764,26 @@ impl Window {
     }
 }
 
+/// The projection every `names.ids` read shares: the row itself, the handle it
+/// points at, and whether that pair is displayed.
+///
+/// Written once because it was written three times. The joins encode which
+/// columns of which table a row is assembled from, so a change to
+/// `names.published` — the one most likely to move — has to reach every reader
+/// or the ones it missed answer from a shape that no longer exists. A caller
+/// appends its own `WHERE`, which is the only part that actually differs.
+const IDENTITY_PROJECTION: &str = r#"SELECT i.platform_id, i.user_id, i.id_node, i.owner,
+                      i.observed_at, i.version, i.handle_node,
+                      h.handle, h.owner AS handle_owner, h.id_node AS handle_id_node,
+                      (p.handle IS NOT NULL) AS published
+               FROM names.ids i
+               LEFT JOIN names.handles h
+                 ON h.chain_id = i.chain_id AND h.handle_node = i.handle_node
+               LEFT JOIN names.published p
+                 ON p.chain_id = i.chain_id AND p.owner = i.owner
+                    AND p.platform_id = i.platform_id AND p.handle = h.handle
+               "#;
+
 // ─── The read side ──────────────────────────────────────────────────────────
 // The same store the writer uses answers the API's queries, so all SQL —
 // and the join shapes the projections were designed for — lives in one
@@ -934,19 +955,9 @@ impl ChainStore {
         &self,
         id_node: B256,
     ) -> Result<Option<IdentityRow>, sqlx::Error> {
-        sqlx::query_as(
-            r#"SELECT i.platform_id, i.user_id, i.id_node, i.owner,
-                      i.observed_at, i.version, i.handle_node,
-                      h.handle, h.owner AS handle_owner, h.id_node AS handle_id_node,
-                      (p.handle IS NOT NULL) AS published
-               FROM names.ids i
-               LEFT JOIN names.handles h
-                 ON h.chain_id = i.chain_id AND h.handle_node = i.handle_node
-               LEFT JOIN names.published p
-                 ON p.chain_id = i.chain_id AND p.owner = i.owner
-                    AND p.platform_id = i.platform_id AND p.handle = h.handle
-               WHERE i.chain_id = $1 AND i.id_node = $2"#,
-        )
+        sqlx::query_as(&format!(
+            "{IDENTITY_PROJECTION}WHERE i.chain_id = $1 AND i.id_node = $2"
+        ))
         .bind(self.chain_id)
         .bind(id_node.as_slice())
         .fetch_optional(&self.pool)
@@ -961,17 +972,9 @@ impl ChainStore {
         user_id: &str,
     ) -> Result<Option<IdentityRow>, sqlx::Error> {
         sqlx::query_as(
-            r#"SELECT i.platform_id, i.user_id, i.id_node, i.owner,
-                      i.observed_at, i.version, i.handle_node,
-                      h.handle, h.owner AS handle_owner, h.id_node AS handle_id_node,
-                      (p.handle IS NOT NULL) AS published
-               FROM names.ids i
-               LEFT JOIN names.handles h
-                 ON h.chain_id = i.chain_id AND h.handle_node = i.handle_node
-               LEFT JOIN names.published p
-                 ON p.chain_id = i.chain_id AND p.owner = i.owner
-                    AND p.platform_id = i.platform_id AND p.handle = h.handle
-               WHERE i.chain_id = $1 AND i.platform_id = $2 AND i.user_id = $3"#,
+            &format!(
+            "{IDENTITY_PROJECTION}WHERE i.chain_id = $1 AND i.platform_id = $2 AND i.user_id = $3"
+        ),
         )
         .bind(self.chain_id)
         .bind(platform_id.as_slice())
@@ -987,18 +990,9 @@ impl ChainStore {
         owner: Address,
     ) -> Result<Vec<IdentityRow>, sqlx::Error> {
         sqlx::query_as(
-            r#"SELECT i.platform_id, i.user_id, i.id_node, i.owner,
-                      i.observed_at, i.version, i.handle_node,
-                      h.handle, h.owner AS handle_owner, h.id_node AS handle_id_node,
-                      (p.handle IS NOT NULL) AS published
-               FROM names.ids i
-               LEFT JOIN names.handles h
-                 ON h.chain_id = i.chain_id AND h.handle_node = i.handle_node
-               LEFT JOIN names.published p
-                 ON p.chain_id = i.chain_id AND p.owner = i.owner
-                    AND p.platform_id = i.platform_id AND p.handle = h.handle
-               WHERE i.chain_id = $1 AND i.owner = $2
-               ORDER BY i.platform_id, i.user_id"#,
+            &format!(
+            "{IDENTITY_PROJECTION}WHERE i.chain_id = $1 AND i.owner = $2\n               ORDER BY i.platform_id, i.user_id"
+        ),
         )
         .bind(self.chain_id)
         .bind(owner.as_slice())
