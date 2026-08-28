@@ -44,6 +44,7 @@ use axum::{
     Router,
 };
 use http_body_util::BodyExt;
+use tokio::sync::Mutex;
 use tower::ServiceExt;
 use usernames_api::ens::{
     ChainGateway,
@@ -93,6 +94,12 @@ sol! {
 }
 
 const CHAIN: i64 = 31343;
+
+/// Both tests here wipe and reseed the same chain's rows, so they must not
+/// overlap — libtest runs them on parallel threads in one process, and
+/// whichever wipes second deletes the other's binding. The other DB-touching
+/// suites hold the same kind of guard.
+static DB_LOCK: Mutex<()> = Mutex::const_new(());
 const SIGNER_KEY: &str =
     "0x00000000000000000000000000000000000000000000000000000000000a11ce";
 const IMPOSTOR_KEY: &str =
@@ -140,6 +147,11 @@ async fn bind(store: &ChainStore, handle: &str, owner: Address) {
         .await
         .expect("apply");
     window.commit(1).await.expect("commit");
+    // The indexer records the head every cycle, and the gateway refuses to
+    // answer from a mirror that cannot say how far behind it is. A test that
+    // skipped this was relying on "unknown" being read as "fresh" — which is
+    // exactly the fail-open the lag gate now closes.
+    store.set_chain_head(1).await;
 }
 
 /// Step 3, in process: hand the gateway what the revert carried, exactly the
@@ -211,6 +223,7 @@ enum WhoSigns {
 
 /// The four protocol steps, end to end. `None` means the suite skipped.
 async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> {
+    let _guard = DB_LOCK.lock().await;
     let url = std::env::var("DATABASE_URL").ok()?;
 
     // ── the read model the gateway answers from ──────────────────────
@@ -296,7 +309,6 @@ async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> 
     let response = ask_gateway(&router, lookup.sender, &lookup.callData).await;
 
     // ── 4. and the chain turns it into an address, or refuses ────────
-    let _ = owner;
     Some(
         resolver
             .resolveWithProof(response, lookup.extraData)

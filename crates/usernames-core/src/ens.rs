@@ -17,15 +17,17 @@
 //! variable number of labels. Platform names and chain names are closed sets
 //! that never overlap, which is what keeps it unambiguous.
 //!
-//! # One chain per process
+//! # Which chain
 //!
-//! This API serves exactly the chain it was configured with, so ENSIP-11
-//! collapses to one comparison: a coin type naming another chain gets a null
-//! answer, and so does a name carrying another chain's label. That is the
-//! specification's rule rather than a shortcut — "answer with an address only
-//! for a chain where the binding exists; for every other chain, including
-//! mainnet, answer null" — and mainnet is not special here. A deployment that
-//! wants mainnet answers runs one of these against mainnet.
+//! A coin type names one chain, and mainnet is one of them rather than a
+//! default: bare `addr(node)` is coin type 60, which is Ethereum mainnet
+//! specifically. Whether an answer is owed for it is the gateway's decision
+//! rather than this module's — see `usernames-api`'s `ens` module, where a
+//! chain outside the served set is refused rather than denied.
+//!
+//! Note the range limit: `0x80000000 | chainId` is injective only below 2^31,
+//! so a larger chain id cannot be named by ENSIP-11 at all. See
+//! [`chain_id_is_addressable`].
 
 use alloy::primitives::{
     keccak256,
@@ -46,6 +48,44 @@ pub const ID_MARKER: &str = "_id";
 
 /// ENSIP-11: an EVM chain's coin type is `0x80000000 | chainId`.
 const EVM_COIN_TYPE_BIT: u64 = 0x8000_0000;
+
+/// The coin type ENSIP-11 gives an EVM chain.
+///
+/// This direction is total and unambiguous for every chain id. It is the
+/// REVERSE that is lossy: above 2^31 the bit is already set, the OR changes
+/// nothing, and two chain ids land on one coin type. So a gateway matches a
+/// query against the chains it was CONFIGURED with, using this function,
+/// rather than computing a chain id back out of the coin type — which would
+/// have to guess, and would guess wrong for any id past 2^31.
+///
+/// Chains that would collide are refused where both are known: at startup.
+pub fn coin_type_for(chain_id: u64) -> U256 {
+    U256::from(EVM_COIN_TYPE_BIT | chain_id)
+}
+
+/// Whether two chains cannot be told apart by their coin type.
+pub fn chain_ids_collide(a: u64, b: u64) -> bool {
+    a != b && coin_type_for(a) == coin_type_for(b)
+}
+
+/// Whether this coin type names an EVM chain at all.
+///
+/// A coin type without the ENSIP-11 bit belongs to another kind of chain
+/// entirely — Bitcoin is 0 — and no libID binding is ever an address of that
+/// kind. That is knowable without serving any chain, which is why such a query
+/// earns a signed null rather than a refusal.
+pub fn names_an_evm_chain(coin_type: U256) -> bool {
+    let Ok(raw) = u64::try_from(coin_type) else {
+        return false;
+    };
+    raw == COIN_TYPE_ETH || raw & EVM_COIN_TYPE_BIT != 0
+}
+
+/// Whether this coin type names Ethereum mainnet, which answers to two: the
+/// legacy 60, and ENSIP-11's `0x80000001`.
+pub fn is_mainnet_coin_type(coin_type: U256) -> bool {
+    coin_type == U256::from(COIN_TYPE_ETH) || coin_type == coin_type_for(1)
+}
 
 /// Coin type 60 is Ethereum mainnet — a specific chain, not an unknown one.
 const COIN_TYPE_ETH: u64 = 60;
@@ -116,12 +156,11 @@ pub struct Query {
 /// The record the client actually asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Record {
-    /// `addr(node)` or `addr(node, coinType)`. The coin type is resolved to
-    /// 60 for the legacy form, which is mainnet and not a wildcard.
+    /// `addr(node)` or `addr(node, coinType)`.
     Addr {
-        /// The chain the caller is asking about, or `None` when the coin type
-        /// names something that is not an EVM chain at all.
-        chain_id: Option<u64>,
+        /// Exactly what the caller asked with, undecoded. Matching it against
+        /// the configured chains is the gateway's job.
+        coin_type: U256,
         /// Whether the caller used the legacy `addr(bytes32)` form, which
         /// returns a bare `address` rather than ENSIP-11's `bytes`.
         legacy: bool,
@@ -208,6 +247,13 @@ fn labels_to_handle(key: &str, labels: &[String]) -> Option<String> {
             });
             local_ok.then(|| format!("{}@gmail.com", labels.join(".")))
         }
+        // A platform the registry knows but this function does not falls
+        // through to `None`, which `parse_query` turns into an error and
+        // `self_answer` into a SIGNED null — a real binding, authoritatively
+        // denied. Nothing at runtime can tell that case from a genuinely
+        // malformed label, so the guard is
+        // `every_registered_platform_has_a_label_transform` rather than a
+        // panic in a request handler.
         _ => None,
     }
 }
@@ -281,15 +327,6 @@ pub fn parse_query(labels: &[String]) -> Result<Query, EnsError> {
     })
 }
 
-/// The chain an ENSIP-11 coin type names, when it names an EVM chain at all.
-pub fn coin_type_chain_id(coin_type: U256) -> Option<u64> {
-    let raw = u64::try_from(coin_type).ok()?;
-    if raw == COIN_TYPE_ETH {
-        return Some(1);
-    }
-    (raw & EVM_COIN_TYPE_BIT != 0).then_some(raw & !EVM_COIN_TYPE_BIT)
-}
-
 /// Decode the `resolve(bytes name, bytes data)` call the resolver forwarded,
 /// returning the DNS-encoded name and the record it wraps.
 pub fn decode_resolve_calldata(call_data: &[u8]) -> Result<(Vec<u8>, Record), EnsError> {
@@ -306,7 +343,11 @@ pub fn decode_resolve_calldata(call_data: &[u8]) -> Result<(Vec<u8>, Record), En
 /// for one shape would be the larger dependency, and the shape is fixed.
 fn decode_two_bytes(body: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     let read_word = |at: usize| -> Option<usize> {
-        let w = body.get(at..at + 32)?;
+        // `checked_add`, because `at` comes from a word this same function
+        // read: a hostile offset near `u64::MAX` overflows the range
+        // expression and panics inside the request handler rather than
+        // returning `None`.
+        let w = body.get(at..at.checked_add(32)?)?;
         // A real offset or length fits far inside a usize; anything using the
         // high bytes is a hostile encoding, not a large value.
         if w[..24].iter().any(|b| *b != 0) {
@@ -331,19 +372,17 @@ fn decode_record(inner: &[u8]) -> Record {
         return Record::Other;
     };
     match (selector, args.len()) {
-        // addr(bytes32) — the node, and nothing else. Coin type 60.
+        // addr(bytes32) — the node and nothing else, which is coin type 60
+        // by definition: Ethereum mainnet.
         (s, 32) if s == ADDR_SELECTOR => Record::Addr {
-            chain_id: Some(1),
+            coin_type: U256::from(COIN_TYPE_ETH),
             legacy: true,
         },
-        // addr(bytes32,uint256) — the node and the coin type.
-        (s, 64) if s == ADDR_COIN_SELECTOR => {
-            let coin = U256::from_be_slice(&args[32..64]);
-            Record::Addr {
-                chain_id: coin_type_chain_id(coin),
-                legacy: false,
-            }
-        }
+        // addr(bytes32,uint256) — carried through exactly as sent.
+        (s, 64) if s == ADDR_COIN_SELECTOR => Record::Addr {
+            coin_type: U256::from_be_slice(&args[32..64]),
+            legacy: false,
+        },
         _ => Record::Other,
     }
 }
@@ -527,6 +566,22 @@ mod tests {
         assert_eq!(handle_of(&q), "alice.b@gmail.com");
     }
 
+    /// Adding a platform to the registry without a label transform here would
+    /// answer every one of its names with a signed "nobody holds this". This
+    /// is the only thing standing between that and production.
+    #[test]
+    fn every_registered_platform_has_a_label_transform() {
+        for key in crate::nodes::platform_keys() {
+            assert!(
+                labels_to_handle(key, &["alice".to_string()]).is_some()
+                    || labels_to_handle(key, &["alice".to_string(), "b".to_string()])
+                        .is_some(),
+                "platform {key:?} is in the registry but inverts no label; \
+                 add its transform beside its normalization rules"
+            );
+        }
+    }
+
     #[test]
     fn gmail_refuses_characters_no_account_can_hold() {
         // Our email rules admit `-`, which Gmail does not issue. Refusing is
@@ -583,11 +638,37 @@ mod tests {
     // ─── Coin types ─────────────────────────────────────────────────
 
     #[test]
-    fn coin_types_name_evm_chains_and_mainnet_is_not_special() {
-        assert_eq!(coin_type_chain_id(U256::from(60u64)), Some(1)); // legacy
-        assert_eq!(coin_type_chain_id(U256::from(0x8000_0001u64)), Some(1));
-        assert_eq!(coin_type_chain_id(U256::from(0x8000_2105u64)), Some(8453)); // Base
-        assert_eq!(coin_type_chain_id(U256::from(0u64)), None); // Bitcoin
+    fn a_chain_gets_the_coin_type_ensip11_gives_it() {
+        assert_eq!(coin_type_for(1), U256::from(0x8000_0001u64));
+        assert_eq!(coin_type_for(8453), U256::from(0x8000_2105u64)); // Base
+                                                                     // Mainnet answers to the legacy 60 as well.
+        assert!(is_mainnet_coin_type(U256::from(60u64)));
+        assert!(is_mainnet_coin_type(coin_type_for(1)));
+        assert!(!is_mainnet_coin_type(coin_type_for(8453)));
+    }
+
+    /// The eden testnet, and why matching forwards is what makes it work.
+    ///
+    /// 3735928814 is 0xDEADBFEE, so bit 31 is already set and the OR changes
+    /// nothing. Going FORWARD that is fine — the coin type is well defined and
+    /// a wallet on eden sends exactly it. What is lost is the reverse: 0xDEADBFEE
+    /// could equally have come from 1588445166. So a gateway compares coin
+    /// types instead of decoding them, and refuses only a configuration that
+    /// serves BOTH of the two colliding chains.
+    #[test]
+    fn a_chain_past_thirty_one_bits_is_addressable_unless_its_twin_is_served() {
+        const EDEN: u64 = 3_735_928_814; // 0xDEADBFEE
+        const TWIN: u64 = 1_588_445_166; // 0x5EADBFEE
+
+        // The coin type a wallet on eden sends, and it names eden exactly.
+        assert_eq!(coin_type_for(EDEN), U256::from(EDEN));
+        assert_eq!(coin_type_for(EDEN), coin_type_for(TWIN));
+        assert!(chain_ids_collide(EDEN, TWIN));
+
+        // Everything else is unambiguous, eden included.
+        assert!(!chain_ids_collide(EDEN, 8453));
+        assert!(!chain_ids_collide(1, 8453));
+        assert!(!chain_ids_collide(EDEN, EDEN));
     }
 
     // ─── The call ───────────────────────────────────────────────────
@@ -628,7 +709,7 @@ mod tests {
         assert_eq!(
             record,
             Record::Addr {
-                chain_id: Some(8453),
+                coin_type: coin_type_for(8453),
                 legacy: false
             }
         );
@@ -658,14 +739,14 @@ mod tests {
     #[test]
     fn the_null_answer_is_an_answer_in_both_record_shapes() {
         let ensip11 = Record::Addr {
-            chain_id: Some(1),
+            coin_type: coin_type_for(1),
             legacy: false,
         };
         // ENSIP-11 returns `bytes`: null is the empty byte string.
         assert_eq!(encode_addr_result(ensip11, None).len(), 64);
         // The legacy form returns `address`: null is the zero address.
         let legacy = Record::Addr {
-            chain_id: Some(1),
+            coin_type: coin_type_for(1),
             legacy: true,
         };
         assert_eq!(encode_addr_result(legacy, None), vec![0u8; 32]);
@@ -676,7 +757,7 @@ mod tests {
         let who = Address::from([0x11u8; 20]);
         let legacy = encode_addr_result(
             Record::Addr {
-                chain_id: Some(1),
+                coin_type: coin_type_for(1),
                 legacy: true,
             },
             Some(who),
@@ -685,7 +766,7 @@ mod tests {
 
         let ensip11 = encode_addr_result(
             Record::Addr {
-                chain_id: Some(1),
+                coin_type: coin_type_for(1),
                 legacy: false,
             },
             Some(who),

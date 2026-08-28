@@ -36,6 +36,15 @@ fn platform_id(domain: &str) -> B256 {
 /// listing both lookup directions, the rules lookup and the parse error
 /// derive from — so adding a platform is one line here (plus its rules in
 /// handles.json via `libid-identity`), not three places that must agree.
+/// Every platform key this build knows, in registry order.
+///
+/// Exposed so a test elsewhere can enumerate them: anything that must be
+/// written once per platform — the ENS label transform, for instance — can
+/// then be checked against this list rather than drifting from it silently.
+pub fn platform_keys() -> impl Iterator<Item = &'static str> {
+    REGISTRY.iter().map(|(key, _)| *key)
+}
+
 const REGISTRY: &[(&str, &str)] = &[
     ("x", PLATFORM_X_DOMAIN),
     ("github", PLATFORM_GITHUB_DOMAIN),

@@ -27,6 +27,10 @@ use alloy::{
 };
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
+use tower_http::cors::{
+    Any,
+    CorsLayer,
+};
 use tracing::info;
 use url::Url;
 use usernames_core::{
@@ -105,6 +109,12 @@ pub struct Config {
     #[arg(long, env = "ENS_RPC_URLS")]
     pub ens_rpc_urls: Option<String>,
 
+    /// `IdentityNames` per chain, for the chains where it is not at
+    /// `IDENTITY_NAMES_ADDRESS`: `8453=0x…`. Only read with
+    /// `ENS_SOURCE=chain`.
+    #[arg(long, env = "ENS_CONTRACTS")]
+    pub ens_contracts: Option<String>,
+
     /// How long a signed answer stays good, in seconds. The resolver enforces
     /// it on chain.
     #[arg(long, env = "ENS_TTL_SECS", default_value_t = 300)]
@@ -146,7 +156,19 @@ pub async fn run() -> anyhow::Result<()> {
     match ens_config(&config, chain_id, pool)? {
         Some(gateway) => {
             info!(resolver = %gateway.resolver, "ENS gateway mounted");
-            app = app.merge(ens::router(ens::GatewayState::new(gateway)));
+            // A `layer` only wraps the routes already on the router it is
+            // called on, and `api::router` applies its CORS layer before this
+            // merge — so the gateway route would answer a browser-side
+            // ERC-3668 client with no `Access-Control-Allow-Origin` while
+            // `/v1/*` worked from the same page. The route is added first and
+            // the layer goes over the merged whole.
+            app = app
+                .merge(ens::router(ens::GatewayState::new(gateway)))
+                .layer(
+                    CorsLayer::new()
+                        .allow_origin(Any)
+                        .allow_methods([axum::http::Method::GET]),
+                );
         }
         None => info!("ENS gateway not configured; the CCIP-Read route is absent"),
     }
@@ -199,10 +221,41 @@ fn ens_config(
     let own = u64::try_from(chain_id).expect("chain id came from a u64");
     let declared = parse_chains(config.ens_chains.as_deref(), own)?;
     let rpc = parse_rpc_urls(config.ens_rpc_urls.as_deref())?;
+    let contracts = parse_contracts(config.ens_contracts.as_deref())?;
+
+    // Both checks belong before the loop. Inside it, an empty `ENS_CHAINS`
+    // skips the body entirely — so `ENS_SOURCE=mirrorr` with `ENS_CHAINS=""`
+    // used to start cleanly, log "gateway mounted", and then 503 every
+    // request because the map was empty.
+    let source_kind = match config.ens_source.as_str() {
+        kind @ ("mirror" | "chain") => kind,
+        other => anyhow::bail!("ENS_SOURCE must be `mirror` or `chain`, not {other:?}"),
+    };
+    if declared.is_empty() {
+        anyhow::bail!(
+            "ENS_CHAINS names no chain; a gateway serving none answers nothing"
+        );
+    }
 
     let mut chains = HashMap::new();
     for (id, label) in declared {
-        let source = match config.ens_source.as_str() {
+        // Two chains whose coin types collide cannot be told apart by a query,
+        // so a gateway serving both would answer one's binding for the other.
+        // `0x80000000 | chainId` stops being injective past 2^31 — the eden
+        // testnet's 3735928814 is such a chain — but serving eden is perfectly
+        // safe as long as its colliding twin is not also served. Refused HERE,
+        // where both chain ids are known, rather than by banning the chain.
+        if let Some(other) = chains
+            .keys()
+            .copied()
+            .find(|other| usernames_core::ens::chain_ids_collide(id, *other))
+        {
+            anyhow::bail!(
+                "chains {id} and {other} share one ENSIP-11 coin type, so a query \
+                 cannot say which it means; serve them from separate gateways"
+            );
+        }
+        let source = match source_kind {
             "mirror" => {
                 // A mirror serves whichever chain's rows it is scoped to, and
                 // they all live in this one database.
@@ -221,9 +274,17 @@ fn ens_config(
                 })?;
                 ens::HandleSource::Chain {
                     provider: RootProvider::new_http(url.clone()),
-                    // One CREATE3 address on every chain, which is what lets
-                    // a single configured address serve all of them.
-                    contract: config.identity_names_address,
+                    // Per chain, with `IDENTITY_NAMES_ADDRESS` as the default.
+                    // The canonical entry contracts are CREATE3-deterministic
+                    // and identical everywhere, but this field is documented
+                    // as the ERC1967 PROXY the rows were indexed from, and a
+                    // proxy carries no such guarantee. Assuming it does turns
+                    // a mismatch into an `eth_call` against an address with no
+                    // code, which surfaces as a decode failure rather than as
+                    // a configuration error.
+                    contract: *contracts
+                        .get(&id)
+                        .unwrap_or(&config.identity_names_address),
                 }
             }
             other => {
@@ -287,6 +348,31 @@ fn parse_rpc_urls(raw: Option<&str>) -> anyhow::Result<HashMap<u64, Url>> {
                 url.trim().parse::<Url>().map_err(|e| {
                     anyhow::anyhow!("ENS_RPC_URLS: {url:?} is not a URL: {e}")
                 })?,
+            ))
+        })
+        .collect()
+}
+
+/// `8453=0x…,10=0x…`.
+fn parse_contracts(raw: Option<&str>) -> anyhow::Result<HashMap<u64, Address>> {
+    let Some(raw) = raw else {
+        return Ok(HashMap::new());
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|entry| {
+            let (id, address) = entry.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("ENS_CONTRACTS: {entry:?} is not `chainId=address`")
+            })?;
+            Ok((
+                id.trim().parse::<u64>().map_err(|_| {
+                    anyhow::anyhow!("ENS_CONTRACTS: {id:?} is not a chain id")
+                })?,
+                address
+                    .trim()
+                    .parse::<Address>()
+                    .map_err(|e| anyhow::anyhow!("ENS_CONTRACTS: {address:?}: {e}"))?,
             ))
         })
         .collect()
