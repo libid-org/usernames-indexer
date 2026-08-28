@@ -18,6 +18,7 @@
 pub mod api;
 pub mod chain;
 pub mod db;
+pub mod ens;
 pub mod events;
 pub mod indexer;
 pub mod nodes;
