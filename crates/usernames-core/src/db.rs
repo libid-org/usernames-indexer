@@ -68,7 +68,7 @@ fn deploy_block_key(contract: Address) -> String {
 }
 
 /// Connect and bring the schema current.
-/// The migrations, embedded at compile time.
+/// The migrations this crate owns, embedded at compile time.
 ///
 /// Exposed because `sqlx::migrate!` resolves its path against the crate that
 /// invokes it, so anything outside this crate — a test in either binary —
@@ -169,6 +169,12 @@ impl ChainStore {
     /// The chain this store is scoped to.
     pub fn chain_id(&self) -> i64 {
         self.chain_id
+    }
+
+    /// The pool behind this store, for a caller that needs a query this type
+    /// does not offer — a test arranging a state the writer would produce.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     async fn get_metadata(&self, key: &str) -> Result<Option<String>, sqlx::Error> {

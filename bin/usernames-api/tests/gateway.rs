@@ -81,19 +81,9 @@ async fn gateway_over(
         .await
         .expect("DATABASE_URL is set but connecting failed");
     db::MIGRATOR.run(&pool).await.expect("migrations");
-    for table in db::PROJECTION_TABLES {
-        sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
-            .bind(CHAIN)
-            .execute(&pool)
-            .await
-            .expect("cleanup");
-    }
-    sqlx::query("DELETE FROM names.chain_metadata WHERE chain_id = $1")
-        .bind(CHAIN)
-        .execute(&pool)
-        .await
-        .expect("metadata cleanup");
-
+    // Every chain this gateway will serve, not just the first: a leftover
+    // cursor or head on a co-tenant chain outlives the test that set it and
+    // contaminates the next one.
     for (id, _) in chains {
         for table in db::PROJECTION_TABLES {
             sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
@@ -102,7 +92,31 @@ async fn gateway_over(
                 .await
                 .expect("cleanup");
         }
+        sqlx::query("DELETE FROM names.chain_metadata WHERE chain_id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("metadata cleanup");
     }
+
+    // Every chain starts SYNCED AND EMPTY, which is a different state from
+    // never indexed: an empty window is committed so a cursor exists, and the
+    // head is recorded. A mirror with neither cannot say how far behind it is,
+    // and the gateway refuses rather than signing a null — correct in
+    // production, and previously invisible here because "unknown" was read as
+    // "fresh".
+    for (id, _) in chains {
+        let store = ChainStore::new(pool.clone(), *id);
+        store
+            .begin_window()
+            .await
+            .expect("begin")
+            .commit(1)
+            .await
+            .expect("commit");
+        store.set_chain_head(1).await;
+    }
+
     let store = ChainStore::new(pool.clone(), chains[0].0);
     let config = Config {
         resolver: RESOLVER,
@@ -156,6 +170,11 @@ async fn bind(store: &ChainStore, handle: &str, owner: Address) {
         .await
         .expect("apply");
     window.commit(1).await.expect("commit");
+    // The indexer records the head every cycle, and the gateway refuses to
+    // answer from a mirror that cannot say how far behind it is. A test that
+    // skipped this was relying on "unknown" being read as "fresh" — which is
+    // exactly the fail-open the lag gate now closes.
+    store.set_chain_head(1).await;
 }
 
 /// `alice.x.handles.link`, and the same with a chain label.
@@ -445,4 +464,64 @@ async fn one_gateway_answers_for_every_chain_it_serves() {
             "chain {chain} answered with another chain's wallet"
         );
     }
+}
+
+/// A mirror that cannot report its own position must refuse, not deny.
+///
+/// This is the fail-open the lag gate closes. `chain_head` and `cursor` are
+/// both absent on a fresh database, and again while `prepare` replays a chain
+/// after a version bump — and an unreadable Postgres looks the same. Folding
+/// that into "no lag" made the gateway sign an authoritative "nobody holds
+/// this" for every name, cached by wallets for the whole `ENS_TTL_SECS`
+/// window.
+#[tokio::test]
+async fn a_mirror_that_cannot_report_its_position_refuses() {
+    let (router, store, _g) = gateway_or_skip!(None, 32);
+    bind(&store, "alice", Address::from([0xbe; 20])).await;
+
+    // Wipe what the mirror knows about its own progress, leaving the binding
+    // in place: the rows say one thing, the cursor says nothing.
+    sqlx::query("DELETE FROM names.chain_metadata WHERE chain_id = $1")
+        .bind(CHAIN)
+        .execute(store.pool())
+        .await
+        .expect("clear metadata");
+
+    let call = resolve_call(
+        &wire_name(&["alice", "x"]),
+        &addr_call(0x8000_0000 | CHAIN as u64),
+    );
+    let (status, body) = ask(&router, RESOLVER, &call).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(!body.contains("\"data\""), "a refusal must carry no answer");
+}
+
+/// The eden testnet resolves, and that it does is the whole point of matching
+/// coin types forwards instead of decoding them backwards.
+///
+/// Eden's chain id is 3735928814 — `0xDEADBFEE`, bit 31 already set — so
+/// `0x80000000 | chainId` returns it unchanged. A gateway that decoded the
+/// coin type would get 1588445166 and refuse every eden name. Comparing
+/// against the chains it serves gets it right, and the only thing that is
+/// genuinely ambiguous — serving both colliding chains at once — is refused at
+/// startup instead.
+#[tokio::test]
+async fn the_eden_testnet_resolves_despite_its_chain_id() {
+    const EDEN: i64 = 3_735_928_814;
+    let Some((router, store, _g)) = gateway_over(&[(EDEN, Some("eden"))], 32).await
+    else {
+        return;
+    };
+    let owner = Address::from([0xed; 20]);
+    bind(&store, "alice", owner).await;
+
+    // Exactly what a wallet on eden sends: `0x80000000 | 3735928814`, which is
+    // 3735928814 itself.
+    let call = resolve_call(
+        &wire_name(&["alice", "x", "eden"]),
+        &addr_call(0x8000_0000u64 | EDEN as u64),
+    );
+    let (status, body) = ask(&router, RESOLVER, &call).await;
+    assert_eq!(status, StatusCode::OK, "eden must resolve: {body}");
+    assert_eq!(verify(&body, &call), Some(owner));
 }

@@ -98,9 +98,10 @@ verifies the signature and returns the record. Both on-chain halves are `view`.
 |---|---|---|
 | `ENS_SIGNER_KEY` | unset | The signing key, hex. Setting it mounts the route |
 | `ENS_RESOLVER_ADDRESS` | — | Required with a key. An answer is bound to one resolver by its signature; a request naming another is refused rather than signed, or this becomes a signing oracle for any contract that asks |
-| `ENS_CHAINS` | this process's chain | Which chains to answer for, and their labels: `3735928814:eden,8453:base` |
+| `ENS_CHAINS` | this process's chain | Which chains to answer for, and their labels: `3735928814:eden,8453:base`. Refused at startup only if two of them share a coin type |
 | `ENS_SOURCE` | `mirror` | `mirror` reads the indexed model; `chain` reads `IdentityNames` over RPC |
-| `ENS_RPC_URLS` | — | Required with `ENS_SOURCE=chain`: `3735928814=http://…,8453=https://…` |
+| `ENS_RPC_URLS` | — | Required with `ENS_SOURCE=chain`: `8453=https://…,10=https://…` |
+| `ENS_CONTRACTS` | `IDENTITY_NAMES_ADDRESS` | Per-chain `IdentityNames`, where it differs: `8453=0x…`. Read only with `ENS_SOURCE=chain` |
 | `ENS_TTL_SECS` | `300` | How long an answer stays good; the resolver enforces it |
 | `ENS_MAX_LAG_BLOCKS` | `32` | How far behind the chain the mirror may be and still assert anything |
 
@@ -121,6 +122,18 @@ So `ENS_CHAINS` is a set, and the answers divide three ways: an address or a
 signed null for a chain in the set, a signed null for a coin type naming no EVM
 chain at all, and an unsigned 503 for an EVM chain outside the set. Only the
 last lets the walk continue, which is exactly when it should.
+
+**Coin types are matched, not decoded.** ENSIP-11 names a chain by
+`0x80000000 | chainId`. Forwards that is exact for every chain id; backwards it
+is not, because above 2³¹ the bit is already set and two chain ids land on one
+coin type. So the gateway compares a query's coin type against the chains it
+serves rather than computing a chain id from it.
+
+That is what lets the eden testnet work: its chain id is 3735928814
+(`0xDEADBFEE`), the OR leaves it unchanged, and a gateway that decoded would
+have got 1588445166 and refused every eden name. The one genuinely ambiguous
+configuration — serving 3735928814 AND 1588445166 together — is refused at
+startup, where both ids are known.
 
 **Where answers come from.** `ENS_SOURCE=mirror` reads the indexed model —
 cheap, and as of the indexer's last committed window, which is what

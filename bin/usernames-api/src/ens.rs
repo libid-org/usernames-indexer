@@ -16,13 +16,18 @@
 //! signature turns an answer into an assertion, and neither of these has
 //! earned one.
 //!
-//! * **A chain this gateway does not serve.** The resolver carries ONE `urls`
-//!   list for every query it ever answers — it cannot route by coin type — so
-//!   ERC-3668 has the client walk that list until something succeeds. A signed
-//!   null is a success, and it ends the walk. A gateway that signed null for
-//!   every chain but its own would therefore answer, authoritatively and
-//!   wrongly, for chains its neighbours in the list were there to serve.
-//!   Refusing steps aside and lets the walk continue.
+//! * **A chain this gateway does not serve** — mainnet included, and that is
+//!   the case worth stating plainly, because `addr(node)` with no coin type
+//!   IS a mainnet query and it is what `getAddress()` sends by default. The
+//!   resolver carries ONE `urls` list for every query it ever answers — it
+//!   cannot route by coin type — so ERC-3668 has the client walk that list
+//!   until something succeeds. A signed null is a success, and it ends the
+//!   walk. A gateway that signed null for every chain but its own would
+//!   therefore answer, authoritatively and wrongly, for chains its neighbours
+//!   in the list were there to serve. Refusing steps aside and lets the walk
+//!   continue — which also means a deployment must list a gateway for every
+//!   chain it wants resolvable, mainnet among them, or the default query
+//!   shape gets an error rather than an address.
 //! * **A mirror too far behind.** Same shape: a signed null from a stale
 //!   mirror denies a binding that may already exist.
 //!
@@ -44,6 +49,7 @@ use alloy::{
     primitives::{
         Address,
         B256,
+        U256,
     },
     providers::RootProvider,
     signers::{
@@ -67,7 +73,10 @@ use axum::{
 };
 use libid_contracts::bindings::identity::IdentityNames;
 use serde::Serialize;
-use tracing::warn;
+use tracing::{
+    error,
+    warn,
+};
 use usernames_core::{
     db::ChainStore,
     ens::{
@@ -142,16 +151,27 @@ impl HandleSource {
         }
     }
 
-    /// How far this source trails the chain, when that question means
-    /// anything. Reading the chain directly, it does not.
-    async fn lag_blocks(&self) -> Option<u64> {
+    /// How far this source trails the chain.
+    ///
+    /// Three answers, not two, and the third is the one that matters: reading
+    /// the chain directly there IS no lag; reading a mirror it is a number; and
+    /// reading a mirror whose head or cursor is missing or unreadable, it is
+    /// UNKNOWN. Folding unknown into "no lag" is how a gateway ends up signing
+    /// authoritative nulls off a wiped or unreachable database — a fresh
+    /// deployment, a version-bump replay clearing `names.chain_metadata`, a
+    /// chain listed in `ENS_CHAINS` that nobody indexed, or Postgres simply
+    /// being down all produce it.
+    async fn lag(&self) -> Lag {
         match self {
+            Self::Chain { .. } => Lag::None,
             Self::Mirror(store) => {
-                let head = store.chain_head().await.ok().flatten()?;
-                let cursor = store.cursor().await.ok().flatten()?;
-                Some(head.saturating_sub(cursor))
+                let (Ok(Some(head)), Ok(Some(cursor))) =
+                    (store.chain_head().await, store.cursor().await)
+                else {
+                    return Lag::Unknown;
+                };
+                Lag::Blocks(head.saturating_sub(cursor))
             }
-            Self::Chain { .. } => None,
         }
     }
 }
@@ -196,17 +216,17 @@ pub struct Config {
 /// State for the one route.
 #[derive(Clone)]
 pub struct GatewayState {
-    config: Config,
-    /// Injected so a test can pin the expiry instead of racing the clock.
-    now: fn() -> u64,
+    // Behind an `Arc` because axum clones the state per request, and this map
+    // holds a `ChainStore` and a provider per chain. `signer` was already
+    // `Arc` for the same reason; this finishes the job.
+    config: Arc<Config>,
 }
 
 impl GatewayState {
     /// Wire the gateway to its configuration.
     pub fn new(config: Config) -> Self {
         Self {
-            config,
-            now: unix_now,
+            config: Arc::new(config),
         }
     }
 }
@@ -289,23 +309,30 @@ async fn resolve(
         // Both of these are unsigned on purpose: a signature would make the
         // answer an assertion, and neither case has earned one. Unsigned lets
         // the client fall through to the next endpoint in `urls`.
-        Answer::NotOurChain(chain_id) => {
+        Answer::NotOurChain(coin_type) => {
             return Err(GatewayError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
-                message: format!("this gateway does not serve chain {chain_id}"),
+                message: format!(
+                    "this gateway serves no chain for coin type {coin_type}"
+                ),
             });
         }
         Answer::TooStale { lag } => {
-            warn!(lag, "refusing to answer from a stale mirror");
+            warn!(?lag, "refusing to answer from a stale mirror");
             return Err(GatewayError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
-                message: format!("read model is {lag} blocks behind; not answering"),
+                message: match lag {
+                    Some(lag) => {
+                        format!("read model is {lag} blocks behind; not answering")
+                    }
+                    None => "read model cannot report its position; not answering".into(),
+                },
             });
         }
     };
 
     let result = ens::encode_addr_result(record, address);
-    let expires = (state.now)() + state.config.ttl_secs;
+    let expires = unix_now() + state.config.ttl_secs;
     let digest =
         ens::signature_digest(state.config.resolver, expires, &call_data, &result);
     let signature = state
@@ -329,16 +356,29 @@ async fn resolve(
     }))
 }
 
+/// How far behind the chain an answer would be.
+enum Lag {
+    /// Read from the chain: the question does not apply.
+    None,
+    /// Read from a mirror, this far behind.
+    Blocks(u64),
+    /// A mirror that cannot say. Treated as too stale, because a source that
+    /// does not know its own position has not earned the right to deny a
+    /// binding.
+    Unknown,
+}
+
 /// Either the address to answer with — `None` meaning a signed null — or a
 /// refusal to assert anything at all.
 enum Answer {
     Address(Option<Address>),
-    /// This gateway does not serve that chain. Unsigned, so the client walks
-    /// on to the next endpoint in the resolver's `urls`.
-    NotOurChain(u64),
-    /// This chain's mirror is too far behind to deny a binding.
+    /// This gateway serves no chain with that coin type. Unsigned, so the
+    /// client walks on to the next endpoint in the resolver's `urls`.
+    NotOurChain(U256),
+    /// This chain's mirror is too far behind to deny a binding, or cannot say
+    /// how far behind it is.
     TooStale {
-        lag: u64,
+        lag: Option<u64>,
     },
 }
 
@@ -350,20 +390,39 @@ async fn self_answer(
     // Any record other than `addr` is null rather than an error, so a client
     // asking for `text()` or something invented later degrades instead of
     // seeing a name that resolves report a failure.
-    let Record::Addr { chain_id, .. } = record else {
+    let Record::Addr { coin_type, .. } = record else {
         return Ok(Answer::Address(None));
     };
-    // A coin type naming no EVM chain — Bitcoin, say — is a signed null: no
-    // libID binding is ever an address of that kind, and that is knowable
-    // without serving any chain.
-    let Some(chain_id) = chain_id else {
-        return Ok(Answer::Address(None));
-    };
-    // A chain this gateway does not serve is the one case that must NOT be
-    // signed. The resolver holds one `urls` list for every query, so a signed
-    // null here ends a walk that a sibling endpoint was there to finish.
-    let Some(chain) = state.config.chains.get(&chain_id) else {
-        return Ok(Answer::NotOurChain(chain_id));
+    // Matched against the chains this gateway SERVES, never decoded back into
+    // a chain id. `0x80000000 | chainId` is not injective past 2^31 — the eden
+    // testnet's 3735928814 is exactly such a chain — so decoding would answer
+    // for a different chain, silently. Forwards the map is exact, and startup
+    // refuses a configuration where two chains share one coin type.
+    //
+    // Mainnet is looked up twice because it answers to two coin types: the
+    // legacy 60, and ENSIP-11's `0x80000001`.
+    let matched = state
+        .config
+        .chains
+        .iter()
+        .find(|(id, _)| ens::coin_type_for(**id) == coin_type)
+        .map(|(_, chain)| chain)
+        .or_else(|| {
+            ens::is_mainnet_coin_type(coin_type)
+                .then(|| state.config.chains.get(&1))
+                .flatten()
+        });
+    let Some(chain) = matched else {
+        // A coin type that names no EVM chain at all — Bitcoin, say — is a
+        // SIGNED null: no libID binding is ever an address of that kind, and
+        // saying so needs no chain. Only an EVM chain we do not serve gets the
+        // refusal, because there a sibling gateway may be the one that can
+        // answer.
+        return Ok(if ens::names_an_evm_chain(coin_type) {
+            Answer::NotOurChain(coin_type)
+        } else {
+            Answer::Address(None)
+        });
     };
 
     let labels = ens::parse_dns_name(name)
@@ -382,12 +441,12 @@ async fn self_answer(
         }
     }
 
-    // Only now, with an answer actually owed, is staleness worth asking about
-    // — and only a mirror has any.
-    if let Some(lag) = chain.source.lag_blocks().await {
-        if lag > state.config.max_lag_blocks {
-            return Ok(Answer::TooStale { lag });
-        }
+    // Only now, with an answer actually owed, is staleness worth asking about.
+    match chain.source.lag().await {
+        Lag::None => {}
+        Lag::Blocks(lag) if lag <= state.config.max_lag_blocks => {}
+        Lag::Blocks(lag) => return Ok(Answer::TooStale { lag: Some(lag) }),
+        Lag::Unknown => return Ok(Answer::TooStale { lag: None }),
     }
 
     let owner = match query.subject {
@@ -410,9 +469,17 @@ async fn self_answer(
     Ok(Answer::Address(owner))
 }
 
+/// The cause is LOGGED, never serialized — the same split `api.rs` makes.
+///
+/// A `sqlx` or RPC error carries schema names, connection strings and provider
+/// detail, and this route is unauthenticated. Returning it would tell a caller
+/// things the REST half of the same process deliberately withholds, and
+/// returning it INSTEAD of logging it — which is what this used to do — leaves
+/// the operator with nothing while the caller has everything.
 fn internal(e: impl std::fmt::Display) -> GatewayError {
+    error!(cause = %e, "gateway lookup failed");
     GatewayError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
-        message: format!("read model unavailable: {e}"),
+        message: "lookup failed".into(),
     }
 }
