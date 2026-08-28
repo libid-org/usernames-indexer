@@ -2,8 +2,15 @@
 
 Indexes [`IdentityNames`](https://github.com/libid-org/libid-contracts/blob/main/solidity/contracts/identity/IdentityNames.sol)
 events into Postgres and serves resolution and search over the claimed
-handles. One binary, two halves: a polling loop that mirrors the contract's
-storage from its events alone, and a read API.
+handles. **Two binaries over one read model**: `usernames-indexer`, a polling
+loop that mirrors the contract's storage from its events alone, and
+`usernames-api`, which serves what the loop wrote. They are separate because
+they scale and fail differently — one writer per chain holds a Postgres
+advisory lease, while readers are stateless and horizontal — and because a
+stalled indexer must not hide behind a healthy-looking endpoint.
+
+Neither binary contains logic: both stand on the `usernames-core` library,
+where the read model, the event decoding and the loop itself live.
 
 The contract was designed for exactly this: `IdentityBound` carries the
 plaintext `userId` and the normalized `handle` next to their storage nodes,
@@ -16,8 +23,13 @@ reverse display without guessing.
 ```sh
 docker compose up -d postgres          # listens on 127.0.0.1:55432
 cp .env.example .env                   # fill in RPC_URL + IDENTITY_NAMES_ADDRESS
-cargo run -p usernames-indexer
+cargo run -p usernames-indexer         # the write half
+cargo run -p usernames-api             # the read half, in another shell
 ```
+
+Start the indexer first on a fresh database: it owns the schema and runs the
+migrations. The API only connects, and a reader that starts before the schema
+exists fails its first query rather than racing the migration.
 
 The compose database's DSN is
 `postgres://usernames:usernames_dev@127.0.0.1:55432/usernames` (already in
@@ -26,19 +38,21 @@ role allowed to create extensions — true for the compose database; on a
 managed instance with a least-privilege role, have an administrator run it
 once beforehand.
 
-Configuration is flags or environment (a `.env` file is read first):
+Configuration is flags or environment (a `.env` file is read first). Each
+binary accepts only what it uses — the API takes no `RPC_URL`, and refusing
+the indexer's knobs is the point rather than an omission:
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `DATABASE_URL` | — | Postgres connection string |
-| `RPC_URL` | — | JSON-RPC endpoint of the chain to follow. Prefer a single node or a sticky endpoint: a load balancer that mixes lagged replicas can answer `eth_getLogs` for blocks a backend has not seen, and events dropped that way past the confirmation margin are gone until a re-index. The loop re-checks the backend's height before committing a window, which narrows but cannot close that hole. |
-| `IDENTITY_NAMES_ADDRESS` | — | The IdentityNames **ERC1967 proxy** (the implementation changes on upgrade; the proxy is the one that emits) |
-| `CHAIN_ID` | unset | Refuse to start unless the RPC reports this chain id |
-| `CONFIRMATIONS` | `5` | Blocks behind the head to stay (shallow-reorg protection) |
-| `POLL_INTERVAL_SECS` | `5` | Poll cadence, and the retry delay after a failure |
-| `MAX_BLOCK_RANGE` | `10000` | Largest `eth_getLogs` window |
-| `START_BLOCK` | unset | Where a FRESH scan starts — consulted only when no cursor exists (new database, or right after a re-index). Unset means the deployment block is found by binary search over `eth_getCode`; only a successful detection is cached, and an RPC failure mid-search retries next cycle |
-| `LISTEN_ADDR` | `127.0.0.1:8080` | Read-API listen address |
+| Variable | Used by | Default | Meaning |
+|---|---|---|---|
+| `DATABASE_URL` | both | — | Postgres connection string |
+| `RPC_URL` | indexer | — | JSON-RPC endpoint of the chain to follow. Prefer a single node or a sticky endpoint: a load balancer that mixes lagged replicas can answer `eth_getLogs` for blocks a backend has not seen, and events dropped that way past the confirmation margin are gone until a re-index. The loop re-checks the backend's height before committing a window, which narrows but cannot close that hole. |
+| `IDENTITY_NAMES_ADDRESS` | both | — | The IdentityNames **ERC1967 proxy** (the implementation changes on upgrade; the proxy is the one that emits). The API echoes it in `/v1/status`; set it to the same value the indexer runs with, or the status names a contract those rows did not come from |
+| `CHAIN_ID` | both | unset / **required** | Indexer: refuse to start unless the RPC reports this chain id. API: **required** — it talks to no chain, so it cannot discover which chain's rows it serves |
+| `CONFIRMATIONS` | indexer | `5` | Blocks behind the head to stay (shallow-reorg protection) |
+| `POLL_INTERVAL_SECS` | indexer | `5` | Poll cadence, and the retry delay after a failure |
+| `MAX_BLOCK_RANGE` | indexer | `10000` | Largest `eth_getLogs` window |
+| `START_BLOCK` | indexer | unset | Where a FRESH scan starts — consulted only when no cursor exists (new database, or right after a re-index). Unset means the deployment block is found by binary search over `eth_getCode`; only a successful detection is cached, and an RPC failure mid-search retries next cycle |
+| `LISTEN_ADDR` | api | `127.0.0.1:8080` | Read-API listen address |
 
 ## API
 
@@ -93,18 +107,34 @@ contract's bindings are not the new contract's bindings.
 
 ## Deploying
 
-Every push to `main` and every `v*.*.*` tag publishes a linux/amd64 image to
-`ghcr.io/libid-org/usernames-indexer` (`:main`, `:latest`, `:<version>`,
-`:sha-<commit>`); PRs build the image without pushing so packaging cannot
-rot. The container binds `0.0.0.0:8080` and is configured entirely through
-the environment (table above). Probes: `GET /health` for liveness; for
-readiness gate on `GET /v1/status` — the resolve endpoints answer 503 by
-design until the first window lands. The API sends permissive CORS for GET,
-so a browser UI (handle.link) can call it directly from any origin.
+Every push to `main` and every `v*.*.*` tag publishes **two** linux/amd64
+images (`:main`, `:latest`, `:<version>`, `:sha-<commit>`); PRs build both
+without pushing so packaging cannot rot:
+
+| Image | Runs | Listens | Needs |
+|---|---|---|---|
+| `ghcr.io/libid-org/usernames-indexer` | the polling loop | nothing | RPC + a writer lease |
+| `ghcr.io/libid-org/usernames-api` | the read API | `0.0.0.0:8080` | the database only |
+
+There is deliberately no image carrying both. An entrypoint would have to
+default to one half, and a deployment that pulled it expecting the other would
+run a container that looks healthy while doing half the job.
+
+**Upgrading from the single-image build:** the `usernames-indexer` image keeps
+its name and keeps indexing, but it no longer serves the API. Deploy
+`usernames-api` alongside it, pointed at the same database and the same
+`IDENTITY_NAMES_ADDRESS`, with `CHAIN_ID` set — the reader cannot discover the
+chain on its own. Nothing in the database changes and no re-index is needed.
+
+Probes belong to the API: `GET /health` for liveness; for readiness gate on
+`GET /v1/status` — the resolve endpoints answer 503 by design until the first
+window lands. It sends permissive CORS for GET, so a browser UI (handle.link)
+can call it directly from any origin. The indexer exposes no port; supervise
+it on process liveness, and on `lagBlocks` from the API's status.
 
 `docker compose up -d --build` runs the full stack locally against the
-compose Postgres — set `RPC_URL` and `IDENTITY_NAMES_ADDRESS` in `.env`
-first.
+compose Postgres — set `RPC_URL`, `IDENTITY_NAMES_ADDRESS` and `CHAIN_ID` in
+`.env` first.
 
 ## Caveats worth knowing
 

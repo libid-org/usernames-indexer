@@ -19,7 +19,7 @@ use alloy::{
 };
 use axum::http::StatusCode;
 use tokio_util::sync::CancellationToken;
-use usernames_indexer::{
+use usernames_core::{
     db::{
         self,
         ChainStore,

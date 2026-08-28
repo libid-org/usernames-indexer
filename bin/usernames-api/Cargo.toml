@@ -1,11 +1,11 @@
 [package]
-name = "usernames-indexer"
+name = "usernames-api"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Mirrors IdentityNames events into Postgres. The write half; it serves nothing."
+description = "Serves handle/id/address resolution and search over the indexed read model. Reads only; it indexes nothing."
 publish = false
 
 [dependencies]
@@ -13,10 +13,10 @@ usernames-core.workspace = true
 
 alloy.workspace = true
 anyhow.workspace = true
+axum.workspace = true
 clap.workspace = true
 dotenvy.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-url.workspace = true

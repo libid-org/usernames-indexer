@@ -5021,7 +5021,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "usernames-indexer"
+name = "usernames-api"
 version = "0.1.0"
 dependencies = [
  "alloy",
@@ -5029,6 +5029,20 @@ dependencies = [
  "axum",
  "clap",
  "dotenvy",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "usernames-core",
+]
+
+[[package]]
+name = "usernames-core"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "axum",
  "http-body-util",
  "libid-contracts",
  "libid-identity",
@@ -5040,8 +5054,22 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+]
+
+[[package]]
+name = "usernames-indexer"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "clap",
+ "dotenvy",
+ "tokio",
+ "tokio-util",
+ "tracing",
  "tracing-subscriber",
  "url",
+ "usernames-core",
 ]
 
 [[package]]
