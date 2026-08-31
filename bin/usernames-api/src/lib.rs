@@ -476,3 +476,121 @@ fn parse_contracts(raw: Option<&str>) -> anyhow::Result<HashMap<u64, Address>> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pool that never dials. Every case below is refused before any query
+    /// runs, which is the point: these are startup checks, so they must not
+    /// need a database to reject a configuration that cannot work.
+    fn lazy_pool() -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+            .expect("lazy pool")
+    }
+
+    /// A signer key is what turns the route on, so every case supplies one.
+    fn config(extra: &[&str]) -> Config {
+        let mut argv = vec![
+            "usernames-api",
+            "--database-url",
+            "postgres://u:p@127.0.0.1:5432/db",
+            "--identity-names-address",
+            "0xd467d48769c26faee36ba6b6fc9228f14aef6dd2",
+            "--chain-id",
+            "3735928814",
+            "--ens-signer-key",
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            "--ens-resolver-address",
+            "0x0000000000000000000000000000000000000001",
+        ];
+        argv.extend_from_slice(extra);
+        Config::try_parse_from(argv).expect("parse")
+    }
+
+    /// `ens::Config` holds a signer and so is not `Debug`; match rather than
+    /// `expect_err`.
+    async fn refusal(extra: &[&str]) -> String {
+        match ens_config(&config(extra), 3735928814, lazy_pool()).await {
+            Ok(_) => panic!("this configuration must be refused"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn without_a_signer_key_there_is_no_gateway() {
+        let config = Config::try_parse_from([
+            "usernames-api",
+            "--database-url",
+            "postgres://u:p@127.0.0.1:5432/db",
+            "--identity-names-address",
+            "0xd467d48769c26faee36ba6b6fc9228f14aef6dd2",
+            "--chain-id",
+            "1",
+        ])
+        .expect("parse");
+        let mounted = ens_config(&config, 1, lazy_pool())
+            .await
+            .expect("no key is not an error")
+            .is_some();
+        assert!(!mounted, "the route must not be mounted without a key");
+    }
+
+    #[tokio::test]
+    async fn a_ttl_the_resolver_would_reject_is_refused() {
+        let message = refusal(&["--ens-ttl-secs", "7200"]).await;
+        assert!(message.contains("MAX_LIFETIME"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_ttl_at_the_ceiling_is_allowed() {
+        let config = config(&["--ens-ttl-secs", "3600"]);
+        assert!(ens_config(&config, 3735928814, lazy_pool()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_repeated_chain_is_refused() {
+        // Invisible to the collision check, which compares DIFFERENT ids: the
+        // second entry used to overwrite the first in silence.
+        let message = refusal(&["--ens-chains", "8453:base,8453:eden"]).await;
+        assert!(message.contains("twice"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_label_spelled_like_a_platform_is_refused() {
+        // The grammar reads right to left, so a trailing `x` is the PLATFORM.
+        let message = refusal(&["--ens-chains", "8453:x"]).await;
+        assert!(message.contains("collides"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_label_the_grammar_cannot_produce_is_refused() {
+        for label in ["Base", "ba_se", "with space"] {
+            let message = refusal(&["--ens-chains", &format!("8453:{label}")]).await;
+            assert!(
+                message.contains("ENS-normalized"),
+                "{label:?} was accepted: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_gateway_serving_no_chain_is_refused() {
+        let message = refusal(&["--ens-chains", ""]).await;
+        assert!(message.contains("names no chain"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn colliding_coin_types_are_refused_together() {
+        // 3735928814 and 1588445166 differ only in the bit ENSIP-11 sets.
+        let message = refusal(&["--ens-chains", "3735928814:eden,1588445166:twin"]).await;
+        assert!(message.contains("coin type"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn chain_source_without_an_endpoint_is_refused() {
+        let message = refusal(&["--ens-source", "chain"]).await;
+        assert!(message.contains("ENS_RPC_URLS"), "{message}");
+    }
+}
