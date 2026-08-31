@@ -71,10 +71,10 @@ async fn gateway(
 
 /// A gateway serving several chains from the one shared database, which is
 /// what the read model's `chain_id` keying already allows.
-async fn gateway_over(
+async fn gateway_parts(
     chains: &[(i64, Option<&str>)],
     max_lag_blocks: u64,
-) -> Option<(Router, ChainStore, MutexGuard<'static, ()>)> {
+) -> Option<(Config, ChainStore, MutexGuard<'static, ()>)> {
     let guard = DB_LOCK.lock().await;
     let url = std::env::var("DATABASE_URL").ok()?;
     let pool = PgPool::connect(&url)
@@ -115,6 +115,10 @@ async fn gateway_over(
             .await
             .expect("commit");
         store.set_chain_head(1).await;
+        // The gate measures the cursor against the TARGET — what the indexer
+        // intends to reach — not the raw head, so a fixture that records only
+        // the head reads as "cannot tell" and refuses every query.
+        store.set_chain_target(1).await;
     }
 
     let store = ChainStore::new(pool.clone(), chains[0].0);
@@ -136,8 +140,20 @@ async fn gateway_over(
         max_lag_blocks,
         signer: std::sync::Arc::new(SIGNER_KEY.parse::<PrivateKeySigner>().expect("key")),
     };
-    let router = usernames_api::ens::router(GatewayState::new(config));
-    Some((router, store, guard))
+    Some((config, store, guard))
+}
+
+/// The gateway route alone, which is what most of these tests exercise.
+async fn gateway_over(
+    chains: &[(i64, Option<&str>)],
+    max_lag_blocks: u64,
+) -> Option<(Router, ChainStore, MutexGuard<'static, ()>)> {
+    let (config, store, guard) = gateway_parts(chains, max_lag_blocks).await?;
+    Some((
+        usernames_api::ens::router(GatewayState::new(config)),
+        store,
+        guard,
+    ))
 }
 
 /// Bind a handle and commit it, so the sync gate opens and the row exists.
@@ -170,11 +186,12 @@ async fn bind(store: &ChainStore, handle: &str, owner: Address) {
         .await
         .expect("apply");
     window.commit(1).await.expect("commit");
-    // The indexer records the head every cycle, and the gateway refuses to
-    // answer from a mirror that cannot say how far behind it is. A test that
-    // skipped this was relying on "unknown" being read as "fresh" — which is
-    // exactly the fail-open the lag gate now closes.
+    // The indexer records both every cycle, and the gateway refuses to answer
+    // from a mirror that cannot say how far behind it is. Staleness is
+    // measured against the TARGET — the block the cursor chases — so that is
+    // the one a fixture must record.
     store.set_chain_head(1).await;
+    store.set_chain_target(1).await;
 }
 
 /// `alice.x.handles.link`, and the same with a chain label.
@@ -194,6 +211,16 @@ fn addr_call(coin: u64) -> Vec<u8> {
     inner.push(1);
     inner.extend_from_slice(&[0u8; 24]);
     inner.extend_from_slice(&coin.to_be_bytes());
+    inner
+}
+
+/// `addr(bytes32)` — the pre-ENSIP-11 shape, and what a wallet asking simply
+/// "what is this name's address" still sends. It carries no coin type; the
+/// gateway must read it as coin type 60, mainnet ETH.
+fn legacy_addr_call() -> Vec<u8> {
+    let mut inner = vec![0x3b, 0x3b, 0x57, 0xde];
+    inner.extend_from_slice(&[0u8; 31]);
+    inner.push(1);
     inner
 }
 
@@ -408,7 +435,9 @@ async fn a_stale_mirror_refuses_rather_than_signing_a_null() {
     // binding exists, and a mirror this far behind has not earned that.
     let (router, store, _g) = gateway_or_skip!(None, 0);
     bind(&store, "alice", Address::from([0xbe; 20])).await;
-    store.set_chain_head(10_000).await;
+    // Far ahead of the cursor, as the TARGET: that is the quantity the gate
+    // compares, and the head alone no longer moves it.
+    store.set_chain_target(10_000).await;
 
     let call = resolve_call(
         &wire_name(&["alice", "x"]),
@@ -524,4 +553,92 @@ async fn the_eden_testnet_resolves_despite_its_chain_id() {
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "eden must resolve: {body}");
     assert_eq!(verify(&body, &call), Some(owner));
+}
+
+/// The legacy shape decodes, and a gateway that does not serve mainnet refuses
+/// it UNSIGNED.
+///
+/// Both halves matter. The decode had no coverage at all, and the refusal is
+/// the multi-chain invariant: coin type 60 names Ethereum mainnet, so a
+/// gateway serving only some other chain has nothing to say about it. Saying
+/// so with a 5xx keeps the client walking the resolver's `urls`; a signed null
+/// would be an authoritative "nobody holds this" and would end that walk at
+/// the first gateway asked.
+#[tokio::test]
+async fn the_legacy_addr_shape_is_refused_unsigned_off_mainnet() {
+    let (router, store, _g) = gateway_or_skip!(None, 32);
+    bind(&store, "alice", Address::from([0xbe; 20])).await;
+
+    let call = resolve_call(&wire_name(&["alice", "x"]), &legacy_addr_call());
+    let (status, body) = ask(&router, RESOLVER, &call).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a signed null here would end the client's url walk: {body}"
+    );
+}
+
+/// What the binary actually serves: both halves on one router, with the
+/// middleware over the whole of it.
+///
+/// The halves were only ever built apart, so three things had no coverage —
+/// that the gateway route does not swallow the API's namespace, that a `/v1`
+/// path which matches nothing is a 404 rather than the gateway's "sender is
+/// not an address", and that CORS is applied once rather than layered twice.
+#[tokio::test]
+async fn the_merged_router_keeps_both_halves_intact() {
+    let Some((config, store, _g)) = gateway_parts(&[(CHAIN, None)], 32).await else {
+        return;
+    };
+    let owner = Address::from([0xbe; 20]);
+    bind(&store, "alice", owner).await;
+
+    let app = usernames_api::build_router(
+        usernames_core::api::AppState::new(store.clone(), Address::ZERO),
+        Some(config),
+    );
+
+    let get = |uri: String| {
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("origin", "https://handle.link")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router")
+        }
+    };
+
+    // The API half still answers, and carries exactly ONE set of CORS headers.
+    let response = get("/v1/status".into()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get_all("vary").iter().count(),
+        1,
+        "two CORS layers would each append a Vary"
+    );
+
+    // A `/v1` path that matches nothing is the API's 404 — not the gateway
+    // claiming every two-segment path and reporting a malformed sender.
+    assert_eq!(
+        get("/v1/typo".into()).await.status(),
+        StatusCode::NOT_FOUND,
+        "the gateway route must not claim the API's namespace"
+    );
+
+    // And the gateway answers under its prefix.
+    let call = resolve_call(
+        &wire_name(&["alice", "x"]),
+        &addr_call(0x8000_0000 | CHAIN as u64),
+    );
+    let uri = format!(
+        "{}/{RESOLVER:?}/0x{}.json",
+        usernames_api::ens::ROUTE_PREFIX,
+        hex::encode(&call)
+    );
+    assert_eq!(get(uri).await.status(), StatusCode::OK);
 }

@@ -22,7 +22,7 @@ reverse display without guessing.
 
 ```sh
 docker compose up -d postgres          # listens on 127.0.0.1:55432
-cp .env.example .env                   # fill in RPC_URL + IDENTITY_NAMES_ADDRESS
+cp .env.example .env                   # fill in RPC_URL, IDENTITY_NAMES_ADDRESS, CHAIN_ID
 cargo run -p usernames-indexer         # the write half
 cargo run -p usernames-api             # the read half, in another shell
 ```

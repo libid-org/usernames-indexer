@@ -22,9 +22,13 @@ use std::{
 
 use alloy::{
     primitives::Address,
-    providers::RootProvider,
+    providers::{
+        Provider,
+        RootProvider,
+    },
     signers::local::PrivateKeySigner,
 };
+use axum::Router;
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{
@@ -102,7 +106,7 @@ pub struct Config {
     /// because it answers from a model kept `CONFIRMATIONS` blocks deep, which
     /// a call at the head is not.
     #[arg(long, env = "ENS_SOURCE", default_value = "mirror")]
-    pub ens_source: String,
+    pub ens_source: EnsSource,
 
     /// JSON-RPC endpoint per chain, required with `ENS_SOURCE=chain`:
     /// `3735928814=http://…,8453=https://…`.
@@ -152,26 +156,16 @@ pub async fn run() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
     info!(addr = %config.listen_addr, chain_id, %contract, "read API listening");
 
-    let mut app = api::router(api::AppState::new(store.clone(), contract));
-    match ens_config(&config, chain_id, pool)? {
-        Some(gateway) => {
-            info!(resolver = %gateway.resolver, "ENS gateway mounted");
-            // A `layer` only wraps the routes already on the router it is
-            // called on, and `api::router` applies its CORS layer before this
-            // merge — so the gateway route would answer a browser-side
-            // ERC-3668 client with no `Access-Control-Allow-Origin` while
-            // `/v1/*` worked from the same page. The route is added first and
-            // the layer goes over the merged whole.
-            app = app
-                .merge(ens::router(ens::GatewayState::new(gateway)))
-                .layer(
-                    CorsLayer::new()
-                        .allow_origin(Any)
-                        .allow_methods([axum::http::Method::GET]),
-                );
-        }
+    let gateway = ens_config(&config, chain_id, pool).await?;
+    match &gateway {
+        Some(g) => info!(
+            resolver = %g.resolver,
+            route = %format!("{}/{{sender}}/{{data}}", ens::ROUTE_PREFIX),
+            "ENS gateway mounted"
+        ),
         None => info!("ENS gateway not configured; the CCIP-Read route is absent"),
     }
+    let app = build_router(api::AppState::new(store.clone(), contract), gateway);
 
     let shutdown = cancel.clone();
     let mut task = tokio::spawn(async move {
@@ -202,7 +196,57 @@ pub async fn run() -> anyhow::Result<()> {
 /// A key without a resolver is a usage error rather than a default, because
 /// there is no safe resolver to guess: signing for whatever address asks would
 /// make this a signing oracle.
-fn ens_config(
+/// Where a signed answer comes from.
+///
+/// A type rather than a string so clap rejects a typo at startup with the
+/// valid values listed, instead of the gateway mounting and every request
+/// failing on a `match` arm nothing reaches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum EnsSource {
+    /// Read the indexed model. Answers as of the last window, so the lag gate
+    /// applies.
+    Mirror,
+    /// Read `IdentityNames` over RPC. Current rather than as-of-last-window.
+    Chain,
+}
+
+/// Every route the binary serves, with the middleware over the whole of it.
+///
+/// Separate from [`run`] so a test can exercise what is actually served. The
+/// halves were only ever built apart — `api::router` in one suite,
+/// `ens::router` in another — so the merge itself, and the layering over it,
+/// had no coverage at all.
+pub fn build_router(state: api::AppState, gateway: Option<ens::Config>) -> Router {
+    let mut app = api::router(state);
+    if let Some(gateway) = gateway {
+        app = app.nest(
+            ens::ROUTE_PREFIX,
+            ens::router(ens::GatewayState::new(gateway)),
+        );
+    }
+    // ONE layer, over the whole router, after every route is on it. A `layer`
+    // wraps only what is already mounted, so applying it inside `api::router`
+    // both missed the gateway route — a browser ERC-3668 client would get no
+    // `Access-Control-Allow-Origin` while `/v1/*` worked from the same page —
+    // and, once a second layer was added to cover it, ran the CORS middleware
+    // twice on every `/v1` response.
+    //
+    // A read-only public resolver: any origin may GET. This is what lets a
+    // browser UI (handle.link) call the API cross-origin at all.
+    app.layer(
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods([axum::http::Method::GET]),
+    )
+}
+
+/// The resolver's `MAX_LIFETIME`, in seconds. It rejects any `expires` further
+/// out than this, so a longer TTL here would have the gateway sign answers the
+/// contract reverts — every one of them, and only in production, since nothing
+/// off chain looks at the deadline.
+const RESOLVER_MAX_LIFETIME_SECS: u64 = 3600;
+
+async fn ens_config(
     config: &Config,
     chain_id: i64,
     pool: sqlx::PgPool,
@@ -223,22 +267,61 @@ fn ens_config(
     let rpc = parse_rpc_urls(config.ens_rpc_urls.as_deref())?;
     let contracts = parse_contracts(config.ens_contracts.as_deref())?;
 
-    // Both checks belong before the loop. Inside it, an empty `ENS_CHAINS`
-    // skips the body entirely — so `ENS_SOURCE=mirrorr` with `ENS_CHAINS=""`
-    // used to start cleanly, log "gateway mounted", and then 503 every
-    // request because the map was empty.
-    let source_kind = match config.ens_source.as_str() {
-        kind @ ("mirror" | "chain") => kind,
-        other => anyhow::bail!("ENS_SOURCE must be `mirror` or `chain`, not {other:?}"),
-    };
+    // The resolver enforces this on chain; refuse at startup rather than let a
+    // deployment sign answers that always revert.
+    if config.ens_ttl_secs > RESOLVER_MAX_LIFETIME_SECS {
+        anyhow::bail!(
+            "ENS_TTL_SECS is {}, but the resolver's MAX_LIFETIME is {}s and it \
+             reverts DeadlineTooFar on anything longer",
+            config.ens_ttl_secs,
+            RESOLVER_MAX_LIFETIME_SECS
+        );
+    }
+
+    // Belongs before the loop: an empty `ENS_CHAINS` skips the body entirely,
+    // so the gateway used to start cleanly, log "gateway mounted", and then
+    // 503 every request because the map was empty.
     if declared.is_empty() {
         anyhow::bail!(
             "ENS_CHAINS names no chain; a gateway serving none answers nothing"
         );
     }
 
-    let mut chains = HashMap::new();
+    let mut chains: HashMap<u64, ens::ChainGateway> = HashMap::new();
     for (id, label) in declared {
+        // A repeated chain id is invisible to the collision check below, which
+        // asks whether two DIFFERENT ids share a coin type. Left alone, the
+        // second entry silently overwrites the first, and the label the
+        // operator meant to serve is simply gone — every name under it gets a
+        // SIGNED null for a chain they believe is configured.
+        if chains.contains_key(&id) {
+            anyhow::bail!("ENS_CHAINS names chain {id} twice");
+        }
+        // A label the name grammar can never produce makes the chain
+        // unaddressable by label, and says so nowhere. The rules come from
+        // `usernames-core` rather than being restated here, so the two cannot
+        // drift.
+        if let Some(label) = label.as_deref() {
+            if !usernames_core::ens::label_is_wellformed(label) {
+                anyhow::bail!(
+                    "ENS_CHAINS label {label:?} is not valid ENS-normalized text; \
+                     a name carrying it cannot parse, so the chain would be \
+                     unaddressable by label"
+                );
+            }
+            // The grammar reads right to left and treats the rightmost label
+            // as the platform (or the id marker), so a chain label spelled
+            // like one is read as that instead — and the chain becomes
+            // unreachable rather than ambiguous.
+            if usernames_core::nodes::Platform::from_key(label).is_some()
+                || label == usernames_core::ens::ID_MARKER
+            {
+                anyhow::bail!(
+                    "ENS_CHAINS label {label:?} collides with a platform label; \
+                     the name grammar would read it as the platform"
+                );
+            }
+        }
         // Two chains whose coin types collide cannot be told apart by a query,
         // so a gateway serving both would answer one's binding for the other.
         // `0x80000000 | chainId` stops being injective past 2^31 — the eden
@@ -255,8 +338,8 @@ fn ens_config(
                  cannot say which it means; serve them from separate gateways"
             );
         }
-        let source = match source_kind {
-            "mirror" => {
+        let source = match config.ens_source {
+            EnsSource::Mirror => {
                 // A mirror serves whichever chain's rows it is scoped to, and
                 // they all live in this one database.
                 ens::HandleSource::Mirror(db::ChainStore::new(
@@ -266,14 +349,33 @@ fn ens_config(
                     })?,
                 ))
             }
-            "chain" => {
+            EnsSource::Chain => {
                 let url = rpc.get(&id).ok_or_else(|| {
                     anyhow::anyhow!(
                         "ENS_SOURCE=chain but ENS_RPC_URLS has no entry for {id}"
                     )
                 })?;
+                let provider = RootProvider::new_http(url.clone());
+                // The signature binds the resolver, the deadline, the request
+                // and the result — never the chain. So a transposed
+                // `ENS_RPC_URLS` entry (two chains, two URLs, one copy-paste)
+                // has this gateway read one chain's bindings and SIGN them
+                // under the other's coin type, and the resolver accepts them
+                // because nothing in the digest disagrees. A wallet is handed
+                // the wrong address, authoritatively, and nothing is logged.
+                // Ask the endpoint who it is, as the indexer already does.
+                let reported = provider.get_chain_id().await.map_err(|e| {
+                    anyhow::anyhow!(
+                        "ENS_RPC_URLS entry for chain {id} is unreachable: {e}"
+                    )
+                })?;
+                anyhow::ensure!(
+                    reported == id,
+                    "ENS_RPC_URLS entry for chain {id} reports chain {reported}; \
+                     answers read from it would be signed under the wrong coin type"
+                );
                 ens::HandleSource::Chain {
-                    provider: RootProvider::new_http(url.clone()),
+                    provider,
                     // Per chain, with `IDENTITY_NAMES_ADDRESS` as the default.
                     // The canonical entry contracts are CREATE3-deterministic
                     // and identical everywhere, but this field is documented
@@ -286,9 +388,6 @@ fn ens_config(
                         .get(&id)
                         .unwrap_or(&config.identity_names_address),
                 }
-            }
-            other => {
-                anyhow::bail!("ENS_SOURCE must be `mirror` or `chain`, not {other:?}")
             }
         };
         chains.insert(id, ens::ChainGateway { label, source });
