@@ -601,6 +601,7 @@ async fn preparing_an_unchanged_chain_keeps_everything() {
             .is_some(),
         "the binding survived"
     );
+    writer.release().await.expect("the lease releases");
 }
 
 #[tokio::test]
@@ -634,6 +635,7 @@ async fn watching_another_contract_clears_the_chain() {
             .is_none(),
         "the previous contract's binding must not survive"
     );
+    writer.release().await.expect("the lease releases");
 }
 
 #[tokio::test]
@@ -659,4 +661,31 @@ async fn the_deployment_block_cache_survives_a_replay() {
         Some(4321),
         "the deployment-block cache is keyed by contract and must outlive the wipe"
     );
+    writer.release().await.expect("the lease releases");
+}
+
+/// The lease must give the lock back, not merely stop being referenced.
+///
+/// It used to hold `pg_try_advisory_lock` on a POOLED connection, so dropping
+/// it returned a live session — lock still held — to the idle pool, where it
+/// sat for the idle timeout. A second indexer, or the next test, then blocked
+/// on a lock nobody was using. Two sequential leases on one chain is the
+/// smallest thing that would have caught it.
+#[tokio::test]
+async fn a_released_lease_frees_the_chain_for_the_next_holder() {
+    let Some((store, _pool, _g)) = test_store_with(2).await else {
+        return;
+    };
+    let first = store.acquire_writer().await.expect("first lease");
+    first.release().await.expect("release");
+
+    // Bounded, because the failure mode is a block rather than an error: on
+    // the old code this waits for the pool's idle timeout, not forever, and an
+    // unbounded await would look like a hung test rather than a broken lock.
+    let second =
+        tokio::time::timeout(std::time::Duration::from_secs(5), store.acquire_writer())
+            .await
+            .expect("the second lease was still blocked on the first")
+            .expect("second lease");
+    second.release().await.expect("release");
 }
