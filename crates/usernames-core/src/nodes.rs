@@ -32,10 +32,6 @@ fn platform_id(domain: &str) -> B256 {
     keccak256(domain.as_bytes())
 }
 
-/// Every platform this build knows, as (short key, domain). The single
-/// listing both lookup directions, the rules lookup and the parse error
-/// derive from — so adding a platform is one line here (plus its rules in
-/// handles.json via `libid-identity`), not three places that must agree.
 /// Every platform key this build knows, in registry order.
 ///
 /// Exposed so a test elsewhere can enumerate them: anything that must be
@@ -45,6 +41,10 @@ pub fn platform_keys() -> impl Iterator<Item = &'static str> {
     REGISTRY.iter().map(|(key, _)| *key)
 }
 
+/// Every platform this build knows, as (short key, domain). The single
+/// listing both lookup directions, the rules lookup and the parse error
+/// derive from — so adding a platform is one line here (plus its rules in
+/// handles.json via `libid-identity`), not three places that must agree.
 const REGISTRY: &[(&str, &str)] = &[
     ("x", PLATFORM_X_DOMAIN),
     ("github", PLATFORM_GITHUB_DOMAIN),

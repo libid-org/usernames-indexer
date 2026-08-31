@@ -25,9 +25,14 @@
 //! rather than this module's — see `usernames-api`'s `ens` module, where a
 //! chain outside the served set is refused rather than denied.
 //!
-//! Note the range limit: `0x80000000 | chainId` is injective only below 2^31,
-//! so a larger chain id cannot be named by ENSIP-11 at all. See
-//! [`chain_id_is_addressable`].
+//! Note what the range limit does and does not cost. `0x80000000 | chainId`
+//! stops being injective at 2^31, so a coin type cannot be decoded back to one
+//! chain id — but the forward direction is always well defined, and a chain
+//! past 2^31 (the eden testnet's 3735928814 is one) is addressable like any
+//! other. That is why [`coin_type_for`] is the only direction offered, and why
+//! a gateway matches a query against its configured chains rather than
+//! decoding. [`chain_ids_collide`] names the pair that cannot be served
+//! together.
 
 use alloy::primitives::{
     keccak256,
@@ -205,7 +210,12 @@ pub fn parse_dns_name(wire: &[u8]) -> Result<Vec<String>, EnsError> {
 
 /// The alphabet a handle-derived label may use: what X and GitHub reduce to
 /// after the substitution, and what Gmail's local part already is.
-fn label_is_wellformed(label: &str) -> bool {
+///
+/// Public because a CHAIN label must satisfy it too — [`parse_query`] compares
+/// one against this alphabet, so a gateway configured with a label outside it
+/// can never be addressed. Validating that at startup means reading the rule
+/// from here rather than restating it, which is how the two would drift.
+pub fn label_is_wellformed(label: &str) -> bool {
     !label.is_empty()
         && label
             .bytes()
@@ -236,6 +246,15 @@ fn labels_to_handle(key: &str, labels: &[String]) -> Option<String> {
         // rather than mapped: Gmail issues none of them, and a mapping for
         // characters no account can hold would be untested code on a payment
         // path.
+        //
+        // ONLY gmail.com, by design — the spec defines a Workspace transform
+        // (`local ++ ["_at"] ++ domain`) and leaves it NOT ENABLED. A refusal
+        // here is not an unreachable account: it falls through to the
+        // id-derived name under [`ID_MARKER`], which every account has. That
+        // is the totality property, and it is why widening this alphabet is a
+        // spec change rather than a bug fix — `+` and `_` are not legal ENS
+        // labels at all, so a Workspace or plus-tagged address has no
+        // handle-derived form to widen INTO.
         "google" => {
             if labels.is_empty() {
                 return None;

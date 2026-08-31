@@ -216,6 +216,11 @@ impl<P: Provider> Indexer<P> {
             };
             let head = latest.saturating_sub(self.config.confirmations);
             self.store.set_chain_head(latest).await;
+            // Both, because they answer different questions: `head` is how far
+            // the chain has grown, `target` is how far this loop intends to
+            // get. A reader measuring staleness must use the second — the
+            // cursor is never advanced past it.
+            self.store.set_chain_target(head).await;
 
             if from_block > head {
                 sleep_or_cancel(&cancel, self.config.poll_interval_secs).await;
