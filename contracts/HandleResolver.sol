@@ -31,14 +31,31 @@ import {IExtendedResolver} from "./IExtendedResolver.sol";
 ///      halves are `view` — nothing is sent and no gas is spent.
 ///
 ///      **The gateway is not trusted.** It signs, and this verifies against a
-///      pinned signer set. Seizing an endpoint buys nothing: the callback
-///      rejects an answer nobody in the set signed. Redirecting resolution
-///      needs the owner key AND a signing key, and those must not be held
-///      together — see the design note in `libid/design/ens-integration.md`.
+///      pinned signer set. Seizing an endpoint buys nothing on its own: the
+///      callback rejects an answer nobody in the set signed, so a stolen URL
+///      can only refuse to answer.
+///
+///      **The owner key is the whole authority, and that is worth saying
+///      plainly.** `setSigner` and `setUrls` are both `onlyOwner`, so whoever
+///      holds it can trust its own signer and point at its own endpoint in two
+///      transactions, with no gateway key involved. This contract does not
+///      split that and cannot; what limits the damage is where the owner key
+///      lives, and that every change is a transaction visible in the registry.
+///      Holding the owner key, the deployer key and the ENS name's owner as ONE
+///      identity — which the current setup does — means one compromise reaches
+///      all three. See `libid/design/ens-integration.md`.
 ///
 ///      The signature covers the resolver, an expiry, the request and the
 ///      result, so an answer cannot be replayed against another resolver,
 ///      reused for a different query, or served after its deadline.
+///
+///      What it does NOT cover is the chain id — matching
+///      `ensdomains/offchain-resolver`'s `SignatureVerifier`, which the test
+///      suite pins byte for byte. So a deployment discipline stands in for it:
+///      an answer signed for a resolver at address A on one chain verifies
+///      unchanged at address A on another. Never share a signing key between
+///      deployments that could land on the same address — which deterministic
+///      deployment makes the usual outcome rather than the exotic one.
 ///
 ///      **Not upgradeable, on purpose.** Replacing it is `setResolver` on the
 ///      ENS name, which is one owner transaction and visible in the registry.
@@ -61,6 +78,21 @@ contract HandleResolver is IExtendedResolver, IERC165, Ownable2Step {
     error UntrustedSigner(address recovered);
     /// A resolver with no endpoint can answer nothing.
     error NoUrls();
+    /// The answer claims a lifetime longer than any answer may have.
+    error DeadlineTooFar(uint64 expires, uint256 ceiling);
+
+    /// The longest an answer may claim to be good for.
+    ///
+    /// `expires` is chosen entirely by the gateway, so without a ceiling a
+    /// compromised or careless signing key mints answers valid until the heat
+    /// death: capture one blob, replay it after the binding moves, and the
+    /// chain returns the wallet the name USED to hold. An hour is already
+    /// generous for a value a payment is routed by.
+    ///
+    /// A constant rather than owner state, on purpose: it bounds what the
+    /// owner's own signer set can do, and a bound the owner can widen is not
+    /// one.
+    uint256 public constant MAX_LIFETIME = 1 hours;
 
     constructor(address owner_, string[] memory urls_, address[] memory signers_) Ownable(owner_) {
         _setUrls(urls_);
@@ -99,6 +131,11 @@ contract HandleResolver is IExtendedResolver, IERC165, Ownable2Step {
         (bytes memory result, uint64 expires, bytes memory signature) = abi.decode(response, (bytes, uint64, bytes));
 
         if (expires < block.timestamp) revert SignatureExpired(expires, block.timestamp);
+        // Both ends, not just the near one: an unbounded deadline is a
+        // replayable answer.
+        if (expires > block.timestamp + MAX_LIFETIME) {
+            revert DeadlineTooFar(expires, block.timestamp + MAX_LIFETIME);
+        }
 
         address signer = ECDSA.recover(makeSignatureHash(address(this), expires, extraData, result), signature);
         if (!signers[signer]) revert UntrustedSigner(signer);

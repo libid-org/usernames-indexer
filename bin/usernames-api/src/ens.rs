@@ -72,6 +72,15 @@ use axum::{
     Router,
 };
 use libid_contracts::bindings::identity::IdentityNames;
+
+alloy::sol! {
+    /// `IdentityNames` rejects a platform it was never configured with.
+    ///
+    /// Declared here because the published bindings do not carry it, and the
+    /// one place that must recognise it should name it rather than compare a
+    /// selector literal.
+    error UnknownPlatform(bytes32 platformId);
+}
 use serde::Serialize;
 use tracing::{
     error,
@@ -123,11 +132,23 @@ impl HandleSource {
                 .and_then(as_address)),
             Self::Chain { provider, contract } => {
                 let names = IdentityNames::new(*contract, provider);
-                let owner = names
+                let owner = match names
                     .resolveHandle(platform, handle.as_str().to_string())
                     .call()
                     .await
-                    .map_err(internal)?;
+                {
+                    Ok(owner) => owner,
+                    // A platform this chain was never configured with is a
+                    // name nobody can hold — the same fact the mirror reports
+                    // as an empty row, and it deserves the same SIGNED null.
+                    // Left as an error it became a 500, so `bob.github.…` on a
+                    // chain wired only for `x` looked like an outage instead
+                    // of an unclaimable name, and logged one line per request.
+                    Err(e) if e.as_decoded_error::<UnknownPlatform>().is_some() => {
+                        return Ok(None);
+                    }
+                    Err(e) => return Err(internal(e)),
+                };
                 // The contract answers the zero address for a name nobody
                 // holds, which is the null answer rather than an address.
                 Ok((!owner.is_zero()).then_some(owner))
@@ -165,12 +186,20 @@ impl HandleSource {
         match self {
             Self::Chain { .. } => Lag::None,
             Self::Mirror(store) => {
-                let (Ok(Some(head)), Ok(Some(cursor))) =
-                    (store.chain_head().await, store.cursor().await)
+                // Against the TARGET, not the chain head. The indexer records
+                // the head as the chain's own height but only ever advances
+                // the cursor to `head - CONFIRMATIONS`, so a fully caught-up
+                // mirror is permanently that far behind the head. Measured
+                // that way, any deployment whose CONFIRMATIONS reached
+                // ENS_MAX_LAG_BLOCKS refused every ENS query forever while
+                // being perfectly healthy — two knobs in two binaries with
+                // nothing relating them.
+                let (Ok(Some(target)), Ok(Some(cursor))) =
+                    (store.chain_target().await, store.cursor().await)
                 else {
                     return Lag::Unknown;
                 };
-                Lag::Blocks(head.saturating_sub(cursor))
+                Lag::Blocks(target.saturating_sub(cursor))
             }
         }
     }
@@ -237,6 +266,15 @@ fn unix_now() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or_default()
 }
+
+/// Where the gateway is mounted, as the prefix the resolver's `urls` must
+/// carry.
+///
+/// Under a prefix rather than at the root: `/{sender}/{data}` matches EVERY
+/// two-segment path, so at the root it claims the whole shape for itself and
+/// answers `/v1/typo` with "sender is not an address" instead of a 404 — and
+/// silently swallows any future two-segment API route.
+pub const ROUTE_PREFIX: &str = "/ens";
 
 /// The ERC-3668 route. `{sender}` and `{data}` are the placeholders the
 /// resolver's `urls` carry; the `.json` suffix is conventional and tolerated
@@ -339,10 +377,10 @@ async fn resolve(
         .config
         .signer
         .sign_hash_sync(&B256::from(digest))
-        .map_err(|e| GatewayError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: format!("signing failed: {e}"),
-        })?;
+        // Through `internal`, like every other failure here: the raw error
+        // went to an anonymous caller while the operator got no log line —
+        // exactly inverted.
+        .map_err(internal)?;
 
     Ok(Json(GatewayResponse {
         data: format!(

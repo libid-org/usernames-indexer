@@ -26,10 +26,6 @@ use serde::{
     Deserialize,
     Serialize,
 };
-use tower_http::cors::{
-    Any,
-    CorsLayer,
-};
 
 use crate::{
     db::{
@@ -56,7 +52,12 @@ impl AppState {
     }
 }
 
-/// The router, ready to serve.
+/// The routes, without middleware.
+///
+/// No CORS layer here on purpose: a `layer` wraps only the routes already on
+/// the router it is called on, so one applied inside this function cannot
+/// cover anything a caller merges afterwards. The binary mounts every route
+/// first and applies CORS once over the whole thing.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -68,13 +69,6 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/resolve/id/{platform}/{user_id}", get(resolve_id))
         .route("/v1/resolve/address/{address}", get(resolve_address))
         .route("/v1/search", get(search))
-        // A read-only public resolver: any origin may GET. This is what lets
-        // a browser UI (handle.link) call the API cross-origin at all.
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods([axum::http::Method::GET]),
-        )
         .with_state(state)
 }
 
