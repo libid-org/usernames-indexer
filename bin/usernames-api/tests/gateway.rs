@@ -8,10 +8,7 @@
 //! Skips silently when `DATABASE_URL` is unset, like the other suites.
 
 use alloy::{
-    primitives::{
-        Address,
-        B256,
-    },
+    primitives::Address,
     signers::local::PrivateKeySigner,
 };
 use axum::{
@@ -41,12 +38,10 @@ use usernames_core::{
         ChainStore,
     },
     ens,
-    events::{
-        LogPosition,
-        NamesEvent,
-    },
-    nodes,
 };
+
+mod common;
+use common::*;
 
 /// This suite's own chain, so it does not collide with the others.
 const CHAIN: i64 = 31341;
@@ -55,12 +50,6 @@ const SIGNER_KEY: &str =
     "0x00000000000000000000000000000000000000000000000000000000000a11ce";
 
 static DB_LOCK: Mutex<()> = Mutex::const_new(());
-
-fn platform_x() -> B256 {
-    nodes::Platform::from_key("x")
-        .expect("x is a known platform")
-        .id()
-}
 
 async fn gateway(
     chain_label: Option<&str>,
@@ -156,103 +145,6 @@ async fn gateway_over(
     ))
 }
 
-/// Bind a handle and commit it, so the sync gate opens and the row exists.
-async fn bind(store: &ChainStore, handle: &str, owner: Address) {
-    let platform = platform_x();
-    let event = NamesEvent::IdentityBound {
-        owner,
-        id_node: nodes::id_node(platform, "42"),
-        handle_node: nodes::handle_node(
-            platform,
-            &nodes::NormalizedHandle::from_chain(handle),
-        ),
-        platform_id: platform,
-        user_id: "42".into(),
-        handle: handle.into(),
-        observed_at: 1_700_000_000,
-        version: 1,
-        published: true,
-    };
-    let mut window = store.begin_window().await.expect("begin");
-    window
-        .apply(
-            &event,
-            &LogPosition {
-                block_number: 1,
-                log_index: 0,
-                tx_hash: B256::from([1u8; 32]),
-            },
-        )
-        .await
-        .expect("apply");
-    window.commit(1).await.expect("commit");
-    // The indexer records both every cycle, and the gateway refuses to answer
-    // from a mirror that cannot say how far behind it is. Staleness is
-    // measured against the TARGET — the block the cursor chases — so that is
-    // the one a fixture must record.
-    store.set_chain_head(1).await;
-    store.set_chain_target(1).await;
-}
-
-/// `alice.x.handles.link`, and the same with a chain label.
-fn wire_name(labels: &[&str]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for label in labels.iter().chain(["handles", "link"].iter()) {
-        out.push(label.len() as u8);
-        out.extend_from_slice(label.as_bytes());
-    }
-    out.push(0);
-    out
-}
-
-/// Takes the labels so the node is the namehash of the name it travels with —
-/// the gateway refuses a request whose two halves describe different names, and
-/// so would every real client, which never builds them apart.
-fn addr_call(labels: &[&str], coin: u64) -> Vec<u8> {
-    let full: Vec<String> = labels
-        .iter()
-        .map(|l| l.to_string())
-        .chain(["handles".to_string(), "link".to_string()])
-        .collect();
-    let mut inner = vec![0xf1, 0xcb, 0x7e, 0x06];
-    inner.extend_from_slice(usernames_core::ens::namehash(&full).as_slice());
-    inner.extend_from_slice(&[0u8; 24]);
-    inner.extend_from_slice(&coin.to_be_bytes());
-    inner
-}
-
-/// `addr(bytes32)` — the pre-ENSIP-11 shape, and what a wallet asking simply
-/// "what is this name's address" still sends. It carries no coin type; the
-/// gateway must read it as coin type 60, mainnet ETH.
-fn legacy_addr_call() -> Vec<u8> {
-    let mut inner = vec![0x3b, 0x3b, 0x57, 0xde];
-    inner.extend_from_slice(&[0u8; 31]);
-    inner.push(1);
-    inner
-}
-
-fn resolve_call(name: &[u8], inner: &[u8]) -> Vec<u8> {
-    let mut out = ens::RESOLVE_SELECTOR.to_vec();
-    let mut push = |n: u64| {
-        let mut w = [0u8; 32];
-        w[24..].copy_from_slice(&n.to_be_bytes());
-        out.extend_from_slice(&w);
-    };
-    push(0x40);
-    push(0x40 + 32 + name.len().div_ceil(32) as u64 * 32);
-    for payload in [name, inner] {
-        let mut w = [0u8; 32];
-        w[24..].copy_from_slice(&(payload.len() as u64).to_be_bytes());
-        out.extend_from_slice(&w);
-        out.extend_from_slice(payload);
-        out.extend(std::iter::repeat_n(
-            0u8,
-            payload.len().div_ceil(32) * 32 - payload.len(),
-        ));
-    }
-    out
-}
-
 async fn ask(router: &Router, sender: Address, call: &[u8]) -> (StatusCode, String) {
     let uri = format!("/{sender}/0x{}.json", hex::encode(call));
     let response = router
@@ -303,8 +195,19 @@ fn verify(body: &str, call: &[u8]) -> Option<Address> {
         "the resolver would recover a signer it does not trust"
     );
 
-    // ENSIP-11 `addr` returns `bytes`: empty is the null answer.
-    (result.len() >= 96).then(|| Address::from_slice(&result[64..84]))
+    // Both shapes, because the caller chooses which to ask in and a helper that
+    // knows only one reports a correct legacy answer as a null.
+    match result.len() {
+        // `addr(bytes32)` returns a bare `address`; the zero address is null.
+        32 => {
+            let who = Address::from_slice(&result[12..32]);
+            (!who.is_zero()).then_some(who)
+        }
+        // ENSIP-11's `addr(bytes32,uint256)` returns `bytes`: offset, length,
+        // then the payload. An empty byte string is null.
+        n if n >= 96 => Some(Address::from_slice(&result[64..84])),
+        _ => None,
+    }
 }
 
 macro_rules! gateway_or_skip {
@@ -585,7 +488,10 @@ async fn the_legacy_addr_shape_is_refused_unsigned_off_mainnet() {
     let (router, store, _g) = gateway_or_skip!(None, 32);
     bind(&store, "alice", Address::from([0xbe; 20])).await;
 
-    let call = resolve_call(&wire_name(&["alice", "x"]), &legacy_addr_call());
+    let call = resolve_call(
+        &wire_name(&["alice", "x"]),
+        &legacy_addr_call(&["alice", "x"]),
+    );
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(
         status,
@@ -686,4 +592,27 @@ async fn a_node_that_is_not_this_name_is_refused() {
     let (status, body) = ask(&router, RESOLVER, &ok).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(verify(&body, &ok).is_some());
+}
+
+/// A name outside this resolver's domain is refused, not answered.
+///
+/// Every answer here is signed, and a signed null is an authoritative "nobody
+/// holds this". This gateway has no standing to say that about `vitalik.eth`.
+/// The check has to run before the record is looked at, because a record it
+/// cannot answer would otherwise short-circuit to a null for any name at all.
+#[tokio::test]
+async fn a_name_outside_the_domain_is_refused_whatever_the_record() {
+    let (router, _store, _g) = gateway_or_skip!(None, 32);
+    let node = usernames_core::ens::namehash(&["vitalik".to_string(), "eth".to_string()]);
+
+    let mut addr = vec![0xf1, 0xcb, 0x7e, 0x06];
+    addr.extend_from_slice(node.as_slice());
+    addr.extend_from_slice(&[0u8; 24]);
+    addr.extend_from_slice(&(0x8000_0000u64 | CHAIN as u64).to_be_bytes());
+
+    for inner in [addr, vec![0xaa, 0xbb, 0xcc, 0xdd]] {
+        let call = resolve_call(b"\x07vitalik\x03eth\x00", &inner);
+        let (status, body) = ask(&router, RESOLVER, &call).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
 }

@@ -153,19 +153,24 @@ pub async fn run() -> anyhow::Result<()> {
     let store = db::ChainStore::new(pool.clone(), chain_id);
 
     let cancel = CancellationToken::new();
-    let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
-    info!(addr = %config.listen_addr, chain_id, %contract, "read API listening");
 
+    // Configured BEFORE the port opens. With `ENS_SOURCE=chain` this awaits an
+    // RPC round trip per chain, and it can still refuse to start — so binding
+    // first would accept connections the process is not yet able to serve, and
+    // reset them if it then aborts. A liveness probe reads that as alive.
     let gateway = ens_config(&config, chain_id, pool).await?;
     match &gateway {
         Some(g) => info!(
             resolver = %g.resolver,
             route = %format!("{}/{{sender}}/{{data}}", ens::ROUTE_PREFIX),
-            "ENS gateway mounted"
+            "ENS gateway configured"
         ),
         None => info!("ENS gateway not configured; the CCIP-Read route is absent"),
     }
     let app = build_router(api::AppState::new(store.clone(), contract), gateway);
+
+    let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
+    info!(addr = %config.listen_addr, chain_id, %contract, "read API listening");
 
     let shutdown = cancel.clone();
     let mut task = tokio::spawn(async move {
@@ -190,12 +195,6 @@ pub async fn run() -> anyhow::Result<()> {
     }
 }
 
-/// Build the gateway configuration, or `None` when this deployment does not
-/// run one.
-///
-/// A key without a resolver is a usage error rather than a default, because
-/// there is no safe resolver to guess: signing for whatever address asks would
-/// make this a signing oracle.
 /// Where a signed answer comes from.
 ///
 /// A type rather than a string so clap rejects a typo at startup with the
@@ -246,6 +245,26 @@ pub fn build_router(state: api::AppState, gateway: Option<ens::Config>) -> Route
 /// off chain looks at the deadline.
 const RESOLVER_MAX_LIFETIME_SECS: u64 = 3600;
 
+/// How far a block timestamp may trail the wall clock this process reads.
+///
+/// The gateway dates an answer `now + ttl`, and the resolver compares it to
+/// `block.timestamp + MAX_LIFETIME` at whatever block the client's `eth_call`
+/// lands on. That block is always at least a little behind now, so a TTL equal
+/// to `MAX_LIFETIME` puts `expires` past the ceiling by exactly the amount the
+/// chain trails — and every answer reverts, in production only, with nothing
+/// off chain the wiser. The room is generous on purpose: shortening a TTL costs
+/// a caller nothing, and guessing this too small costs every answer.
+const BLOCK_TIMESTAMP_SLACK_SECS: u64 = 300;
+
+/// The longest TTL a gateway may be configured with.
+const MAX_TTL_SECS: u64 = RESOLVER_MAX_LIFETIME_SECS - BLOCK_TIMESTAMP_SLACK_SECS;
+
+/// Build the gateway configuration, or `None` when this deployment does not
+/// run one.
+///
+/// A key without a resolver is a usage error rather than a default, because
+/// there is no safe resolver to guess: signing for whatever address asks would
+/// make this a signing oracle.
 async fn ens_config(
     config: &Config,
     chain_id: i64,
@@ -269,12 +288,15 @@ async fn ens_config(
 
     // The resolver enforces this on chain; refuse at startup rather than let a
     // deployment sign answers that always revert.
-    if config.ens_ttl_secs > RESOLVER_MAX_LIFETIME_SECS {
+    if config.ens_ttl_secs > MAX_TTL_SECS {
         anyhow::bail!(
             "ENS_TTL_SECS is {}, but the resolver's MAX_LIFETIME is {}s and it \
-             reverts DeadlineTooFar on anything longer",
+             measures from the block's timestamp, not from now — leave {}s for \
+             the chain to trail, so at most {}",
             config.ens_ttl_secs,
-            RESOLVER_MAX_LIFETIME_SECS
+            RESOLVER_MAX_LIFETIME_SECS,
+            BLOCK_TIMESTAMP_SLACK_SECS,
+            MAX_TTL_SECS
         );
     }
 
@@ -317,6 +339,21 @@ async fn ens_config(
                 anyhow::bail!(
                     "ENS_CHAINS label {label:?} collides with a platform label; \
                      the name grammar would read it as the platform"
+                );
+            }
+        }
+        // Two chains under one label make the label meaningless: it is supposed
+        // to NARROW, and a query naming it would be answered by whichever chain
+        // the coin type picked — which is the widening the design forbids.
+        if let Some(label) = label.as_deref() {
+            if let Some(other) = chains
+                .iter()
+                .find(|(_, c)| c.label.as_deref() == Some(label))
+                .map(|(id, _)| *id)
+            {
+                anyhow::bail!(
+                    "ENS_CHAINS gives chains {id} and {other} the same label \
+                     {label:?}; a label that names two chains narrows to neither"
                 );
             }
         }
@@ -541,10 +578,20 @@ mod tests {
         assert!(message.contains("MAX_LIFETIME"), "{message}");
     }
 
+    /// The ceiling leaves room for the chain to trail. A TTL equal to the
+    /// resolver's `MAX_LIFETIME` is refused, because it dates every answer past
+    /// what the contract accepts at any block older than this instant — which
+    /// is every block.
     #[tokio::test]
-    async fn a_ttl_at_the_ceiling_is_allowed() {
-        let config = config(&["--ens-ttl-secs", "3600"]);
-        assert!(ens_config(&config, 3735928814, lazy_pool()).await.is_ok());
+    async fn the_ttl_ceiling_leaves_the_chain_room_to_trail() {
+        let at_ceiling = config(&["--ens-ttl-secs", &MAX_TTL_SECS.to_string()]);
+        assert!(ens_config(&at_ceiling, 3735928814, lazy_pool())
+            .await
+            .is_ok());
+
+        let message =
+            refusal(&["--ens-ttl-secs", &RESOLVER_MAX_LIFETIME_SECS.to_string()]).await;
+        assert!(message.contains("trail"), "{message}");
     }
 
     #[tokio::test]
@@ -553,6 +600,14 @@ mod tests {
         // second entry used to overwrite the first in silence.
         let message = refusal(&["--ens-chains", "8453:base,8453:eden"]).await;
         assert!(message.contains("twice"), "{message}");
+    }
+
+    /// One label, two chains: the label stops narrowing and starts picking
+    /// whichever chain the coin type matched.
+    #[tokio::test]
+    async fn two_chains_under_one_label_are_refused() {
+        let message = refusal(&["--ens-chains", "8453:base,10:base"]).await;
+        assert!(message.contains("same label"), "{message}");
     }
 
     #[tokio::test]
