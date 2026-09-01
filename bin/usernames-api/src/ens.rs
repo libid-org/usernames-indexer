@@ -178,8 +178,11 @@ impl HandleSource {
                 // ENS_MAX_LAG_BLOCKS refused every ENS query forever while
                 // being perfectly healthy — two knobs in two binaries with
                 // nothing relating them.
+                // Concurrently: the two are independent, and this is the hot
+                // path — awaited in sequence they cost two round trips per
+                // request instead of one.
                 let (Ok(Some(target)), Ok(Some(cursor))) =
-                    (store.chain_target().await, store.cursor().await)
+                    tokio::join!(store.chain_target(), store.cursor())
                 else {
                     return Lag::Unknown;
                 };
@@ -326,8 +329,13 @@ async fn resolve(
     let (name, record) = ens::decode_resolve_calldata(&call_data)
         .map_err(|e| GatewayError::bad_request(e.to_string()))?;
 
-    let address = match self_answer(&state, &name, record).await? {
-        Answer::Address(address) => address,
+    let result = match self_answer(&state, &name, record).await? {
+        Answer::Addr { address, legacy } => ens::encode_addr_result(legacy, address),
+        // Empty, not `addr`'s null. The caller decodes by ITS record's return
+        // type, and `addr`'s empty `bytes` read as `pubkey(bytes32)` or
+        // `interfaceImplementer` is a non-zero value rather than an absence.
+        // Nothing decodes an empty result as something.
+        Answer::NoSuchRecord => Vec::new(),
         // Both of these are unsigned on purpose: a signature would make the
         // answer an assertion, and neither case has earned one. Unsigned lets
         // the client fall through to the next endpoint in `urls`.
@@ -353,7 +361,6 @@ async fn resolve(
         }
     };
 
-    let result = ens::encode_addr_result(record, address);
     let expires = unix_now() + state.config.ttl_secs;
     let digest =
         ens::signature_digest(state.config.resolver, expires, &call_data, &result);
@@ -390,18 +397,24 @@ enum Lag {
     Unknown,
 }
 
-/// Either the address to answer with — `None` meaning a signed null — or a
-/// refusal to assert anything at all.
+/// Either something to answer with — a null included, which is an answer — or
+/// a refusal to assert anything at all.
 enum Answer {
-    Address(Option<Address>),
+    /// An `addr` answer, and the shape to encode it in. `None` is the signed
+    /// null: an authoritative "nobody holds this".
+    Addr {
+        address: Option<Address>,
+        legacy: bool,
+    },
+    /// A record this gateway has no answer shape for. Distinct from a null,
+    /// because a null has a shape and this has none.
+    NoSuchRecord,
     /// This gateway serves no chain with that coin type. Unsigned, so the
     /// client walks on to the next endpoint in the resolver's `urls`.
     NotOurChain(U256),
     /// This chain's mirror is too far behind to deny a binding, or cannot say
     /// how far behind it is.
-    TooStale {
-        lag: Option<u64>,
-    },
+    TooStale { lag: Option<u64> },
 }
 
 async fn self_answer(
@@ -409,15 +422,59 @@ async fn self_answer(
     name: &[u8],
     record: Record,
 ) -> Result<Answer, GatewayError> {
-    // Any record other than `addr` is null rather than an error, so a client
-    // asking for `text()` or something invented later degrades instead of
-    // seeing a name that resolves report a failure.
+    // The NAME is settled before the record is looked at. Every answer below
+    // is signed, and a signature makes it an assertion about a name — so the
+    // name has to be one this resolver has standing to speak about, whatever
+    // record was asked of it.
+    let labels = ens::parse_dns_name(name)
+        .map_err(|e| GatewayError::bad_request(e.to_string()))?;
+    let query = match ens::parse_query(&labels) {
+        Ok(query) => query,
+        // Not a name under this resolver's domain. Refused rather than
+        // answered: a signed null is an authoritative "nobody holds this", and
+        // this gateway has no standing to say that about someone else's name.
+        Err(ens::EnsError::ForeignDomain) => {
+            return Err(GatewayError::bad_request(
+                "this resolver answers only for names under handles.link",
+            ));
+        }
+        // A name under our domain that this build cannot read is a name nobody
+        // holds. Refusing would report an error for text a wallet is entitled
+        // to ask about.
+        Err(_) => {
+            return Ok(Answer::Addr {
+                address: None,
+                legacy: false,
+            })
+        }
+    };
+
+    // Only `addr` has a shape this gateway can fill. Anything else — `text()`,
+    // or a record invented later — degrades to no result rather than to an
+    // error, so a name that resolves fine for addresses does not look broken.
     let Record::Addr {
-        node, coin_type, ..
+        node,
+        coin_type,
+        legacy,
     } = record
     else {
-        return Ok(Answer::Address(None));
+        return Ok(Answer::NoSuchRecord);
     };
+
+    // The request names one thing twice — as a name, and as the node inside
+    // the record call — and only the caller has ever seen the two agree. The
+    // signature covers both, so answering without checking would sign a result
+    // that is true of the name and attributed to the node.
+    //
+    // In practice this is a consistency check rather than a defence: one caller
+    // builds both halves. What it earns is the guarantee the design assumes
+    // elsewhere — that ENSIP-15 on the client and our own normalization agree.
+    // Where they ever stop agreeing, this refuses instead of signing.
+    if ens::namehash(&labels) != node {
+        return Err(GatewayError::bad_request(
+            "the name and the node in the record call are not the same name",
+        ));
+    }
     // Matched against the chains this gateway SERVES, never decoded back into
     // a chain id. `0x80000000 | chainId` is not injective past 2^31 — the eden
     // testnet's 3735928814 is exactly such a chain — so decoding would answer
@@ -446,37 +503,21 @@ async fn self_answer(
         return Ok(if ens::names_an_evm_chain(coin_type) {
             Answer::NotOurChain(coin_type)
         } else {
-            Answer::Address(None)
+            Answer::Addr {
+                address: None,
+                legacy,
+            }
         });
     };
 
-    let labels = ens::parse_dns_name(name)
-        .map_err(|e| GatewayError::bad_request(e.to_string()))?;
-    // The request names one thing twice — as a name, and as the node inside the
-    // record call — and only the caller has ever seen the two agree. The
-    // signature covers both, so answering without checking would sign a result
-    // that is true of the name and attributed to the node.
-    //
-    // In practice this is a consistency check rather than a defence: one caller
-    // builds both halves. What it earns is the guarantee the design assumes
-    // elsewhere — that ENSIP-15 on the client and our own normalization agree.
-    // Where they ever stop agreeing, this refuses instead of signing.
-    if ens::namehash(&labels) != node {
-        return Err(GatewayError::bad_request(
-            "the name and the node in the record call are not the same name",
-        ));
-    }
-    let query = match ens::parse_query(&labels) {
-        Ok(query) => query,
-        // A name this build cannot read is a name nobody holds. Refusing
-        // would report an error for text a wallet is entitled to ask about.
-        Err(_) => return Ok(Answer::Address(None)),
-    };
     // A chain label narrows and never widens: a label naming another chain is
     // simply not this chain's name.
     if let Some(label) = &query.chain_label {
         if chain.label.as_deref() != Some(label.as_str()) {
-            return Ok(Answer::Address(None));
+            return Ok(Answer::Addr {
+                address: None,
+                legacy,
+            });
         }
     }
 
@@ -495,7 +536,10 @@ async fn self_answer(
             // it is the only way to a `NormalizedHandle`, which is what keeps
             // a raw string from ever being hashed into a key nobody finds.
             let Ok(normalized) = platform.normalize_query(&handle) else {
-                return Ok(Answer::Address(None));
+                return Ok(Answer::Addr {
+                    address: None,
+                    legacy,
+                });
             };
             chain
                 .source
@@ -504,7 +548,10 @@ async fn self_answer(
         }
     };
 
-    Ok(Answer::Address(owner))
+    Ok(Answer::Addr {
+        address: owner,
+        legacy,
+    })
 }
 
 /// The cause is LOGGED, never serialized — the same split `api.rs` makes.

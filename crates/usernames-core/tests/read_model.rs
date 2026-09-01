@@ -41,10 +41,9 @@ async fn test_store() -> Option<(ChainStore, PgPool, MutexGuard<'static, ()>)> {
 
 /// The same, with room for more than one connection.
 ///
-/// A writer lease holds its connection for as long as it lives, because the
-/// advisory lock is session-scoped. One connection is enough for a test that
-/// only reads and writes rows; a test that takes the lease AND queries needs a
-/// second, or it waits on itself until the pool times out.
+/// Not needed by the lease any more — it opens its own session outside the pool
+/// precisely so it cannot starve one — but kept for a test that wants
+/// concurrent queries of its own.
 async fn test_store_with(
     max_connections: u32,
 ) -> Option<(ChainStore, PgPool, MutexGuard<'static, ()>)> {

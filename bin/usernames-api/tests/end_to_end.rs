@@ -27,7 +27,6 @@ use alloy::{
     primitives::{
         Address,
         Bytes,
-        B256,
         U256,
     },
     providers::ProviderBuilder,
@@ -52,17 +51,13 @@ use usernames_api::ens::{
     GatewayState,
     HandleSource,
 };
-use usernames_core::{
-    db::{
-        self,
-        ChainStore,
-    },
-    events::{
-        LogPosition,
-        NamesEvent,
-    },
-    nodes,
+use usernames_core::db::{
+    self,
+    ChainStore,
 };
+
+mod common;
+use common::*;
 
 sol! {
     /// ERC-3668. The resolver reverts with this rather than returning, which
@@ -108,56 +103,11 @@ const SIGNER_KEY: &str =
     "0x00000000000000000000000000000000000000000000000000000000000a11ce";
 const IMPOSTOR_KEY: &str =
     "0x0000000000000000000000000000000000000000000000000000000000000bad";
-const GATEWAY_URL: &str = "https://gw.handles.link/{sender}/{data}.json";
-
-/// `alice.x.handles.link` in DNS wire format.
-fn wire_name(labels: &[&str]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for label in labels.iter().chain(["handles", "link"].iter()) {
-        out.push(label.len() as u8);
-        out.extend_from_slice(label.as_bytes());
-    }
-    out.push(0);
-    out
-}
-
-/// Seed one binding into the read model the gateway answers from.
-async fn bind(store: &ChainStore, handle: &str, owner: Address) {
-    let platform = nodes::Platform::from_key("x").unwrap().id();
-    let event = NamesEvent::IdentityBound {
-        owner,
-        id_node: nodes::id_node(platform, "42"),
-        handle_node: nodes::handle_node(
-            platform,
-            &nodes::NormalizedHandle::from_chain(handle),
-        ),
-        platform_id: platform,
-        user_id: "42".into(),
-        handle: handle.into(),
-        observed_at: 1_700_000_000,
-        version: 1,
-        published: true,
-    };
-    let mut window = store.begin_window().await.expect("begin");
-    window
-        .apply(
-            &event,
-            &LogPosition {
-                block_number: 1,
-                log_index: 0,
-                tx_hash: B256::from([7u8; 32]),
-            },
-        )
-        .await
-        .expect("apply");
-    window.commit(1).await.expect("commit");
-    // The indexer records both every cycle, and the gateway refuses to answer
-    // from a mirror that cannot say how far behind it is. Staleness is
-    // measured against the TARGET — the block the cursor chases — so that is
-    // the one a fixture must record.
-    store.set_chain_head(1).await;
-    store.set_chain_target(1).await;
-}
+/// Carries the `/ens` prefix the route is mounted under, so the fixture is the
+/// shape an operator would actually put in the resolver's `urls`. The test
+/// calls the router directly, so a wrong path here would never fail — which is
+/// exactly why it has to be right.
+const GATEWAY_URL: &str = "https://gw.handles.link/ens/{sender}/{data}.json";
 
 /// Step 3, in process: hand the gateway what the revert carried, exactly the
 /// way an HTTP client would after substituting the placeholders.

@@ -87,7 +87,7 @@ mounted only when `ENS_SIGNER_KEY` is set; unset, the route is absent rather
 than present and failing.
 
 ```
-GET /{sender}/{data}.json   ->  { "data": "0x…" }
+GET /ens/{sender}/{data}.json   ->  { "data": "0x…" }
 ```
 
 The resolver reverts `OffchainLookup` carrying this endpoint, the client fetches

@@ -45,7 +45,7 @@ use alloy::{
 };
 
 use crate::nodes::{
-    Known,
+    KnownPlatform,
     Platform,
 };
 
@@ -227,10 +227,11 @@ pub fn namehash(labels: &[String]) -> B256 {
 /// The alphabet a handle-derived label may use: what X and GitHub reduce to
 /// after the substitution, and what Gmail's local part already is.
 ///
-/// Public because a CHAIN label must satisfy it too — [`parse_query`] compares
-/// one against this alphabet, so a gateway configured with a label outside it
-/// can never be addressed. Validating that at startup means reading the rule
-/// from here rather than restating it, which is how the two would drift.
+/// Public because a CHAIN label must satisfy it too. [`parse_query`] does not
+/// check it — a chain label is compared verbatim against the configured ones,
+/// so an unusable label simply matches nothing — which is why the gateway
+/// refuses such a label at STARTUP instead, reading the rule from here rather
+/// than restating it.
 pub fn label_is_wellformed(label: &str) -> bool {
     !label.is_empty()
         && label
@@ -244,20 +245,20 @@ pub fn label_is_wellformed(label: &str) -> bool {
 /// produced, so this returns the handle in exactly the byte form the chain
 /// keyed — no case, no padding, no leading at-sign to strip.
 ///
-/// Takes [`Known`] rather than a key, so the `match` below is exhaustive: a
+/// Takes [`KnownPlatform`] rather than a key, so the `match` below is exhaustive: a
 /// platform added to that type does not compile until its transform is written
 /// here. That guarantee is why the type exists.
-fn labels_to_handle(platform: Known, labels: &[String]) -> Option<String> {
+fn labels_to_handle(platform: KnownPlatform, labels: &[String]) -> Option<String> {
     match platform {
         // X's alphabet is `[a-z0-9_]` and contains no hyphen, so `_` -> `-`
         // is a bijection onto its image and reverses by replacing every `-`.
-        Known::X => {
+        KnownPlatform::X => {
             let [label] = labels else { return None };
             label_is_wellformed(label).then(|| label.replace('-', "_"))
         }
         // GitHub's rules forbid a doubled hyphen and issue no underscores, so
         // the forward direction is the identity and so is this.
-        Known::GitHub => {
+        KnownPlatform::GitHub => {
             let [label] = labels else { return None };
             label_is_wellformed(label).then(|| label.clone())
         }
@@ -280,7 +281,7 @@ fn labels_to_handle(platform: Known, labels: &[String]) -> Option<String> {
         // is available: unlike X, where `_` maps to `-` because X forbids `-`,
         // a Google address may hold both, so the map would not be reversible —
         // and an irreversible map on a payment path is worse than no name.
-        Known::Google => {
+        KnownPlatform::Google => {
             if labels.is_empty() {
                 return None;
             }
@@ -328,7 +329,7 @@ pub fn parse_query(labels: &[String]) -> Result<Query, EnsError> {
     // Right to left. The rightmost label is either the platform, or a chain
     // label with the platform one further in.
     let (chain_label, marker_at) = match rest.last().map(String::as_str) {
-        Some(last) if Known::from_key(last).is_some() => (None, rest.len() - 1),
+        Some(last) if KnownPlatform::from_key(last).is_some() => (None, rest.len() - 1),
         Some(chain) => {
             if rest.len() < 2 {
                 return Err(EnsError::EmptyName);
@@ -346,7 +347,7 @@ pub fn parse_query(labels: &[String]) -> Result<Query, EnsError> {
 
     // A platform label this build does not know is not a parse failure — it
     // is a name nobody can hold, which the caller learns as a null answer.
-    let platform = Known::from_key(marker).ok_or(EnsError::EmptyName)?;
+    let platform = KnownPlatform::from_key(marker).ok_or(EnsError::EmptyName)?;
     let handle = labels_to_handle(platform, head)
         .ok_or_else(|| EnsError::UnnormalizedLabel(head.join(".")))?;
 
@@ -400,17 +401,19 @@ fn decode_record(inner: &[u8]) -> Record {
     }
 }
 
-/// ABI-encode what the record returns.
+/// ABI-encode what an `addr` record returns, in the shape the caller asked in.
 ///
 /// `None` is the null answer, and it is a real answer rather than an absence:
 /// ENSIP-11's `addr` returns `bytes`, so null is the empty byte string, and
 /// the legacy form returns the zero address.
-pub fn encode_addr_result(record: Record, address: Option<Address>) -> Vec<u8> {
-    match record {
-        // The legacy shape returns `address`, and the zero address is its null.
-        Record::Addr { legacy: true, .. } => address.unwrap_or_default().abi_encode(),
-        // ENSIP-11 returns `bytes`, and the empty byte string is its null.
-        _ => Bytes::from(address.map(|a| a.to_vec()).unwrap_or_default()).abi_encode(),
+pub fn encode_addr_result(legacy: bool, address: Option<Address>) -> Vec<u8> {
+    if legacy {
+        // `addr(bytes32)` returns `address`, whose null is the zero address.
+        address.unwrap_or_default().abi_encode()
+    } else {
+        // ENSIP-11's `addr(bytes32,uint256)` returns `bytes`, whose null is the
+        // empty byte string.
+        Bytes::from(address.map(|a| a.to_vec()).unwrap_or_default()).abi_encode()
     }
 }
 
@@ -581,7 +584,7 @@ mod tests {
     #[test]
     fn a_gmail_address_keeps_its_implied_domain() {
         assert_eq!(
-            labels_to_handle(Known::Google, &["alice".into(), "smith".into()]),
+            labels_to_handle(KnownPlatform::Google, &["alice".into(), "smith".into()]),
             Some("alice.smith@gmail.com".into())
         );
     }
@@ -592,7 +595,7 @@ mod tests {
     fn the_at_separator_carries_a_workspace_domain() {
         let labels = ["green", "baneling", "_at", "fuel", "sh"].map(String::from);
         assert_eq!(
-            labels_to_handle(Known::Google, &labels),
+            labels_to_handle(KnownPlatform::Google, &labels),
             Some("green.baneling@fuel.sh".into())
         );
     }
@@ -603,7 +606,7 @@ mod tests {
     fn a_hyphenated_domain_survives() {
         let labels = ["alice", "_at", "my-company", "com"].map(String::from);
         assert_eq!(
-            labels_to_handle(Known::Google, &labels),
+            labels_to_handle(KnownPlatform::Google, &labels),
             Some("alice@my-company.com".into())
         );
     }
@@ -615,7 +618,11 @@ mod tests {
             vec!["_at".to_string(), "fuel".into()],
             vec!["alice".into(), "_at".into()],
         ] {
-            assert_eq!(labels_to_handle(Known::Google, &labels), None, "{labels:?}");
+            assert_eq!(
+                labels_to_handle(KnownPlatform::Google, &labels),
+                None,
+                "{labels:?}"
+            );
         }
     }
 
@@ -625,7 +632,7 @@ mod tests {
     #[test]
     fn a_second_separator_is_refused() {
         let labels = ["a", "_at", "b", "_at", "c"].map(String::from);
-        assert_eq!(labels_to_handle(Known::Google, &labels), None);
+        assert_eq!(labels_to_handle(KnownPlatform::Google, &labels), None);
     }
 
     // ─── Namehash ───────────────────────────────────────────────────
@@ -769,43 +776,19 @@ mod tests {
 
     #[test]
     fn the_null_answer_is_an_answer_in_both_record_shapes() {
-        let ensip11 = Record::Addr {
-            node: B256::ZERO,
-            coin_type: coin_type_for(1),
-            legacy: false,
-        };
         // ENSIP-11 returns `bytes`: null is the empty byte string.
-        assert_eq!(encode_addr_result(ensip11, None).len(), 64);
+        assert_eq!(encode_addr_result(false, None).len(), 64);
         // The legacy form returns `address`: null is the zero address.
-        let legacy = Record::Addr {
-            node: B256::ZERO,
-            coin_type: coin_type_for(1),
-            legacy: true,
-        };
-        assert_eq!(encode_addr_result(legacy, None), vec![0u8; 32]);
+        assert_eq!(encode_addr_result(true, None), vec![0u8; 32]);
     }
 
     #[test]
     fn an_address_encodes_as_its_record_declares() {
         let who = Address::from([0x11u8; 20]);
-        let legacy = encode_addr_result(
-            Record::Addr {
-                node: B256::ZERO,
-                coin_type: coin_type_for(1),
-                legacy: true,
-            },
-            Some(who),
-        );
+        let legacy = encode_addr_result(true, Some(who));
         assert_eq!(&legacy[12..], who.as_slice());
 
-        let ensip11 = encode_addr_result(
-            Record::Addr {
-                node: B256::ZERO,
-                coin_type: coin_type_for(1),
-                legacy: false,
-            },
-            Some(who),
-        );
+        let ensip11 = encode_addr_result(false, Some(who));
         assert_eq!(ensip11.len(), 96);
         assert_eq!(ensip11[31], 0x20); // offset
         assert_eq!(ensip11[63], 20); // length

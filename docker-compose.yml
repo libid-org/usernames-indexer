@@ -10,6 +10,14 @@ services:
     build:
       context: .
       target: indexer
+    # Everything `.env.example` documents reaches the container, not just the
+    # names repeated below. Without this the optional settings — the whole ENS
+    # block especially — are interpolated into the compose file and then
+    # dropped, so a configured gateway silently never mounts. The explicit map
+    # stays because it takes precedence and carries the `:?` checks.
+    env_file:
+      - path: .env
+        required: false
     environment:
       DATABASE_URL: postgres://usernames:${POSTGRES_PASSWORD:-usernames_dev}@postgres:5432/usernames
       RPC_URL: ${RPC_URL:?set RPC_URL}
@@ -25,6 +33,14 @@ services:
     build:
       context: .
       target: api
+    # Everything `.env.example` documents reaches the container, not just the
+    # names repeated below. Without this the optional settings — the whole ENS
+    # block especially — are interpolated into the compose file and then
+    # dropped, so a configured gateway silently never mounts. The explicit map
+    # stays because it takes precedence and carries the `:?` checks.
+    env_file:
+      - path: .env
+        required: false
     environment:
       DATABASE_URL: postgres://usernames:${POSTGRES_PASSWORD:-usernames_dev}@postgres:5432/usernames
       IDENTITY_NAMES_ADDRESS: ${IDENTITY_NAMES_ADDRESS:?set IDENTITY_NAMES_ADDRESS}

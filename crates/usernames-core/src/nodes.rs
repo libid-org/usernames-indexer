@@ -40,7 +40,7 @@ fn platform_id(domain: &str) -> B256 {
 /// a test noticing later. Adding a platform is a variant here plus its rules in
 /// `libid-identity`; everything that must follow stops compiling until it does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Known {
+pub enum KnownPlatform {
     /// X, formerly Twitter.
     X,
     /// GitHub.
@@ -49,9 +49,10 @@ pub enum Known {
     Google,
 }
 
-impl Known {
-    /// Every variant, in the order a listing shows them.
-    pub const ALL: [Self; 3] = [Self::X, Self::GitHub, Self::Google];
+impl KnownPlatform {
+    /// Every variant, in the order a listing shows them. A slice rather than
+    /// an array so adding one is a single line and not also an arity.
+    pub const ALL: &'static [Self] = &[Self::X, Self::GitHub, Self::Google];
 
     /// The short key: what a name, a URL path and the API's JSON all call it.
     pub const fn key(self) -> &'static str {
@@ -73,7 +74,7 @@ impl Known {
 
     /// The platform a short key names, when this build knows it.
     pub fn from_key(key: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|p| p.key() == key)
+        Self::ALL.iter().copied().find(|p| p.key() == key)
     }
 
     /// The 32-byte id the chain keys this platform by.
@@ -91,8 +92,8 @@ impl Known {
     }
 }
 
-static KNOWN_BY_ID: LazyLock<HashMap<B256, Known>> =
-    LazyLock::new(|| Known::ALL.into_iter().map(|p| (p.id(), p)).collect());
+static KNOWN_BY_ID: LazyLock<HashMap<B256, KnownPlatform>> =
+    LazyLock::new(|| KnownPlatform::ALL.iter().map(|p| (p.id(), *p)).collect());
 
 /// A platform reference that is neither a known key nor a 0x-hex 32-byte id.
 /// The message derives the key list from the registry, so it cannot rot as
@@ -105,7 +106,7 @@ pub struct UnknownPlatform {
 impl std::fmt::Display for UnknownPlatform {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "unknown platform {:?}: use ", self.raw)?;
-        for platform in Known::ALL {
+        for platform in KnownPlatform::ALL {
             write!(f, "{}, ", platform.key())?;
         }
         write!(f, "or a 0x-hex platform id")
@@ -120,11 +121,11 @@ impl std::error::Error for UnknownPlatform {}
 #[derive(Debug, Clone, Copy)]
 pub struct Platform {
     id: B256,
-    known: Option<Known>,
+    known: Option<KnownPlatform>,
 }
 
-impl From<Known> for Platform {
-    fn from(known: Known) -> Self {
+impl From<KnownPlatform> for Platform {
+    fn from(known: KnownPlatform) -> Self {
         Self {
             id: known.id(),
             known: Some(known),
@@ -135,7 +136,7 @@ impl From<Known> for Platform {
 impl Platform {
     /// The platform a short key names, when this build knows it.
     pub fn from_key(key: &str) -> Option<Self> {
-        Known::from_key(key).map(Self::from)
+        KnownPlatform::from_key(key).map(Self::from)
     }
 
     /// A caller-supplied reference: a known key, or a 0x-hex id — which
@@ -161,26 +162,26 @@ impl Platform {
     }
 
     /// The platform itself, when this build knows the id.
-    pub fn known(&self) -> Option<Known> {
+    pub fn known(&self) -> Option<KnownPlatform> {
         self.known
     }
 
     /// The short key, when this build knows the id. The API serializes this,
     /// so the wire form stays a string even though the type behind it is not.
     pub fn key(&self) -> Option<&'static str> {
-        self.known.map(Known::key)
+        self.known.map(KnownPlatform::key)
     }
 
     /// The platform for a bare id — for rows read back from the database,
     /// where only the id survives. An id this build does not know still
     /// indexes; it just has no normalization rules or name on this side.
-    pub fn known_of(id: B256) -> Option<Known> {
+    pub fn known_of(id: B256) -> Option<KnownPlatform> {
         KNOWN_BY_ID.get(&id).copied()
     }
 
     /// The short key for a bare id, for the same callers as [`Self::key`].
     pub fn key_of(id: B256) -> Option<&'static str> {
-        Self::known_of(id).map(Known::key)
+        Self::known_of(id).map(KnownPlatform::key)
     }
 
     /// Normalize a full handle exactly the way the chain did before it keyed
@@ -192,7 +193,7 @@ impl Platform {
         &self,
         raw: &str,
     ) -> Result<NormalizedHandle, libid_identity::HandleError> {
-        match self.known.and_then(Known::rules) {
+        match self.known.and_then(KnownPlatform::rules) {
             Some(rules) => libid_identity::normalize(raw, rules).map(NormalizedHandle),
             None => Ok(NormalizedHandle(raw.to_string())),
         }
@@ -332,7 +333,7 @@ mod tests {
 
         // The refusal names every registered key, derived from the registry.
         let err = Platform::parse("myspace").unwrap_err().to_string();
-        for platform in Known::ALL {
+        for platform in KnownPlatform::ALL {
             assert!(err.contains(platform.key()), "{err}");
         }
     }
