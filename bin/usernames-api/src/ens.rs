@@ -52,10 +52,7 @@ use alloy::{
         U256,
     },
     providers::RootProvider,
-    signers::{
-        local::PrivateKeySigner,
-        SignerSync,
-    },
+    signers::Signer,
 };
 use axum::{
     extract::{
@@ -224,9 +221,15 @@ pub struct Config {
     /// How far behind the chain a MIRROR may be and still assert anything.
     /// Meaningless for a chain-backed source, which has no lag.
     pub max_lag_blocks: u64,
-    /// The signing key. One secret, pinned by the resolver's signer set;
-    /// rotating it is an owner transaction there, not a deploy here.
-    pub signer: Arc<PrivateKeySigner>,
+    /// What signs an answer, pinned by the resolver's signer set; rotating it
+    /// is an owner transaction there, not a deploy here.
+    ///
+    /// Behind `dyn` because the key need not be local. A KMS signer reaches the
+    /// network to sign, so it satisfies only the async `Signer` — which is why
+    /// the call site awaits rather than signing in place. That costs a local
+    /// key nothing and leaves the signing path untouched when a deployment
+    /// stops holding its own secret.
+    pub signer: Arc<dyn Signer + Send + Sync>,
 }
 
 /// State for the one route.
@@ -367,7 +370,8 @@ async fn resolve(
     let signature = state
         .config
         .signer
-        .sign_hash_sync(&B256::from(digest))
+        .sign_hash(&B256::from(digest))
+        .await
         // Through `internal`, like every other failure here: the raw error
         // went to an anonymous caller while the operator got no log line —
         // exactly inverted.
