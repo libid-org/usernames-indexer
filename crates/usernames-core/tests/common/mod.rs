@@ -11,7 +11,7 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use tower::ServiceExt;
-use usernames_indexer::{
+use usernames_core::{
     api,
     db::ChainStore,
 };

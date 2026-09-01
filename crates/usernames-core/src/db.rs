@@ -14,6 +14,7 @@ use alloy::primitives::{
     B256,
 };
 use sqlx::{
+    Connection,
     PgPool,
     Postgres,
     Transaction,
@@ -59,6 +60,7 @@ const SCHEMA_VERSION_KEY: &str = "schema_version";
 const CONTRACT_KEY: &str = "contract";
 const CURSOR_KEY: &str = "cursor";
 const HEAD_KEY: &str = "head";
+const TARGET_KEY: &str = "target";
 const WINDOW_ERROR_KEY: &str = "window_error";
 
 fn deploy_block_key(contract: Address) -> String {
@@ -67,11 +69,30 @@ fn deploy_block_key(contract: Address) -> String {
     format!("deploy_block:{contract}")
 }
 
+/// The migrations this crate owns, embedded at compile time.
+///
+/// Exposed because `sqlx::migrate!` resolves its path against the crate that
+/// invokes it, so anything outside this crate — a test in either binary —
+/// would have to spell a relative path back to here and would break the day
+/// the layout moves.
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
 /// Connect and bring the schema current.
 pub async fn connect_and_migrate(database_url: &str) -> anyhow::Result<PgPool> {
     let pool = PgPool::connect(database_url).await?;
-    sqlx::migrate!("./migrations").run(&pool).await?;
+    MIGRATOR.run(&pool).await?;
     Ok(pool)
+}
+
+/// Connect without touching the schema.
+///
+/// For the read API, which owns nothing here. Migrating is a write, and the
+/// writer is the indexer: two processes racing `sqlx::migrate!` on a fresh
+/// database is a deadlock waiting to be reported as a startup flake. A reader
+/// that starts before the schema exists fails its first query and gets
+/// restarted, which is the right outcome and a visible one.
+pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
+    Ok(PgPool::connect(database_url).await?)
 }
 
 /// Why applying an event failed. Distinct from [`sqlx::Error`] because not
@@ -127,9 +148,33 @@ impl From<sqlx::Error> for ApplyError {
 /// makes it safe. The lease remembers which chain it locks, and `prepare`
 /// verifies the match, so a lease from one store cannot vouch for another.
 pub struct WriterLease {
-    _conn: sqlx::pool::PoolConnection<Postgres>,
+    /// A connection of its OWN, deliberately not one from the pool. An advisory
+    /// lock taken with `pg_try_advisory_lock` is held for the SESSION, and a
+    /// pooled connection outlives the lease: dropping it returned a live
+    /// session, still holding the lock, to the idle pool, where it sat for the
+    /// idle timeout. A second indexer — or the next test — then blocked on a
+    /// lock nobody was using. Here the session is the lease's own, so dropping
+    /// it closes the socket and Postgres releases the lock.
+    conn: sqlx::PgConnection,
     /// The chain whose advisory lock this connection holds.
     chain_id: i64,
+}
+
+impl WriterLease {
+    /// Give the lock back and close the session.
+    ///
+    /// Dropping the lease also releases it, by closing the socket — but on
+    /// Postgres's schedule rather than the caller's. Prefer this where the
+    /// release has to have happened before the next statement runs, which is
+    /// every test that takes a second lease on the same chain.
+    pub async fn release(mut self) -> Result<(), sqlx::Error> {
+        let key = format!("usernames-indexer:{}", self.chain_id);
+        sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+            .bind(&key)
+            .execute(&mut self.conn)
+            .await?;
+        self.conn.close().await
+    }
 }
 
 /// All persistence for one chain: the pool and the chain id fused, so chain
@@ -149,6 +194,12 @@ impl ChainStore {
     /// The chain this store is scoped to.
     pub fn chain_id(&self) -> i64 {
         self.chain_id
+    }
+
+    /// The pool behind this store, for a caller that needs a query this type
+    /// does not offer — a test arranging a state the writer would produce.
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     async fn get_metadata(&self, key: &str) -> Result<Option<String>, sqlx::Error> {
@@ -178,12 +229,14 @@ impl ChainStore {
     /// Take the chain's writer lease, waiting (with a log line) if another
     /// instance still holds it.
     pub async fn acquire_writer(&self) -> Result<WriterLease, sqlx::Error> {
-        let mut conn = self.pool.acquire().await?;
+        // Its own session, not `pool.acquire()` — see [`WriterLease`].
+        let mut conn =
+            sqlx::PgConnection::connect_with(&self.pool.connect_options()).await?;
         let key = format!("usernames-indexer:{}", self.chain_id);
         let taken: bool =
             sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, 0))")
                 .bind(&key)
-                .fetch_one(&mut *conn)
+                .fetch_one(&mut conn)
                 .await?;
         if !taken {
             warn!(
@@ -192,11 +245,11 @@ impl ChainStore {
             );
             sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
                 .bind(&key)
-                .execute(&mut *conn)
+                .execute(&mut conn)
                 .await?;
         }
         Ok(WriterLease {
-            _conn: conn,
+            conn,
             chain_id: self.chain_id,
         })
     }
@@ -302,6 +355,33 @@ impl ChainStore {
         Ok(value.and_then(|v| v.parse().ok()))
     }
 
+    /// Record the block the cursor is actually chasing: the head minus the
+    /// confirmation depth.
+    ///
+    /// Separate from [`Self::set_chain_head`] because the two answer different
+    /// questions. The head is how far the CHAIN has grown, which is what
+    /// `/v1/status` reports. This is how far the indexer INTENDS to get, and
+    /// it is the only honest thing to measure a cursor against: the cursor is
+    /// never advanced past it, so a fully caught-up mirror sits exactly here
+    /// and `CONFIRMATIONS` blocks behind the head. Comparing the cursor to the
+    /// head instead makes a healthy mirror look permanently late by the
+    /// confirmation depth.
+    pub async fn set_chain_target(&self, target: u64) {
+        if let Err(e) = self.set_metadata(TARGET_KEY, &target.to_string()).await {
+            warn!(%e, "failed to record the chain target");
+        }
+    }
+
+    /// The block the cursor is chasing, as last recorded by the indexer loop.
+    ///
+    /// `None` before the first window of a fresh deployment, and on an indexer
+    /// old enough to predate the key — a caller that must not answer off a
+    /// stale model treats both as "cannot tell".
+    pub async fn chain_target(&self) -> Result<Option<u64>, sqlx::Error> {
+        let value = self.get_metadata(TARGET_KEY).await?;
+        Ok(value.and_then(|v| v.parse().ok()))
+    }
+
     /// Record (or clear, with `None`) the last window failure, so a stalled
     /// loop is visible in `/v1/status` instead of only in the logs. Best
     /// effort.
@@ -386,14 +466,11 @@ fn sanitize(value: &str, what: &str) -> String {
 /// columns do, instead of the journal being scrubbed in silence.
 fn sanitize_json(value: &mut serde_json::Value) -> bool {
     match value {
-        serde_json::Value::String(s) => {
-            if s.contains('\0') {
-                *s = s.replace('\0', "\u{fffd}");
-                true
-            } else {
-                false
-            }
+        serde_json::Value::String(s) if s.contains('\0') => {
+            *s = s.replace('\0', "\u{fffd}");
+            true
         }
+        serde_json::Value::String(_) => false,
         // Deliberately exhaustive: every element must be scrubbed, so no
         // short-circuiting combinator fits here.
         serde_json::Value::Array(items) => {
@@ -744,6 +821,26 @@ impl Window {
     }
 }
 
+/// The projection every `names.ids` read shares: the row itself, the handle it
+/// points at, and whether that pair is displayed.
+///
+/// Written once because it was written three times. The joins encode which
+/// columns of which table a row is assembled from, so a change to
+/// `names.published` — the one most likely to move — has to reach every reader
+/// or the ones it missed answer from a shape that no longer exists. A caller
+/// appends its own `WHERE`, which is the only part that actually differs.
+const IDENTITY_PROJECTION: &str = r#"SELECT i.platform_id, i.user_id, i.id_node, i.owner,
+                      i.observed_at, i.version, i.handle_node,
+                      h.handle, h.owner AS handle_owner, h.id_node AS handle_id_node,
+                      (p.handle IS NOT NULL) AS published
+               FROM names.ids i
+               LEFT JOIN names.handles h
+                 ON h.chain_id = i.chain_id AND h.handle_node = i.handle_node
+               LEFT JOIN names.published p
+                 ON p.chain_id = i.chain_id AND p.owner = i.owner
+                    AND p.platform_id = i.platform_id AND p.handle = h.handle
+               "#;
+
 // ─── The read side ──────────────────────────────────────────────────────────
 // The same store the writer uses answers the API's queries, so all SQL —
 // and the join shapes the projections were designed for — lives in one
@@ -912,17 +1009,9 @@ impl ChainStore {
         user_id: &str,
     ) -> Result<Option<IdentityRow>, sqlx::Error> {
         sqlx::query_as(
-            r#"SELECT i.platform_id, i.user_id, i.id_node, i.owner,
-                      i.observed_at, i.version, i.handle_node,
-                      h.handle, h.owner AS handle_owner, h.id_node AS handle_id_node,
-                      (p.handle IS NOT NULL) AS published
-               FROM names.ids i
-               LEFT JOIN names.handles h
-                 ON h.chain_id = i.chain_id AND h.handle_node = i.handle_node
-               LEFT JOIN names.published p
-                 ON p.chain_id = i.chain_id AND p.owner = i.owner
-                    AND p.platform_id = i.platform_id AND p.handle = h.handle
-               WHERE i.chain_id = $1 AND i.platform_id = $2 AND i.user_id = $3"#,
+            &format!(
+            "{IDENTITY_PROJECTION}WHERE i.chain_id = $1 AND i.platform_id = $2 AND i.user_id = $3"
+        ),
         )
         .bind(self.chain_id)
         .bind(platform_id.as_slice())
@@ -938,18 +1027,9 @@ impl ChainStore {
         owner: Address,
     ) -> Result<Vec<IdentityRow>, sqlx::Error> {
         sqlx::query_as(
-            r#"SELECT i.platform_id, i.user_id, i.id_node, i.owner,
-                      i.observed_at, i.version, i.handle_node,
-                      h.handle, h.owner AS handle_owner, h.id_node AS handle_id_node,
-                      (p.handle IS NOT NULL) AS published
-               FROM names.ids i
-               LEFT JOIN names.handles h
-                 ON h.chain_id = i.chain_id AND h.handle_node = i.handle_node
-               LEFT JOIN names.published p
-                 ON p.chain_id = i.chain_id AND p.owner = i.owner
-                    AND p.platform_id = i.platform_id AND p.handle = h.handle
-               WHERE i.chain_id = $1 AND i.owner = $2
-               ORDER BY i.platform_id, i.user_id"#,
+            &format!(
+            "{IDENTITY_PROJECTION}WHERE i.chain_id = $1 AND i.owner = $2\n               ORDER BY i.platform_id, i.user_id"
+        ),
         )
         .bind(self.chain_id)
         .bind(owner.as_slice())

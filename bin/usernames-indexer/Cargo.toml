@@ -5,28 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Indexes IdentityNames events into Postgres and serves handle/id/address resolution and search."
+description = "Mirrors IdentityNames events into Postgres. The write half; it serves nothing."
 publish = false
 
 [dependencies]
+usernames-core.workspace = true
+
 alloy.workspace = true
 anyhow.workspace = true
-axum.workspace = true
 clap.workspace = true
 dotenvy.workspace = true
-libid-contracts.workspace = true
-libid-identity.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-sqlx.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
-
-[dev-dependencies]
-alloy = { workspace = true, features = ["node-bindings", "signer-local"] }
-http-body-util = "0.1"
-tower = { version = "0.5", features = ["util"] }

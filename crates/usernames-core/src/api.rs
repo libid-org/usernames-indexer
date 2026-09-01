@@ -1,13 +1,7 @@
 //! The read API. Resolution answers exactly what the contract's resolvers
 //! answer, from the projections; search is the one thing the chain cannot do.
 
-use std::{
-    str::FromStr,
-    sync::{
-        Arc,
-        OnceLock,
-    },
-};
+use std::str::FromStr;
 
 use alloy::primitives::{
     Address,
@@ -32,10 +26,6 @@ use serde::{
     Deserialize,
     Serialize,
 };
-use tower_http::cors::{
-    Any,
-    CorsLayer,
-};
 
 use crate::{
     db::{
@@ -52,26 +42,22 @@ pub struct AppState {
     store: ChainStore,
     /// The watched contract, echoed in `/v1/status`.
     contract: Address,
-    /// Set once the first committed window has been observed. Within a
-    /// process lifetime the fact never un-happens — the only wipe (prepare)
-    /// runs before the API starts — so after the first success the sync gate
-    /// is a memory read instead of a query per request.
-    synced: Arc<OnceLock<()>>,
 }
 
 impl AppState {
     /// State for one deployment: the chain the store is scoped to is the
     /// chain this API serves.
     pub fn new(store: ChainStore, contract: Address) -> Self {
-        Self {
-            store,
-            contract,
-            synced: Arc::new(OnceLock::new()),
-        }
+        Self { store, contract }
     }
 }
 
-/// The router, ready to serve.
+/// The routes, without middleware.
+///
+/// No CORS layer here on purpose: a `layer` wraps only the routes already on
+/// the router it is called on, so one applied inside this function cannot
+/// cover anything a caller merges afterwards. The binary mounts every route
+/// first and applies CORS once over the whole thing.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -83,13 +69,6 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/resolve/id/{platform}/{user_id}", get(resolve_id))
         .route("/v1/resolve/address/{address}", get(resolve_address))
         .route("/v1/search", get(search))
-        // A read-only public resolver: any origin may GET. This is what lets
-        // a browser UI (handle.link) call the API cross-origin at all.
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods([axum::http::Method::GET]),
-        )
         .with_state(state)
 }
 
@@ -182,14 +161,19 @@ fn reject_nul(raw: &str, what: &str) -> Result<(), ApiError> {
 /// committed a window would serve authoritative-looking 404s for names that
 /// are bound on chain. Refuse to answer until the first window landed.
 async fn ensure_synced(state: &AppState) -> Result<(), ApiError> {
-    if state.synced.get().is_some() {
-        return Ok(());
-    }
+    // Asked every request, deliberately. This used to be memoized in a
+    // `OnceLock` on the reasoning that the only wipe — `prepare`, on a version
+    // bump or a contract change — ran before the API started, so the fact could
+    // never un-happen. That held while one process was both halves. It does
+    // not now: the indexer is a separate process and may wipe and replay a
+    // chain at any moment, including while this one holds a cached `true`.
+    //
+    // The cached answer would then be served over an empty read model, and a
+    // name that exists on chain would come back as a 404 rather than the 503
+    // that says "ask again later". A single indexed lookup per request is a
+    // small price for not lying about it.
     match state.store.cursor().await? {
-        Some(_) => {
-            let _ = state.synced.set(());
-            Ok(())
-        }
+        Some(_) => Ok(()),
         None => Err(ApiError::not_synced()),
     }
 }

@@ -1,22 +1,62 @@
-# Local development stack: one Postgres the indexer and its tests share.
+# Local development stack: one Postgres, one indexer, one API.
 #
 # `docker compose up -d postgres` for the database alone (cargo run against
-# it); `docker compose up -d --build` for the full containerized stack —
-# indexer included, configured through the environment or a .env file.
+# it); `docker compose up -d --build` for the full containerized stack.
+#
+# The two halves are separate images on purpose — see the Dockerfile. The
+# indexer writes and listens on nothing; the API listens and writes nothing.
 services:
   indexer:
-    build: .
+    build:
+      context: .
+      target: indexer
+    # Everything `.env.example` documents reaches the container, not just the
+    # names repeated below. Without this the optional settings — the whole ENS
+    # block especially — are interpolated into the compose file and then
+    # dropped, so a configured gateway silently never mounts. The explicit map
+    # stays because it takes precedence and carries the `:?` checks.
+    env_file:
+      - path: .env
+        required: false
     environment:
       DATABASE_URL: postgres://usernames:${POSTGRES_PASSWORD:-usernames_dev}@postgres:5432/usernames
       RPC_URL: ${RPC_URL:?set RPC_URL}
       IDENTITY_NAMES_ADDRESS: ${IDENTITY_NAMES_ADDRESS:?set IDENTITY_NAMES_ADDRESS}
       CHAIN_ID: ${CHAIN_ID:-}
       CONFIRMATIONS: ${CONFIRMATIONS:-5}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      target: api
+    # Everything `.env.example` documents reaches the container, not just the
+    # names repeated below. Without this the optional settings — the whole ENS
+    # block especially — are interpolated into the compose file and then
+    # dropped, so a configured gateway silently never mounts. The explicit map
+    # stays because it takes precedence and carries the `:?` checks.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgres://usernames:${POSTGRES_PASSWORD:-usernames_dev}@postgres:5432/usernames
+      IDENTITY_NAMES_ADDRESS: ${IDENTITY_NAMES_ADDRESS:?set IDENTITY_NAMES_ADDRESS}
+      # Required here, unlike the indexer: nothing in this process talks to a
+      # chain, so it cannot discover which chain's rows it serves.
+      CHAIN_ID: ${CHAIN_ID:?set CHAIN_ID}
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:
       postgres:
         condition: service_healthy
+      # Ordering only: the API answers 503 until the indexer's first window
+      # lands, so it may start before there is anything to serve. What it must
+      # not do is start before the schema exists, which the indexer migrates.
+      indexer:
+        condition: service_started
     restart: unless-stopped
 
   postgres:

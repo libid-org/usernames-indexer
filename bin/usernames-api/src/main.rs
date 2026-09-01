@@ -1,4 +1,4 @@
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    usernames_indexer::run().await
+    usernames_api::run().await
 }

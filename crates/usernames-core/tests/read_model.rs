@@ -18,7 +18,7 @@ use tokio::sync::{
     Mutex,
     MutexGuard,
 };
-use usernames_indexer::{
+use usernames_core::{
     db::{
         self,
         ChainStore,
@@ -36,17 +36,25 @@ const CHAIN: i64 = 31337;
 static DB_LOCK: Mutex<()> = Mutex::const_new(());
 
 async fn test_store() -> Option<(ChainStore, PgPool, MutexGuard<'static, ()>)> {
+    test_store_with(1).await
+}
+
+/// The same, with room for more than one connection.
+///
+/// Not needed by the lease any more — it opens its own session outside the pool
+/// precisely so it cannot starve one — but kept for a test that wants
+/// concurrent queries of its own.
+async fn test_store_with(
+    max_connections: u32,
+) -> Option<(ChainStore, PgPool, MutexGuard<'static, ()>)> {
     let guard = DB_LOCK.lock().await;
     let url = std::env::var("DATABASE_URL").ok()?;
     let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
+        .max_connections(max_connections)
         .connect(&url)
         .await
         .expect("DATABASE_URL is set but connecting failed");
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .expect("migrations failed");
+    db::MIGRATOR.run(&pool).await.expect("migrations failed");
     // Scoped to this suite's chain, like the anvil suite scopes to its own:
     // neither depends on cargo happening to run test binaries sequentially.
     for table in db::PROJECTION_TABLES {
@@ -530,4 +538,153 @@ async fn unconfigured_platform_and_impossible_text_name_their_codes() {
     let (status, body) = get(&store, "/v1/resolve/handle/x/a%20b").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["error"]["code"], "handle_impossible", "{body}");
+}
+
+// ─── The replay gate ────────────────────────────────────────────────────────
+// `prepare` is the only thing in the process that deletes a chain's rows, and
+// it decides to on two conditions nothing else tests. It also carries one
+// deliberate exception — the deployment-block cache survives — which until now
+// existed as a comment.
+
+const OTHER_CONTRACT: Address = Address::new([0xcd; 20]);
+
+fn a_contract() -> Address {
+    Address::new([0xab; 20])
+}
+
+/// Bind one handle and note a deployment block, so a wipe has something to
+/// take and something to leave.
+async fn seed(store: &ChainStore) {
+    apply(
+        store,
+        1,
+        bind(
+            addr(1),
+            nodes::Platform::from_key("x").unwrap().id(),
+            "1",
+            "alice",
+            1,
+            true,
+        ),
+    )
+    .await;
+    store
+        .set_deploy_block(a_contract(), 4321)
+        .await
+        .expect("deploy block");
+}
+
+#[tokio::test]
+async fn preparing_an_unchanged_chain_keeps_everything() {
+    let Some((store, _pool, _g)) = test_store_with(2).await else {
+        return;
+    };
+    let writer = store.acquire_writer().await.expect("lease");
+    store.prepare(&writer, a_contract()).await.expect("first");
+    seed(&store).await;
+
+    // Same version, same contract: nothing to replay.
+    store.prepare(&writer, a_contract()).await.expect("second");
+    assert!(
+        store.cursor().await.unwrap().is_some(),
+        "the cursor survived"
+    );
+    assert!(
+        store
+            .resolve_handle(
+                nodes::Platform::from_key("x").unwrap().id(),
+                &nodes::NormalizedHandle::from_chain("alice"),
+            )
+            .await
+            .unwrap()
+            .is_some(),
+        "the binding survived"
+    );
+    writer.release().await.expect("the lease releases");
+}
+
+#[tokio::test]
+async fn watching_another_contract_clears_the_chain() {
+    // The old contract's bindings are not the new contract's bindings, so
+    // inheriting them would answer for an account nobody bound here.
+    let Some((store, _pool, _g)) = test_store_with(2).await else {
+        return;
+    };
+    let writer = store.acquire_writer().await.expect("lease");
+    store.prepare(&writer, a_contract()).await.expect("first");
+    seed(&store).await;
+
+    store
+        .prepare(&writer, OTHER_CONTRACT)
+        .await
+        .expect("repoint");
+
+    assert!(
+        store.cursor().await.unwrap().is_none(),
+        "the cursor must be gone so the scan restarts"
+    );
+    assert!(
+        store
+            .resolve_handle(
+                nodes::Platform::from_key("x").unwrap().id(),
+                &nodes::NormalizedHandle::from_chain("alice"),
+            )
+            .await
+            .unwrap()
+            .is_none(),
+        "the previous contract's binding must not survive"
+    );
+    writer.release().await.expect("the lease releases");
+}
+
+#[tokio::test]
+async fn the_deployment_block_cache_survives_a_replay() {
+    // The one carve-out, and the reason for it: the cache is keyed by
+    // contract, and `eth_getCode` history does not change shape with the read
+    // model. Losing it would re-run the binary search over the whole chain on
+    // every version bump.
+    let Some((store, _pool, _g)) = test_store_with(2).await else {
+        return;
+    };
+    let writer = store.acquire_writer().await.expect("lease");
+    store.prepare(&writer, a_contract()).await.expect("first");
+    seed(&store).await;
+
+    store
+        .prepare(&writer, OTHER_CONTRACT)
+        .await
+        .expect("repoint");
+
+    assert_eq!(
+        store.deploy_block(a_contract()).await.unwrap(),
+        Some(4321),
+        "the deployment-block cache is keyed by contract and must outlive the wipe"
+    );
+    writer.release().await.expect("the lease releases");
+}
+
+/// The lease must give the lock back, not merely stop being referenced.
+///
+/// It used to hold `pg_try_advisory_lock` on a POOLED connection, so dropping
+/// it returned a live session — lock still held — to the idle pool, where it
+/// sat for the idle timeout. A second indexer, or the next test, then blocked
+/// on a lock nobody was using. Two sequential leases on one chain is the
+/// smallest thing that would have caught it.
+#[tokio::test]
+async fn a_released_lease_frees_the_chain_for_the_next_holder() {
+    let Some((store, _pool, _g)) = test_store_with(2).await else {
+        return;
+    };
+    let first = store.acquire_writer().await.expect("first lease");
+    first.release().await.expect("release");
+
+    // Bounded, because the failure mode is a block rather than an error: on
+    // the old code this waits for the pool's idle timeout, not forever, and an
+    // unbounded await would look like a hung test rather than a broken lock.
+    let second =
+        tokio::time::timeout(std::time::Duration::from_secs(5), store.acquire_writer())
+            .await
+            .expect("the second lease was still blocked on the first")
+            .expect("second lease");
+    second.release().await.expect("release");
 }

@@ -15,9 +15,21 @@ permissions:
 
 jobs:
   image:
-    name: Build and publish
+    name: Build and publish (${{ matrix.target }})
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # One compile, two runtime images. Deliberately no combined image: an
+        # entrypoint would have to default to one half, and a deployment that
+        # pulled it expecting the other would look healthy while doing half
+        # the job.
+        include:
+          - target: indexer
+            image: usernames-indexer
+          - target: api
+            image: usernames-api
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -35,7 +47,8 @@ jobs:
         id: tags
         run: |
           set -euo pipefail
-          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          image="ghcr.io/$owner/${{ matrix.image }}"
           tags="$image:sha-${GITHUB_SHA::12}"
           case "$GITHUB_REF" in
             refs/tags/v*) tags="$tags,$image:${GITHUB_REF#refs/tags/v},$image:latest" ;;
@@ -47,8 +60,9 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
+          target: ${{ matrix.target }}
           platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.tags.outputs.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
