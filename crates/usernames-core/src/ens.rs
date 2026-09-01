@@ -40,7 +40,10 @@ use alloy::primitives::{
     U256,
 };
 
-use crate::nodes::Platform;
+use crate::nodes::{
+    Known,
+    Platform,
+};
 
 /// The domain every name sits under, as labels.
 pub const DOMAIN: [&str; 2] = ["handles", "link"];
@@ -219,17 +222,21 @@ pub fn label_is_wellformed(label: &str) -> bool {
 /// The forward direction is specified against what `HandleNormalizer`
 /// produced, so this returns the handle in exactly the byte form the chain
 /// keyed — no case, no padding, no leading at-sign to strip.
-fn labels_to_handle(key: &str, labels: &[String]) -> Option<String> {
-    match key {
+///
+/// Takes [`Known`] rather than a key, so the `match` below is exhaustive: a
+/// platform added to that type does not compile until its transform is written
+/// here. That guarantee is why the type exists.
+fn labels_to_handle(platform: Known, labels: &[String]) -> Option<String> {
+    match platform {
         // X's alphabet is `[a-z0-9_]` and contains no hyphen, so `_` -> `-`
         // is a bijection onto its image and reverses by replacing every `-`.
-        "x" => {
+        Known::X => {
             let [label] = labels else { return None };
             label_is_wellformed(label).then(|| label.replace('-', "_"))
         }
         // GitHub's rules forbid a doubled hyphen and issue no underscores, so
         // the forward direction is the identity and so is this.
-        "github" => {
+        Known::GitHub => {
             let [label] = labels else { return None };
             label_is_wellformed(label).then(|| label.clone())
         }
@@ -252,7 +259,7 @@ fn labels_to_handle(key: &str, labels: &[String]) -> Option<String> {
         // is available: unlike X, where `_` maps to `-` because X forbids `-`,
         // a Google address may hold both, so the map would not be reversible —
         // and an irreversible map on a payment path is worse than no name.
-        "google" => {
+        Known::Google => {
             if labels.is_empty() {
                 return None;
             }
@@ -276,14 +283,6 @@ fn labels_to_handle(key: &str, labels: &[String]) -> Option<String> {
             });
             local_ok.then(|| format!("{}@gmail.com", labels.join(".")))
         }
-        // A platform the registry knows but this function does not falls
-        // through to `None`, which `parse_query` turns into an error and
-        // `self_answer` into a SIGNED null — a real binding, authoritatively
-        // denied. Nothing at runtime can tell that case from a genuinely
-        // malformed label, so the guard is
-        // `every_registered_platform_has_a_label_transform` rather than a
-        // panic in a request handler.
-        _ => None,
     }
 }
 
@@ -308,7 +307,7 @@ pub fn parse_query(labels: &[String]) -> Result<Query, EnsError> {
     // Right to left. The rightmost label is either the platform, or a chain
     // label with the platform one further in.
     let (chain_label, marker_at) = match rest.last().map(String::as_str) {
-        Some(last) if Platform::from_key(last).is_some() => (None, rest.len() - 1),
+        Some(last) if Known::from_key(last).is_some() => (None, rest.len() - 1),
         Some(chain) => {
             if rest.len() < 2 {
                 return Err(EnsError::EmptyName);
@@ -326,12 +325,15 @@ pub fn parse_query(labels: &[String]) -> Result<Query, EnsError> {
 
     // A platform label this build does not know is not a parse failure — it
     // is a name nobody can hold, which the caller learns as a null answer.
-    let platform = Platform::from_key(marker).ok_or(EnsError::EmptyName)?;
-    let handle = labels_to_handle(marker, head)
+    let platform = Known::from_key(marker).ok_or(EnsError::EmptyName)?;
+    let handle = labels_to_handle(platform, head)
         .ok_or_else(|| EnsError::UnnormalizedLabel(head.join(".")))?;
 
     Ok(Query {
-        subject: Subject::Handle { platform, handle },
+        subject: Subject::Handle {
+            platform: platform.into(),
+            handle,
+        },
         chain_label,
     })
 }
@@ -574,22 +576,6 @@ mod tests {
         assert_eq!(handle_of(&q), "alice.b@gmail.com");
     }
 
-    /// Adding a platform to the registry without a label transform here would
-    /// answer every one of its names with a signed "nobody holds this". This
-    /// is the only thing standing between that and production.
-    #[test]
-    fn every_registered_platform_has_a_label_transform() {
-        for key in crate::nodes::platform_keys() {
-            assert!(
-                labels_to_handle(key, &["alice".to_string()]).is_some()
-                    || labels_to_handle(key, &["alice".to_string(), "b".to_string()])
-                        .is_some(),
-                "platform {key:?} is in the registry but inverts no label; \
-                 add its transform beside its normalization rules"
-            );
-        }
-    }
-
     #[test]
     fn gmail_refuses_characters_no_account_can_hold() {
         // Our email rules admit `-`, which Gmail does not issue. Refusing is
@@ -621,7 +607,7 @@ mod tests {
     #[test]
     fn a_gmail_address_keeps_its_implied_domain() {
         assert_eq!(
-            labels_to_handle("google", &["alice".into(), "smith".into()]),
+            labels_to_handle(Known::Google, &["alice".into(), "smith".into()]),
             Some("alice.smith@gmail.com".into())
         );
     }
@@ -632,7 +618,7 @@ mod tests {
     fn the_at_separator_carries_a_workspace_domain() {
         let labels = ["green", "baneling", "_at", "fuel", "sh"].map(String::from);
         assert_eq!(
-            labels_to_handle("google", &labels),
+            labels_to_handle(Known::Google, &labels),
             Some("green.baneling@fuel.sh".into())
         );
     }
@@ -643,7 +629,7 @@ mod tests {
     fn a_hyphenated_domain_survives() {
         let labels = ["alice", "_at", "my-company", "com"].map(String::from);
         assert_eq!(
-            labels_to_handle("google", &labels),
+            labels_to_handle(Known::Google, &labels),
             Some("alice@my-company.com".into())
         );
     }
@@ -655,7 +641,7 @@ mod tests {
             vec!["_at".to_string(), "fuel".into()],
             vec!["alice".into(), "_at".into()],
         ] {
-            assert_eq!(labels_to_handle("google", &labels), None, "{labels:?}");
+            assert_eq!(labels_to_handle(Known::Google, &labels), None, "{labels:?}");
         }
     }
 
@@ -665,7 +651,7 @@ mod tests {
     #[test]
     fn a_second_separator_is_refused() {
         let labels = ["a", "_at", "b", "_at", "c"].map(String::from);
-        assert_eq!(labels_to_handle("google", &labels), None);
+        assert_eq!(labels_to_handle(Known::Google, &labels), None);
     }
 
     // ─── Coin types ─────────────────────────────────────────────────
