@@ -156,22 +156,6 @@ impl HandleSource {
         }
     }
 
-    async fn resolve_id_node(&self, node: B256) -> Result<Option<Address>, GatewayError> {
-        match self {
-            Self::Mirror(store) => Ok(store
-                .resolve_by_id_node(node)
-                .await
-                .map_err(internal)?
-                .map(|row| row.owner)
-                .as_deref()
-                .and_then(as_address)),
-            // Not a refusal: the id-derived name cannot be encoded in DNS wire
-            // format at all (64 hex characters is one past the label ceiling),
-            // so nothing can ask this and a null is the honest answer.
-            Self::Chain { .. } => Ok(None),
-        }
-    }
-
     /// How far this source trails the chain.
     ///
     /// Three answers, not two, and the third is the one that matters: reading
@@ -501,7 +485,6 @@ async fn self_answer(
                 .resolve_handle(platform.id(), &normalized)
                 .await?
         }
-        Subject::IdNode(node) => chain.source.resolve_id_node(node).await?,
     };
 
     Ok(Answer::Address(owner))
