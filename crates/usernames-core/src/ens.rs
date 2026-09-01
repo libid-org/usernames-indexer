@@ -10,7 +10,6 @@
 //!
 //! ```text
 //! <handle labels> . <platform> [ . <chain> ] . handles . link
-//! <idNode as 64 hex> . _id [ . <chain> ] . handles . link
 //! ```
 //!
 //! The parse runs right to left, because a Gmail local part contributes a
@@ -45,11 +44,6 @@ use crate::nodes::Platform;
 
 /// The domain every name sits under, as labels.
 pub const DOMAIN: [&str; 2] = ["handles", "link"];
-
-/// The label marking an id-derived name. A leading underscore is the only
-/// position ENS permits one, and no handle-derived label contains an
-/// underscore at all, so this cannot collide with a platform label.
-pub const ID_MARKER: &str = "_id";
 
 /// ENSIP-11: an EVM chain's coin type is `0x80000000 | chainId`.
 const EVM_COIN_TYPE_BIT: u64 = 0x8000_0000;
@@ -143,8 +137,6 @@ pub enum Subject {
         /// The handle the labels invert to.
         handle: String,
     },
-    /// An account addressed by the storage key `IdentityNames` already uses.
-    IdNode(B256),
 }
 
 /// A parsed name: what it asks about, and whether it narrows to a chain.
@@ -247,18 +239,36 @@ fn labels_to_handle(key: &str, labels: &[String]) -> Option<String> {
         // characters no account can hold would be untested code on a payment
         // path.
         //
-        // ONLY gmail.com, by design — the spec defines a Workspace transform
-        // (`local ++ ["_at"] ++ domain`) and leaves it NOT ENABLED. A refusal
-        // here is not an unreachable account: it falls through to the
-        // id-derived name under [`ID_MARKER`], which every account has. That
-        // is the totality property, and it is why widening this alphabet is a
-        // spec change rather than a bug fix — `+` and `_` are not legal ENS
-        // labels at all, so a Workspace or plus-tagged address has no
-        // handle-derived form to widen INTO.
+        // Two forms, told apart by the `_at` separator. Without it the domain
+        // is the one the platform label implies; with it the labels carry the
+        // domain themselves, which is what reaches a Workspace address.
+        //
+        // `_at` cannot be mistaken for part of an address: an underscore is not
+        // a legal ENS label byte, so the well-formedness check below refuses it
+        // everywhere except as the separator this branch consumes.
+        //
+        // An address carrying `_` or `+` still has NO name. Both are legal in a
+        // Google address and neither can appear in a label, and no substitution
+        // is available: unlike X, where `_` maps to `-` because X forbids `-`,
+        // a Google address may hold both, so the map would not be reversible —
+        // and an irreversible map on a payment path is worse than no name.
         "google" => {
             if labels.is_empty() {
                 return None;
             }
+            let all_wellformed = |part: &[String]| {
+                !part.is_empty() && part.iter().all(|l| label_is_wellformed(l))
+            };
+
+            if let Some(at) = labels.iter().position(|l| l == "_at") {
+                let (local, domain) = (&labels[..at], &labels[at + 1..]);
+                return (all_wellformed(local) && all_wellformed(domain))
+                    .then(|| format!("{}@{}", local.join("."), domain.join(".")));
+            }
+
+            // Gmail: the local part alone, and its alphabet is narrower than a
+            // label's — Gmail issues no hyphen, so accepting one here would
+            // invent an address nobody can hold.
             let local_ok = labels.iter().all(|l| {
                 !l.is_empty()
                     && l.bytes()
@@ -295,12 +305,10 @@ pub fn parse_query(labels: &[String]) -> Result<Query, EnsError> {
         return Err(EnsError::EmptyName);
     }
 
-    // Right to left. The rightmost label is either the platform (or `_id`),
-    // or a chain label with the platform one further in.
+    // Right to left. The rightmost label is either the platform, or a chain
+    // label with the platform one further in.
     let (chain_label, marker_at) = match rest.last().map(String::as_str) {
-        Some(last) if last == ID_MARKER || Platform::from_key(last).is_some() => {
-            (None, rest.len() - 1)
-        }
+        Some(last) if Platform::from_key(last).is_some() => (None, rest.len() - 1),
         Some(chain) => {
             if rest.len() < 2 {
                 return Err(EnsError::EmptyName);
@@ -314,24 +322,6 @@ pub fn parse_query(labels: &[String]) -> Result<Query, EnsError> {
     let head = &rest[..marker_at];
     if head.is_empty() {
         return Err(EnsError::EmptyName);
-    }
-
-    if marker == ID_MARKER {
-        // The id form carries the storage key itself, so the gateway answers
-        // it from one lookup and never rebuilds an account id out of labels.
-        // It has no platform label on purpose: `idNode` already derives from
-        // the platform id, and a second statement of it could disagree.
-        let [hex] = head else {
-            return Err(EnsError::EmptyName);
-        };
-        let node = (hex.len() == 64)
-            .then(|| hex.parse::<B256>().ok())
-            .flatten()
-            .ok_or_else(|| EnsError::UnnormalizedLabel(hex.clone()))?;
-        return Ok(Query {
-            subject: Subject::IdNode(node),
-            chain_label,
-        });
     }
 
     // A platform label this build does not know is not a parse failure — it
@@ -494,7 +484,6 @@ mod tests {
     fn handle_of(q: &Query) -> String {
         match &q.subject {
             Subject::Handle { handle, .. } => handle.clone(),
-            Subject::IdNode(n) => panic!("expected a handle, got id node {n}"),
         }
     }
 
@@ -612,46 +601,71 @@ mod tests {
         ));
     }
 
-    /// The id-derived form parses — from labels. What it cannot do is arrive.
-    ///
-    /// The design writes it as `<idNode as 64 hex characters>._id.handles.link`,
-    /// and 64 characters is one past what a DNS label may hold: RFC 1035 caps a
-    /// label at 63 octets, and the two high bits of the length byte are
-    /// reserved for compression, so 64 is not merely long but unencodable.
-    /// Standard clients enforce it — ethers' `dnsEncode` refuses above 63 by
-    /// default — which means no wallet can send this name in the first place.
-    ///
-    /// So the parse is written and tested against labels directly, and
-    /// `a_sixty_four_character_label_cannot_be_encoded_at_all` records why the
-    /// wire path stops short. Splitting the node across two labels, or encoding
-    /// it in a shorter alphabet, would both work — but which one is a change to
-    /// the name shape, and that belongs in the design rather than here.
+    /// A label may hold 63 octets. The ceiling is the reason the design's
+    /// id-derived name — the storage key as 64 hex characters — was dropped
+    /// rather than implemented: it is one past what a name can carry, so no
+    /// client could ever send it. Standard encoders enforce this (ethers'
+    /// `dnsEncode` refuses above 63), which makes it unencodable rather than
+    /// merely long.
     #[test]
-    fn the_id_form_carries_the_storage_key_itself() {
-        let node = "11".repeat(32);
-        let q = parse_query(&[
-            node.clone(),
-            ID_MARKER.into(),
-            "handles".into(),
-            "link".into(),
-        ])
-        .unwrap();
-        match q.subject {
-            Subject::IdNode(n) => assert_eq!(n, node.parse::<B256>().unwrap()),
-            other => panic!("expected an id node, got {other:?}"),
-        }
-        // No platform label: `idNode` derives from the platform id already,
-        // and a second statement of it could disagree with the first.
-        assert_eq!(q.chain_label, None);
+    fn a_label_past_sixty_three_octets_cannot_be_encoded() {
+        let long = "1".repeat(64);
+        let mut wire = vec![long.len() as u8];
+        wire.extend_from_slice(long.as_bytes());
+        wire.extend_from_slice(b"\x07handles\x04link\x00");
+        assert_eq!(parse_dns_name(&wire), Err(EnsError::MalformedName));
     }
 
+    // ─── Google: the two address forms ──────────────────────────────
+
     #[test]
-    fn a_sixty_four_character_label_cannot_be_encoded_at_all() {
-        let node = "11".repeat(32);
-        let mut wire = vec![node.len() as u8]; // 64
-        wire.extend_from_slice(node.as_bytes());
-        wire.extend_from_slice(b"\x03_id\x07handles\x04link\x00");
-        assert_eq!(parse_dns_name(&wire), Err(EnsError::MalformedName));
+    fn a_gmail_address_keeps_its_implied_domain() {
+        assert_eq!(
+            labels_to_handle("google", &["alice".into(), "smith".into()]),
+            Some("alice.smith@gmail.com".into())
+        );
+    }
+
+    /// The `_at` separator carries the domain, which is what reaches an
+    /// address outside gmail.com — the case that had no name at all before.
+    #[test]
+    fn the_at_separator_carries_a_workspace_domain() {
+        let labels = ["green", "baneling", "_at", "fuel", "sh"].map(String::from);
+        assert_eq!(
+            labels_to_handle("google", &labels),
+            Some("green.baneling@fuel.sh".into())
+        );
+    }
+
+    /// A hyphen is legal in a label and in a domain, so it survives the round
+    /// trip — unlike gmail's narrower alphabet.
+    #[test]
+    fn a_hyphenated_domain_survives() {
+        let labels = ["alice", "_at", "my-company", "com"].map(String::from);
+        assert_eq!(
+            labels_to_handle("google", &labels),
+            Some("alice@my-company.com".into())
+        );
+    }
+
+    /// Both sides must exist: `_at` at either edge names no address.
+    #[test]
+    fn a_separator_at_the_edge_is_refused() {
+        for labels in [
+            vec!["_at".to_string(), "fuel".into()],
+            vec!["alice".into(), "_at".into()],
+        ] {
+            assert_eq!(labels_to_handle("google", &labels), None, "{labels:?}");
+        }
+    }
+
+    /// A second `_at` cannot be smuggled in as part of the address: an
+    /// underscore is not a legal label byte, so the domain half refuses it and
+    /// the form stays unambiguous.
+    #[test]
+    fn a_second_separator_is_refused() {
+        let labels = ["a", "_at", "b", "_at", "c"].map(String::from);
+        assert_eq!(labels_to_handle("google", &labels), None);
     }
 
     // ─── Coin types ─────────────────────────────────────────────────

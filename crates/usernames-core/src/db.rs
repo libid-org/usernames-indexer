@@ -1001,26 +1001,6 @@ impl ChainStore {
         .await
     }
 
-    /// The same row, found by the storage key rather than by `(platform, id)`.
-    ///
-    /// For the id-derived ENS name, which carries `idNode` itself: the chain
-    /// already derived it from the platform id and the account id, so asking
-    /// for those again would let a caller state a platform that disagrees with
-    /// the node. There is no honest way to resolve that disagreement, so the
-    /// node is the only thing asked for.
-    pub async fn resolve_by_id_node(
-        &self,
-        id_node: B256,
-    ) -> Result<Option<IdentityRow>, sqlx::Error> {
-        sqlx::query_as(&format!(
-            "{IDENTITY_PROJECTION}WHERE i.chain_id = $1 AND i.id_node = $2"
-        ))
-        .bind(self.chain_id)
-        .bind(id_node.as_slice())
-        .fetch_optional(&self.pool)
-        .await
-    }
-
     /// The row `resolveId` answers from. The id is matched byte-verbatim,
     /// exactly as the chain keys it.
     pub async fn resolve_id(

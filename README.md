@@ -145,8 +145,6 @@ answers from a model kept `CONFIRMATIONS` blocks deep, which a call at the head
 is not — a binding created and then reorged away is visible to `chain` and not
 to `mirror`.
 
-The id-derived name is mirror-only regardless: `IdentityNames` exposes no
-getter keyed by `idNode`, only the event.
 
 **Tested against the real resolver.** `bin/usernames-api/tests/end_to_end.rs`
 deploys `HandleResolver` on anvil and walks the protocol as a wallet does:
@@ -160,13 +158,17 @@ Regenerating the resolver bytecode the test deploys is described in
 [`contracts/README.md`](contracts/README.md); a drifted copy is a test that
 passes against a resolver nobody deploys.
 
-**Not yet answerable: the id-derived name.** The design writes it as
-`<idNode as 64 hex>._id.handles.link`, and 64 characters is one past the DNS
-label ceiling of RFC 1035, so no standard client can encode it — ethers'
-`dnsEncode` refuses above 63. The parse and the `byId` lookup are implemented
-and tested; what is missing is a name shape that fits, and choosing one
-(two labels, or a shorter alphabet) is a change to the design rather than to
-this code.
+**Addresses without a name.** A Google address is bound as proved, and its
+alphabet is wider than a label's: `_` and `+` are both legal in an address and
+neither can appear in an ENS label. No substitution is available — unlike X,
+where `_` maps to `-` because X forbids `-`, a Google address may hold both, so
+the map would not be reversible, and an irreversible map on a payment path is
+worse than no name. Such accounts are reachable by address, not by name.
+
+The design's id-derived fallback (`<idNode as 64 hex>._id.handles.link`) is not
+implemented, and deliberately: 64 characters is one past the DNS label ceiling
+of RFC 1035, so no standard client can encode it — ethers' `dnsEncode` refuses
+above 63. It could not have covered these accounts, or any others.
 
 ## Read model
 

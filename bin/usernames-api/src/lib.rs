@@ -313,9 +313,7 @@ async fn ens_config(
             // as the platform (or the id marker), so a chain label spelled
             // like one is read as that instead — and the chain becomes
             // unreachable rather than ambiguous.
-            if usernames_core::nodes::Platform::from_key(label).is_some()
-                || label == usernames_core::ens::ID_MARKER
-            {
+            if usernames_core::nodes::Platform::from_key(label).is_some() {
                 anyhow::bail!(
                     "ENS_CHAINS label {label:?} collides with a platform label; \
                      the name grammar would read it as the platform"
