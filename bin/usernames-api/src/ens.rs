@@ -412,7 +412,10 @@ async fn self_answer(
     // Any record other than `addr` is null rather than an error, so a client
     // asking for `text()` or something invented later degrades instead of
     // seeing a name that resolves report a failure.
-    let Record::Addr { coin_type, .. } = record else {
+    let Record::Addr {
+        node, coin_type, ..
+    } = record
+    else {
         return Ok(Answer::Address(None));
     };
     // Matched against the chains this gateway SERVES, never decoded back into
@@ -449,6 +452,20 @@ async fn self_answer(
 
     let labels = ens::parse_dns_name(name)
         .map_err(|e| GatewayError::bad_request(e.to_string()))?;
+    // The request names one thing twice — as a name, and as the node inside the
+    // record call — and only the caller has ever seen the two agree. The
+    // signature covers both, so answering without checking would sign a result
+    // that is true of the name and attributed to the node.
+    //
+    // In practice this is a consistency check rather than a defence: one caller
+    // builds both halves. What it earns is the guarantee the design assumes
+    // elsewhere — that ENSIP-15 on the client and our own normalization agree.
+    // Where they ever stop agreeing, this refuses instead of signing.
+    if ens::namehash(&labels) != node {
+        return Err(GatewayError::bad_request(
+            "the name and the node in the record call are not the same name",
+        ));
+    }
     let query = match ens::parse_query(&labels) {
         Ok(query) => query,
         // A name this build cannot read is a name nobody holds. Refusing

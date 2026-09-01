@@ -290,10 +290,13 @@ async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> 
     }));
 
     // ── 1. the wallet asks the resolver, and is told where to look ───
+    let labels = ["alice", "x", "handles", "link"].map(String::from);
     let name = Bytes::from(wire_name(&["alice", "x"]));
     let inner = Bytes::from(
         addrCall {
-            node: B256::from([1u8; 32]),
+            // The namehash of the same name, as a wallet sends it: the gateway
+            // checks that the request's two halves describe one name.
+            node: usernames_core::ens::namehash(&labels),
             coinType: U256::from(0x8000_0000u64 | CHAIN as u64),
         }
         .abi_encode(),
