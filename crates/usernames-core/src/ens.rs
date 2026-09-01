@@ -162,6 +162,10 @@ pub struct Query {
 pub enum Record {
     /// `addr(node)` or `addr(node, coinType)`.
     Addr {
+        /// The node the caller named, for checking against the name that
+        /// arrived beside it. Both halves of the request describe one name,
+        /// and only the caller has ever seen them agree.
+        node: B256,
         /// Exactly what the caller asked with, undecoded. Matching it against
         /// the configured chains is the gateway's job.
         coin_type: U256,
@@ -205,6 +209,19 @@ pub fn parse_dns_name(wire: &[u8]) -> Result<Vec<String>, EnsError> {
         return Err(EnsError::MalformedName);
     }
     Ok(labels)
+}
+
+/// EIP-137 namehash, folded right to left over the LABELS.
+///
+/// Over the list rather than over a joined name on purpose. A DNS wire label
+/// may itself contain a dot — nothing in the format forbids it — so joining and
+/// hashing the string would give `["a.b"]` and `["a", "b"]` one hash for two
+/// different names. The wire format already said where the boundaries are;
+/// rebuilding them out of a string throws that away.
+pub fn namehash(labels: &[String]) -> B256 {
+    labels.iter().rev().fold(B256::ZERO, |parent, label| {
+        keccak256([parent.as_slice(), keccak256(label.as_bytes()).as_slice()].concat())
+    })
 }
 
 /// The alphabet a handle-derived label may use: what X and GitHub reduce to
@@ -363,7 +380,8 @@ fn decode_record(inner: &[u8]) -> Record {
         // addr(bytes32) — the node and nothing else, which is coin type 60 by
         // definition: Ethereum mainnet.
         s if s == ADDR_SELECTOR => match <(B256,)>::abi_decode_params(args) {
-            Ok(_) => Record::Addr {
+            Ok((node,)) => Record::Addr {
+                node,
                 coin_type: U256::from(COIN_TYPE_ETH),
                 legacy: true,
             },
@@ -371,7 +389,8 @@ fn decode_record(inner: &[u8]) -> Record {
         },
         // addr(bytes32,uint256) — the coin type carried through exactly as sent.
         s if s == ADDR_COIN_SELECTOR => match <(B256, U256)>::abi_decode_params(args) {
-            Ok((_, coin_type)) => Record::Addr {
+            Ok((node, coin_type)) => Record::Addr {
+                node,
                 coin_type,
                 legacy: false,
             },
@@ -609,6 +628,40 @@ mod tests {
         assert_eq!(labels_to_handle(Known::Google, &labels), None);
     }
 
+    // ─── Namehash ───────────────────────────────────────────────────
+
+    /// EIP-137's own vectors, so the fold is pinned to the standard rather
+    /// than to itself.
+    #[test]
+    fn namehash_matches_the_eip137_vectors() {
+        let of =
+            |name: &str| namehash(&name.split('.').map(String::from).collect::<Vec<_>>());
+        assert_eq!(namehash(&[]), B256::ZERO);
+        assert_eq!(
+            of("eth").to_string(),
+            "0x93cdeb708b7545dc668eb9280176169d1c33cfd8ed6f04690a0bcc88a93fc4ae"
+        );
+        assert_eq!(
+            of("foo.eth").to_string(),
+            "0xde9b09fd7c5f901e23a3f19fecc54828e9c848539801e86591bd9801b019f84f"
+        );
+        assert_eq!(
+            of("alice.x.handles.link").to_string(),
+            "0x21a53adadf8699366708518cccb5ff27860eb2559be8d4c552dede0b5eb81f86"
+        );
+    }
+
+    /// The reason this folds over labels and not over a joined string. A DNS
+    /// label may hold a dot, so `["a.b"]` and `["a", "b"]` are two names — and
+    /// a namehash taken over `labels.join(".")` would give them one node, and
+    /// answer either with the other's address.
+    #[test]
+    fn a_label_holding_a_dot_is_not_two_labels() {
+        let one = namehash(&["a.b".to_string()]);
+        let two = namehash(&["a".to_string(), "b".to_string()]);
+        assert_ne!(one, two);
+    }
+
     // ─── Coin types ─────────────────────────────────────────────────
 
     #[test]
@@ -647,10 +700,12 @@ mod tests {
 
     // ─── The call ───────────────────────────────────────────────────
 
-    fn addr_call(coin: u64) -> Vec<u8> {
+    /// Takes the node rather than inventing one: a real request carries the
+    /// namehash of the name beside it, and a fixture that does not is a
+    /// fixture no client would send.
+    fn addr_call(node: B256, coin: u64) -> Vec<u8> {
         let mut inner = ADDR_COIN_SELECTOR.to_vec();
-        inner.extend_from_slice(&[0u8; 31]);
-        inner.push(1);
+        inner.extend_from_slice(node.as_slice());
         inner.extend_from_slice(&U256::from(coin).to_be_bytes::<32>());
         inner
     }
@@ -677,12 +732,14 @@ mod tests {
 
     #[test]
     fn the_forwarded_call_decodes_to_a_name_and_a_record() {
-        let call = resolve_call(ALICE_X, &addr_call(0x8000_2105));
+        let node = namehash(&labels(ALICE_X));
+        let call = resolve_call(ALICE_X, &addr_call(node, 0x8000_2105));
         let (name, record) = decode_resolve_calldata(&call).unwrap();
         assert_eq!(name, ALICE_X);
         assert_eq!(
             record,
             Record::Addr {
+                node,
                 coin_type: coin_type_for(8453),
                 legacy: false
             }
@@ -713,6 +770,7 @@ mod tests {
     #[test]
     fn the_null_answer_is_an_answer_in_both_record_shapes() {
         let ensip11 = Record::Addr {
+            node: B256::ZERO,
             coin_type: coin_type_for(1),
             legacy: false,
         };
@@ -720,6 +778,7 @@ mod tests {
         assert_eq!(encode_addr_result(ensip11, None).len(), 64);
         // The legacy form returns `address`: null is the zero address.
         let legacy = Record::Addr {
+            node: B256::ZERO,
             coin_type: coin_type_for(1),
             legacy: true,
         };
@@ -731,6 +790,7 @@ mod tests {
         let who = Address::from([0x11u8; 20]);
         let legacy = encode_addr_result(
             Record::Addr {
+                node: B256::ZERO,
                 coin_type: coin_type_for(1),
                 legacy: true,
             },
@@ -740,6 +800,7 @@ mod tests {
 
         let ensip11 = encode_addr_result(
             Record::Addr {
+                node: B256::ZERO,
                 coin_type: coin_type_for(1),
                 legacy: false,
             },
@@ -759,7 +820,11 @@ mod tests {
     /// rather than against itself.
     #[test]
     fn the_digest_matches_the_solidity_resolver() {
-        let request = resolve_call(ALICE_X, &addr_call(0x8000_2105));
+        // The node is the vector's input, not a meaningful namehash: these are
+        // the exact bytes `cast` and the Solidity test were given, and the
+        // digest is only a digest of them.
+        let request =
+            resolve_call(ALICE_X, &addr_call(B256::with_last_byte(1), 0x8000_2105));
         let mut result = vec![0u8; 32];
         result[30] = 0xbe;
         result[31] = 0xef;
