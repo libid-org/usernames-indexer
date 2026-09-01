@@ -33,11 +33,15 @@
 //! decoding. [`chain_ids_collide`] names the pair that cannot be served
 //! together.
 
-use alloy::primitives::{
-    keccak256,
-    Address,
-    B256,
-    U256,
+use alloy::{
+    primitives::{
+        keccak256,
+        Address,
+        Bytes,
+        B256,
+        U256,
+    },
+    sol_types::SolValue,
 };
 
 use crate::nodes::{
@@ -345,36 +349,9 @@ pub fn decode_resolve_calldata(call_data: &[u8]) -> Result<(Vec<u8>, Record), En
     if selector != RESOLVE_SELECTOR {
         return Err(EnsError::NotResolve);
     }
-    let (name, inner) = decode_two_bytes(body).ok_or(EnsError::MalformedCallData)?;
-    Ok((name, decode_record(&inner)))
-}
-
-/// `(bytes,bytes)` as ABI head-and-tail, by hand: two offsets, then two
-/// length-prefixed payloads. Hand-rolled because pulling a full ABI decoder in
-/// for one shape would be the larger dependency, and the shape is fixed.
-fn decode_two_bytes(body: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-    let read_word = |at: usize| -> Option<usize> {
-        // `checked_add`, because `at` comes from a word this same function
-        // read: a hostile offset near `u64::MAX` overflows the range
-        // expression and panics inside the request handler rather than
-        // returning `None`.
-        let w = body.get(at..at.checked_add(32)?)?;
-        // A real offset or length fits far inside a usize; anything using the
-        // high bytes is a hostile encoding, not a large value.
-        if w[..24].iter().any(|b| *b != 0) {
-            return None;
-        }
-        let mut n = [0u8; 8];
-        n.copy_from_slice(&w[24..32]);
-        usize::try_from(u64::from_be_bytes(n)).ok()
-    };
-    let read_bytes = |offset: usize| -> Option<Vec<u8>> {
-        let len = read_word(offset)?;
-        let start = offset.checked_add(32)?;
-        let end = start.checked_add(len)?;
-        body.get(start..end).map(<[u8]>::to_vec)
-    };
-    Some((read_bytes(read_word(0)?)?, read_bytes(read_word(32)?)?))
+    let (name, inner) = <(Bytes, Bytes)>::abi_decode_params(body)
+        .map_err(|_| EnsError::MalformedCallData)?;
+    Ok((name.into(), decode_record(&inner)))
 }
 
 /// Which record the inner calldata asks for.
@@ -382,17 +359,23 @@ fn decode_record(inner: &[u8]) -> Record {
     let Some((selector, args)) = inner.split_at_checked(4) else {
         return Record::Other;
     };
-    match (selector, args.len()) {
-        // addr(bytes32) — the node and nothing else, which is coin type 60
-        // by definition: Ethereum mainnet.
-        (s, 32) if s == ADDR_SELECTOR => Record::Addr {
-            coin_type: U256::from(COIN_TYPE_ETH),
-            legacy: true,
+    match selector {
+        // addr(bytes32) — the node and nothing else, which is coin type 60 by
+        // definition: Ethereum mainnet.
+        s if s == ADDR_SELECTOR => match <(B256,)>::abi_decode_params(args) {
+            Ok(_) => Record::Addr {
+                coin_type: U256::from(COIN_TYPE_ETH),
+                legacy: true,
+            },
+            Err(_) => Record::Other,
         },
-        // addr(bytes32,uint256) — carried through exactly as sent.
-        (s, 64) if s == ADDR_COIN_SELECTOR => Record::Addr {
-            coin_type: U256::from_be_slice(&args[32..64]),
-            legacy: false,
+        // addr(bytes32,uint256) — the coin type carried through exactly as sent.
+        s if s == ADDR_COIN_SELECTOR => match <(B256, U256)>::abi_decode_params(args) {
+            Ok((_, coin_type)) => Record::Addr {
+                coin_type,
+                legacy: false,
+            },
+            Err(_) => Record::Other,
         },
         _ => Record::Other,
     }
@@ -405,25 +388,10 @@ fn decode_record(inner: &[u8]) -> Record {
 /// the legacy form returns the zero address.
 pub fn encode_addr_result(record: Record, address: Option<Address>) -> Vec<u8> {
     match record {
-        Record::Addr { legacy: true, .. } => {
-            let mut out = vec![0u8; 32];
-            if let Some(address) = address {
-                out[12..].copy_from_slice(address.as_slice());
-            }
-            out
-        }
-        // `bytes`: offset, length, then the padded payload.
-        _ => {
-            let mut out = vec![0u8; 64];
-            out[31] = 0x20;
-            if let Some(address) = address {
-                out[63] = 20;
-                let mut word = [0u8; 32];
-                word[..20].copy_from_slice(address.as_slice());
-                out.extend_from_slice(&word);
-            }
-            out
-        }
+        // The legacy shape returns `address`, and the zero address is its null.
+        Record::Addr { legacy: true, .. } => address.unwrap_or_default().abi_encode(),
+        // ENSIP-11 returns `bytes`, and the empty byte string is its null.
+        _ => Bytes::from(address.map(|a| a.to_vec()).unwrap_or_default()).abi_encode(),
     }
 }
 
@@ -451,25 +419,12 @@ pub fn signature_digest(
 /// ABI-encode `(bytes result, uint64 expires, bytes signature)` — the blob the
 /// resolver's callback decodes.
 pub fn encode_response(result: &[u8], expires: u64, signature: &[u8]) -> Vec<u8> {
-    fn push_word(out: &mut Vec<u8>, n: u64) {
-        let mut w = [0u8; 32];
-        w[24..].copy_from_slice(&n.to_be_bytes());
-        out.extend_from_slice(&w);
-    }
-
-    let mut out = Vec::new();
-    let result_at = 3 * 32;
-    let sig_at = result_at + 32 + result.len().div_ceil(32) * 32;
-    push_word(&mut out, result_at as u64);
-    push_word(&mut out, expires);
-    push_word(&mut out, sig_at as u64);
-    for payload in [result, signature] {
-        push_word(&mut out, payload.len() as u64);
-        out.extend_from_slice(payload);
-        let pad = payload.len().div_ceil(32) * 32 - payload.len();
-        out.extend(std::iter::repeat_n(0u8, pad));
-    }
-    out
+    (
+        Bytes::copy_from_slice(result),
+        expires,
+        Bytes::copy_from_slice(signature),
+    )
+        .abi_encode_params()
 }
 
 #[cfg(test)]
