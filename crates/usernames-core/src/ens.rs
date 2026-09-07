@@ -310,7 +310,15 @@ fn labels_to_handle(platform: KnownPlatform, labels: &[String]) -> Option<String
 
 /// Parse the labels of a full name into the question it asks.
 pub fn parse_query(labels: &[String]) -> Result<Query, EnsError> {
-    for label in labels {
+    // The domain before anything else, so a name that is not ours is refused
+    // as foreign whatever its labels look like. Label hygiene is a statement
+    // about OUR names; a name under someone else's domain is not owed it, and
+    // a caller must not be able to turn "foreign" into "unreadable" — which
+    // is answered — by miscasing a label.
+    let rest = labels
+        .strip_suffix(&DOMAIN.map(String::from))
+        .ok_or(EnsError::ForeignDomain)?;
+    for label in rest {
         // ENS normalization never produces uppercase or whitespace. Refusing
         // here means the rest of this module never sees text a wallet could
         // not have sent.
@@ -319,9 +327,6 @@ pub fn parse_query(labels: &[String]) -> Result<Query, EnsError> {
             return Err(EnsError::UnnormalizedLabel(label.clone()));
         }
     }
-    let rest = labels
-        .strip_suffix(&DOMAIN.map(String::from))
-        .ok_or(EnsError::ForeignDomain)?;
     if rest.is_empty() {
         return Err(EnsError::EmptyName);
     }

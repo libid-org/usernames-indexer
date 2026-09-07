@@ -206,10 +206,12 @@ pub struct ChainGateway {
 /// What the gateway needs beyond the chains it serves.
 #[derive(Clone)]
 pub struct Config {
-    /// The resolver this gateway answers for. An answer is bound to it by the
-    /// signature, and a request naming another resolver is refused rather
-    /// than signed — otherwise this is a signing oracle for any contract that
-    /// cares to ask.
+    /// The resolver this gateway answers for. Every answer is signed for this
+    /// address, whatever `{sender}` the path carries: the target is
+    /// configuration, never the request. A request naming another resolver is
+    /// refused rather than answered, so a value that fell behind a
+    /// `setResolver` is a visible 400 instead of a signature the resolver
+    /// rejects.
     pub resolver: Address,
     /// Every chain this gateway can speak for, by chain id. A coin type
     /// naming anything else gets an unsigned refusal, not a signed null: the
@@ -313,10 +315,18 @@ async fn resolve(
     let sender: Address = sender
         .parse()
         .map_err(|_| GatewayError::bad_request("sender is not an address"))?;
-    // Bound to one resolver on purpose. The signature names the target, so
-    // signing for a caller-supplied one would let any contract borrow this
-    // key's authority.
+    // Bound to one resolver on purpose. The digest below names the configured
+    // target, never `sender`, so this check adds no authority — what it adds
+    // is a visible error. Logged, because a 4xx is terminal for an ERC-3668
+    // client (it ends the walk of the resolver's `urls`) and a line here is
+    // the only way an operator learns that `ENS_RESOLVER_ADDRESS` fell behind
+    // a `setResolver`.
     if sender != state.config.resolver {
+        warn!(
+            %sender,
+            resolver = %state.config.resolver,
+            "refusing a request that names another resolver"
+        );
         return Err(GatewayError::bad_request(
             "this gateway answers for a different resolver",
         ));
@@ -432,30 +442,26 @@ async fn self_answer(
     // record was asked of it.
     let labels = ens::parse_dns_name(name)
         .map_err(|e| GatewayError::bad_request(e.to_string()))?;
-    let query = match ens::parse_query(&labels) {
-        Ok(query) => query,
-        // Not a name under this resolver's domain. Refused rather than
-        // answered: a signed null is an authoritative "nobody holds this", and
-        // this gateway has no standing to say that about someone else's name.
-        Err(ens::EnsError::ForeignDomain) => {
-            return Err(GatewayError::bad_request(
-                "this resolver answers only for names under handles.link",
-            ));
-        }
-        // A name under our domain that this build cannot read is a name nobody
-        // holds. Refusing would report an error for text a wallet is entitled
-        // to ask about.
-        Err(_) => {
-            return Ok(Answer::Addr {
-                address: None,
-                legacy: false,
-            })
-        }
-    };
+    let parsed = ens::parse_query(&labels);
+    // Not a name under this resolver's domain. Refused rather than answered:
+    // a signed null is an authoritative "nobody holds this", and this gateway
+    // has no standing to say that about someone else's name.
+    if matches!(parsed, Err(ens::EnsError::ForeignDomain)) {
+        return Err(GatewayError::bad_request(
+            "this resolver answers only for names under handles.link",
+        ));
+    }
 
     // Only `addr` has a shape this gateway can fill. Anything else — `text()`,
     // or a record invented later — degrades to no result rather than to an
     // error, so a name that resolves fine for addresses does not look broken.
+    //
+    // Settled before any null is built, because a null has the shape of the
+    // record it answers: `addr(bytes32)` returns an `address` and its null is
+    // 32 zero bytes, while ENSIP-11's `addr(bytes32,uint256)` returns `bytes`
+    // and its null is the empty string. A null built before the record was
+    // read hard-coded the second shape, and a wallet decoding the first read
+    // the `bytes` offset word as the address 0x…0020 — signed.
     let Record::Addr {
         node,
         coin_type,
@@ -512,6 +518,21 @@ async fn self_answer(
                 legacy,
             }
         });
+    };
+
+    // A name under our domain that this build cannot read is a name nobody
+    // holds. Refusing would report an error for text a wallet is entitled to
+    // ask about. Answered only here, past the chain check: a chain this
+    // gateway does not serve keeps its unsigned refusal, so the client walks
+    // on to a sibling that may read the name.
+    let query = match parsed {
+        Ok(query) => query,
+        Err(_) => {
+            return Ok(Answer::Addr {
+                address: None,
+                legacy,
+            })
+        }
     };
 
     // A chain label narrows and never widens: a label naming another chain is

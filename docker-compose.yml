@@ -10,20 +10,23 @@ services:
     build:
       context: .
       target: indexer
-    # Everything `.env.example` documents reaches the container, not just the
-    # names repeated below. Without this the optional settings — the whole ENS
-    # block especially — are interpolated into the compose file and then
-    # dropped, so a configured gateway silently never mounts. The explicit map
-    # stays because it takes precedence and carries the `:?` checks.
-    env_file:
-      - path: .env
-        required: false
+    # An explicit map and no `env_file`: `.env` also carries the API's signing
+    # key, and this half has no use for it. Everything the indexer reads is
+    # listed here, with the `:?` checks on what it cannot do without. The
+    # optional settings use the value-less form, which passes a variable
+    # through from `.env` or the shell only when it is set: `${VAR:-}` would
+    # set it to the empty string, which clap refuses for an `Option<u64>`, and
+    # the container would exit at startup.
     environment:
       DATABASE_URL: postgres://usernames:${POSTGRES_PASSWORD:-usernames_dev}@postgres:5432/usernames
       RPC_URL: ${RPC_URL:?set RPC_URL}
       IDENTITY_NAMES_ADDRESS: ${IDENTITY_NAMES_ADDRESS:?set IDENTITY_NAMES_ADDRESS}
-      CHAIN_ID: ${CHAIN_ID:-}
+      CHAIN_ID:
       CONFIRMATIONS: ${CONFIRMATIONS:-5}
+      POLL_INTERVAL_SECS: ${POLL_INTERVAL_SECS:-5}
+      MAX_BLOCK_RANGE: ${MAX_BLOCK_RANGE:-10000}
+      START_BLOCK:
+      RUST_LOG:
     depends_on:
       postgres:
         condition: service_healthy
@@ -47,6 +50,10 @@ services:
       # Required here, unlike the indexer: nothing in this process talks to a
       # chain, so it cannot discover which chain's rows it serves.
       CHAIN_ID: ${CHAIN_ID:?set CHAIN_ID}
+      # The image's bind, pinned: `.env` may carry the cargo-run value
+      # `127.0.0.1:8080`, and through `env_file` it would win — a container
+      # listening on its own loopback, behind a port map that reaches nothing.
+      LISTEN_ADDR: 0.0.0.0:8080
     ports:
       - "127.0.0.1:8080:8080"
     depends_on:

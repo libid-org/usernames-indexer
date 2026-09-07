@@ -158,9 +158,10 @@ async fn ask(router: &Router, sender: Address, call: &[u8]) -> (StatusCode, Stri
     (status, text)
 }
 
-/// Pull `result` back out of the gateway's blob and check the signature is the
-/// one the resolver would accept. Returns the address, or `None` for a null.
-fn verify(body: &str, call: &[u8]) -> Option<Address> {
+/// The signed result inside a gateway answer, once the signature is checked
+/// to be one the resolver would accept. These are the bytes the callback
+/// returns to the wallet, in whatever shape the record call asked for.
+fn signed_result(body: &str, call: &[u8]) -> Vec<u8> {
     let value: serde_json::Value = serde_json::from_str(body).expect("json");
     let data = hex::decode(
         value["data"]
@@ -194,7 +195,12 @@ fn verify(body: &str, call: &[u8]) -> Option<Address> {
         SIGNER_KEY.parse::<PrivateKeySigner>().unwrap().address(),
         "the resolver would recover a signer it does not trust"
     );
+    result.to_vec()
+}
 
+/// The address in a gateway answer, or `None` for a null in either shape.
+fn verify(body: &str, call: &[u8]) -> Option<Address> {
+    let result = signed_result(body, call);
     // Both shapes, because the caller chooses which to ask in and a helper that
     // knows only one reports a correct legacy answer as a null.
     match result.len() {
@@ -333,6 +339,45 @@ async fn a_name_this_build_cannot_read_is_null_rather_than_an_error() {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(verify(&body, &call), None);
     }
+}
+
+/// The null for an unreadable name takes the shape of the record asked in.
+///
+/// `addr(bytes32)` returns an `address`, so its null is 32 zero bytes; the
+/// ENSIP-11 form returns `bytes`, whose null is empty. A null built before the
+/// record was read came out in the second shape whatever the caller asked, and
+/// a wallet decoding the first read the `bytes` offset word as the address
+/// 0x…0020 — signed, so authoritative.
+#[tokio::test]
+async fn an_unreadable_name_is_null_in_the_shape_the_caller_asked_in() {
+    // Mainnet, because the legacy form is coin type 60 and a gateway that does
+    // not serve it refuses unsigned rather than answering.
+    let Some((router, _store, _g)) = gateway_over(&[(1, None)], 32).await else {
+        return;
+    };
+    let labels = ["alice", "myspace"];
+    let call = resolve_call(&wire_name(&labels), &legacy_addr_call(&labels));
+    let (status, body) = ask(&router, RESOLVER, &call).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        signed_result(&body, &call),
+        [0u8; 32],
+        "the legacy null is the zero address, 32 bytes"
+    );
+    assert_eq!(verify(&body, &call), None);
+}
+
+/// A chain this gateway does not serve keeps its unsigned refusal for an
+/// unreadable name too: the null is never signed ahead of the chain check, so
+/// the client walks on to a sibling that may read the name.
+#[tokio::test]
+async fn an_unreadable_name_off_our_chains_is_still_refused_unsigned() {
+    let (router, _store, _g) = gateway_or_skip!(None, 32);
+    let labels = ["alice", "myspace"];
+    let call = resolve_call(&wire_name(&labels), &addr_call(&labels, 0x8000_2105));
+    let (status, body) = ask(&router, RESOLVER, &call).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(!body.contains("\"data\""), "a refusal must carry no answer");
 }
 
 #[tokio::test]
@@ -552,7 +597,11 @@ async fn the_merged_router_keeps_both_halves_intact() {
         "the gateway route must not claim the API's namespace"
     );
 
-    // And the gateway answers under its prefix.
+    // And the gateway answers under its prefix — with the CORS header, on the
+    // answer and on a refusal alike. This is the regression `build_router`
+    // exists to prevent: a layer applied inside `api::router` leaves the
+    // gateway route without `Access-Control-Allow-Origin`, and a browser
+    // running the batch gateway in the page never sees the answer.
     let call = resolve_call(
         &wire_name(&["alice", "x"]),
         &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
@@ -562,7 +611,30 @@ async fn the_merged_router_keeps_both_halves_intact() {
         usernames_api::ens::ROUTE_PREFIX,
         hex::encode(&call)
     );
-    assert_eq!(get(uri).await.status(), StatusCode::OK);
+    let allowed_origin = |response: &axum::response::Response| {
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .map(|v| v.as_bytes().to_vec())
+    };
+    let answer = get(uri).await;
+    assert_eq!(answer.status(), StatusCode::OK);
+    assert_eq!(
+        allowed_origin(&answer).as_deref(),
+        Some(&b"*"[..]),
+        "the gateway route carries no CORS header"
+    );
+    let refused = get(format!(
+        "{}/not-an-address/0x00.json",
+        usernames_api::ens::ROUTE_PREFIX
+    ))
+    .await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        allowed_origin(&refused).as_deref(),
+        Some(&b"*"[..]),
+        "a refusal without the CORS header is one a browser cannot even read"
+    );
 }
 
 /// The request names one thing twice — once as a name, once as the node inside
@@ -599,7 +671,9 @@ async fn a_node_that_is_not_this_name_is_refused() {
 /// Every answer here is signed, and a signed null is an authoritative "nobody
 /// holds this". This gateway has no standing to say that about `vitalik.eth`.
 /// The check has to run before the record is looked at, because a record it
-/// cannot answer would otherwise short-circuit to a null for any name at all.
+/// cannot answer would otherwise short-circuit to a null for any name at all —
+/// and before label hygiene, because `Vitalik.eth` is foreign first and
+/// unnormalized second, and "unreadable" would have earned it a signed null.
 #[tokio::test]
 async fn a_name_outside_the_domain_is_refused_whatever_the_record() {
     let (router, _store, _g) = gateway_or_skip!(None, 32);
@@ -611,8 +685,13 @@ async fn a_name_outside_the_domain_is_refused_whatever_the_record() {
     addr.extend_from_slice(&(0x8000_0000u64 | CHAIN as u64).to_be_bytes());
 
     for inner in [addr, vec![0xaa, 0xbb, 0xcc, 0xdd]] {
-        let call = resolve_call(b"\x07vitalik\x03eth\x00", &inner);
-        let (status, body) = ask(&router, RESOLVER, &call).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        for name in [
+            &b"\x07vitalik\x03eth\x00"[..],
+            &b"\x07Vitalik\x03eth\x00"[..],
+        ] {
+            let call = resolve_call(name, &inner);
+            let (status, body) = ask(&router, RESOLVER, &call).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        }
     }
 }

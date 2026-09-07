@@ -30,11 +30,11 @@ use usernames_core::{
 #[command(name = "usernames-indexer", about)]
 pub struct Config {
     /// Postgres connection string.
-    #[arg(long, env = "DATABASE_URL")]
+    #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
     pub database_url: String,
 
     /// JSON-RPC endpoint of the chain to follow.
-    #[arg(long, env = "RPC_URL")]
+    #[arg(long, env = "RPC_URL", hide_env_values = true)]
     pub rpc_url: Url,
 
     /// The IdentityNames ERC1967 proxy address. Typed as an address so
@@ -127,5 +127,30 @@ pub async fn run() -> anyhow::Result<()> {
             Ok(()) => Err(anyhow::anyhow!("indexer task exited unexpectedly")),
             Err(e) => Err(anyhow::anyhow!("indexer task died: {e}")),
         },
+    }
+}
+
+#[cfg(test)]
+mod help_tests {
+    use clap::CommandFactory;
+
+    use super::Config;
+
+    /// clap renders `[env: NAME=value]` in `--help` for every argument bound
+    /// to a variable, and `.env` is read before parsing, so without
+    /// `hide_env_values` a secret is one `--help` away from a CI log.
+    #[test]
+    fn help_never_prints_a_secret() {
+        let command = Config::command();
+        for secret in ["database_url", "rpc_url"] {
+            let arg = command
+                .get_arguments()
+                .find(|a| a.get_id() == secret)
+                .unwrap_or_else(|| panic!("{secret} is an argument"));
+            assert!(
+                arg.is_hide_env_values_set(),
+                "{secret} shows its value in --help"
+            );
+        }
     }
 }
