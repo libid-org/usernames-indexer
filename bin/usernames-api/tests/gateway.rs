@@ -120,7 +120,7 @@ async fn gateway_parts(
     let store = ChainStore::new(pool.clone(), chains[0]);
     let config = Config {
         resolver: RESOLVER,
-        pool: pool.clone(),
+        store: db::Store::new(pool.clone()),
         ttl_secs: 300,
         max_lag_blocks,
         signer: std::sync::Arc::new(SIGNER_KEY.parse::<PrivateKeySigner>().expect("key")),
@@ -181,7 +181,11 @@ fn signed_result(body: &str, call: &[u8]) -> Vec<u8> {
     let sig_len = word(sig_at) as usize;
     let signature = &data[sig_at + 32..sig_at + 32 + sig_len];
 
-    let digest = ens::signature_digest(RESOLVER, expires, call, result);
+    let digest = ens::Reply {
+        result: result.to_vec(),
+        expires,
+    }
+    .digest(RESOLVER, call);
     let recovered = alloy::primitives::Signature::try_from(signature)
         .expect("65-byte signature")
         .recover_address_from_prehash(&digest)
@@ -873,7 +877,8 @@ async fn a_node_that_is_not_this_name_is_refused() {
 #[tokio::test]
 async fn a_name_outside_the_domain_is_refused_whatever_the_record() {
     let (router, _store, _g) = gateway_or_skip!(32);
-    let node = usernames_core::ens::namehash(&["vitalik".to_string(), "eth".to_string()]);
+    let node =
+        ens::Name::from_labels(vec!["vitalik".to_string(), "eth".to_string()]).node();
 
     let mut addr = vec![0xf1, 0xcb, 0x7e, 0x06];
     addr.extend_from_slice(node.as_slice());

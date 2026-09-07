@@ -223,7 +223,7 @@ async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> 
     // The gateway is bound to THIS resolver, because the signature names it.
     let router = usernames_api::ens::router(GatewayState::new(Config {
         resolver: *resolver.address(),
-        pool: store.pool().clone(),
+        store: db::Store::new(store.pool().clone()),
         ttl_secs: 300,
         max_lag_blocks: 32,
         signer: std::sync::Arc::new(signer),
@@ -236,7 +236,7 @@ async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> 
         addrCall {
             // The namehash of the same name, as a wallet sends it: the gateway
             // checks that the request's two halves describe one name.
-            node: usernames_core::ens::namehash(&labels),
+            node: usernames_core::ens::Name::from_labels(labels.to_vec()).node(),
             coinType: U256::from(0x8000_0000u64 | CHAIN as u64),
         }
         .abi_encode(),

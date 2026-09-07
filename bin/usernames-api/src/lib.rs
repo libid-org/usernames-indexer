@@ -114,7 +114,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     // Configured BEFORE the port opens: it can refuse to start, and binding
     // first would accept connections the process is not yet able to serve.
-    let gateway = ens_config(&config, pool)?;
+    let gateway = config.gateway(pool)?;
     match &gateway {
         Some(g) => info!(
             resolver = %g.resolver,
@@ -201,58 +201,56 @@ const BLOCK_TIMESTAMP_SLACK_SECS: u64 = 300;
 /// The longest TTL a gateway may be configured with.
 const MAX_TTL_SECS: u64 = RESOLVER_MAX_LIFETIME_SECS - BLOCK_TIMESTAMP_SLACK_SECS;
 
-/// The key this gateway signs with, and the resolver it signs for.
-///
-/// `None` when no gateway runs: the key is what turns the route on. A key
-/// without a resolver is a usage error rather than a default, because there is
-/// no safe resolver to guess — signing for whatever address asked would make
-/// this a signing oracle.
-fn signing_identity(
-    config: &Config,
-) -> anyhow::Result<Option<(PrivateKeySigner, Address)>> {
-    let Some(key) = config.ens_signer_key.as_deref() else {
-        return Ok(None);
-    };
-    let resolver = config.ens_resolver_address.ok_or_else(|| {
-        anyhow::anyhow!("ENS_SIGNER_KEY is set but ENS_RESOLVER_ADDRESS is not")
-    })?;
-    let signer: PrivateKeySigner = key
-        .trim_start_matches("0x")
-        .parse()
-        .map_err(|e| anyhow::anyhow!("ENS_SIGNER_KEY is not a private key: {e}"))?;
-    Ok(Some((signer, resolver)))
-}
-
-/// Build the gateway configuration, or `None` when this deployment runs none.
-fn ens_config(
-    config: &Config,
-    pool: sqlx::PgPool,
-) -> anyhow::Result<Option<ens::Config>> {
-    let Some((signer, resolver)) = signing_identity(config)? else {
-        return Ok(None);
-    };
-
-    // The resolver enforces this on chain; refuse at startup rather than let a
-    // deployment sign answers that always revert.
-    if config.ens_ttl_secs > MAX_TTL_SECS {
-        anyhow::bail!(
-            "ENS_TTL_SECS is {}, but the resolver's MAX_LIFETIME is {}s and it \
-             measures from the block's timestamp, not from now — leave {}s for \
-             the chain to trail, so at most {}",
-            config.ens_ttl_secs,
-            RESOLVER_MAX_LIFETIME_SECS,
-            BLOCK_TIMESTAMP_SLACK_SECS,
-            MAX_TTL_SECS
-        );
+impl Config {
+    /// The key this gateway signs with, and the resolver it signs for.
+    ///
+    /// `None` when no gateway runs: the key is what turns the route on. A key
+    /// without a resolver is a usage error rather than a default, because
+    /// there is no safe resolver to guess — signing for whatever address asked
+    /// would make this a signing oracle.
+    fn signing_identity(&self) -> anyhow::Result<Option<(PrivateKeySigner, Address)>> {
+        let Some(key) = self.ens_signer_key.as_deref() else {
+            return Ok(None);
+        };
+        let resolver = self.ens_resolver_address.ok_or_else(|| {
+            anyhow::anyhow!("ENS_SIGNER_KEY is set but ENS_RESOLVER_ADDRESS is not")
+        })?;
+        let signer: PrivateKeySigner = key
+            .trim_start_matches("0x")
+            .parse()
+            .map_err(|e| anyhow::anyhow!("ENS_SIGNER_KEY is not a private key: {e}"))?;
+        Ok(Some((signer, resolver)))
     }
 
-    Ok(Some(ens::Config {
-        resolver,
-        pool,
-        ttl_secs: config.ens_ttl_secs,
-        max_lag_blocks: config.ens_max_lag_blocks,
-        signer: Arc::new(signer),
-    }))
+    /// The gateway this configuration describes, or `None` when this
+    /// deployment runs none.
+    pub fn gateway(&self, pool: sqlx::PgPool) -> anyhow::Result<Option<ens::Config>> {
+        let Some((signer, resolver)) = self.signing_identity()? else {
+            return Ok(None);
+        };
+
+        // The resolver enforces this on chain; refuse at startup rather than
+        // let a deployment sign answers that always revert.
+        if self.ens_ttl_secs > MAX_TTL_SECS {
+            anyhow::bail!(
+                "ENS_TTL_SECS is {}, but the resolver's MAX_LIFETIME is {}s and it \
+                 measures from the block's timestamp, not from now — leave {}s for \
+                 the chain to trail, so at most {}",
+                self.ens_ttl_secs,
+                RESOLVER_MAX_LIFETIME_SECS,
+                BLOCK_TIMESTAMP_SLACK_SECS,
+                MAX_TTL_SECS
+            );
+        }
+
+        Ok(Some(ens::Config {
+            resolver,
+            store: db::Store::new(pool),
+            ttl_secs: self.ens_ttl_secs,
+            max_lag_blocks: self.ens_max_lag_blocks,
+            signer: Arc::new(signer),
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -291,7 +289,7 @@ mod tests {
     /// `ens::Config` holds a signer and so is not `Debug`; match rather than
     /// `expect_err`.
     fn refusal(extra: &[&str]) -> String {
-        match ens_config(&config(extra), lazy_pool()) {
+        match config(extra).gateway(lazy_pool()) {
             Ok(_) => panic!("this configuration must be refused"),
             Err(e) => e.to_string(),
         }
@@ -309,7 +307,8 @@ mod tests {
             "1",
         ])
         .expect("parse");
-        let mounted = ens_config(&config, lazy_pool())
+        let mounted = config
+            .gateway(lazy_pool())
             .expect("no key is not an error")
             .is_some();
         assert!(!mounted, "the route must not be mounted without a key");
@@ -328,7 +327,7 @@ mod tests {
     #[tokio::test]
     async fn the_ttl_ceiling_leaves_the_chain_room_to_trail() {
         let at_ceiling = config(&["--ens-ttl-secs", &MAX_TTL_SECS.to_string()]);
-        assert!(ens_config(&at_ceiling, lazy_pool()).is_ok());
+        assert!(at_ceiling.gateway(lazy_pool()).is_ok());
 
         let message =
             refusal(&["--ens-ttl-secs", &RESOLVER_MAX_LIFETIME_SECS.to_string()]);

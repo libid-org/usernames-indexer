@@ -55,7 +55,7 @@ pub fn namehash_of(labels: &[&str]) -> B256 {
         .map(|l| (*l).to_string())
         .chain(["handles".to_string(), "link".to_string()])
         .collect();
-    usernames_core::ens::namehash(&full)
+    usernames_core::ens::Name::from_labels(full).node()
 }
 
 /// `resolve(name, data)`, encoded by the same codec the gateway decodes with.
