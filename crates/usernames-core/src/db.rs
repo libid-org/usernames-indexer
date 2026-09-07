@@ -116,12 +116,6 @@ impl Store {
     }
 }
 
-fn deploy_block_key(contract: Address) -> String {
-    // The address is part of the key: repointing the indexer at a different
-    // contract must not inherit the old contract's deployment block.
-    format!("deploy_block:{contract}")
-}
-
 /// The migrations this crate owns, embedded at compile time.
 ///
 /// Exposed because `sqlx::migrate!` resolves its path against the crate that
@@ -476,6 +470,13 @@ impl ChainStore {
         }
     }
 
+    /// The metadata key the deployment block of `contract` is cached under.
+    /// The address is part of it: repointing the indexer at a different
+    /// contract must not inherit the old contract's deployment block.
+    fn deploy_block_key(contract: Address) -> String {
+        format!("deploy_block:{contract}")
+    }
+
     /// The validity the store will write for a report: at most ten years,
     /// so the `bigint` addition in Postgres can never overflow and fail the
     /// whole statement, target included.
@@ -581,7 +582,7 @@ impl ChainStore {
         &self,
         contract: Address,
     ) -> Result<Option<u64>, sqlx::Error> {
-        let value = self.get_metadata(&deploy_block_key(contract)).await?;
+        let value = self.get_metadata(&Self::deploy_block_key(contract)).await?;
         Ok(value.and_then(|v| v.parse().ok()))
     }
 
@@ -592,7 +593,7 @@ impl ChainStore {
         contract: Address,
         block: u64,
     ) -> Result<(), sqlx::Error> {
-        self.set_metadata(&deploy_block_key(contract), &block.to_string())
+        self.set_metadata(&Self::deploy_block_key(contract), &block.to_string())
             .await
     }
 
@@ -1040,9 +1041,7 @@ impl HandleRow {
             .and_then(|bytes| <[u8; 20]>::try_from(bytes).ok())
             .map(Address::from)
     }
-}
 
-impl HandleRow {
     /// Mirrors `resolvePair`: the account id this handle points back at
     /// still resolves to the same wallet.
     pub fn id_agrees(&self) -> bool {

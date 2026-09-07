@@ -178,8 +178,8 @@ impl Config {
             ));
         }
 
-        let (chain_id, mirror) = match self.mirror_for(coin_type).await? {
-            ChainMatch::One { chain_id, mirror } => (chain_id, mirror),
+        let mirror = match self.mirror_for(coin_type).await? {
+            ChainMatch::One(mirror) => mirror,
             // A coin type that names no EVM chain at all — Bitcoin, say — is a
             // SIGNED null: no libID binding is ever an address of that kind,
             // and saying so needs no chain. Only an EVM chain the store does
@@ -204,7 +204,7 @@ impl Config {
         // A chain label narrows and never widens: a label naming another chain
         // is simply not this chain's name.
         if let Some(label) = &query.chain_label {
-            if KnownChain::label_of(chain_id) != Some(label.as_str()) {
+            if KnownChain::label_of(mirror.chain_id()) != Some(label.as_str()) {
                 return Ok(null);
             }
         }
@@ -254,13 +254,14 @@ impl Config {
             .filter(|id| coin_type.names_chain(*id))
             .collect();
         Ok(match candidates.as_slice() {
-            [chain_id] => ChainMatch::One {
-                chain_id: *chain_id,
-                mirror: self.mirror(*chain_id),
-            },
+            [chain_id] => ChainMatch::One(self.mirror(*chain_id)),
             [] => ChainMatch::None,
             both => {
-                warn!(chains = ?both, %coin_type, "two indexed chains share one coin type");
+                warn!(
+                    chains = ?both,
+                    %coin_type,
+                    "two indexed chains share one coin type"
+                );
                 ChainMatch::Ambiguous
             }
         })
@@ -293,7 +294,10 @@ impl Config {
         request: &[u8],
         result: Vec<u8>,
     ) -> Result<GatewayResponse, GatewayError> {
-        let reply = Reply::good_for(result, self.ttl_secs);
+        let reply = Reply {
+            result,
+            expires: Self::now().saturating_add(self.ttl_secs),
+        };
         let signature = self
             .signer
             .sign_hash(&B256::from(reply.digest(self.resolver, request)))
@@ -305,6 +309,41 @@ impl Config {
         Ok(GatewayResponse {
             data: format!("0x{}", hex::encode(reply.encode(&signature.as_bytes()))),
         })
+    }
+
+    /// The clock an expiry is dated from: the gateway's, so the core module
+    /// stays pure. Saturating, so an absurd TTL cannot wrap it — the startup
+    /// ceiling rules one out anyway.
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default()
+    }
+
+    /// Refuse a request that names another resolver.
+    ///
+    /// Bound to one resolver on purpose. The digest names the configured
+    /// target, never `sender`, so this check adds no authority — what it adds
+    /// is a visible error. Logged, because a 4xx is terminal for an ERC-3668
+    /// client (it ends the walk of the resolver's `urls`) and a line here is
+    /// the only way an operator learns that `ENS_RESOLVER_ADDRESS` fell behind
+    /// a `setResolver`.
+    fn accept(&self, sender: &str) -> Result<(), GatewayError> {
+        let sender: Address = sender
+            .parse()
+            .map_err(|_| GatewayError::bad_request("sender is not an address"))?;
+        if sender != self.resolver {
+            warn!(
+                %sender,
+                resolver = %self.resolver,
+                "refusing a request that names another resolver"
+            );
+            return Err(GatewayError::bad_request(
+                "this gateway answers for a different resolver",
+            ));
+        }
+        Ok(())
     }
 
     /// One row per chain the store holds, as supervision should see it.
@@ -336,8 +375,8 @@ impl Config {
 
 /// Which chain a coin type named among the chains the store holds.
 enum ChainMatch {
-    /// Exactly one, and its mirror.
-    One { chain_id: u64, mirror: Mirror },
+    /// Exactly one: its mirror.
+    One(Mirror),
     /// None: the store does not hold a chain with that coin type.
     None,
     /// Two, which share the coin type; neither may be answered.
@@ -348,6 +387,11 @@ enum ChainMatch {
 struct Mirror(ChainStore);
 
 impl Mirror {
+    /// The chain this is the mirror of.
+    fn chain_id(&self) -> u64 {
+        u64::try_from(self.0.chain_id()).expect("came from a u64")
+    }
+
     /// The owner a name resolves to, as of whatever block this chain's
     /// indexer last committed. `None` is the null answer — a name nobody
     /// holds.
@@ -624,10 +668,10 @@ impl GatewayError {
 
     /// An unsigned refusal: the client walks on to the next endpoint in the
     /// resolver's `urls`.
-    fn unavailable(message: impl ToString) -> Self {
+    fn unavailable(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
-            message: message.to_string(),
+            message: message.into(),
         }
     }
 
@@ -658,40 +702,38 @@ impl IntoResponse for GatewayError {
     }
 }
 
-/// The ERC-3668 route: check the sender, decode the call, answer, sign.
+/// One request's calldata, as the path carried it and as it decodes.
+struct Request {
+    /// The exact bytes the resolver will pass back as `extraData`, which the
+    /// signature must cover.
+    call_data: Vec<u8>,
+    /// What they ask.
+    call: ResolveCall,
+}
+
+impl Request {
+    /// The `{data}` path segment: hex, with or without `0x`, with or without
+    /// the conventional `.json` suffix.
+    fn from_path(data: &str) -> Result<Self, GatewayError> {
+        let call_data = hex::decode(
+            data.strip_suffix(".json")
+                .unwrap_or(data)
+                .trim_start_matches("0x"),
+        )
+        .map_err(|_| GatewayError::bad_request("data is not hex"))?;
+        let call = ResolveCall::decode(&call_data).map_err(GatewayError::bad_request)?;
+        Ok(Self { call_data, call })
+    }
+}
+
+/// The ERC-3668 route: accept the sender, decode the call, answer, sign.
 async fn resolve(
     State(state): State<GatewayState>,
     Path((sender, data)): Path<(String, String)>,
 ) -> Result<Json<GatewayResponse>, GatewayError> {
     let config = &state.config;
-    let sender: Address = sender
-        .parse()
-        .map_err(|_| GatewayError::bad_request("sender is not an address"))?;
-    // Bound to one resolver on purpose. The digest names the configured
-    // target, never `sender`, so this check adds no authority — what it adds
-    // is a visible error. Logged, because a 4xx is terminal for an ERC-3668
-    // client (it ends the walk of the resolver's `urls`) and a line here is
-    // the only way an operator learns that `ENS_RESOLVER_ADDRESS` fell behind
-    // a `setResolver`.
-    if sender != config.resolver {
-        warn!(
-            %sender,
-            resolver = %config.resolver,
-            "refusing a request that names another resolver"
-        );
-        return Err(GatewayError::bad_request(
-            "this gateway answers for a different resolver",
-        ));
-    }
-
-    let call_data = hex::decode(
-        data.strip_suffix(".json")
-            .unwrap_or(&data)
-            .trim_start_matches("0x"),
-    )
-    .map_err(|_| GatewayError::bad_request("data is not hex"))?;
-    let call = ResolveCall::decode(&call_data).map_err(GatewayError::bad_request)?;
-
-    let result = config.answer(&call).await?.into_result()?;
-    Ok(Json(config.sign(&call_data, result).await?))
+    config.accept(&sender)?;
+    let request = Request::from_path(&data)?;
+    let result = config.answer(&request.call).await?.into_result()?;
+    Ok(Json(config.sign(&request.call_data, result).await?))
 }

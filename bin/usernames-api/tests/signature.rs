@@ -25,8 +25,8 @@ fn signer() -> PrivateKeySigner {
         .expect("a valid key")
 }
 
-/// The same construction `signature_digest` builds, spelled out again from the
-/// specification rather than reused, so this fails if that function drifts.
+/// The same construction `Reply::digest` builds, spelled out again from the
+/// specification rather than reused, so this fails if that method drifts.
 fn digest(target: Address, expires: u64, request: &[u8], result: &[u8]) -> B256 {
     let mut preimage = vec![0x19, 0x00];
     preimage.extend_from_slice(target.as_slice());

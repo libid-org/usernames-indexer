@@ -271,7 +271,7 @@ pub enum Record {
 
 impl Record {
     /// Which record the inner calldata asks for.
-    pub fn decode(inner: &[u8]) -> Self {
+    fn decode(inner: &[u8]) -> Self {
         let Some((selector, args)) = inner.split_at_checked(4) else {
             return Self::Other;
         };
@@ -554,18 +554,6 @@ pub struct Reply {
 }
 
 impl Reply {
-    /// A reply good for `ttl_secs` from now.
-    pub fn good_for(result: Vec<u8>, ttl_secs: u64) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or_default();
-        Self {
-            result,
-            expires: now.saturating_add(ttl_secs),
-        }
-    }
-
     /// What the gateway signs, byte-identical to
     /// `HandleResolver.makeSignatureHash` and to the `SignatureVerifier` of
     /// the ENS reference.
