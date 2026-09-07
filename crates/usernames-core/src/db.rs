@@ -61,7 +61,23 @@ const CONTRACT_KEY: &str = "contract";
 const CURSOR_KEY: &str = "cursor";
 const HEAD_KEY: &str = "head";
 const TARGET_KEY: &str = "target";
+const TARGET_REPORTED_AT_KEY: &str = "target_reported_at";
+const TARGET_VALID_UNTIL_KEY: &str = "target_valid_until";
 const WINDOW_ERROR_KEY: &str = "window_error";
+
+/// The mirror's standing, as [`ChainStore::mirror_position`] reads it, every
+/// moment by the database's clock.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MirrorPosition {
+    /// The block the indexer last set out to reach.
+    pub target: Option<u64>,
+    /// The block the cursor has committed through.
+    pub cursor: Option<u64>,
+    /// Unix seconds at which the indexer last reported.
+    pub reported_at: Option<u64>,
+    /// Seconds until the indexer's last report expires; negative once it has.
+    pub valid_for: Option<i64>,
+}
 
 fn deploy_block_key(contract: Address) -> String {
     // The address is part of the key: repointing the indexer at a different
@@ -366,10 +382,99 @@ impl ChainStore {
     /// and `CONFIRMATIONS` blocks behind the head. Comparing the cursor to the
     /// head instead makes a healthy mirror look permanently late by the
     /// confirmation depth.
-    pub async fn set_chain_target(&self, target: u64) {
-        if let Err(e) = self.set_metadata(TARGET_KEY, &target.to_string()).await {
+    /// Record the target, when it was reported, and how long readers may
+    /// trust that report — `valid_for_secs` from now, by the database's
+    /// clock. One statement, so the three cannot disagree: a report must
+    /// never vouch for a target write that failed, and no host's clock
+    /// enters into it.
+    pub async fn set_chain_target(&self, target: u64, valid_for_secs: u64) {
+        let written = sqlx::query(
+            r#"INSERT INTO names.chain_metadata (chain_id, key, value)
+               VALUES ($1, $2, $3),
+                      ($1, $4, EXTRACT(EPOCH FROM now())::bigint::text),
+                      ($1, $5, (EXTRACT(EPOCH FROM now())::bigint + $6)::text)
+               ON CONFLICT (chain_id, key) DO UPDATE SET value = EXCLUDED.value"#,
+        )
+        .bind(self.chain_id)
+        .bind(TARGET_KEY)
+        .bind(target.to_string())
+        .bind(TARGET_REPORTED_AT_KEY)
+        .bind(TARGET_VALID_UNTIL_KEY)
+        .bind(i64::try_from(valid_for_secs).unwrap_or(i64::MAX))
+        .execute(&self.pool)
+        .await;
+        if let Err(e) = written {
             warn!(%e, "failed to record the chain target");
         }
+    }
+
+    /// Renew the report without moving the target. A long catch-up commits
+    /// chunk by chunk under one target, and every committed chunk is proof
+    /// that the loop is alive and the chain reachable; without this a healthy
+    /// backfill would expire.
+    pub async fn touch_chain_target(&self, valid_for_secs: u64) {
+        let touched = sqlx::query(
+            r#"INSERT INTO names.chain_metadata (chain_id, key, value)
+               VALUES ($1, $2, EXTRACT(EPOCH FROM now())::bigint::text),
+                      ($1, $3, (EXTRACT(EPOCH FROM now())::bigint + $4)::text)
+               ON CONFLICT (chain_id, key) DO UPDATE SET value = EXCLUDED.value"#,
+        )
+        .bind(self.chain_id)
+        .bind(TARGET_REPORTED_AT_KEY)
+        .bind(TARGET_VALID_UNTIL_KEY)
+        .bind(i64::try_from(valid_for_secs).unwrap_or(i64::MAX))
+        .execute(&self.pool)
+        .await;
+        if let Err(e) = touched {
+            warn!(%e, "failed to renew the chain target's report");
+        }
+    }
+
+    /// Set when the report expires, as Unix seconds of the database's clock.
+    /// Public so a test can expire it; the loop writes nothing but the future.
+    pub async fn set_chain_target_valid_until(&self, secs: u64) {
+        if let Err(e) = self
+            .set_metadata(TARGET_VALID_UNTIL_KEY, &secs.to_string())
+            .await
+        {
+            warn!(%e, "failed to record when the chain target's report expires");
+        }
+    }
+
+    /// Where the mirror stands, in one read: the target, the cursor, when the
+    /// indexer last reported and how long that report is still good — the
+    /// last by the database's clock, the same one that stamped it. One
+    /// statement, so the four are a snapshot and one round trip on the
+    /// gateway's hot path.
+    pub async fn mirror_position(&self) -> Result<MirrorPosition, sqlx::Error> {
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            r#"SELECT key, value, EXTRACT(EPOCH FROM now())::bigint
+               FROM names.chain_metadata
+               WHERE chain_id = $1 AND key IN ($2, $3, $4, $5)"#,
+        )
+        .bind(self.chain_id)
+        .bind(TARGET_KEY)
+        .bind(CURSOR_KEY)
+        .bind(TARGET_REPORTED_AT_KEY)
+        .bind(TARGET_VALID_UNTIL_KEY)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut position = MirrorPosition::default();
+        for (key, value, now) in rows {
+            if key == TARGET_KEY {
+                position.target = value.parse().ok();
+            } else if key == CURSOR_KEY {
+                position.cursor = value.parse().ok();
+            } else if key == TARGET_REPORTED_AT_KEY {
+                position.reported_at = value.parse().ok();
+            } else if key == TARGET_VALID_UNTIL_KEY {
+                position.valid_for = value
+                    .parse::<i64>()
+                    .ok()
+                    .map(|until| until.saturating_sub(now));
+            }
+        }
+        Ok(position)
     }
 
     /// The block the cursor is chasing, as last recorded by the indexer loop.

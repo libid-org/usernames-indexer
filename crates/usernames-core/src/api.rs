@@ -207,6 +207,13 @@ struct Status {
     /// steady is healthy; growing means the loop is stalled or starved —
     /// `last_window_error` says which.
     lag_blocks: Option<u64>,
+    /// Unix seconds at which the indexer last reported. `lag_blocks` cannot
+    /// show a stopped loop — its two terms are both that loop's writes and
+    /// freeze together — so watch this and `report_valid_for` too.
+    indexer_reported_at: Option<u64>,
+    /// Seconds until the indexer's last report expires, negative once it
+    /// has: past zero the ENS gateway refuses this chain's mirror.
+    report_valid_for: Option<i64>,
     last_window_error: Option<String>,
     indexer_version: &'static str,
 }
@@ -214,12 +221,15 @@ struct Status {
 async fn status(State(state): State<AppState>) -> Result<Json<Status>, ApiError> {
     let last = state.store.cursor().await?;
     let head = state.store.chain_head().await?;
+    let position = state.store.mirror_position().await?;
     Ok(Json(Status {
         chain_id: state.store.chain_id(),
         contract: state.contract.to_string(),
         last_indexed_block: last,
         chain_head_block: head,
         lag_blocks: head.map(|h| h.saturating_sub(last.unwrap_or(0))),
+        indexer_reported_at: position.reported_at,
+        report_valid_for: position.valid_for,
         last_window_error: state.store.window_error().await?,
         indexer_version: db::INDEXER_VERSION,
     }))

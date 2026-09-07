@@ -42,6 +42,12 @@ pub struct IndexerConfig {
     /// database, or right after a re-index). When unset, the deployment block
     /// is detected by binary search over `eth_getCode` and cached.
     pub start_block: Option<u64>,
+    /// How long readers may trust a report this loop makes, in seconds. Set
+    /// beside every target and renewed per committed chunk; a reader that
+    /// finds it expired treats the mirror as stale. It has to cover a poll
+    /// interval, a slow chunk and a missed cycle, which is why the CLI derives
+    /// it from `poll_interval_secs` when nothing sets it.
+    pub stale_after_secs: u64,
 }
 
 /// One chain's indexer: the store, the RPC provider and the knobs fused, so
@@ -220,7 +226,9 @@ impl<P: Provider> Indexer<P> {
             // the chain has grown, `target` is how far this loop intends to
             // get. A reader measuring staleness must use the second — the
             // cursor is never advanced past it.
-            self.store.set_chain_target(head).await;
+            self.store
+                .set_chain_target(head, self.config.stale_after_secs)
+                .await;
 
             if from_block > head {
                 sleep_or_cancel(&cancel, self.config.poll_interval_secs).await;
@@ -238,6 +246,12 @@ impl<P: Provider> Indexer<P> {
                     Ok(applied) => {
                         total += applied;
                         chunk_from = chunk_to + 1;
+                        // Each committed chunk is proof the loop is alive and
+                        // the chain reachable. Without this a long catch-up
+                        // would expire under the API's gate.
+                        self.store
+                            .touch_chain_target(self.config.stale_after_secs)
+                            .await;
                     }
                     Err(e) => {
                         warn!(%e, chunk_from, chunk_to, "window failed; will retry");
