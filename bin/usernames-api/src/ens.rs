@@ -350,13 +350,12 @@ struct GatewayStatus {
 async fn status(State(state): State<GatewayState>) -> Json<GatewayStatus> {
     let mut chains = Vec::with_capacity(state.config.chains.len());
     for (id, chain) in &state.config.chains {
-        let (source, position) = match &chain.source {
-            HandleSource::Chain { .. } => ("chain", None),
-            HandleSource::Mirror(store) => ("mirror", store.mirror_position().await.ok()),
-        };
-        let lag = match source {
-            "chain" => Lag::None,
-            _ => mirror_lag(position),
+        let (source, position, lag) = match &chain.source {
+            HandleSource::Chain { .. } => ("chain", None, Lag::None),
+            HandleSource::Mirror(store) => {
+                let position = store.mirror_position().await.ok();
+                ("mirror", position, mirror_lag(position))
+            }
         };
         chains.push(ChainStatus {
             chain_id: *id,

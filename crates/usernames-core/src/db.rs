@@ -79,6 +79,15 @@ pub struct MirrorPosition {
     pub valid_for: Option<i64>,
 }
 
+/// The longest validity the store will write: ten years. Anything larger is
+/// a mistake, and a value near `i64::MAX` would overflow the `bigint` addition
+/// in Postgres and fail the whole statement, target included.
+const MAX_VALID_FOR_SECS: u64 = 10 * 366 * 24 * 60 * 60;
+
+fn valid_for_bind(valid_for_secs: u64) -> i64 {
+    i64::try_from(valid_for_secs.min(MAX_VALID_FOR_SECS)).unwrap_or(i64::MAX)
+}
+
 fn deploy_block_key(contract: Address) -> String {
     // The address is part of the key: repointing the indexer at a different
     // contract must not inherit the old contract's deployment block.
@@ -382,12 +391,17 @@ impl ChainStore {
     /// and `CONFIRMATIONS` blocks behind the head. Comparing the cursor to the
     /// head instead makes a healthy mirror look permanently late by the
     /// confirmation depth.
+    ///
     /// Record the target, when it was reported, and how long readers may
     /// trust that report — `valid_for_secs` from now, by the database's
     /// clock. One statement, so the three cannot disagree: a report must
     /// never vouch for a target write that failed, and no host's clock
     /// enters into it.
-    pub async fn set_chain_target(&self, target: u64, valid_for_secs: u64) {
+    ///
+    /// Returns whether the write landed, so a caller renewing the report
+    /// later in the same cycle can decline to vouch for a target that never
+    /// made it.
+    pub async fn set_chain_target(&self, target: u64, valid_for_secs: u64) -> bool {
         let written = sqlx::query(
             r#"INSERT INTO names.chain_metadata (chain_id, key, value)
                VALUES ($1, $2, $3),
@@ -400,11 +414,15 @@ impl ChainStore {
         .bind(target.to_string())
         .bind(TARGET_REPORTED_AT_KEY)
         .bind(TARGET_VALID_UNTIL_KEY)
-        .bind(i64::try_from(valid_for_secs).unwrap_or(i64::MAX))
+        .bind(valid_for_bind(valid_for_secs))
         .execute(&self.pool)
         .await;
-        if let Err(e) = written {
-            warn!(%e, "failed to record the chain target");
+        match written {
+            Ok(_) => true,
+            Err(e) => {
+                warn!(%e, "failed to record the chain target");
+                false
+            }
         }
     }
 
@@ -422,7 +440,7 @@ impl ChainStore {
         .bind(self.chain_id)
         .bind(TARGET_REPORTED_AT_KEY)
         .bind(TARGET_VALID_UNTIL_KEY)
-        .bind(i64::try_from(valid_for_secs).unwrap_or(i64::MAX))
+        .bind(valid_for_bind(valid_for_secs))
         .execute(&self.pool)
         .await;
         if let Err(e) = touched {
@@ -430,8 +448,12 @@ impl ChainStore {
         }
     }
 
-    /// Set when the report expires, as Unix seconds of the database's clock.
-    /// Public so a test can expire it; the loop writes nothing but the future.
+    /// Set when the report expires, as absolute Unix seconds.
+    ///
+    /// A test seam, and nothing else: production writes validity only through
+    /// [`Self::set_chain_target`] and [`Self::touch_chain_target`], relative
+    /// to the database's clock. Nothing in the binaries may call this.
+    #[doc(hidden)]
     pub async fn set_chain_target_valid_until(&self, secs: u64) {
         if let Err(e) = self
             .set_metadata(TARGET_VALID_UNTIL_KEY, &secs.to_string())

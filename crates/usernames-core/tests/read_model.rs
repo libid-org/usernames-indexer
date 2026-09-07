@@ -688,3 +688,31 @@ async fn a_released_lease_frees_the_chain_for_the_next_holder() {
             .expect("second lease");
     second.release().await.expect("release");
 }
+
+/// The report the indexer makes beside the target expires on its own
+/// schedule, by the database's clock, and a renewal moves the expiry without
+/// moving the target — which is what keeps a long catch-up alive.
+#[tokio::test]
+async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
+    let Some((store, _pool, _g)) = test_store().await else {
+        return;
+    };
+    assert!(
+        store.set_chain_target(5, 1).await,
+        "the target write landed"
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let position = store.mirror_position().await.expect("position");
+    assert_eq!(position.target, Some(5));
+    assert!(position.valid_for.is_some_and(|s| s < 0), "{position:?}");
+
+    store.touch_chain_target(120).await;
+    let position = store.mirror_position().await.expect("position");
+    assert_eq!(
+        position.target,
+        Some(5),
+        "a renewal must not move the target"
+    );
+    assert!(position.valid_for.is_some_and(|s| s > 0), "{position:?}");
+    assert!(position.reported_at.is_some(), "{position:?}");
+}

@@ -26,6 +26,7 @@ services:
       POLL_INTERVAL_SECS: ${POLL_INTERVAL_SECS:-5}
       MAX_BLOCK_RANGE: ${MAX_BLOCK_RANGE:-10000}
       START_BLOCK:
+      STALE_AFTER_SECS:
       RUST_LOG:
     depends_on:
       postgres:
