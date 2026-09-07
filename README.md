@@ -47,7 +47,7 @@ the indexer's knobs is the point rather than an omission:
 | `DATABASE_URL` | both | — | Postgres connection string |
 | `RPC_URL` | indexer | — | JSON-RPC endpoint of the chain to follow. Prefer a single node or a sticky endpoint: a load balancer that mixes lagged replicas can answer `eth_getLogs` for blocks a backend has not seen, and events dropped that way past the confirmation margin are gone until a re-index. The loop re-checks the backend's height before committing a window, which narrows but cannot close that hole. |
 | `IDENTITY_NAMES_ADDRESS` | both | — | The IdentityNames **ERC1967 proxy** (the implementation changes on upgrade; the proxy is the one that emits). The API echoes it in `/v1/status`; set it to the same value the indexer runs with, or the status names a contract those rows did not come from |
-| `CHAIN_ID` | both | unset / **required** | Indexer: refuse to start unless the RPC reports this chain id. API: **required** — it talks to no chain, so it cannot discover which chain's rows it serves |
+| `CHAIN_ID` | both | unset / **required** | Indexer: refuse to start unless the RPC reports this chain id. API: **required** for `/v1/*` — that half talks to no chain, so it cannot discover which chain's rows it serves. The ENS gateway serves every chain in the store and does not read it |
 | `CONFIRMATIONS` | indexer | `5` | Blocks behind the head to stay (shallow-reorg protection) |
 | `POLL_INTERVAL_SECS` | indexer | `5` | Poll cadence, and the retry delay after a failure |
 | `STALE_AFTER_SECS` | indexer | four poll intervals + 60 | How long readers may trust this indexer's last report; the ENS gateway refuses this chain once it expires. Must exceed `POLL_INTERVAL_SECS`, and at most a year |
@@ -89,9 +89,9 @@ than present and failing.
 
 ```
 GET /ens/{sender}/{data}.json   ->  { "data": "0x…" }
-GET /ens/status                 ->  { "chains": [ { "chainId", "label", "source",
-                                      "lagBlocks", "indexerReportedAt",
-                                      "reportValidFor", "stale" } ] }
+GET /ens/status                 ->  { "chains": [ { "chainId", "label", "lagBlocks",
+                                      "indexerReportedAt", "reportValidFor",
+                                      "ambiguous", "stale" } ] }
 ```
 
 The resolver reverts `OffchainLookup` carrying this endpoint, the client fetches
@@ -142,8 +142,9 @@ only until its next cycle lands.
 
 **One gateway, every chain in the store — and a refusal for the rest.** The
 gateway serves whatever chains indexers have written into the database, read
-per request: nothing lists them, and an indexer for a new chain is answered
-for the first time it commits. The resolver carries ONE `urls` list for every
+per request: nothing lists them, and an indexer for a new chain is discovered
+— and gated on its own lag — from its first committed window. The resolver
+carries ONE `urls` list for every
 query it can answer; it cannot route by coin type. ERC-3668 has the client
 walk that list until something succeeds, and a signed null is a success — so
 a gateway that signed null for chains it does not hold would end the walk and
@@ -154,7 +155,14 @@ the store, a signed null for a coin type naming no EVM chain at all, and an
 unsigned 503 for an EVM chain the store does not hold. Only the last lets the
 walk continue, which is exactly when it should. A chain's label in a name
 (`alice.x.base.handles.link`) comes from one table in `usernames-core`, the
-closed set the grammar needs — not from configuration.
+closed set the grammar needs — not from configuration. To name a chain, add it
+to `KNOWN_CHAINS` in `crates/usernames-core/src/ens.rs`; the `known_chains`
+test keeps the set closed, so that is a release, not a deploy. A chain not
+listed is served by coin type and cannot be named by label. To stop serving a
+chain, delete its `names.chain_metadata` rows (and its projection rows); the
+gateway stops listing it on the next request. A database shared by
+deployments is a served set shared by their gateways — give a gateway its own
+database to narrow it.
 
 **Coin types are matched, not decoded.** ENSIP-11 names a chain by
 `0x80000000 | chainId`. Forwards that is exact for every chain id; backwards it
@@ -166,7 +174,8 @@ That is what lets the eden testnet work: its chain id is 3735928814
 (`0xDEADBFEE`), the OR leaves it unchanged, and a gateway that decoded would
 have got 1588445166 and refused every eden name. The one genuinely ambiguous
 store — holding 3735928814 AND 1588445166 together — is refused per request,
-unsigned, so a wallet walks on rather than being answered with a guess.
+unsigned, so a wallet walks on rather than being answered with a guess;
+`/ens/status` marks both rows `ambiguous`.
 
 **Where answers come from.** The indexed model, and nothing else: the gateway
 opens no RPC and takes no per-chain configuration. Answers are as of the
