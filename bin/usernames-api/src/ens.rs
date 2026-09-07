@@ -110,9 +110,10 @@ async fn owner_of(
 /// `names.chain_metadata`, a chain nobody indexed yet, or Postgres simply
 /// being down all produce it.
 async fn lag(store: &ChainStore) -> Lag {
-    // In one read, because this is the hot path and because the values must
-    // be a snapshot: the target, the cursor, and whether the indexer's report
-    // is still good — by the database's clock, the same one that stamped it.
+    // The position in one read, because this is the hot path and because the
+    // values must be a snapshot: the target, the cursor, and whether the
+    // indexer's report is still good — by the database's clock, the same one
+    // that stamped it.
     //
     // Against the TARGET, not the chain head: the indexer only ever advances
     // the cursor to `head - CONFIRMATIONS`, so a caught-up mirror sits
@@ -196,9 +197,8 @@ pub struct Config {
 /// State for the one route.
 #[derive(Clone)]
 pub struct GatewayState {
-    // Behind an `Arc` because axum clones the state per request, and this map
-    // holds a `ChainStore` and a provider per chain. `signer` was already
-    // `Arc` for the same reason; this finishes the job.
+    // Behind an `Arc` so axum's per-request clone of the state copies one
+    // pointer rather than a pool handle and a boxed signer.
     config: Arc<Config>,
 }
 
@@ -249,7 +249,12 @@ struct ChainStatus {
     indexer_reported_at: Option<u64>,
     /// Seconds until the indexer's last report expires, negative once it has.
     report_valid_for: Option<i64>,
-    /// Whether a query for this chain would be refused right now.
+    /// Whether another chain in the store shares this chain's coin type, in
+    /// which case queries for that coin type are refused however fresh either
+    /// is: the store cannot say which was meant.
+    ambiguous: bool,
+    /// Whether a query for this chain would be refused right now, for any of
+    /// the reasons above.
     stale: bool,
 }
 
@@ -265,15 +270,25 @@ struct GatewayStatus {
 async fn status(
     State(state): State<GatewayState>,
 ) -> Result<Json<GatewayStatus>, GatewayError> {
-    let mut chains = Vec::new();
-    for id in db::indexed_chains(&state.config.pool)
+    let indexed: Vec<u64> = db::indexed_chains(&state.config.pool)
         .await
         .map_err(internal)?
-    {
-        let store = ChainStore::new(state.config.pool.clone(), id);
+        .into_iter()
+        .filter_map(|id| u64::try_from(id).ok())
+        .collect();
+    let mut chains = Vec::with_capacity(indexed.len());
+    for &chain_id in &indexed {
+        let store = ChainStore::new(
+            state.config.pool.clone(),
+            i64::try_from(chain_id).expect("came from an i64"),
+        );
         let position = store.mirror_position().await.ok();
         let lag = mirror_lag(position);
-        let chain_id = u64::try_from(id).unwrap_or_default();
+        // What the gate sees: a chain sharing its coin type with another in
+        // the store is refused for that coin type however fresh either is.
+        let ambiguous = indexed
+            .iter()
+            .any(|other| ens::chain_ids_collide(chain_id, *other));
         chains.push(ChainStatus {
             chain_id,
             label: ens::chain_label(chain_id).map(str::to_string),
@@ -283,7 +298,8 @@ async fn status(
             },
             indexer_reported_at: position.and_then(|p| p.reported_at),
             report_valid_for: position.and_then(|p| p.valid_for),
-            stale: staleness(&lag, state.config.max_lag_blocks).is_some(),
+            ambiguous,
+            stale: ambiguous || staleness(&lag, state.config.max_lag_blocks).is_some(),
         });
     }
     Ok(Json(GatewayStatus { chains }))
@@ -562,6 +578,8 @@ async fn self_answer(
                 }
             });
         }
+        // A label does not rescue the pair: the coin type is what the wallet
+        // sends, and it is the coin type that is ambiguous.
         both => {
             warn!(chains = ?both, %coin_type, "two indexed chains share one coin type");
             return Ok(Answer::Ambiguous(coin_type));
@@ -627,8 +645,8 @@ async fn self_answer(
 
 /// The cause is LOGGED, never serialized — the same split `api.rs` makes.
 ///
-/// A `sqlx` or RPC error carries schema names, connection strings and provider
-/// detail, and this route is unauthenticated. Returning it would tell a caller
+/// A `sqlx` error carries schema names and connection strings, and this route
+/// is unauthenticated. Returning it would tell a caller
 /// things the REST half of the same process deliberately withholds, and
 /// returning it INSTEAD of logging it — which is what this used to do — leaves
 /// the operator with nothing while the caller has everything.

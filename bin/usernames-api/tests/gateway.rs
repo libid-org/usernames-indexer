@@ -577,6 +577,32 @@ async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
     assert!(valid_for_of(CHAIN).is_some_and(|s| s > 0), "{status}");
 }
 
+/// A chain outside `KNOWN_CHAINS` is served under its coin type and cannot be
+/// named by label: the unlabelled name answers, and any label at all is a
+/// name nobody holds.
+#[tokio::test]
+async fn a_chain_without_a_label_answers_only_the_unlabelled_name() {
+    let (router, store, _g) = gateway_or_skip!(32);
+    let here = Address::from([0xbe; 20]);
+    bind(&store, "alice", here).await;
+    let coin = 0x8000_0000 | CHAIN as u64;
+
+    let plain = resolve_call(
+        &wire_name(&["alice", "x"]),
+        &addr_call(&["alice", "x"], coin),
+    );
+    let (_, body) = ask(&router, RESOLVER, &plain).await;
+    assert_eq!(verify(&body, &plain), Some(here));
+
+    let labelled = resolve_call(
+        &wire_name(&["alice", "x", "local"]),
+        &addr_call(&["alice", "x", "local"], coin),
+    );
+    let (status, body) = ask(&router, RESOLVER, &labelled).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(verify(&body, &labelled), None);
+}
+
 /// The chains served are whatever the store holds. Nothing is configured, so
 /// an indexer for a new chain is answered for the first time it commits —
 /// with no restart, and no list anywhere to forget it in.
@@ -591,6 +617,10 @@ async fn a_chain_that_appears_in_the_store_is_served_without_a_restart() {
     // Not in the store yet: refused unsigned, so a wallet walks on.
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        body.contains("serves no chain"),
+        "refused for the right reason: {body}"
+    );
 
     // An indexer for it commits its first window and reports.
     let other = ChainStore::new(store.pool().clone(), OTHER);
@@ -630,6 +660,31 @@ async fn two_indexed_chains_on_one_coin_type_are_refused_unsigned() {
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert!(body.contains("share"), "{body}");
+    assert!(!body.contains("\"data\""), "a refusal must carry no answer");
+
+    // And supervision sees the same verdict, on both halves of the pair.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router");
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let status: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    for id in [EDEN, TWIN] {
+        let row = status["chains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["chainId"] == id)
+            .expect("listed");
+        assert_eq!(row["ambiguous"], true, "{status}");
+        assert_eq!(row["stale"], true, "{status}");
+    }
 }
 
 /// The eden testnet resolves, and that it does is the whole point of matching

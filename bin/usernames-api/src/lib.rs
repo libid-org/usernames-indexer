@@ -3,9 +3,9 @@
 //!
 //! Stateless and horizontal. It takes no writer lease, runs no migration and
 //! opens no RPC connection — the chain reaches it only through rows the
-//! indexer wrote. Several of these may serve one database, and one of them may
-//! serve several chains' worth of rows only in the sense that each process is
-//! scoped to the chain id it was configured with.
+//! indexer wrote. Several of these may serve one database. The `/v1` half is
+//! scoped to the chain id it was configured with; the ENS gateway serves every
+//! chain the store holds, read per request.
 //!
 //! It answers `503 not_synced` until that chain's first window is committed,
 //! which is why readiness must gate on `/v1/status` rather than `/health`.
@@ -261,7 +261,8 @@ mod tests {
 
     /// A pool that never dials. Every case below is refused before any query
     /// runs, which is the point: these are startup checks, so they must not
-    /// need a database to reject a configuration that cannot work.
+    /// need a database to reject a configuration that cannot work. It still
+    /// wants a runtime to be built in, which is why the cases are async.
     fn lazy_pool() -> sqlx::PgPool {
         sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
@@ -289,7 +290,7 @@ mod tests {
 
     /// `ens::Config` holds a signer and so is not `Debug`; match rather than
     /// `expect_err`.
-    async fn refusal(extra: &[&str]) -> String {
+    fn refusal(extra: &[&str]) -> String {
         match ens_config(&config(extra), lazy_pool()) {
             Ok(_) => panic!("this configuration must be refused"),
             Err(e) => e.to_string(),
@@ -316,7 +317,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_ttl_the_resolver_would_reject_is_refused() {
-        let message = refusal(&["--ens-ttl-secs", "7200"]).await;
+        let message = refusal(&["--ens-ttl-secs", "7200"]);
         assert!(message.contains("MAX_LIFETIME"), "{message}");
     }
 
@@ -330,7 +331,7 @@ mod tests {
         assert!(ens_config(&at_ceiling, lazy_pool()).is_ok());
 
         let message =
-            refusal(&["--ens-ttl-secs", &RESOLVER_MAX_LIFETIME_SECS.to_string()]).await;
+            refusal(&["--ens-ttl-secs", &RESOLVER_MAX_LIFETIME_SECS.to_string()]);
         assert!(message.contains("trail"), "{message}");
     }
 }

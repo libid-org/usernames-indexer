@@ -54,11 +54,13 @@ pub const DOMAIN: [&str; 2] = ["handles", "link"];
 
 /// The chains a name may narrow to, by label — `alice.x.base.handles.link`.
 ///
-/// A closed set that never overlaps the platform keys, and the ONE place a
-/// chain's label is defined. The gateway answers for whatever chains the
-/// store holds; this table only says what each is called in a name. A chain
-/// absent here is still served under its coin type, and cannot be named by
-/// label.
+/// The labels the gateway ANSWERS for, and the one place a chain's label is
+/// defined: the parser carries whatever label it finds, and a name naming a
+/// label not here is answered as a name nobody holds. Never overlaps the
+/// platform keys, which is what lets the parse tell the two apart. The
+/// gateway serves whatever chains the store holds; a chain absent here is
+/// still served under its coin type, and cannot be named by label. Adding
+/// one is a release, not a deploy.
 pub const KNOWN_CHAINS: [(u64, &str); 2] = [(3_735_928_814, "eden"), (8453, "base")];
 
 /// The label a chain carries in a name, if it has one.
@@ -77,11 +79,12 @@ const EVM_COIN_TYPE_BIT: u64 = 0x8000_0000;
 /// This direction is total and unambiguous for every chain id. It is the
 /// REVERSE that is lossy: above 2^31 the bit is already set, the OR changes
 /// nothing, and two chain ids land on one coin type. So a gateway matches a
-/// query against the chains it was CONFIGURED with, using this function,
-/// rather than computing a chain id back out of the coin type — which would
-/// have to guess, and would guess wrong for any id past 2^31.
+/// query against the chains the store holds, using this function, rather
+/// than computing a chain id back out of the coin type — which would have to
+/// guess, and would guess wrong for any id past 2^31.
 ///
-/// Chains that would collide are refused where both are known: at startup.
+/// Two indexed chains that collide are refused per request, unsigned, for the
+/// coin type they share.
 pub fn coin_type_for(chain_id: u64) -> U256 {
     U256::from(EVM_COIN_TYPE_BIT | chain_id)
 }
@@ -184,7 +187,7 @@ pub enum Record {
         /// and only the caller has ever seen them agree.
         node: B256,
         /// Exactly what the caller asked with, undecoded. Matching it against
-        /// the configured chains is the gateway's job.
+        /// the chains the store holds is the gateway's job.
         coin_type: U256,
         /// Whether the caller used the legacy `addr(bytes32)` form, which
         /// returns a bare `address` rather than ENSIP-11's `bytes`.
