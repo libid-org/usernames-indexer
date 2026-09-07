@@ -52,7 +52,7 @@ use usernames_core::{
 #[command(name = "usernames-api", about)]
 pub struct Config {
     /// Postgres connection string.
-    #[arg(long, env = "DATABASE_URL")]
+    #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
     pub database_url: String,
 
     /// The IdentityNames ERC1967 proxy this database was indexed from,
@@ -74,7 +74,7 @@ pub struct Config {
     /// CCIP-Read route on: unset, the route is not mounted at all rather than
     /// mounted and failing, so a deployment that has not been given a key
     /// serves 404 there instead of 500.
-    #[arg(long, env = "ENS_SIGNER_KEY")]
+    #[arg(long, env = "ENS_SIGNER_KEY", hide_env_values = true)]
     pub ens_signer_key: Option<String>,
 
     /// The resolver this gateway answers for. Required with a signing key:
@@ -110,7 +110,7 @@ pub struct Config {
 
     /// JSON-RPC endpoint per chain, required with `ENS_SOURCE=chain`:
     /// `3735928814=http://…,8453=https://…`.
-    #[arg(long, env = "ENS_RPC_URLS")]
+    #[arg(long, env = "ENS_RPC_URLS", hide_env_values = true)]
     pub ens_rpc_urls: Option<String>,
 
     /// `IdentityNames` per chain, for the chains where it is not at
@@ -720,5 +720,30 @@ mod tests {
     async fn chain_source_without_an_endpoint_is_refused() {
         let message = refusal(&["--ens-source", "chain"]).await;
         assert!(message.contains("ENS_RPC_URLS"), "{message}");
+    }
+}
+
+#[cfg(test)]
+mod help_tests {
+    use clap::CommandFactory;
+
+    use super::Config;
+
+    /// clap renders `[env: NAME=value]` in `--help` for every argument bound
+    /// to a variable, and `.env` is read before parsing, so without
+    /// `hide_env_values` a secret is one `--help` away from a CI log.
+    #[test]
+    fn help_never_prints_a_secret() {
+        let command = Config::command();
+        for secret in ["database_url", "ens_signer_key", "ens_rpc_urls"] {
+            let arg = command
+                .get_arguments()
+                .find(|a| a.get_id() == secret)
+                .unwrap_or_else(|| panic!("{secret} is an argument"));
+            assert!(
+                arg.is_hide_env_values_set(),
+                "{secret} shows its value in --help"
+            );
+        }
     }
 }
