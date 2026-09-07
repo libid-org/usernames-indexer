@@ -158,8 +158,6 @@ async fn ask(router: &Router, sender: Address, call: &[u8]) -> (StatusCode, Stri
     (status, text)
 }
 
-/// Pull `result` back out of the gateway's blob and check the signature is the
-/// one the resolver would accept. Returns the address, or `None` for a null.
 /// The signed result inside a gateway answer, once the signature is checked
 /// to be one the resolver would accept. These are the bytes the callback
 /// returns to the wallet, in whatever shape the record call asked for.
@@ -200,6 +198,7 @@ fn signed_result(body: &str, call: &[u8]) -> Vec<u8> {
     result.to_vec()
 }
 
+/// The address in a gateway answer, or `None` for a null in either shape.
 fn verify(body: &str, call: &[u8]) -> Option<Address> {
     let result = signed_result(body, call);
     // Both shapes, because the caller chooses which to ask in and a helper that
@@ -672,7 +671,9 @@ async fn a_node_that_is_not_this_name_is_refused() {
 /// Every answer here is signed, and a signed null is an authoritative "nobody
 /// holds this". This gateway has no standing to say that about `vitalik.eth`.
 /// The check has to run before the record is looked at, because a record it
-/// cannot answer would otherwise short-circuit to a null for any name at all.
+/// cannot answer would otherwise short-circuit to a null for any name at all —
+/// and before label hygiene, because `Vitalik.eth` is foreign first and
+/// unnormalized second, and "unreadable" would have earned it a signed null.
 #[tokio::test]
 async fn a_name_outside_the_domain_is_refused_whatever_the_record() {
     let (router, _store, _g) = gateway_or_skip!(None, 32);
@@ -684,8 +685,13 @@ async fn a_name_outside_the_domain_is_refused_whatever_the_record() {
     addr.extend_from_slice(&(0x8000_0000u64 | CHAIN as u64).to_be_bytes());
 
     for inner in [addr, vec![0xaa, 0xbb, 0xcc, 0xdd]] {
-        let call = resolve_call(b"\x07vitalik\x03eth\x00", &inner);
-        let (status, body) = ask(&router, RESOLVER, &call).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        for name in [
+            &b"\x07vitalik\x03eth\x00"[..],
+            &b"\x07Vitalik\x03eth\x00"[..],
+        ] {
+            let call = resolve_call(name, &inner);
+            let (status, body) = ask(&router, RESOLVER, &call).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        }
     }
 }
