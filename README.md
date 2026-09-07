@@ -102,10 +102,6 @@ verifies the signature and returns the record. Both on-chain halves are `view`.
 |---|---|---|
 | `ENS_SIGNER_KEY` | unset | The signing key, hex. Setting it mounts the route |
 | `ENS_RESOLVER_ADDRESS` | — | Required with a key. Every answer is signed for this address, whatever `{sender}` the path carries; a request naming another resolver is refused with a 400, so a value that fell behind a `setResolver` is a visible error rather than a signature the resolver rejects |
-| `ENS_CHAINS` | this process's chain | Which chains to answer for, and their labels: `3735928814:eden,8453:base`. Refused at startup only if two of them share a coin type |
-| `ENS_SOURCE` | `mirror` | `mirror` reads the indexed model; `chain` reads `IdentityNames` over RPC |
-| `ENS_RPC_URLS` | — | Required with `ENS_SOURCE=chain`: `8453=https://…,10=https://…` |
-| `ENS_CONTRACTS` | `IDENTITY_NAMES_ADDRESS` | Per-chain `IdentityNames`, where it differs: `8453=0x…`. Read only with `ENS_SOURCE=chain` |
 | `ENS_TTL_SECS` | `300` | How long an answer stays good; the resolver enforces it |
 | `ENS_MAX_LAG_BLOCKS` | `32` | How far behind the chain the mirror may be and still assert anything. The target is set at the top of a cycle and the cursor catches up chunk by chunk, so this must exceed the blocks any served chain produces in one of its indexer's poll intervals |
 
@@ -144,16 +140,21 @@ the indexer image first, or together. A gateway on this version refuses, with
 a 503, a chain whose indexer has never written one — that chain alone, and
 only until its next cycle lands.
 
-**One gateway, several chains — and a refusal for the rest.** The resolver
-carries ONE `urls` list for every query it can answer; it cannot route by coin
-type. ERC-3668 has the client walk that list until something succeeds, and a
-signed null is a success — so a gateway that signed null for chains it does not
-serve would end the walk and deny a binding the next endpoint existed to serve.
+**One gateway, every chain in the store — and a refusal for the rest.** The
+gateway serves whatever chains indexers have written into the database, read
+per request: nothing lists them, and an indexer for a new chain is answered
+for the first time it commits. The resolver carries ONE `urls` list for every
+query it can answer; it cannot route by coin type. ERC-3668 has the client
+walk that list until something succeeds, and a signed null is a success — so
+a gateway that signed null for chains it does not hold would end the walk and
+deny a binding the next endpoint existed to serve.
 
-So `ENS_CHAINS` is a set, and the answers divide three ways: an address or a
-signed null for a chain in the set, a signed null for a coin type naming no EVM
-chain at all, and an unsigned 503 for an EVM chain outside the set. Only the
-last lets the walk continue, which is exactly when it should.
+So the answers divide three ways: an address or a signed null for a chain in
+the store, a signed null for a coin type naming no EVM chain at all, and an
+unsigned 503 for an EVM chain the store does not hold. Only the last lets the
+walk continue, which is exactly when it should. A chain's label in a name
+(`alice.x.base.handles.link`) comes from one table in `usernames-core`, the
+closed set the grammar needs — not from configuration.
 
 **Coin types are matched, not decoded.** ENSIP-11 names a chain by
 `0x80000000 | chainId`. Forwards that is exact for every chain id; backwards it
@@ -164,18 +165,13 @@ serves rather than computing a chain id from it.
 That is what lets the eden testnet work: its chain id is 3735928814
 (`0xDEADBFEE`), the OR leaves it unchanged, and a gateway that decoded would
 have got 1588445166 and refused every eden name. The one genuinely ambiguous
-configuration — serving 3735928814 AND 1588445166 together — is refused at
-startup, where both ids are known.
+store — holding 3735928814 AND 1588445166 together — is refused per request,
+unsigned, so a wallet walks on rather than being answered with a guess.
 
-**Where answers come from.** `ENS_SOURCE=mirror` reads the indexed model —
-cheap, and as of the indexer's last committed window, which is what
-`ENS_MAX_LAG_BLOCKS` guards. `ENS_SOURCE=chain` reads `IdentityNames` over RPC:
-current rather than as-of-last-window, so the lag gate stops applying, at the
-cost of an `eth_call` per query and a trust dependency on the endpoint. The
-mirror is the default because it needs no further configuration and because it
-answers from a model kept `CONFIRMATIONS` blocks deep, which a call at the head
-is not — a binding created and then reorged away is visible to `chain` and not
-to `mirror`.
+**Where answers come from.** The indexed model, and nothing else: the gateway
+opens no RPC and takes no per-chain configuration. Answers are as of the
+indexer's last committed window, kept `CONFIRMATIONS` blocks deep, which is
+what `ENS_MAX_LAG_BLOCKS` and the indexer's own report guard.
 
 
 **Tested against the real resolver.** `bin/usernames-api/tests/end_to_end.rs`
