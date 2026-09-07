@@ -84,20 +84,36 @@ pub struct MirrorPosition {
 /// in Postgres and fail the whole statement, target included.
 const MAX_VALID_FOR_SECS: u64 = 10 * 366 * 24 * 60 * 60;
 
-fn valid_for_bind(valid_for_secs: u64) -> i64 {
-    i64::try_from(valid_for_secs.min(MAX_VALID_FOR_SECS)).unwrap_or(i64::MAX)
+/// The whole store: every chain any indexer has written into one database.
+///
+/// What the gateway serves is exactly what this holds — nothing to configure,
+/// and a new indexer is served the first time it commits a window. A
+/// [`ChainStore`] is one chain's view of the same pool.
+#[derive(Clone)]
+pub struct Store {
+    pool: PgPool,
 }
 
-/// Every chain an indexer has written into this store, by cursor. What the
-/// gateway serves is exactly this: nothing to configure, and a new indexer is
-/// served the first time it commits a window.
-pub async fn indexed_chains(pool: &PgPool) -> Result<Vec<i64>, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT chain_id FROM names.chain_metadata WHERE key = $1 ORDER BY chain_id",
-    )
-    .bind(CURSOR_KEY)
-    .fetch_all(pool)
-    .await
+impl Store {
+    /// The store over a pool.
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// One chain's view of this store.
+    pub fn chain(&self, chain_id: i64) -> ChainStore {
+        ChainStore::new(self.pool.clone(), chain_id)
+    }
+
+    /// Every chain an indexer has written into this store, by cursor.
+    pub async fn indexed_chains(&self) -> Result<Vec<i64>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT chain_id FROM names.chain_metadata WHERE key = $1 ORDER BY chain_id",
+        )
+        .bind(CURSOR_KEY)
+        .fetch_all(&self.pool)
+        .await
+    }
 }
 
 fn deploy_block_key(contract: Address) -> String {
@@ -426,7 +442,7 @@ impl ChainStore {
         .bind(target.to_string())
         .bind(TARGET_REPORTED_AT_KEY)
         .bind(TARGET_VALID_UNTIL_KEY)
-        .bind(valid_for_bind(valid_for_secs))
+        .bind(Self::valid_for_bind(valid_for_secs))
         .execute(&self.pool)
         .await;
         match written {
@@ -452,12 +468,19 @@ impl ChainStore {
         .bind(self.chain_id)
         .bind(TARGET_REPORTED_AT_KEY)
         .bind(TARGET_VALID_UNTIL_KEY)
-        .bind(valid_for_bind(valid_for_secs))
+        .bind(Self::valid_for_bind(valid_for_secs))
         .execute(&self.pool)
         .await;
         if let Err(e) = touched {
             warn!(%e, "failed to renew the chain target's report");
         }
+    }
+
+    /// The validity the store will write for a report: at most ten years,
+    /// so the `bigint` addition in Postgres can never overflow and fail the
+    /// whole statement, target included.
+    fn valid_for_bind(valid_for_secs: u64) -> i64 {
+        i64::try_from(valid_for_secs.min(MAX_VALID_FOR_SECS)).unwrap_or(i64::MAX)
     }
 
     /// Set when the report expires, as absolute Unix seconds.
@@ -1006,6 +1029,17 @@ pub struct HandleRow {
     pub user_id: Option<String>,
     /// The wallet that account id currently resolves to.
     pub id_owner: Option<Vec<u8>>,
+}
+
+impl HandleRow {
+    /// The owner as an address, or `None` after retirement or for a row whose
+    /// bytes are not an address.
+    pub fn owner_address(&self) -> Option<Address> {
+        self.owner
+            .as_deref()
+            .and_then(|bytes| <[u8; 20]>::try_from(bytes).ok())
+            .map(Address::from)
+    }
 }
 
 impl HandleRow {

@@ -65,7 +65,11 @@ fn the_signer_recovers_from_what_the_gateway_signs() {
 
     let expected = digest(target, expires, &request, &result);
     assert_eq!(
-        ens::signature_digest(target, expires, &request, &result),
+        ens::Reply {
+            result: result.clone(),
+            expires
+        }
+        .digest(target, &request),
         expected,
         "the module's digest drifted from the specification"
     );
