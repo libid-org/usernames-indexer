@@ -227,6 +227,8 @@ async fn indexes_a_real_chain_end_to_end() {
         poll_interval_secs: 1,
         max_block_range: 2,
         start_block: None,
+        // A report good for two minutes; the loop renews it every cycle.
+        stale_after_secs: 120,
     };
     let task = tokio::spawn(
         indexer::Indexer::new(store.clone(), provider.clone(), config)
@@ -295,6 +297,17 @@ async fn indexes_a_real_chain_end_to_end() {
 
     // Ops tables filled from the admin events.
     let (_, body) = get(&store, contract, "/v1/status").await;
+    // The loop reports beside every target it sets, with an expiry in the
+    // future, and the API surfaces both: this is what tells a caught-up
+    // mirror from one whose indexer stopped.
+    assert!(
+        body["indexerReportedAt"].as_u64().is_some(),
+        "no report after a real loop ran: {body}"
+    );
+    assert!(
+        body["reportValidFor"].as_i64().is_some_and(|s| s > 0),
+        "a fresh report must still be valid: {body}"
+    );
     assert!(
         body["lastIndexedBlock"]
             .as_u64()

@@ -119,5 +119,5 @@ pub async fn bind(store: &ChainStore, handle: &str, owner: Address) {
     // against the TARGET — the block the cursor chases — so that is the one a
     // fixture must record.
     store.set_chain_head(1).await;
-    store.set_chain_target(1).await;
+    store.set_chain_target(1, 120).await;
 }

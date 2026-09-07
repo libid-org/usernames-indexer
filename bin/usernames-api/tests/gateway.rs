@@ -107,7 +107,7 @@ async fn gateway_parts(
         // The gate measures the cursor against the TARGET — what the indexer
         // intends to reach — not the raw head, so a fixture that records only
         // the head reads as "cannot tell" and refuses every query.
-        store.set_chain_target(1).await;
+        store.set_chain_target(1, 120).await;
     }
 
     let store = ChainStore::new(pool.clone(), chains[0].0);
@@ -401,7 +401,7 @@ async fn a_stale_mirror_refuses_rather_than_signing_a_null() {
     bind(&store, "alice", Address::from([0xbe; 20])).await;
     // Far ahead of the cursor, as the TARGET: that is the quantity the gate
     // compares, and the head alone no longer moves it.
-    store.set_chain_target(10_000).await;
+    store.set_chain_target(10_000, 120).await;
 
     let call = resolve_call(
         &wire_name(&["alice", "x"]),
@@ -487,6 +487,88 @@ async fn a_mirror_that_cannot_report_its_position_refuses() {
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert!(!body.contains("\"data\""), "a refusal must carry no answer");
+}
+
+/// The block gate cannot see a stopped indexer: target and cursor are both
+/// its own writes, so they freeze together and lag reads zero for as long as
+/// it stays down — signed nulls for bindings made since, and old addresses
+/// after a rebind, for the whole `ENS_TTL_SECS` each. The report the indexer
+/// makes beside the target expires on the indexer's own schedule, and that is
+/// what notices.
+#[tokio::test]
+async fn an_expired_report_is_too_stale_however_small_the_lag() {
+    let (router, store, _g) = gateway_or_skip!(None, 32);
+    bind(&store, "alice", Address::from([0xbe; 20])).await;
+    // Caught up by the block measure, and the report long expired.
+    store.set_chain_target_valid_until(1).await;
+
+    let call = resolve_call(
+        &wire_name(&["alice", "x"]),
+        &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
+    );
+    let (status, body) = ask(&router, RESOLVER, &call).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.contains("expired"), "{body}");
+    assert!(!body.contains("\"data\""), "a refusal must carry no answer");
+}
+
+/// One chain's dead indexer is that chain's problem. Every row the gate reads
+/// is keyed by chain, so the refusal reaches the chain whose report expired
+/// and no other — the API keeps answering for everyone else. And supervision
+/// sees exactly what the gate sees, one row per chain.
+#[tokio::test]
+async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
+    const OTHER: i64 = 31342;
+    let Some((router, store, _g)) =
+        gateway_over(&[(CHAIN, None), (OTHER, None)], 32).await
+    else {
+        return;
+    };
+    let here = Address::from([0xbe; 20]);
+    bind(&store, "alice", here).await;
+    let other_store = ChainStore::new(store.pool().clone(), OTHER);
+    bind(&other_store, "alice", Address::from([0xed; 20])).await;
+    // The other chain's indexer stopped long ago.
+    other_store.set_chain_target_valid_until(1).await;
+
+    let dead = resolve_call(
+        &wire_name(&["alice", "x"]),
+        &addr_call(&["alice", "x"], 0x8000_0000 | OTHER as u64),
+    );
+    let (status, body) = ask(&router, RESOLVER, &dead).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+
+    let alive = resolve_call(
+        &wire_name(&["alice", "x"]),
+        &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
+    );
+    let (status, body) = ask(&router, RESOLVER, &alive).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(verify(&body, &alive), Some(here));
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let status: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    let stale_of = |id: i64| {
+        status["chains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["chainId"] == id)
+            .map(|c| c["stale"].as_bool().unwrap())
+    };
+    assert_eq!(stale_of(OTHER), Some(true), "{status}");
+    assert_eq!(stale_of(CHAIN), Some(false), "{status}");
 }
 
 /// The eden testnet resolves, and that it does is the whole point of matching

@@ -84,7 +84,10 @@ use tracing::{
     warn,
 };
 use usernames_core::{
-    db::ChainStore,
+    db::{
+        ChainStore,
+        MirrorPosition,
+    },
     ens::{
         self,
         Record,
@@ -157,8 +160,9 @@ impl HandleSource {
     ///
     /// Three answers, not two, and the third is the one that matters: reading
     /// the chain directly there IS no lag; reading a mirror it is a number; and
-    /// reading a mirror whose head or cursor is missing or unreadable, it is
-    /// UNKNOWN. Folding unknown into "no lag" is how a gateway ends up signing
+    /// reading a mirror whose target, cursor or report is missing or
+    /// unreadable, it is UNKNOWN. Folding unknown into "no lag" is how a
+    /// gateway ends up signing
     /// authoritative nulls off a wiped or unreachable database — a fresh
     /// deployment, a version-bump replay clearing `names.chain_metadata`, a
     /// chain listed in `ENS_CHAINS` that nobody indexed, or Postgres simply
@@ -175,17 +179,54 @@ impl HandleSource {
                 // ENS_MAX_LAG_BLOCKS refused every ENS query forever while
                 // being perfectly healthy — two knobs in two binaries with
                 // nothing relating them.
-                // Concurrently: the two are independent, and this is the hot
-                // path — awaited in sequence they cost two round trips per
-                // request instead of one.
-                let (Ok(Some(target)), Ok(Some(cursor))) =
-                    tokio::join!(store.chain_target(), store.cursor())
-                else {
-                    return Lag::Unknown;
-                };
-                Lag::Blocks(target.saturating_sub(cursor))
+                //
+                // And whether the indexer's report is still good, because the
+                // target is the indexer's own claim about the chain. A loop
+                // that stopped — crashed, lost its RPC, waiting on the writer
+                // lease — leaves target and cursor frozen together, so by
+                // blocks alone a dead indexer reads as caught up, for as long
+                // as it stays dead. The report it makes beside the target
+                // expires on its own schedule, and that is what notices.
+                //
+                // One read, because this is the hot path and because the
+                // values must be a snapshot.
+                mirror_lag(store.mirror_position().await.ok())
             }
         }
+    }
+}
+
+/// The lag a mirror position amounts to. Missing pieces are `Unknown`, and
+/// unknown is refused: a source that cannot say where it stands has not
+/// earned the right to deny a binding.
+fn mirror_lag(position: Option<MirrorPosition>) -> Lag {
+    match position {
+        Some(MirrorPosition {
+            target: Some(target),
+            cursor: Some(cursor),
+            valid_for: Some(valid_for),
+            ..
+        }) => Lag::Mirror {
+            blocks: target.saturating_sub(cursor),
+            valid_for,
+        },
+        _ => Lag::Unknown,
+    }
+}
+
+/// Why a mirror in this position may not answer, if it may not. The one rule
+/// the gate and `/status` share, so supervision sees what the gate sees.
+fn staleness(lag: &Lag, max_lag_blocks: u64) -> Option<Staleness> {
+    match *lag {
+        Lag::None => None,
+        Lag::Mirror { valid_for, .. } if valid_for < 0 => {
+            Some(Staleness::Expired(valid_for.unsigned_abs()))
+        }
+        Lag::Mirror { blocks, .. } if blocks > max_lag_blocks => {
+            Some(Staleness::Behind(blocks))
+        }
+        Lag::Mirror { .. } => None,
+        Lag::Unknown => Some(Staleness::Unknown),
     }
 }
 
@@ -274,7 +315,64 @@ pub const ROUTE_PREFIX: &str = "/ens";
 pub fn router(state: GatewayState) -> Router {
     Router::new()
         .route("/{sender}/{data}", get(resolve))
+        .route("/status", get(status))
         .with_state(state)
+}
+
+/// One served chain, as supervision should see it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChainStatus {
+    chain_id: u64,
+    label: Option<String>,
+    /// `mirror` or `chain`.
+    source: &'static str,
+    /// Blocks between the indexer's target and its cursor. Mirrors only.
+    lag_blocks: Option<u64>,
+    /// Unix seconds at which the indexer last reported. Mirrors only.
+    indexer_reported_at: Option<u64>,
+    /// Seconds until the indexer's last report expires, negative once it has.
+    /// Mirrors only.
+    report_valid_for: Option<i64>,
+    /// Whether a query for this chain would be refused right now.
+    stale: bool,
+}
+
+#[derive(Serialize)]
+struct GatewayStatus {
+    chains: Vec<ChainStatus>,
+}
+
+/// `GET /status`: one row per served chain. For alerting, never for
+/// readiness — a chain whose indexer stopped is refused on its own and the
+/// others keep answering, so nothing here should take the process out of
+/// rotation.
+async fn status(State(state): State<GatewayState>) -> Json<GatewayStatus> {
+    let mut chains = Vec::with_capacity(state.config.chains.len());
+    for (id, chain) in &state.config.chains {
+        let (source, position) = match &chain.source {
+            HandleSource::Chain { .. } => ("chain", None),
+            HandleSource::Mirror(store) => ("mirror", store.mirror_position().await.ok()),
+        };
+        let lag = match source {
+            "chain" => Lag::None,
+            _ => mirror_lag(position),
+        };
+        chains.push(ChainStatus {
+            chain_id: *id,
+            label: chain.label.clone(),
+            source,
+            lag_blocks: match lag {
+                Lag::Mirror { blocks, .. } => Some(blocks),
+                _ => None,
+            },
+            indexer_reported_at: position.and_then(|p| p.reported_at),
+            report_valid_for: position.and_then(|p| p.valid_for),
+            stale: staleness(&lag, state.config.max_lag_blocks).is_some(),
+        });
+    }
+    chains.sort_by_key(|c| c.chain_id);
+    Json(GatewayStatus { chains })
 }
 
 /// What ERC-3668 hands back: one hex blob the resolver's callback decodes.
@@ -360,15 +458,20 @@ async fn resolve(
                 ),
             });
         }
-        Answer::TooStale { lag } => {
-            warn!(?lag, "refusing to answer from a stale mirror");
+        Answer::TooStale(why) => {
+            warn!(?why, "refusing to answer from a stale mirror");
             return Err(GatewayError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
-                message: match lag {
-                    Some(lag) => {
+                message: match why {
+                    Staleness::Behind(lag) => {
                         format!("read model is {lag} blocks behind; not answering")
                     }
-                    None => "read model cannot report its position; not answering".into(),
+                    Staleness::Expired(secs) => format!(
+                        "the indexer's last report expired {secs}s ago; not answering"
+                    ),
+                    Staleness::Unknown => {
+                        "read model cannot report its position; not answering".into()
+                    }
                 },
             });
         }
@@ -403,11 +506,24 @@ async fn resolve(
 enum Lag {
     /// Read from the chain: the question does not apply.
     None,
-    /// Read from a mirror, this far behind.
-    Blocks(u64),
+    /// Read from a mirror: this many blocks behind the target its indexer
+    /// last set, and this many seconds before that indexer's report expires
+    /// — negative once it has.
+    Mirror { blocks: u64, valid_for: i64 },
     /// A mirror that cannot say. Treated as too stale, because a source that
     /// does not know its own position has not earned the right to deny a
     /// binding.
+    Unknown,
+}
+
+/// Why a mirror was refused an answer.
+#[derive(Debug)]
+enum Staleness {
+    /// The cursor trails the target by this many blocks.
+    Behind(u64),
+    /// The indexer's last report expired this many seconds ago.
+    Expired(u64),
+    /// The mirror cannot report its position at all.
     Unknown,
 }
 
@@ -426,9 +542,9 @@ enum Answer {
     /// This gateway serves no chain with that coin type. Unsigned, so the
     /// client walks on to the next endpoint in the resolver's `urls`.
     NotOurChain(U256),
-    /// This chain's mirror is too far behind to deny a binding, or cannot say
-    /// how far behind it is.
-    TooStale { lag: Option<u64> },
+    /// This chain's mirror has not earned the right to deny a binding: too
+    /// far behind, its indexer's report expired, or unable to say.
+    TooStale(Staleness),
 }
 
 async fn self_answer(
@@ -547,11 +663,8 @@ async fn self_answer(
     }
 
     // Only now, with an answer actually owed, is staleness worth asking about.
-    match chain.source.lag().await {
-        Lag::None => {}
-        Lag::Blocks(lag) if lag <= state.config.max_lag_blocks => {}
-        Lag::Blocks(lag) => return Ok(Answer::TooStale { lag: Some(lag) }),
-        Lag::Unknown => return Ok(Answer::TooStale { lag: None }),
+    if let Some(why) = staleness(&chain.source.lag().await, state.config.max_lag_blocks) {
+        return Ok(Answer::TooStale(why));
     }
 
     let owner = match query.subject {

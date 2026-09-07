@@ -50,6 +50,7 @@ the indexer's knobs is the point rather than an omission:
 | `CHAIN_ID` | both | unset / **required** | Indexer: refuse to start unless the RPC reports this chain id. API: **required** — it talks to no chain, so it cannot discover which chain's rows it serves |
 | `CONFIRMATIONS` | indexer | `5` | Blocks behind the head to stay (shallow-reorg protection) |
 | `POLL_INTERVAL_SECS` | indexer | `5` | Poll cadence, and the retry delay after a failure |
+| `STALE_AFTER_SECS` | four poll intervals + 60 | How long readers may trust this indexer's last report; the ENS gateway refuses this chain once it expires |
 | `MAX_BLOCK_RANGE` | indexer | `10000` | Largest `eth_getLogs` window |
 | `START_BLOCK` | indexer | unset | Where a FRESH scan starts — consulted only when no cursor exists (new database, or right after a re-index). Unset means the deployment block is found by binary search over `eth_getCode`; only a successful detection is cached, and an RPC failure mid-search retries next cycle |
 | `LISTEN_ADDR` | api | `127.0.0.1:8080` | Read-API listen address |
@@ -111,6 +112,29 @@ every unclaimed name looks like an outage. A mirror further behind than
 `ENS_MAX_LAG_BLOCKS` gets an *unsigned* 503 instead, so the client falls through
 to the next endpoint in the resolver's `urls`. Signing a null from a stale
 mirror would assert the absence of a binding that may already exist.
+
+**Two bounds, because one cannot see the other's failure.** `ENS_MAX_LAG_BLOCKS`
+measures the cursor against the target — and both are the indexer's own
+writes, so an indexer that stopped (crashed, lost its RPC, waiting on the
+writer lease) freezes them together and reads as caught up for as long as it
+stays down. So beside every target it sets, the indexer also declares how long
+that report may be trusted (`STALE_AFTER_SECS`, four poll intervals plus a
+minute unless set), renewing it per cycle and per committed chunk; the gateway
+refuses a chain whose report has expired. The expiry is stamped and read back
+with the database's clock, so no host's clock enters into it, and every
+indexer sets its own, so slow chains and fast chains each expire on their own
+schedule. Every row involved is keyed by chain: one chain's dead indexer
+expires that chain alone, and the others keep answering.
+
+`GET /ens/status` lists every served chain with its position and whether it
+would be refused right now; `/v1/status` reports the API's own chain. Both are
+for alerting, never for readiness — gate a pod on `/health`, or one stopped
+indexer takes every chain out of rotation.
+
+**Upgrading across this change:** the report is the indexer's write, so deploy
+the indexer image first, or together. A gateway on this version refuses, with
+a 503, a chain whose indexer has never written one — that chain alone, and
+only until its next cycle lands.
 
 **One gateway, several chains — and a refusal for the rest.** The resolver
 carries ONE `urls` list for every query it can answer; it cannot route by coin
@@ -222,7 +246,9 @@ Probes belong to the API: `GET /health` for liveness; for readiness gate on
 `GET /v1/status` — the resolve endpoints answer 503 by design until the first
 window lands. It sends permissive CORS for GET, so a browser UI (handle.link)
 can call it directly from any origin. The indexer exposes no port; supervise
-it on process liveness, and on `lagBlocks` from the API's status.
+it on process liveness, and on `lagBlocks` and `reportValidFor` from the API's
+status — the first cannot move once the loop stops, the second counts down
+exactly then — or on `/ens/status` for every chain the gateway serves.
 
 `docker compose up -d --build` runs the full stack locally against the
 compose Postgres — set `RPC_URL`, `IDENTITY_NAMES_ADDRESS` and `CHAIN_ID` in
@@ -243,4 +269,4 @@ compose Postgres — set `RPC_URL`, `IDENTITY_NAMES_ADDRESS` and `CHAIN_ID` in
 - **Sync state is a caller's concern**: until the first window commits, the
   resolution endpoints answer 503 rather than an authoritative-looking 404.
   After that, a replaying or lagging indexer serves what it has; gate on
-  `/v1/status` (`lagBlocks`, `lastWindowError`) where staleness matters.
+  `/v1/status` (`lagBlocks`, `reportValidFor`, `lastWindowError`) where staleness matters.

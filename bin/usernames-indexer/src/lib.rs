@@ -63,6 +63,14 @@ pub struct Config {
     /// Scan start override. Unset means: detect the deployment block.
     #[arg(long, env = "START_BLOCK")]
     pub start_block: Option<u64>,
+
+    /// How long readers may trust this indexer's last report, in seconds. The
+    /// API refuses a chain whose report has expired, so this decides how soon
+    /// a stopped indexer is noticed — and how long a slow chunk or a missed
+    /// cycle may take without a healthy loop reading as stopped. Unset means
+    /// four poll intervals plus a minute.
+    #[arg(long, env = "STALE_AFTER_SECS")]
+    pub stale_after_secs: Option<u64>,
 }
 
 /// Parse the environment, connect everything, and index until ctrl-c.
@@ -101,6 +109,16 @@ pub async fn run() -> anyhow::Result<()> {
     store.prepare(&writer, contract).await?;
 
     let cancel = CancellationToken::new();
+    let stale_after_secs = config.stale_after_secs.unwrap_or(
+        config
+            .poll_interval_secs
+            .saturating_mul(4)
+            .saturating_add(60),
+    );
+    anyhow::ensure!(
+        stale_after_secs > 0,
+        "STALE_AFTER_SECS is 0; every report would expire as it was written"
+    );
     let indexer = indexer::Indexer::new(
         store,
         provider,
@@ -110,6 +128,7 @@ pub async fn run() -> anyhow::Result<()> {
             poll_interval_secs: config.poll_interval_secs,
             max_block_range: config.max_block_range,
             start_block: config.start_block,
+            stale_after_secs,
         },
     );
     info!(chain_id, %contract, "indexing");
