@@ -61,12 +61,59 @@ const CONTRACT_KEY: &str = "contract";
 const CURSOR_KEY: &str = "cursor";
 const HEAD_KEY: &str = "head";
 const TARGET_KEY: &str = "target";
+const TARGET_REPORTED_AT_KEY: &str = "target_reported_at";
+const TARGET_VALID_UNTIL_KEY: &str = "target_valid_until";
 const WINDOW_ERROR_KEY: &str = "window_error";
 
-fn deploy_block_key(contract: Address) -> String {
-    // The address is part of the key: repointing the indexer at a different
-    // contract must not inherit the old contract's deployment block.
-    format!("deploy_block:{contract}")
+/// The mirror's standing, as [`ChainStore::mirror_position`] reads it, every
+/// moment by the database's clock.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MirrorPosition {
+    /// The block the indexer last set out to reach.
+    pub target: Option<u64>,
+    /// The block the cursor has committed through.
+    pub cursor: Option<u64>,
+    /// Unix seconds at which the indexer last reported.
+    pub reported_at: Option<u64>,
+    /// Seconds until the indexer's last report expires; negative once it has.
+    pub valid_for: Option<i64>,
+}
+
+/// The longest validity the store will write: ten years. Anything larger is
+/// a mistake, and a value near `i64::MAX` would overflow the `bigint` addition
+/// in Postgres and fail the whole statement, target included.
+const MAX_VALID_FOR_SECS: u64 = 10 * 366 * 24 * 60 * 60;
+
+/// The whole store: every chain any indexer has written into one database.
+///
+/// What the gateway serves is exactly what this holds — nothing to configure,
+/// and a new indexer is served the first time it commits a window. A
+/// [`ChainStore`] is one chain's view of the same pool.
+#[derive(Clone)]
+pub struct Store {
+    pool: PgPool,
+}
+
+impl Store {
+    /// The store over a pool.
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// One chain's view of this store.
+    pub fn chain(&self, chain_id: i64) -> ChainStore {
+        ChainStore::new(self.pool.clone(), chain_id)
+    }
+
+    /// Every chain an indexer has written into this store, by cursor.
+    pub async fn indexed_chains(&self) -> Result<Vec<i64>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT chain_id FROM names.chain_metadata WHERE key = $1 ORDER BY chain_id",
+        )
+        .bind(CURSOR_KEY)
+        .fetch_all(&self.pool)
+        .await
+    }
 }
 
 /// The migrations this crate owns, embedded at compile time.
@@ -366,10 +413,126 @@ impl ChainStore {
     /// and `CONFIRMATIONS` blocks behind the head. Comparing the cursor to the
     /// head instead makes a healthy mirror look permanently late by the
     /// confirmation depth.
-    pub async fn set_chain_target(&self, target: u64) {
-        if let Err(e) = self.set_metadata(TARGET_KEY, &target.to_string()).await {
-            warn!(%e, "failed to record the chain target");
+    ///
+    /// Record the target, when it was reported, and how long readers may
+    /// trust that report — `valid_for_secs` from now, by the database's
+    /// clock. One statement, so the three cannot disagree: a report must
+    /// never vouch for a target write that failed, and no host's clock
+    /// enters into it.
+    ///
+    /// Returns whether the write landed, so a caller renewing the report
+    /// later in the same cycle can decline to vouch for a target that never
+    /// made it.
+    pub async fn set_chain_target(&self, target: u64, valid_for_secs: u64) -> bool {
+        let written = sqlx::query(
+            r#"INSERT INTO names.chain_metadata (chain_id, key, value)
+               VALUES ($1, $2, $3),
+                      ($1, $4, EXTRACT(EPOCH FROM now())::bigint::text),
+                      ($1, $5, (EXTRACT(EPOCH FROM now())::bigint + $6)::text)
+               ON CONFLICT (chain_id, key) DO UPDATE SET value = EXCLUDED.value"#,
+        )
+        .bind(self.chain_id)
+        .bind(TARGET_KEY)
+        .bind(target.to_string())
+        .bind(TARGET_REPORTED_AT_KEY)
+        .bind(TARGET_VALID_UNTIL_KEY)
+        .bind(Self::valid_for_bind(valid_for_secs))
+        .execute(&self.pool)
+        .await;
+        match written {
+            Ok(_) => true,
+            Err(e) => {
+                warn!(%e, "failed to record the chain target");
+                false
+            }
         }
+    }
+
+    /// Renew the report without moving the target. A long catch-up commits
+    /// chunk by chunk under one target, and every committed chunk is proof
+    /// that the loop is alive and the chain reachable; without this a healthy
+    /// backfill would expire.
+    pub async fn touch_chain_target(&self, valid_for_secs: u64) {
+        let touched = sqlx::query(
+            r#"INSERT INTO names.chain_metadata (chain_id, key, value)
+               VALUES ($1, $2, EXTRACT(EPOCH FROM now())::bigint::text),
+                      ($1, $3, (EXTRACT(EPOCH FROM now())::bigint + $4)::text)
+               ON CONFLICT (chain_id, key) DO UPDATE SET value = EXCLUDED.value"#,
+        )
+        .bind(self.chain_id)
+        .bind(TARGET_REPORTED_AT_KEY)
+        .bind(TARGET_VALID_UNTIL_KEY)
+        .bind(Self::valid_for_bind(valid_for_secs))
+        .execute(&self.pool)
+        .await;
+        if let Err(e) = touched {
+            warn!(%e, "failed to renew the chain target's report");
+        }
+    }
+
+    /// The metadata key the deployment block of `contract` is cached under.
+    /// The address is part of it: repointing the indexer at a different
+    /// contract must not inherit the old contract's deployment block.
+    fn deploy_block_key(contract: Address) -> String {
+        format!("deploy_block:{contract}")
+    }
+
+    /// The validity the store will write for a report: at most ten years,
+    /// so the `bigint` addition in Postgres can never overflow and fail the
+    /// whole statement, target included.
+    fn valid_for_bind(valid_for_secs: u64) -> i64 {
+        i64::try_from(valid_for_secs.min(MAX_VALID_FOR_SECS)).unwrap_or(i64::MAX)
+    }
+
+    /// Set when the report expires, as absolute Unix seconds.
+    ///
+    /// A test seam, and nothing else: production writes validity only through
+    /// [`Self::set_chain_target`] and [`Self::touch_chain_target`], relative
+    /// to the database's clock. Nothing in the binaries may call this.
+    #[doc(hidden)]
+    pub async fn set_chain_target_valid_until(&self, secs: u64) {
+        if let Err(e) = self
+            .set_metadata(TARGET_VALID_UNTIL_KEY, &secs.to_string())
+            .await
+        {
+            warn!(%e, "failed to record when the chain target's report expires");
+        }
+    }
+
+    /// Where the mirror stands, in one read: the target, the cursor, when the
+    /// indexer last reported and how long that report is still good — the
+    /// last by the database's clock, the same one that stamped it. One
+    /// statement, so the four are a snapshot and one round trip on the
+    /// gateway's hot path.
+    pub async fn mirror_position(&self) -> Result<MirrorPosition, sqlx::Error> {
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
+            r#"SELECT key, value, EXTRACT(EPOCH FROM now())::bigint
+               FROM names.chain_metadata
+               WHERE chain_id = $1 AND key IN ($2, $3, $4, $5)"#,
+        )
+        .bind(self.chain_id)
+        .bind(TARGET_KEY)
+        .bind(CURSOR_KEY)
+        .bind(TARGET_REPORTED_AT_KEY)
+        .bind(TARGET_VALID_UNTIL_KEY)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut position = MirrorPosition::default();
+        for (key, value, now) in rows {
+            if key == TARGET_KEY {
+                position.target = value.parse().ok();
+            } else if key == CURSOR_KEY {
+                position.cursor = value.parse().ok();
+            } else if key == TARGET_REPORTED_AT_KEY {
+                position.reported_at = value.parse().ok();
+            } else if key == TARGET_VALID_UNTIL_KEY {
+                position.valid_for = value
+                    .parse::<i64>()
+                    .ok()
+                    .map(|until| until.saturating_sub(now));
+            }
+        }
+        Ok(position)
     }
 
     /// The block the cursor is chasing, as last recorded by the indexer loop.
@@ -419,7 +582,7 @@ impl ChainStore {
         &self,
         contract: Address,
     ) -> Result<Option<u64>, sqlx::Error> {
-        let value = self.get_metadata(&deploy_block_key(contract)).await?;
+        let value = self.get_metadata(&Self::deploy_block_key(contract)).await?;
         Ok(value.and_then(|v| v.parse().ok()))
     }
 
@@ -430,7 +593,7 @@ impl ChainStore {
         contract: Address,
         block: u64,
     ) -> Result<(), sqlx::Error> {
-        self.set_metadata(&deploy_block_key(contract), &block.to_string())
+        self.set_metadata(&Self::deploy_block_key(contract), &block.to_string())
             .await
     }
 
@@ -870,6 +1033,15 @@ pub struct HandleRow {
 }
 
 impl HandleRow {
+    /// The owner as an address, or `None` after retirement or for a row whose
+    /// bytes are not an address.
+    pub fn owner_address(&self) -> Option<Address> {
+        self.owner
+            .as_deref()
+            .and_then(|bytes| <[u8; 20]>::try_from(bytes).ok())
+            .map(Address::from)
+    }
+
     /// Mirrors `resolvePair`: the account id this handle points back at
     /// still resolves to the same wallet.
     pub fn id_agrees(&self) -> bool {

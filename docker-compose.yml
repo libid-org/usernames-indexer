@@ -26,6 +26,7 @@ services:
       POLL_INTERVAL_SECS: ${POLL_INTERVAL_SECS:-5}
       MAX_BLOCK_RANGE: ${MAX_BLOCK_RANGE:-10000}
       START_BLOCK:
+      STALE_AFTER_SECS:
       RUST_LOG:
     depends_on:
       postgres:
@@ -47,8 +48,9 @@ services:
     environment:
       DATABASE_URL: postgres://usernames:${POSTGRES_PASSWORD:-usernames_dev}@postgres:5432/usernames
       IDENTITY_NAMES_ADDRESS: ${IDENTITY_NAMES_ADDRESS:?set IDENTITY_NAMES_ADDRESS}
-      # Required here, unlike the indexer: nothing in this process talks to a
-      # chain, so it cannot discover which chain's rows it serves.
+      # Required here, unlike the indexer: the `/v1` half talks to no chain, so
+      # it cannot discover which chain's rows it serves. The ENS gateway serves
+      # every chain in the store and does not read it.
       CHAIN_ID: ${CHAIN_ID:?set CHAIN_ID}
       # The image's bind, pinned: `.env` may carry the cargo-run value
       # `127.0.0.1:8080`, and through `env_file` it would win — a container
