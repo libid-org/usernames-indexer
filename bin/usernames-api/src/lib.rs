@@ -15,17 +15,12 @@
 pub mod ens;
 
 use std::{
-    collections::HashMap,
     net::SocketAddr,
     sync::Arc,
 };
 
 use alloy::{
     primitives::Address,
-    providers::{
-        Provider,
-        RootProvider,
-    },
     signers::local::PrivateKeySigner,
 };
 use axum::Router;
@@ -36,7 +31,6 @@ use tower_http::cors::{
     CorsLayer,
 };
 use tracing::info;
-use url::Url;
 use usernames_core::{
     api,
     db,
@@ -83,42 +77,6 @@ pub struct Config {
     #[arg(long, env = "ENS_RESOLVER_ADDRESS")]
     pub ens_resolver_address: Option<Address>,
 
-    /// Which chains this gateway answers for, and what each is called in the
-    /// name hierarchy: `3735928814:eden,8453:base`. The label is optional.
-    ///
-    /// A coin type naming anything outside this set gets an UNSIGNED refusal,
-    /// not a signed null. The resolver carries one `urls` list for every chain
-    /// it ever answers, so a signed null here would end the client's walk
-    /// through that list — and a sibling gateway further down it may have been
-    /// the one that could answer.
-    ///
-    /// Unset falls back to the chain this process indexes, which is the
-    /// single-chain deployment.
-    #[arg(long, env = "ENS_CHAINS")]
-    pub ens_chains: Option<String>,
-
-    /// Where answers come from: `mirror` reads the indexed model, `chain`
-    /// reads `IdentityNames` over RPC.
-    ///
-    /// `chain` is the stronger source for a SIGNED answer — it is current
-    /// rather than as-of-last-window, so `ENS_MAX_LAG_BLOCKS` stops applying.
-    /// `mirror` is the default because it needs no further configuration and
-    /// because it answers from a model kept `CONFIRMATIONS` blocks deep, which
-    /// a call at the head is not.
-    #[arg(long, env = "ENS_SOURCE", default_value = "mirror")]
-    pub ens_source: EnsSource,
-
-    /// JSON-RPC endpoint per chain, required with `ENS_SOURCE=chain`:
-    /// `3735928814=http://…,8453=https://…`.
-    #[arg(long, env = "ENS_RPC_URLS", hide_env_values = true)]
-    pub ens_rpc_urls: Option<String>,
-
-    /// `IdentityNames` per chain, for the chains where it is not at
-    /// `IDENTITY_NAMES_ADDRESS`: `8453=0x…`. Only read with
-    /// `ENS_SOURCE=chain`.
-    #[arg(long, env = "ENS_CONTRACTS")]
-    pub ens_contracts: Option<String>,
-
     /// How long a signed answer stays good, in seconds. The resolver enforces
     /// it on chain.
     #[arg(long, env = "ENS_TTL_SECS", default_value_t = 300)]
@@ -154,11 +112,9 @@ pub async fn run() -> anyhow::Result<()> {
 
     let cancel = CancellationToken::new();
 
-    // Configured BEFORE the port opens. With `ENS_SOURCE=chain` this awaits an
-    // RPC round trip per chain, and it can still refuse to start — so binding
-    // first would accept connections the process is not yet able to serve, and
-    // reset them if it then aborts. A liveness probe reads that as alive.
-    let gateway = ens_config(&config, chain_id, pool).await?;
+    // Configured BEFORE the port opens: it can refuse to start, and binding
+    // first would accept connections the process is not yet able to serve.
+    let gateway = ens_config(&config, pool)?;
     match &gateway {
         Some(g) => info!(
             resolver = %g.resolver,
@@ -193,20 +149,6 @@ pub async fn run() -> anyhow::Result<()> {
             Err(e) => Err(anyhow::anyhow!("API task died: {e}")),
         },
     }
-}
-
-/// Where a signed answer comes from.
-///
-/// A type rather than a string so clap rejects a typo at startup with the
-/// valid values listed, instead of the gateway mounting and every request
-/// failing on a `match` arm nothing reaches.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub enum EnsSource {
-    /// Read the indexed model. Answers as of the last window, so the lag gate
-    /// applies.
-    Mirror,
-    /// Read `IdentityNames` over RPC. Current rather than as-of-last-window.
-    Chain,
 }
 
 /// Every route the binary serves, with the middleware over the whole of it.
@@ -281,147 +223,9 @@ fn signing_identity(
     Ok(Some((signer, resolver)))
 }
 
-/// The chains one gateway may answer for together, or why this set cannot be
-/// one gateway's.
-///
-/// Pure and total on purpose: every refusal here is a statement about the
-/// configuration alone, needing no pool, no endpoint and no chain — which is
-/// what lets all of it be exercised without any of them. Each entry is checked
-/// against the ones before it, so a refusal always names both halves of the
-/// conflict.
-fn validated_chains(
-    declared: Vec<(u64, Option<String>)>,
-) -> anyhow::Result<Vec<(u64, Option<String>)>> {
-    if declared.is_empty() {
-        anyhow::bail!(
-            "ENS_CHAINS names no chain; a gateway serving none answers nothing"
-        );
-    }
-
-    for (i, (id, label)) in declared.iter().enumerate() {
-        let earlier = &declared[..i];
-
-        // A repeated id is invisible to the collision check below, which asks
-        // whether two DIFFERENT ids share a coin type. Left alone, the second
-        // entry silently overwrites the first, and the label the operator meant
-        // to serve is gone — every name under it answering a SIGNED null for a
-        // chain they believe is configured.
-        if earlier.iter().any(|(other, _)| other == id) {
-            anyhow::bail!("ENS_CHAINS names chain {id} twice");
-        }
-
-        if let Some(label) = label.as_deref() {
-            // A label the name grammar can never produce makes the chain
-            // unaddressable by label, and says so nowhere. The rules come from
-            // `usernames-core` rather than being restated here.
-            if !usernames_core::ens::label_is_wellformed(label) {
-                anyhow::bail!(
-                    "ENS_CHAINS label {label:?} is not valid ENS-normalized text; \
-                     a name carrying it cannot parse, so the chain would be \
-                     unaddressable by label"
-                );
-            }
-            // The grammar reads right to left and takes the rightmost label as
-            // the platform, so a chain label spelled like one is read as that
-            // instead — the chain becomes unreachable rather than ambiguous.
-            if usernames_core::nodes::Platform::from_key(label).is_some() {
-                anyhow::bail!(
-                    "ENS_CHAINS label {label:?} collides with a platform label; \
-                     the name grammar would read it as the platform"
-                );
-            }
-            // Two chains under one label make the label meaningless: it is
-            // supposed to NARROW, and a query naming it would be answered by
-            // whichever chain the coin type picked — the widening the design
-            // forbids.
-            if let Some((other, _)) =
-                earlier.iter().find(|(_, l)| l.as_deref() == Some(label))
-            {
-                anyhow::bail!(
-                    "ENS_CHAINS gives chains {id} and {other} the same label \
-                     {label:?}; a label that names two chains narrows to neither"
-                );
-            }
-        }
-
-        // Two chains whose coin types collide cannot be told apart by a query,
-        // so a gateway serving both would answer one's binding for the other.
-        // `0x80000000 | chainId` stops being injective past 2^31 — the eden
-        // testnet's 3735928814 is such a chain — but serving eden is perfectly
-        // safe as long as its colliding twin is not also served. Refused HERE,
-        // where both ids are known, rather than by banning the chain.
-        if let Some((other, _)) = earlier
-            .iter()
-            .find(|(other, _)| usernames_core::ens::chain_ids_collide(*id, *other))
-        {
-            anyhow::bail!(
-                "chains {id} and {other} share one ENSIP-11 coin type, so a query \
-                 cannot say which it means; serve them from separate gateways"
-            );
-        }
-    }
-    Ok(declared)
-}
-
-/// Where one chain's answers come from.
-///
-/// The only part of the configuration that reaches outside this process, which
-/// is why it is the only part that is async.
-async fn chain_source(
-    config: &Config,
-    id: u64,
-    pool: &sqlx::PgPool,
-    rpc: &HashMap<u64, Url>,
-    contracts: &HashMap<u64, Address>,
-) -> anyhow::Result<ens::HandleSource> {
-    match config.ens_source {
-        // A mirror serves whichever chain's rows it is scoped to, and they all
-        // live in this one database.
-        EnsSource::Mirror => Ok(ens::HandleSource::Mirror(db::ChainStore::new(
-            pool.clone(),
-            i64::try_from(id)
-                .map_err(|_| anyhow::anyhow!("chain id {id} does not fit a BIGINT"))?,
-        ))),
-        EnsSource::Chain => {
-            let url = rpc.get(&id).ok_or_else(|| {
-                anyhow::anyhow!("ENS_SOURCE=chain but ENS_RPC_URLS has no entry for {id}")
-            })?;
-            let provider = RootProvider::new_http(url.clone());
-            // The signature binds the resolver, the deadline, the request and
-            // the result — never the chain. So a transposed `ENS_RPC_URLS`
-            // entry (two chains, two URLs, one copy-paste) has this gateway
-            // read one chain's bindings and SIGN them under the other's coin
-            // type, and the resolver accepts them because nothing in the digest
-            // disagrees. A wallet is handed the wrong address, authoritatively,
-            // and nothing is logged. Ask the endpoint who it is, as the indexer
-            // already does.
-            let reported = provider.get_chain_id().await.map_err(|e| {
-                anyhow::anyhow!("ENS_RPC_URLS entry for chain {id} is unreachable: {e}")
-            })?;
-            anyhow::ensure!(
-                reported == id,
-                "ENS_RPC_URLS entry for chain {id} reports chain {reported}; \
-                 answers read from it would be signed under the wrong coin type"
-            );
-            Ok(ens::HandleSource::Chain {
-                provider,
-                // Per chain, with `IDENTITY_NAMES_ADDRESS` as the default. The
-                // canonical entry contracts are CREATE3-deterministic and
-                // identical everywhere, but this field is documented as the
-                // ERC1967 PROXY the rows were indexed from, and a proxy carries
-                // no such guarantee. Assuming it does turns a mismatch into an
-                // `eth_call` against an address with no code, which surfaces as
-                // a decode failure rather than as a configuration error.
-                contract: *contracts.get(&id).unwrap_or(&config.identity_names_address),
-            })
-        }
-    }
-}
-
 /// Build the gateway configuration, or `None` when this deployment runs none.
-async fn ens_config(
+fn ens_config(
     config: &Config,
-    chain_id: i64,
     pool: sqlx::PgPool,
 ) -> anyhow::Result<Option<ens::Config>> {
     let Some((signer, resolver)) = signing_identity(config)? else {
@@ -442,99 +246,13 @@ async fn ens_config(
         );
     }
 
-    let own = u64::try_from(chain_id).expect("chain id came from a u64");
-    let declared = validated_chains(parse_chains(config.ens_chains.as_deref(), own)?)?;
-    let rpc = parse_rpc_urls(config.ens_rpc_urls.as_deref())?;
-    let contracts = parse_contracts(config.ens_contracts.as_deref())?;
-
-    let mut chains = HashMap::new();
-    for (id, label) in declared {
-        let source = chain_source(config, id, &pool, &rpc, &contracts).await?;
-        chains.insert(id, ens::ChainGateway { label, source });
-    }
-
     Ok(Some(ens::Config {
         resolver,
-        chains,
+        pool,
         ttl_secs: config.ens_ttl_secs,
         max_lag_blocks: config.ens_max_lag_blocks,
         signer: Arc::new(signer),
     }))
-}
-
-/// `3735928814:eden,8453:base`, or the process's own chain when unset.
-fn parse_chains(
-    raw: Option<&str>,
-    own: u64,
-) -> anyhow::Result<Vec<(u64, Option<String>)>> {
-    let Some(raw) = raw else {
-        return Ok(vec![(own, None)]);
-    };
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|entry| {
-            let (id, label) = match entry.split_once(':') {
-                Some((id, label)) => (id, Some(label.trim().to_string())),
-                None => (entry, None),
-            };
-            Ok((
-                id.trim().parse::<u64>().map_err(|_| {
-                    anyhow::anyhow!("ENS_CHAINS: {id:?} is not a chain id")
-                })?,
-                label,
-            ))
-        })
-        .collect()
-}
-
-/// `3735928814=http://…,8453=https://…`.
-fn parse_rpc_urls(raw: Option<&str>) -> anyhow::Result<HashMap<u64, Url>> {
-    let Some(raw) = raw else {
-        return Ok(HashMap::new());
-    };
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|entry| {
-            let (id, url) = entry.split_once('=').ok_or_else(|| {
-                anyhow::anyhow!("ENS_RPC_URLS: {entry:?} is not `chainId=url`")
-            })?;
-            Ok((
-                id.trim().parse::<u64>().map_err(|_| {
-                    anyhow::anyhow!("ENS_RPC_URLS: {id:?} is not a chain id")
-                })?,
-                url.trim().parse::<Url>().map_err(|e| {
-                    anyhow::anyhow!("ENS_RPC_URLS: {url:?} is not a URL: {e}")
-                })?,
-            ))
-        })
-        .collect()
-}
-
-/// `8453=0x…,10=0x…`.
-fn parse_contracts(raw: Option<&str>) -> anyhow::Result<HashMap<u64, Address>> {
-    let Some(raw) = raw else {
-        return Ok(HashMap::new());
-    };
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|entry| {
-            let (id, address) = entry.split_once('=').ok_or_else(|| {
-                anyhow::anyhow!("ENS_CONTRACTS: {entry:?} is not `chainId=address`")
-            })?;
-            Ok((
-                id.trim().parse::<u64>().map_err(|_| {
-                    anyhow::anyhow!("ENS_CONTRACTS: {id:?} is not a chain id")
-                })?,
-                address
-                    .trim()
-                    .parse::<Address>()
-                    .map_err(|e| anyhow::anyhow!("ENS_CONTRACTS: {address:?}: {e}"))?,
-            ))
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -572,7 +290,7 @@ mod tests {
     /// `ens::Config` holds a signer and so is not `Debug`; match rather than
     /// `expect_err`.
     async fn refusal(extra: &[&str]) -> String {
-        match ens_config(&config(extra), 3735928814, lazy_pool()).await {
+        match ens_config(&config(extra), lazy_pool()) {
             Ok(_) => panic!("this configuration must be refused"),
             Err(e) => e.to_string(),
         }
@@ -590,8 +308,7 @@ mod tests {
             "1",
         ])
         .expect("parse");
-        let mounted = ens_config(&config, 1, lazy_pool())
-            .await
+        let mounted = ens_config(&config, lazy_pool())
             .expect("no key is not an error")
             .is_some();
         assert!(!mounted, "the route must not be mounted without a key");
@@ -610,116 +327,11 @@ mod tests {
     #[tokio::test]
     async fn the_ttl_ceiling_leaves_the_chain_room_to_trail() {
         let at_ceiling = config(&["--ens-ttl-secs", &MAX_TTL_SECS.to_string()]);
-        assert!(ens_config(&at_ceiling, 3735928814, lazy_pool())
-            .await
-            .is_ok());
+        assert!(ens_config(&at_ceiling, lazy_pool()).is_ok());
 
         let message =
             refusal(&["--ens-ttl-secs", &RESOLVER_MAX_LIFETIME_SECS.to_string()]).await;
         assert!(message.contains("trail"), "{message}");
-    }
-
-    #[tokio::test]
-    async fn a_repeated_chain_is_refused() {
-        // Invisible to the collision check, which compares DIFFERENT ids: the
-        // second entry used to overwrite the first in silence.
-        let message = refusal(&["--ens-chains", "8453:base,8453:eden"]).await;
-        assert!(message.contains("twice"), "{message}");
-    }
-
-    /// One label, two chains: the label stops narrowing and starts picking
-    /// whichever chain the coin type matched.
-    #[tokio::test]
-    async fn two_chains_under_one_label_are_refused() {
-        let message = refusal(&["--ens-chains", "8453:base,10:base"]).await;
-        assert!(message.contains("same label"), "{message}");
-    }
-
-    #[tokio::test]
-    async fn a_label_spelled_like_a_platform_is_refused() {
-        // The grammar reads right to left, so a trailing `x` is the PLATFORM.
-        let message = refusal(&["--ens-chains", "8453:x"]).await;
-        assert!(message.contains("collides"), "{message}");
-    }
-
-    #[tokio::test]
-    async fn a_label_the_grammar_cannot_produce_is_refused() {
-        for label in ["Base", "ba_se", "with space"] {
-            let message = refusal(&["--ens-chains", &format!("8453:{label}")]).await;
-            assert!(
-                message.contains("ENS-normalized"),
-                "{label:?} was accepted: {message}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn a_gateway_serving_no_chain_is_refused() {
-        let message = refusal(&["--ens-chains", ""]).await;
-        assert!(message.contains("names no chain"), "{message}");
-    }
-
-    #[tokio::test]
-    async fn colliding_coin_types_are_refused_together() {
-        // 3735928814 and 1588445166 differ only in the bit ENSIP-11 sets.
-        let message = refusal(&["--ens-chains", "3735928814:eden,1588445166:twin"]).await;
-        assert!(message.contains("coin type"), "{message}");
-    }
-
-    /// The `chain` source against a real endpoint, and the check that makes it
-    /// safe.
-    ///
-    /// Skipped when anvil is not on PATH, like the rest of the chain-touching
-    /// suite. Worth the process: this is the only test that runs the chain-id
-    /// verification against something that can actually answer, and a
-    /// verification nothing exercises is a comment.
-    #[tokio::test]
-    async fn the_chain_source_refuses_an_endpoint_that_is_another_chain() {
-        let Ok(anvil) = alloy::node_bindings::Anvil::new().try_spawn() else {
-            return;
-        };
-        let endpoint = anvil.endpoint();
-        let chain_id = anvil.chain_id();
-
-        // Named as itself: accepted, and the source is built.
-        let honest = config(&[
-            "--ens-source",
-            "chain",
-            "--ens-chains",
-            &format!("{chain_id}:local"),
-            "--ens-rpc-urls",
-            &format!("{chain_id}={endpoint}"),
-        ]);
-        assert!(
-            ens_config(&honest, chain_id as i64, lazy_pool())
-                .await
-                .is_ok(),
-            "an endpoint that is the chain it is declared as must be accepted"
-        );
-
-        // Named as a different chain: this is the transposed-entry mistake, and
-        // it must not start. Left alone it would sign this chain's bindings
-        // under another chain's coin type, and the resolver would accept every
-        // one of them.
-        let transposed = config(&[
-            "--ens-source",
-            "chain",
-            "--ens-chains",
-            "8453:base",
-            "--ens-rpc-urls",
-            &format!("8453={endpoint}"),
-        ]);
-        let message = match ens_config(&transposed, chain_id as i64, lazy_pool()).await {
-            Ok(_) => panic!("an endpoint reporting another chain must be refused"),
-            Err(e) => e.to_string(),
-        };
-        assert!(message.contains("reports chain"), "{message}");
-    }
-
-    #[tokio::test]
-    async fn chain_source_without_an_endpoint_is_refused() {
-        let message = refusal(&["--ens-source", "chain"]).await;
-        assert!(message.contains("ENS_RPC_URLS"), "{message}");
     }
 }
 
@@ -735,7 +347,7 @@ mod help_tests {
     #[test]
     fn help_never_prints_a_secret() {
         let command = Config::command();
-        for secret in ["database_url", "ens_signer_key", "ens_rpc_urls"] {
+        for secret in ["database_url", "ens_signer_key"] {
             let arg = command
                 .get_arguments()
                 .find(|a| a.get_id() == secret)

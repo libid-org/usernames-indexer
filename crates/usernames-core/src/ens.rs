@@ -52,6 +52,23 @@ use crate::nodes::{
 /// The domain every name sits under, as labels.
 pub const DOMAIN: [&str; 2] = ["handles", "link"];
 
+/// The chains a name may narrow to, by label — `alice.x.base.handles.link`.
+///
+/// A closed set that never overlaps the platform keys, and the ONE place a
+/// chain's label is defined. The gateway answers for whatever chains the
+/// store holds; this table only says what each is called in a name. A chain
+/// absent here is still served under its coin type, and cannot be named by
+/// label.
+pub const KNOWN_CHAINS: [(u64, &str); 2] = [(3_735_928_814, "eden"), (8453, "base")];
+
+/// The label a chain carries in a name, if it has one.
+pub fn chain_label(chain_id: u64) -> Option<&'static str> {
+    KNOWN_CHAINS
+        .iter()
+        .find(|(id, _)| *id == chain_id)
+        .map(|(_, label)| *label)
+}
+
 /// ENSIP-11: an EVM chain's coin type is `0x80000000 | chainId`.
 const EVM_COIN_TYPE_BIT: u64 = 0x8000_0000;
 
@@ -839,5 +856,32 @@ mod tests {
         let sig_at = 3 * 32 + 32 + 32;
         assert_eq!(out[sig_at + 31], 65);
         assert_eq!(out.len(), sig_at + 32 + 96);
+    }
+}
+
+#[cfg(test)]
+mod known_chains {
+    use super::*;
+
+    /// The table is the grammar's closed set: every label well-formed, no two
+    /// chains sharing a label or a coin type, and no label a platform could be
+    /// mistaken for — the parse decides "platform or chain" by the platform
+    /// keys, so an overlap would make one name mean two things.
+    #[test]
+    fn chain_labels_form_a_closed_set_apart_from_the_platforms() {
+        for (i, (id, label)) in KNOWN_CHAINS.iter().enumerate() {
+            assert!(label_is_wellformed(label), "{label}");
+            assert!(
+                KnownPlatform::from_key(label).is_none(),
+                "{label} is a platform"
+            );
+            assert_eq!(chain_label(*id), Some(*label));
+            for (other_id, other_label) in &KNOWN_CHAINS[i + 1..] {
+                assert_ne!(id, other_id);
+                assert_ne!(label, other_label);
+                assert!(!chain_ids_collide(*id, *other_id), "{id} and {other_id}");
+            }
+        }
+        assert_eq!(chain_label(31341), None);
     }
 }

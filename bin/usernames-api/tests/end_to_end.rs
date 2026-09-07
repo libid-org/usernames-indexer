@@ -46,10 +46,8 @@ use http_body_util::BodyExt;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
 use usernames_api::ens::{
-    ChainGateway,
     Config,
     GatewayState,
-    HandleSource,
 };
 use usernames_core::db::{
     self,
@@ -225,15 +223,7 @@ async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> 
     // The gateway is bound to THIS resolver, because the signature names it.
     let router = usernames_api::ens::router(GatewayState::new(Config {
         resolver: *resolver.address(),
-        chains: [(
-            CHAIN as u64,
-            ChainGateway {
-                label: None,
-                source: HandleSource::Mirror(store),
-            },
-        )]
-        .into_iter()
-        .collect(),
+        pool: store.pool().clone(),
         ttl_secs: 300,
         max_lag_blocks: 32,
         signer: std::sync::Arc::new(signer),

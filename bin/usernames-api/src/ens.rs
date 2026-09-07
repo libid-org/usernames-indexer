@@ -16,7 +16,7 @@
 //! signature turns an answer into an assertion, and neither of these has
 //! earned one.
 //!
-//! * **A chain this gateway does not serve** — mainnet included, and that is
+//! * **A chain the store does not hold** — mainnet included, and that is
 //!   the case worth stating plainly, because `addr(node)` with no coin type
 //!   IS a mainnet query and it is what `getAddress()` sends by default. The
 //!   resolver carries ONE `urls` list for every query it ever answers — it
@@ -25,25 +25,21 @@
 //!   walk. A gateway that signed null for every chain but its own would
 //!   therefore answer, authoritatively and wrongly, for chains its neighbours
 //!   in the list were there to serve. Refusing steps aside and lets the walk
-//!   continue — which also means a deployment must list a gateway for every
-//!   chain it wants resolvable, mainnet among them, or the default query
-//!   shape gets an error rather than an address.
+//!   continue — which also means a deployment must index every chain it
+//!   wants resolvable, mainnet among them, or the default query shape gets an
+//!   error rather than an address.
 //! * **A mirror too far behind.** Same shape: a signed null from a stale
 //!   mirror denies a binding that may already exist.
 //!
 //! # Where an answer comes from
 //!
-//! [`HandleSource`] is one lookup wide and has two implementations. The mirror
-//! answers from Postgres, cheaply, as of whatever block the indexer last
-//! committed. The chain answers over RPC, as of the head. They differ in what
-//! they can honestly assert, which is why the second needs no lag gate — and
-//! why it is the stronger choice for a signed answer, whatever the default
-//! says.
+//! The store, and nothing else. Every chain an indexer has written into it is
+//! served, discovered per request rather than configured, so a new indexer is
+//! answered for the first time it commits. An answer is as of whatever block
+//! that indexer last committed — which is what [`Config::max_lag_blocks`] and
+//! the indexer's own report guard.
 
-use std::{
-    collections::HashMap,
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use alloy::{
     primitives::{
@@ -51,7 +47,6 @@ use alloy::{
         B256,
         U256,
     },
-    providers::RootProvider,
     signers::Signer,
 };
 use axum::{
@@ -68,23 +63,15 @@ use axum::{
     Json,
     Router,
 };
-use libid_contracts::bindings::identity::IdentityNames;
-
-alloy::sol! {
-    /// `IdentityNames` rejects a platform it was never configured with.
-    ///
-    /// Declared here because the published bindings do not carry it, and the
-    /// one place that must recognise it should name it rather than compare a
-    /// selector literal.
-    error UnknownPlatform(bytes32 platformId);
-}
 use serde::Serialize;
+use sqlx::PgPool;
 use tracing::{
     error,
     warn,
 };
 use usernames_core::{
     db::{
+        self,
         ChainStore,
         MirrorPosition,
     },
@@ -96,104 +83,46 @@ use usernames_core::{
     nodes::NormalizedHandle,
 };
 
-/// Where one chain's answers come from.
+/// The owner a name resolves to, from the indexed model of one chain.
 ///
-/// One lookup wide, and closed: an enum rather than a trait because there are
-/// exactly two and dynamic dispatch would buy nothing.
-#[derive(Clone)]
-pub enum HandleSource {
-    /// The indexed read model. Cheap, and as of whatever block the indexer
-    /// last committed — which is what [`Config::max_lag_blocks`] guards.
-    Mirror(ChainStore),
-    /// The contract itself, as of the head. No lag to guard, and no `_id`
-    /// form: `IdentityNames` exposes no getter keyed by `idNode`, only the
-    /// event, so a node-addressed name has nothing to ask.
-    Chain {
-        /// The JSON-RPC endpoint for this chain.
-        provider: RootProvider,
-        /// `IdentityNames`, which sits at one CREATE3 address on every chain.
-        contract: Address,
-    },
+/// `None` is the null answer — a name nobody holds — as of whatever block
+/// that chain's indexer last committed.
+async fn owner_of(
+    store: &ChainStore,
+    platform: B256,
+    handle: &NormalizedHandle,
+) -> Result<Option<Address>, GatewayError> {
+    Ok(store
+        .resolve_handle(platform, handle)
+        .await
+        .map_err(internal)?
+        .and_then(|row| row.owner)
+        .as_deref()
+        .and_then(as_address))
 }
 
-impl HandleSource {
-    async fn resolve_handle(
-        &self,
-        platform: B256,
-        handle: &NormalizedHandle,
-    ) -> Result<Option<Address>, GatewayError> {
-        match self {
-            Self::Mirror(store) => Ok(store
-                .resolve_handle(platform, handle)
-                .await
-                .map_err(internal)?
-                .and_then(|row| row.owner)
-                .as_deref()
-                .and_then(as_address)),
-            Self::Chain { provider, contract } => {
-                let names = IdentityNames::new(*contract, provider);
-                let owner = match names
-                    .resolveHandle(platform, handle.as_str().to_string())
-                    .call()
-                    .await
-                {
-                    Ok(owner) => owner,
-                    // A platform this chain was never configured with is a
-                    // name nobody can hold — the same fact the mirror reports
-                    // as an empty row, and it deserves the same SIGNED null.
-                    // Left as an error it became a 500, so `bob.github.…` on a
-                    // chain wired only for `x` looked like an outage instead
-                    // of an unclaimable name, and logged one line per request.
-                    Err(e) if e.as_decoded_error::<UnknownPlatform>().is_some() => {
-                        return Ok(None);
-                    }
-                    Err(e) => return Err(internal(e)),
-                };
-                // The contract answers the zero address for a name nobody
-                // holds, which is the null answer rather than an address.
-                Ok((!owner.is_zero()).then_some(owner))
-            }
-        }
-    }
-
-    /// How far this source trails the chain.
-    ///
-    /// Three answers, not two, and the third is the one that matters: reading
-    /// the chain directly there IS no lag; reading a mirror it is a number; and
-    /// reading a mirror whose target, cursor or report is missing or
-    /// unreadable, it is UNKNOWN. Folding unknown into "no lag" is how a
-    /// gateway ends up signing
-    /// authoritative nulls off a wiped or unreachable database — a fresh
-    /// deployment, a version-bump replay clearing `names.chain_metadata`, a
-    /// chain listed in `ENS_CHAINS` that nobody indexed, or Postgres simply
-    /// being down all produce it.
-    async fn lag(&self) -> Lag {
-        match self {
-            Self::Chain { .. } => Lag::None,
-            Self::Mirror(store) => {
-                // Against the TARGET, not the chain head. The indexer records
-                // the head as the chain's own height but only ever advances
-                // the cursor to `head - CONFIRMATIONS`, so a fully caught-up
-                // mirror is permanently that far behind the head. Measured
-                // that way, any deployment whose CONFIRMATIONS reached
-                // ENS_MAX_LAG_BLOCKS refused every ENS query forever while
-                // being perfectly healthy — two knobs in two binaries with
-                // nothing relating them.
-                //
-                // And whether the indexer's report is still good, because the
-                // target is the indexer's own claim about the chain. A loop
-                // that stopped — crashed, lost its RPC, waiting on the writer
-                // lease — leaves target and cursor frozen together, so by
-                // blocks alone a dead indexer reads as caught up, for as long
-                // as it stays dead. The report it makes beside the target
-                // expires on its own schedule, and that is what notices.
-                //
-                // One read, because this is the hot path and because the
-                // values must be a snapshot.
-                mirror_lag(store.mirror_position().await.ok())
-            }
-        }
-    }
+/// How far one chain's mirror trails the chain.
+///
+/// Two answers: a number when the store can say, and UNKNOWN when its target,
+/// cursor or report is missing or unreadable. Folding unknown into "no lag" is
+/// how a gateway ends up signing authoritative nulls off a wiped or
+/// unreachable database — a fresh deployment, a version-bump replay clearing
+/// `names.chain_metadata`, a chain nobody indexed yet, or Postgres simply
+/// being down all produce it.
+async fn lag(store: &ChainStore) -> Lag {
+    // In one read, because this is the hot path and because the values must
+    // be a snapshot: the target, the cursor, and whether the indexer's report
+    // is still good — by the database's clock, the same one that stamped it.
+    //
+    // Against the TARGET, not the chain head: the indexer only ever advances
+    // the cursor to `head - CONFIRMATIONS`, so a caught-up mirror sits
+    // permanently that far behind the head, and measured that way a healthy
+    // deployment would refuse forever. And WHETHER the report is still good,
+    // because the target is the indexer's own claim: a loop that stopped
+    // leaves target and cursor frozen together, so by blocks alone a dead
+    // indexer reads as caught up for as long as it stays dead. The report it
+    // makes beside the target expires on its own schedule, and that notices.
+    mirror_lag(store.mirror_position().await.ok())
 }
 
 /// The lag a mirror position amounts to. Missing pieces are `Unknown`, and
@@ -218,7 +147,6 @@ fn mirror_lag(position: Option<MirrorPosition>) -> Lag {
 /// the gate and `/status` share, so supervision sees what the gate sees.
 fn staleness(lag: &Lag, max_lag_blocks: u64) -> Option<Staleness> {
     match *lag {
-        Lag::None => None,
         Lag::Mirror { valid_for, .. } if valid_for < 0 => {
             Some(Staleness::Expired(valid_for.unsigned_abs()))
         }
@@ -234,17 +162,7 @@ fn as_address(bytes: &[u8]) -> Option<Address> {
     <[u8; 20]>::try_from(bytes).ok().map(Address::from)
 }
 
-/// One chain this gateway answers for.
-#[derive(Clone)]
-pub struct ChainGateway {
-    /// This chain's label in the name hierarchy, when it has one. A name
-    /// carrying a different label is not this chain's name.
-    pub label: Option<String>,
-    /// Where its answers come from.
-    pub source: HandleSource,
-}
-
-/// What the gateway needs beyond the chains it serves.
+/// What the gateway needs: the store it reads, and the identity it signs with.
 #[derive(Clone)]
 pub struct Config {
     /// The resolver this gateway answers for. Every answer is signed for this
@@ -254,15 +172,15 @@ pub struct Config {
     /// `setResolver` is a visible 400 instead of a signature the resolver
     /// rejects.
     pub resolver: Address,
-    /// Every chain this gateway can speak for, by chain id. A coin type
-    /// naming anything else gets an unsigned refusal, not a signed null: the
-    /// resolver has one `urls` list for all chains, so asserting here would
-    /// end a walk that another endpoint was there to finish.
-    pub chains: HashMap<u64, ChainGateway>,
+    /// The store every answer comes from. Which chains it holds is read per
+    /// request, never configured: a coin type naming a chain no indexer has
+    /// written gets an unsigned refusal, not a signed null — the resolver has
+    /// one `urls` list for all chains, so asserting here would end a walk that
+    /// another endpoint was there to finish.
+    pub pool: PgPool,
     /// How long an answer stays good. The resolver enforces it on chain.
     pub ttl_secs: u64,
-    /// How far behind the chain a MIRROR may be and still assert anything.
-    /// Meaningless for a chain-backed source, which has no lag.
+    /// How far behind the chain a mirror may be and still assert anything.
     pub max_lag_blocks: u64,
     /// What signs an answer, pinned by the resolver's signer set; rotating it
     /// is an owner transaction there, not a deploy here.
@@ -325,14 +243,11 @@ pub fn router(state: GatewayState) -> Router {
 struct ChainStatus {
     chain_id: u64,
     label: Option<String>,
-    /// `mirror` or `chain`.
-    source: &'static str,
-    /// Blocks between the indexer's target and its cursor. Mirrors only.
+    /// Blocks between the indexer's target and its cursor.
     lag_blocks: Option<u64>,
-    /// Unix seconds at which the indexer last reported. Mirrors only.
+    /// Unix seconds at which the indexer last reported.
     indexer_reported_at: Option<u64>,
     /// Seconds until the indexer's last report expires, negative once it has.
-    /// Mirrors only.
     report_valid_for: Option<i64>,
     /// Whether a query for this chain would be refused right now.
     stale: bool,
@@ -343,35 +258,35 @@ struct GatewayStatus {
     chains: Vec<ChainStatus>,
 }
 
-/// `GET /status`: one row per served chain. For alerting, never for
+/// `GET /status`: one row per chain the store holds. For alerting, never for
 /// readiness — a chain whose indexer stopped is refused on its own and the
 /// others keep answering, so nothing here should take the process out of
 /// rotation.
-async fn status(State(state): State<GatewayState>) -> Json<GatewayStatus> {
-    let mut chains = Vec::with_capacity(state.config.chains.len());
-    for (id, chain) in &state.config.chains {
-        let (source, position, lag) = match &chain.source {
-            HandleSource::Chain { .. } => ("chain", None, Lag::None),
-            HandleSource::Mirror(store) => {
-                let position = store.mirror_position().await.ok();
-                ("mirror", position, mirror_lag(position))
-            }
-        };
+async fn status(
+    State(state): State<GatewayState>,
+) -> Result<Json<GatewayStatus>, GatewayError> {
+    let mut chains = Vec::new();
+    for id in db::indexed_chains(&state.config.pool)
+        .await
+        .map_err(internal)?
+    {
+        let store = ChainStore::new(state.config.pool.clone(), id);
+        let position = store.mirror_position().await.ok();
+        let lag = mirror_lag(position);
+        let chain_id = u64::try_from(id).unwrap_or_default();
         chains.push(ChainStatus {
-            chain_id: *id,
-            label: chain.label.clone(),
-            source,
+            chain_id,
+            label: ens::chain_label(chain_id).map(str::to_string),
             lag_blocks: match lag {
                 Lag::Mirror { blocks, .. } => Some(blocks),
-                _ => None,
+                Lag::Unknown => None,
             },
             indexer_reported_at: position.and_then(|p| p.reported_at),
             report_valid_for: position.and_then(|p| p.valid_for),
             stale: staleness(&lag, state.config.max_lag_blocks).is_some(),
         });
     }
-    chains.sort_by_key(|c| c.chain_id);
-    Json(GatewayStatus { chains })
+    Ok(Json(GatewayStatus { chains }))
 }
 
 /// What ERC-3668 hands back: one hex blob the resolver's callback decodes.
@@ -457,6 +372,14 @@ async fn resolve(
                 ),
             });
         }
+        Answer::Ambiguous(coin_type) => {
+            return Err(GatewayError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: format!(
+                    "two indexed chains share coin type {coin_type}; not answering"
+                ),
+            });
+        }
         Answer::TooStale(why) => {
             warn!(?why, "refusing to answer from a stale mirror");
             return Err(GatewayError {
@@ -503,8 +426,6 @@ async fn resolve(
 
 /// How far behind the chain an answer would be.
 enum Lag {
-    /// Read from the chain: the question does not apply.
-    None,
     /// Read from a mirror: this many blocks behind the target its indexer
     /// last set, and this many seconds before that indexer's report expires
     /// — negative once it has.
@@ -538,9 +459,12 @@ enum Answer {
     /// A record this gateway has no answer shape for. Distinct from a null,
     /// because a null has a shape and this has none.
     NoSuchRecord,
-    /// This gateway serves no chain with that coin type. Unsigned, so the
-    /// client walks on to the next endpoint in the resolver's `urls`.
+    /// The store holds no chain with that coin type. Unsigned, so the client
+    /// walks on to the next endpoint in the resolver's `urls`.
     NotOurChain(U256),
+    /// The store holds two chains with that coin type, so any answer would be
+    /// a guess. Unsigned, for the same reason.
+    Ambiguous(U256),
     /// This chain's mirror has not earned the right to deny a binding: too
     /// far behind, its indexer's report expired, or unable to say.
     TooStale(Staleness),
@@ -600,40 +524,53 @@ async fn self_answer(
             "the name and the node in the record call are not the same name",
         ));
     }
-    // Matched against the chains this gateway SERVES, never decoded back into
-    // a chain id. `0x80000000 | chainId` is not injective past 2^31 — the eden
-    // testnet's 3735928814 is exactly such a chain — so decoding would answer
-    // for a different chain, silently. Forwards the map is exact, and startup
-    // refuses a configuration where two chains share one coin type.
+    // Matched against the chains the STORE holds — whatever indexers have
+    // written — never decoded back into a chain id. `0x80000000 | chainId` is
+    // not injective past 2^31 (the eden testnet's 3735928814 is such a
+    // chain), so decoding would answer for a different chain, silently.
+    // Forwards the map is exact. Read per request, so a new indexer is served
+    // the first time it commits, and refused per request when two indexed
+    // chains share one coin type: answering either would be a guess.
     //
     // Mainnet is looked up twice because it answers to two coin types: the
     // legacy 60, and ENSIP-11's `0x80000001`.
-    let matched = state
-        .config
-        .chains
-        .iter()
-        .find(|(id, _)| ens::coin_type_for(**id) == coin_type)
-        .map(|(_, chain)| chain)
-        .or_else(|| {
-            ens::is_mainnet_coin_type(coin_type)
-                .then(|| state.config.chains.get(&1))
-                .flatten()
-        });
-    let Some(chain) = matched else {
+    let indexed = db::indexed_chains(&state.config.pool)
+        .await
+        .map_err(internal)?;
+    let candidates: Vec<u64> = indexed
+        .into_iter()
+        .filter_map(|id| u64::try_from(id).ok())
+        .filter(|id| {
+            ens::coin_type_for(*id) == coin_type
+                || (*id == 1 && ens::is_mainnet_coin_type(coin_type))
+        })
+        .collect();
+    let chain_id = match candidates.as_slice() {
+        [id] => *id,
         // A coin type that names no EVM chain at all — Bitcoin, say — is a
         // SIGNED null: no libID binding is ever an address of that kind, and
-        // saying so needs no chain. Only an EVM chain we do not serve gets the
-        // refusal, because there a sibling gateway may be the one that can
-        // answer.
-        return Ok(if ens::names_an_evm_chain(coin_type) {
-            Answer::NotOurChain(coin_type)
-        } else {
-            Answer::Addr {
-                address: None,
-                legacy,
-            }
-        });
+        // saying so needs no chain. Only an EVM chain the store does not hold
+        // gets the refusal, because there a sibling gateway may be the one
+        // that can answer.
+        [] => {
+            return Ok(if ens::names_an_evm_chain(coin_type) {
+                Answer::NotOurChain(coin_type)
+            } else {
+                Answer::Addr {
+                    address: None,
+                    legacy,
+                }
+            });
+        }
+        both => {
+            warn!(chains = ?both, %coin_type, "two indexed chains share one coin type");
+            return Ok(Answer::Ambiguous(coin_type));
+        }
     };
+    let chain = ChainStore::new(
+        state.config.pool.clone(),
+        i64::try_from(chain_id).expect("came from an i64"),
+    );
 
     // A name under our domain that this build cannot read is a name nobody
     // holds. Refusing would report an error for text a wallet is entitled to
@@ -653,7 +590,7 @@ async fn self_answer(
     // A chain label narrows and never widens: a label naming another chain is
     // simply not this chain's name.
     if let Some(label) = &query.chain_label {
-        if chain.label.as_deref() != Some(label.as_str()) {
+        if ens::chain_label(chain_id) != Some(label.as_str()) {
             return Ok(Answer::Addr {
                 address: None,
                 legacy,
@@ -662,7 +599,7 @@ async fn self_answer(
     }
 
     // Only now, with an answer actually owed, is staleness worth asking about.
-    if let Some(why) = staleness(&chain.source.lag().await, state.config.max_lag_blocks) {
+    if let Some(why) = staleness(&lag(&chain).await, state.config.max_lag_blocks) {
         return Ok(Answer::TooStale(why));
     }
 
@@ -678,10 +615,7 @@ async fn self_answer(
                     legacy,
                 });
             };
-            chain
-                .source
-                .resolve_handle(platform.id(), &normalized)
-                .await?
+            owner_of(&chain, platform.id(), &normalized).await?
         }
     };
 

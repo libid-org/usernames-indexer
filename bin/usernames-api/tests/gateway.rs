@@ -27,10 +27,8 @@ use tokio::sync::{
 };
 use tower::ServiceExt;
 use usernames_api::ens::{
-    ChainGateway,
     Config,
     GatewayState,
-    HandleSource,
 };
 use usernames_core::{
     db::{
@@ -45,6 +43,16 @@ use common::*;
 
 /// This suite's own chain, so it does not collide with the others.
 const CHAIN: i64 = 31341;
+/// A second chain in the same store, for the multi-chain cases.
+const OTHER: i64 = 31342;
+/// The eden testnet: chain id `0xDEADBFEE`, bit 31 already set, so its
+/// ENSIP-11 coin type is the id itself.
+const EDEN: i64 = 3_735_928_814;
+/// The chain id that lands on eden's coin type from the other side of the OR.
+const TWIN: i64 = 1_588_445_166;
+/// Every chain any test here may write, so a fixture can clear them all: the
+/// gateway serves whatever the store holds, so a leftover would be served.
+const SUITE_CHAINS: [i64; 5] = [CHAIN, OTHER, EDEN, TWIN, 1];
 const RESOLVER: Address = Address::new([0xaa; 20]);
 const SIGNER_KEY: &str =
     "0x00000000000000000000000000000000000000000000000000000000000a11ce";
@@ -52,16 +60,15 @@ const SIGNER_KEY: &str =
 static DB_LOCK: Mutex<()> = Mutex::const_new(());
 
 async fn gateway(
-    chain_label: Option<&str>,
     max_lag_blocks: u64,
 ) -> Option<(Router, ChainStore, MutexGuard<'static, ()>)> {
-    gateway_over(&[(CHAIN, chain_label)], max_lag_blocks).await
+    gateway_over(&[CHAIN], max_lag_blocks).await
 }
 
-/// A gateway serving several chains from the one shared database, which is
-/// what the read model's `chain_id` keying already allows.
+/// A gateway over a store holding several chains — which is all that "serving
+/// several chains" means now: the chains are whatever the store holds.
 async fn gateway_parts(
-    chains: &[(i64, Option<&str>)],
+    chains: &[i64],
     max_lag_blocks: u64,
 ) -> Option<(Config, ChainStore, MutexGuard<'static, ()>)> {
     let guard = DB_LOCK.lock().await;
@@ -70,10 +77,10 @@ async fn gateway_parts(
         .await
         .expect("DATABASE_URL is set but connecting failed");
     db::MIGRATOR.run(&pool).await.expect("migrations");
-    // Every chain this gateway will serve, not just the first: a leftover
-    // cursor or head on a co-tenant chain outlives the test that set it and
-    // contaminates the next one.
-    for (id, _) in chains {
+    // Every chain this suite may have written, not just the ones this test
+    // serves: the store IS what the gateway serves, so a leftover chain from
+    // another test would be served here too.
+    for id in SUITE_CHAINS {
         for table in db::PROJECTION_TABLES {
             sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
                 .bind(id)
@@ -94,7 +101,7 @@ async fn gateway_parts(
     // and the gateway refuses rather than signing a null — correct in
     // production, and previously invisible here because "unknown" was read as
     // "fresh".
-    for (id, _) in chains {
+    for id in chains {
         let store = ChainStore::new(pool.clone(), *id);
         store
             .begin_window()
@@ -110,21 +117,10 @@ async fn gateway_parts(
         store.set_chain_target(1, 120).await;
     }
 
-    let store = ChainStore::new(pool.clone(), chains[0].0);
+    let store = ChainStore::new(pool.clone(), chains[0]);
     let config = Config {
         resolver: RESOLVER,
-        chains: chains
-            .iter()
-            .map(|(id, label)| {
-                (
-                    *id as u64,
-                    ChainGateway {
-                        label: label.map(str::to_string),
-                        source: HandleSource::Mirror(ChainStore::new(pool.clone(), *id)),
-                    },
-                )
-            })
-            .collect(),
+        pool: pool.clone(),
         ttl_secs: 300,
         max_lag_blocks,
         signer: std::sync::Arc::new(SIGNER_KEY.parse::<PrivateKeySigner>().expect("key")),
@@ -134,7 +130,7 @@ async fn gateway_parts(
 
 /// The gateway route alone, which is what most of these tests exercise.
 async fn gateway_over(
-    chains: &[(i64, Option<&str>)],
+    chains: &[i64],
     max_lag_blocks: u64,
 ) -> Option<(Router, ChainStore, MutexGuard<'static, ()>)> {
     let (config, store, guard) = gateway_parts(chains, max_lag_blocks).await?;
@@ -217,8 +213,8 @@ fn verify(body: &str, call: &[u8]) -> Option<Address> {
 }
 
 macro_rules! gateway_or_skip {
-    ($label:expr, $lag:expr) => {
-        match gateway($label, $lag).await {
+    ($lag:expr) => {
+        match gateway($lag).await {
             Some(parts) => parts,
             None => return,
         }
@@ -227,7 +223,7 @@ macro_rules! gateway_or_skip {
 
 #[tokio::test]
 async fn a_bound_handle_resolves_and_the_signature_verifies() {
-    let (router, store, _g) = gateway_or_skip!(None, 32);
+    let (router, store, _g) = gateway_or_skip!(32);
     let owner = Address::from([0xbe; 20]);
     bind(&store, "alice", owner).await;
 
@@ -244,7 +240,7 @@ async fn a_bound_handle_resolves_and_the_signature_verifies() {
 async fn a_name_nobody_holds_gets_a_signed_null() {
     // The point of signing a null: a wallet must be able to trust "nobody
     // holds this" as much as it trusts an address.
-    let (router, _store, _g) = gateway_or_skip!(None, 32);
+    let (router, _store, _g) = gateway_or_skip!(32);
     let call = resolve_call(
         &wire_name(&["nobody", "x"]),
         &addr_call(&["nobody", "x"], 0x8000_0000 | CHAIN as u64),
@@ -264,7 +260,7 @@ async fn a_name_nobody_holds_gets_a_signed_null() {
 /// chains rather than one.
 #[tokio::test]
 async fn a_chain_this_gateway_does_not_serve_is_refused_not_signed() {
-    let (router, store, _g) = gateway_or_skip!(None, 32);
+    let (router, store, _g) = gateway_or_skip!(32);
     bind(&store, "alice", Address::from([0xbe; 20])).await;
 
     // Base, while this gateway serves only the test chain.
@@ -281,7 +277,7 @@ async fn a_chain_this_gateway_does_not_serve_is_refused_not_signed() {
 /// is ever a Bitcoin address, and knowing that needs no chain.
 #[tokio::test]
 async fn a_non_evm_coin_type_is_answered_null() {
-    let (router, store, _g) = gateway_or_skip!(None, 32);
+    let (router, store, _g) = gateway_or_skip!(32);
     bind(&store, "alice", Address::from([0xbe; 20])).await;
 
     let call = resolve_call(&wire_name(&["alice", "x"]), &addr_call(&["alice", "x"], 0));
@@ -292,9 +288,11 @@ async fn a_non_evm_coin_type_is_answered_null() {
 
 #[tokio::test]
 async fn a_chain_label_narrows_and_never_widens() {
-    let (router, store, _g) = gateway_or_skip!(Some("eden"), 32);
+    let Some((router, store, _g)) = gateway_over(&[EDEN], 32).await else {
+        return;
+    };
     bind(&store, "alice", Address::from([0xbe; 20])).await;
-    let coin = 0x8000_0000 | CHAIN as u64;
+    let coin = 0x8000_0000 | EDEN as u64;
 
     // Our label: answered.
     let ours = resolve_call(
@@ -317,7 +315,7 @@ async fn a_chain_label_narrows_and_never_widens() {
 async fn a_record_that_is_not_addr_degrades_to_null() {
     // A client asking for `text()` must not see an error on a name that
     // resolves fine for addresses.
-    let (router, store, _g) = gateway_or_skip!(None, 32);
+    let (router, store, _g) = gateway_or_skip!(32);
     bind(&store, "alice", Address::from([0xbe; 20])).await;
 
     let call = resolve_call(&wire_name(&["alice", "x"]), &[0xaa, 0xbb, 0xcc, 0xdd]);
@@ -328,7 +326,7 @@ async fn a_record_that_is_not_addr_degrades_to_null() {
 
 #[tokio::test]
 async fn a_name_this_build_cannot_read_is_null_rather_than_an_error() {
-    let (router, _store, _g) = gateway_or_skip!(None, 32);
+    let (router, _store, _g) = gateway_or_skip!(32);
     let coin = 0x8000_0000 | CHAIN as u64;
     for labels in [
         ["alice", "myspace"].as_slice(), // a platform nobody knows
@@ -352,7 +350,7 @@ async fn a_name_this_build_cannot_read_is_null_rather_than_an_error() {
 async fn an_unreadable_name_is_null_in_the_shape_the_caller_asked_in() {
     // Mainnet, because the legacy form is coin type 60 and a gateway that does
     // not serve it refuses unsigned rather than answering.
-    let Some((router, _store, _g)) = gateway_over(&[(1, None)], 32).await else {
+    let Some((router, _store, _g)) = gateway_over(&[1], 32).await else {
         return;
     };
     let labels = ["alice", "myspace"];
@@ -372,7 +370,7 @@ async fn an_unreadable_name_is_null_in_the_shape_the_caller_asked_in() {
 /// the client walks on to a sibling that may read the name.
 #[tokio::test]
 async fn an_unreadable_name_off_our_chains_is_still_refused_unsigned() {
-    let (router, _store, _g) = gateway_or_skip!(None, 32);
+    let (router, _store, _g) = gateway_or_skip!(32);
     let labels = ["alice", "myspace"];
     let call = resolve_call(&wire_name(&labels), &addr_call(&labels, 0x8000_2105));
     let (status, body) = ask(&router, RESOLVER, &call).await;
@@ -384,7 +382,7 @@ async fn an_unreadable_name_off_our_chains_is_still_refused_unsigned() {
 async fn a_request_for_another_resolver_is_refused_not_signed() {
     // The signature names its target, so signing for a caller-supplied sender
     // would lend this key's authority to any contract that asked.
-    let (router, _store, _g) = gateway_or_skip!(None, 32);
+    let (router, _store, _g) = gateway_or_skip!(32);
     let call = resolve_call(
         &wire_name(&["alice", "x"]),
         &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
@@ -397,7 +395,7 @@ async fn a_request_for_another_resolver_is_refused_not_signed() {
 async fn a_stale_mirror_refuses_rather_than_signing_a_null() {
     // The distinction the lag gate exists for: a signed null asserts that no
     // binding exists, and a mirror this far behind has not earned that.
-    let (router, store, _g) = gateway_or_skip!(None, 0);
+    let (router, store, _g) = gateway_or_skip!(0);
     bind(&store, "alice", Address::from([0xbe; 20])).await;
     // Far ahead of the cursor, as the TARGET: that is the quantity the gate
     // compares, and the head alone no longer moves it.
@@ -414,7 +412,7 @@ async fn a_stale_mirror_refuses_rather_than_signing_a_null() {
 
 #[tokio::test]
 async fn garbage_in_the_path_is_the_callers_error() {
-    let (router, _store, _g) = gateway_or_skip!(None, 32);
+    let (router, _store, _g) = gateway_or_skip!(32);
     for call in [vec![0xde, 0xad, 0xbe, 0xef], vec![]] {
         let (status, _) = ask(&router, RESOLVER, &call).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -425,10 +423,7 @@ async fn garbage_in_the_path_is_the_callers_error() {
 /// its own chain's answer rather than the first one's.
 #[tokio::test]
 async fn one_gateway_answers_for_every_chain_it_serves() {
-    const OTHER: i64 = 31342;
-    let Some((router, store, _g)) =
-        gateway_over(&[(CHAIN, None), (OTHER, None)], 32).await
-    else {
+    let Some((router, store, _g)) = gateway_over(&[CHAIN, OTHER], 32).await else {
         return;
     };
     let here = Address::from([0xbe; 20]);
@@ -469,7 +464,7 @@ async fn one_gateway_answers_for_every_chain_it_serves() {
 /// window.
 #[tokio::test]
 async fn a_mirror_that_cannot_report_its_position_refuses() {
-    let (router, store, _g) = gateway_or_skip!(None, 32);
+    let (router, store, _g) = gateway_or_skip!(32);
     bind(&store, "alice", Address::from([0xbe; 20])).await;
 
     // Wipe what the mirror knows about its own progress, leaving the binding
@@ -497,7 +492,7 @@ async fn a_mirror_that_cannot_report_its_position_refuses() {
 /// what notices.
 #[tokio::test]
 async fn an_expired_report_is_too_stale_however_small_the_lag() {
-    let (router, store, _g) = gateway_or_skip!(None, 32);
+    let (router, store, _g) = gateway_or_skip!(32);
     bind(&store, "alice", Address::from([0xbe; 20])).await;
     // Caught up by the block measure, and the report long expired.
     store.set_chain_target_valid_until(1).await;
@@ -518,10 +513,7 @@ async fn an_expired_report_is_too_stale_however_small_the_lag() {
 /// sees exactly what the gate sees, one row per chain.
 #[tokio::test]
 async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
-    const OTHER: i64 = 31342;
-    let Some((router, store, _g)) =
-        gateway_over(&[(CHAIN, None), (OTHER, None)], 32).await
-    else {
+    let Some((router, store, _g)) = gateway_over(&[CHAIN, OTHER], 32).await else {
         return;
     };
     let here = Address::from([0xbe; 20]);
@@ -585,20 +577,73 @@ async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
     assert!(valid_for_of(CHAIN).is_some_and(|s| s > 0), "{status}");
 }
 
+/// The chains served are whatever the store holds. Nothing is configured, so
+/// an indexer for a new chain is answered for the first time it commits —
+/// with no restart, and no list anywhere to forget it in.
+#[tokio::test]
+async fn a_chain_that_appears_in_the_store_is_served_without_a_restart() {
+    let (router, store, _g) = gateway_or_skip!(32);
+    let call = resolve_call(
+        &wire_name(&["alice", "x"]),
+        &addr_call(&["alice", "x"], 0x8000_0000 | OTHER as u64),
+    );
+
+    // Not in the store yet: refused unsigned, so a wallet walks on.
+    let (status, body) = ask(&router, RESOLVER, &call).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+
+    // An indexer for it commits its first window and reports.
+    let other = ChainStore::new(store.pool().clone(), OTHER);
+    other
+        .begin_window()
+        .await
+        .expect("begin")
+        .commit(1)
+        .await
+        .expect("commit");
+    other.set_chain_head(1).await;
+    other.set_chain_target(1, 120).await;
+    let there = Address::from([0xed; 20]);
+    bind(&other, "alice", there).await;
+
+    // The same router, untouched, now answers for it.
+    let (status, body) = ask(&router, RESOLVER, &call).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(verify(&body, &call), Some(there));
+}
+
+/// Two indexed chains that share one coin type cannot be told apart by a
+/// query, so neither is answered: an unsigned refusal keeps the wallet
+/// walking, where a guess would sign the wrong chain's address. Decided per
+/// request, where the store is known, rather than at a startup that knows no
+/// chains.
+#[tokio::test]
+async fn two_indexed_chains_on_one_coin_type_are_refused_unsigned() {
+    let Some((router, store, _g)) = gateway_over(&[EDEN, TWIN], 32).await else {
+        return;
+    };
+    bind(&store, "alice", Address::from([0xed; 20])).await;
+    let call = resolve_call(
+        &wire_name(&["alice", "x"]),
+        &addr_call(&["alice", "x"], 0x8000_0000u64 | EDEN as u64),
+    );
+    let (status, body) = ask(&router, RESOLVER, &call).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.contains("share"), "{body}");
+}
+
 /// The eden testnet resolves, and that it does is the whole point of matching
 /// coin types forwards instead of decoding them backwards.
 ///
 /// Eden's chain id is 3735928814 — `0xDEADBFEE`, bit 31 already set — so
 /// `0x80000000 | chainId` returns it unchanged. A gateway that decoded the
 /// coin type would get 1588445166 and refuse every eden name. Comparing
-/// against the chains it serves gets it right, and the only thing that is
-/// genuinely ambiguous — serving both colliding chains at once — is refused at
-/// startup instead.
+/// against the chains the store holds gets it right, and the only thing that
+/// is genuinely ambiguous — both colliding chains in one store — is refused
+/// per request instead.
 #[tokio::test]
 async fn the_eden_testnet_resolves_despite_its_chain_id() {
-    const EDEN: i64 = 3_735_928_814;
-    let Some((router, store, _g)) = gateway_over(&[(EDEN, Some("eden"))], 32).await
-    else {
+    let Some((router, store, _g)) = gateway_over(&[EDEN], 32).await else {
         return;
     };
     let owner = Address::from([0xed; 20]);
@@ -626,7 +671,7 @@ async fn the_eden_testnet_resolves_despite_its_chain_id() {
 /// the first gateway asked.
 #[tokio::test]
 async fn the_legacy_addr_shape_is_refused_unsigned_off_mainnet() {
-    let (router, store, _g) = gateway_or_skip!(None, 32);
+    let (router, store, _g) = gateway_or_skip!(32);
     bind(&store, "alice", Address::from([0xbe; 20])).await;
 
     let call = resolve_call(
@@ -650,7 +695,7 @@ async fn the_legacy_addr_shape_is_refused_unsigned_off_mainnet() {
 /// not an address", and that CORS is applied once rather than layered twice.
 #[tokio::test]
 async fn the_merged_router_keeps_both_halves_intact() {
-    let Some((config, store, _g)) = gateway_parts(&[(CHAIN, None)], 32).await else {
+    let Some((config, store, _g)) = gateway_parts(&[CHAIN], 32).await else {
         return;
     };
     let owner = Address::from([0xbe; 20]);
@@ -739,7 +784,7 @@ async fn the_merged_router_keeps_both_halves_intact() {
 /// would be true of the name and attributed to the node.
 #[tokio::test]
 async fn a_node_that_is_not_this_name_is_refused() {
-    let (router, store, _g) = gateway_or_skip!(None, 32);
+    let (router, store, _g) = gateway_or_skip!(32);
     bind(&store, "alice", Address::from([0xbe; 20])).await;
 
     let coin = 0x8000_0000 | CHAIN as u64;
@@ -772,7 +817,7 @@ async fn a_node_that_is_not_this_name_is_refused() {
 /// unnormalized second, and "unreadable" would have earned it a signed null.
 #[tokio::test]
 async fn a_name_outside_the_domain_is_refused_whatever_the_record() {
-    let (router, _store, _g) = gateway_or_skip!(None, 32);
+    let (router, _store, _g) = gateway_or_skip!(32);
     let node = usernames_core::ens::namehash(&["vitalik".to_string(), "eth".to_string()]);
 
     let mut addr = vec![0xf1, 0xcb, 0x7e, 0x06];

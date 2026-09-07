@@ -88,6 +88,18 @@ fn valid_for_bind(valid_for_secs: u64) -> i64 {
     i64::try_from(valid_for_secs.min(MAX_VALID_FOR_SECS)).unwrap_or(i64::MAX)
 }
 
+/// Every chain an indexer has written into this store, by cursor. What the
+/// gateway serves is exactly this: nothing to configure, and a new indexer is
+/// served the first time it commits a window.
+pub async fn indexed_chains(pool: &PgPool) -> Result<Vec<i64>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT chain_id FROM names.chain_metadata WHERE key = $1 ORDER BY chain_id",
+    )
+    .bind(CURSOR_KEY)
+    .fetch_all(pool)
+    .await
+}
+
 fn deploy_block_key(contract: Address) -> String {
     // The address is part of the key: repointing the indexer at a different
     // contract must not inherit the old contract's deployment block.
