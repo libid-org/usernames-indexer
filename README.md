@@ -50,7 +50,7 @@ the indexer's knobs is the point rather than an omission:
 | `CHAIN_ID` | both | unset / **required** | Indexer: refuse to start unless the RPC reports this chain id. API: **required** — it talks to no chain, so it cannot discover which chain's rows it serves |
 | `CONFIRMATIONS` | indexer | `5` | Blocks behind the head to stay (shallow-reorg protection) |
 | `POLL_INTERVAL_SECS` | indexer | `5` | Poll cadence, and the retry delay after a failure |
-| `STALE_AFTER_SECS` | four poll intervals + 60 | How long readers may trust this indexer's last report; the ENS gateway refuses this chain once it expires |
+| `STALE_AFTER_SECS` | indexer | four poll intervals + 60 | How long readers may trust this indexer's last report; the ENS gateway refuses this chain once it expires. Must exceed `POLL_INTERVAL_SECS`, and at most a year |
 | `MAX_BLOCK_RANGE` | indexer | `10000` | Largest `eth_getLogs` window |
 | `START_BLOCK` | indexer | unset | Where a FRESH scan starts — consulted only when no cursor exists (new database, or right after a re-index). Unset means the deployment block is found by binary search over `eth_getCode`; only a successful detection is cached, and an RPC failure mid-search retries next cycle |
 | `LISTEN_ADDR` | api | `127.0.0.1:8080` | Read-API listen address |
@@ -63,7 +63,7 @@ the indexer's knobs is the point rather than an omission:
 | `GET /v1/resolve/id/{platform}/{userId}` | The wallet an account id resolves to (`resolveId`), plus the handle that account currently holds |
 | `GET /v1/resolve/address/{address}` | Every identity a wallet proved, with `resolves` and `published` flags (`primaryOf`'s reverse display) |
 | `GET /v1/search?q=gre&platform=x&limit=10` | Matching variants for a partial handle: exact, then prefix, then substring, then trigram-fuzzy |
-| `GET /v1/status` | Chain id, contract, last indexed block, chain head, lag, last window error, read-model version |
+| `GET /v1/status` | Chain id, contract, last indexed block, chain head, lag, when the indexer last reported and how long that report is still good, last window error, read-model version |
 | `GET /health` | Liveness |
 
 `{platform}` is a short key (`x`, `github`, `google`) or a 0x-hex 32-byte
@@ -89,6 +89,9 @@ than present and failing.
 
 ```
 GET /ens/{sender}/{data}.json   ->  { "data": "0x…" }
+GET /ens/status                 ->  { "chains": [ { "chainId", "label", "source",
+                                      "lagBlocks", "indexerReportedAt",
+                                      "reportValidFor", "stale" } ] }
 ```
 
 The resolver reverts `OffchainLookup` carrying this endpoint, the client fetches
@@ -104,7 +107,7 @@ verifies the signature and returns the record. Both on-chain halves are `view`.
 | `ENS_RPC_URLS` | — | Required with `ENS_SOURCE=chain`: `8453=https://…,10=https://…` |
 | `ENS_CONTRACTS` | `IDENTITY_NAMES_ADDRESS` | Per-chain `IdentityNames`, where it differs: `8453=0x…`. Read only with `ENS_SOURCE=chain` |
 | `ENS_TTL_SECS` | `300` | How long an answer stays good; the resolver enforces it |
-| `ENS_MAX_LAG_BLOCKS` | `32` | How far behind the chain the mirror may be and still assert anything |
+| `ENS_MAX_LAG_BLOCKS` | `32` | How far behind the chain the mirror may be and still assert anything. The target is set at the top of a cycle and the cursor catches up chunk by chunk, so this must exceed the blocks any served chain produces in one of its indexer's poll intervals |
 
 **Null is an answer; stale is not.** A name nobody holds gets a *signed* null —
 a wallet has to trust "nobody holds this" as much as it trusts an address, or
@@ -128,8 +131,13 @@ expires that chain alone, and the others keep answering.
 
 `GET /ens/status` lists every served chain with its position and whether it
 would be refused right now; `/v1/status` reports the API's own chain. Both are
-for alerting, never for readiness — gate a pod on `/health`, or one stopped
-indexer takes every chain out of rotation.
+for alerting. A readiness probe may look at the STATUS CODE of `/v1/status`,
+which is 200 whenever the database answers, but never at a chain's `stale`,
+`reportValidFor` or `lagBlocks`: one stopped indexer would take every chain
+out of rotation, when the gate already refuses that chain alone. And the
+report says only that the loop is alive and can see the head. Progress is
+still what `ENS_MAX_LAG_BLOCKS` measures, and `lastWindowError` is the alert
+for a loop that is up but failing its windows.
 
 **Upgrading across this change:** the report is the indexer's write, so deploy
 the indexer image first, or together. A gateway on this version refuses, with
@@ -243,12 +251,15 @@ its name and keeps indexing, but it no longer serves the API. Deploy
 chain on its own. Nothing in the database changes and no re-index is needed.
 
 Probes belong to the API: `GET /health` for liveness; for readiness gate on
-`GET /v1/status` — the resolve endpoints answer 503 by design until the first
-window lands. It sends permissive CORS for GET, so a browser UI (handle.link)
-can call it directly from any origin. The indexer exposes no port; supervise
-it on process liveness, and on `lagBlocks` and `reportValidFor` from the API's
+the status code of `GET /v1/status`, which is 200 whenever the database
+answers — the resolve endpoints answer 503 by design until the first window
+lands. It sends permissive CORS for GET, so a browser UI (handle.link) can
+call it directly from any origin. The indexer exposes no port; supervise it on
+process liveness, and alert on `lagBlocks` and `reportValidFor` from the API's
 status — the first cannot move once the loop stops, the second counts down
-exactly then — or on `/ens/status` for every chain the gateway serves.
+exactly then — or on `/ens/status` for every chain the gateway serves. Never
+fail readiness on those fields: one stopped indexer would take every chain
+out of rotation.
 
 `docker compose up -d --build` runs the full stack locally against the
 compose Postgres — set `RPC_URL`, `IDENTITY_NAMES_ADDRESS` and `CHAIN_ID` in
@@ -268,5 +279,5 @@ compose Postgres — set `RPC_URL`, `IDENTITY_NAMES_ADDRESS` and `CHAIN_ID` in
   normalized or named by key on this side until `handles.json` learns them.
 - **Sync state is a caller's concern**: until the first window commits, the
   resolution endpoints answer 503 rather than an authoritative-looking 404.
-  After that, a replaying or lagging indexer serves what it has; gate on
+  After that, a replaying or lagging indexer serves what it has; watch
   `/v1/status` (`lagBlocks`, `reportValidFor`, `lastWindowError`) where staleness matters.

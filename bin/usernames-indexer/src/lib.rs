@@ -73,6 +73,10 @@ pub struct Config {
     pub stale_after_secs: Option<u64>,
 }
 
+/// The longest a report may be trusted: a year. Past that the setting is a
+/// mistake, and the store would clamp it anyway.
+const MAX_STALE_AFTER_SECS: u64 = 366 * 24 * 60 * 60;
+
 /// Parse the environment, connect everything, and index until ctrl-c.
 pub async fn run() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
@@ -85,6 +89,26 @@ pub async fn run() -> anyhow::Result<()> {
 
     let config = Config::parse();
     let contract = config.identity_names_address;
+    // Pure configuration, checked before anything is touched: `prepare`
+    // below may wipe the chain's rows on a version bump, and a refusal has
+    // to come before that, not after.
+    let stale_after_secs = config.stale_after_secs.unwrap_or(
+        config
+            .poll_interval_secs
+            .saturating_mul(4)
+            .saturating_add(60),
+    );
+    anyhow::ensure!(
+        stale_after_secs > config.poll_interval_secs,
+        "STALE_AFTER_SECS ({stale_after_secs}) must exceed POLL_INTERVAL_SECS ({}), or \
+         every idle cycle expires the report before the next one renews it",
+        config.poll_interval_secs
+    );
+    anyhow::ensure!(
+        stale_after_secs <= MAX_STALE_AFTER_SECS,
+        "STALE_AFTER_SECS ({stale_after_secs}) is more than a year; a report nobody \
+         expects to expire is not a report"
+    );
 
     let provider: RootProvider = RootProvider::new_http(config.rpc_url.clone());
     let reported = provider.get_chain_id().await?;
@@ -109,16 +133,6 @@ pub async fn run() -> anyhow::Result<()> {
     store.prepare(&writer, contract).await?;
 
     let cancel = CancellationToken::new();
-    let stale_after_secs = config.stale_after_secs.unwrap_or(
-        config
-            .poll_interval_secs
-            .saturating_mul(4)
-            .saturating_add(60),
-    );
-    anyhow::ensure!(
-        stale_after_secs > 0,
-        "STALE_AFTER_SECS is 0; every report would expire as it was written"
-    );
     let indexer = indexer::Indexer::new(
         store,
         provider,

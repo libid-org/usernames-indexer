@@ -537,6 +537,10 @@ async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
     );
     let (status, body) = ask(&router, RESOLVER, &dead).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        body.contains("expired"),
+        "refused for the right reason: {body}"
+    );
 
     let alive = resolve_call(
         &wire_name(&["alice", "x"]),
@@ -569,6 +573,16 @@ async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
     };
     assert_eq!(stale_of(OTHER), Some(true), "{status}");
     assert_eq!(stale_of(CHAIN), Some(false), "{status}");
+    let valid_for_of = |id: i64| {
+        status["chains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["chainId"] == id)
+            .and_then(|c| c["reportValidFor"].as_i64())
+    };
+    assert!(valid_for_of(OTHER).is_some_and(|s| s < 0), "{status}");
+    assert!(valid_for_of(CHAIN).is_some_and(|s| s > 0), "{status}");
 }
 
 /// The eden testnet resolves, and that it does is the whole point of matching
