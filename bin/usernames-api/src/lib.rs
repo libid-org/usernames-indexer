@@ -224,7 +224,7 @@ impl Config {
 
     /// The gateway this configuration describes, or `None` when this
     /// deployment runs none.
-    pub fn gateway(&self, pool: sqlx::PgPool) -> anyhow::Result<Option<ens::Config>> {
+    fn gateway(&self, pool: sqlx::PgPool) -> anyhow::Result<Option<ens::Config>> {
         let Some((signer, resolver)) = self.signing_identity()? else {
             return Ok(None);
         };
