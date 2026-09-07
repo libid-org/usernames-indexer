@@ -97,7 +97,7 @@ verifies the signature and returns the record. Both on-chain halves are `view`.
 | Variable | Default | Meaning |
 |---|---|---|
 | `ENS_SIGNER_KEY` | unset | The signing key, hex. Setting it mounts the route |
-| `ENS_RESOLVER_ADDRESS` | — | Required with a key. An answer is bound to one resolver by its signature; a request naming another is refused rather than signed, or this becomes a signing oracle for any contract that asks |
+| `ENS_RESOLVER_ADDRESS` | — | Required with a key. Every answer is signed for this address, whatever `{sender}` the path carries; a request naming another resolver is refused with a 400, so a value that fell behind a `setResolver` is a visible error rather than a signature the resolver rejects |
 | `ENS_CHAINS` | this process's chain | Which chains to answer for, and their labels: `3735928814:eden,8453:base`. Refused at startup only if two of them share a coin type |
 | `ENS_SOURCE` | `mirror` | `mirror` reads the indexed model; `chain` reads `IdentityNames` over RPC |
 | `ENS_RPC_URLS` | — | Required with `ENS_SOURCE=chain`: `8453=https://…,10=https://…` |
