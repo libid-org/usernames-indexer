@@ -274,7 +274,7 @@ mod tests {
             "--database-url",
             "postgres://u:p@127.0.0.1:5432/db",
             "--identity-names-address",
-            "0xd467d48769c26faee36ba6b6fc9228f14aef6dd2",
+            "0xe78b53a183dd51763df44beb2500ddab9bb0329e",
             "--chain-id",
             "3735928814",
             "--ens-signer-key",
@@ -302,7 +302,7 @@ mod tests {
             "--database-url",
             "postgres://u:p@127.0.0.1:5432/db",
             "--identity-names-address",
-            "0xd467d48769c26faee36ba6b6fc9228f14aef6dd2",
+            "0xe78b53a183dd51763df44beb2500ddab9bb0329e",
             "--chain-id",
             "1",
         ])
