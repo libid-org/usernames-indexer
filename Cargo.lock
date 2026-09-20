@@ -5723,6 +5723,7 @@ dependencies = [
  "dotenvy",
  "hex",
  "http-body-util",
+ "libid-contracts",
  "libid-signer",
  "serde",
  "serde_json",

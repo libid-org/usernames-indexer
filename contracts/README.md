@@ -1,22 +1,18 @@
 # Contract sources used by the tests
 
-These are copies, not the source of truth. Each is compiled once and its
-creation bytecode pasted into a `sol!` block in the test that deploys it; the
-copy is here so the pasted bytes can be regenerated and diffed rather than
+`MockIdentityNames.sol` is the indexer's test double: the exact event surface
+of `IdentityNames`, each event behind a function that emits it, so the anvil
+suite decodes real ABI-encoded logs. It is compiled once and its creation
+bytecode pasted into the `sol!` block in `crates/usernames-core/tests/anvil.rs`;
+the source is here so the literal can be regenerated and diffed rather than
 trusted.
 
-| File | Origin | Used by |
-|---|---|---|
-| `MockIdentityNames.sol` | written here | `crates/usernames-core/tests/anvil.rs` |
-| `HandleResolver.sol`, `IExtendedResolver.sol` | [libid-contracts](https://github.com/libid-org/libid-contracts) `solidity/contracts/ens/` | `bin/usernames-api/tests/end_to_end.rs` |
-
-To regenerate a bytecode literal:
+To regenerate the literal, in a foundry project holding only this file:
 
 ```sh
-forge build --root . contracts/HandleResolver.sol
-jq -r .bytecode.object out/HandleResolver.sol/HandleResolver.json
+forge build --use 0.8.33
+jq -r .bytecode.object out/MockIdentityNames.sol/MockIdentityNames.json
 ```
 
-A drifted copy is a test that passes against a resolver nobody deploys, so
-when `libid-contracts` changes `HandleResolver`, refresh both the source here
-and the literal in the test.
+The ENS resolver the API's end-to-end test deploys is the `libid-contracts`
+crate's embedded `HandleResolver` artifact; nothing of it lives here.

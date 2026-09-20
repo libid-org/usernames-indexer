@@ -189,16 +189,13 @@ what `ENS_MAX_LAG_BLOCKS` and the indexer's own report guard.
 
 
 **Tested against the real resolver.** `bin/usernames-api/tests/end_to_end.rs`
-deploys `HandleResolver` on anvil and walks the protocol as a wallet does:
+deploys the `HandleResolver` the `libid-contracts` crate ships on anvil and
+walks the protocol as a wallet does:
 `resolve` reverts `OffchainLookup`, the revert is decoded, the gateway signs
 the answer in process, and `resolveWithProof` on chain turns it back into an
 address. A second case signs with a key the resolver does not trust and
 asserts the contract's own `UntrustedSigner` — so the passing case proves the
 chain checked something rather than that something returned bytes.
-
-Regenerating the resolver bytecode the test deploys is described in
-[`contracts/README.md`](contracts/README.md); a drifted copy is a test that
-passes against a resolver nobody deploys.
 
 **Addresses without a name.** A Google address is bound as proved, and its
 alphabet is wider than a label's: `_` and `+` are both legal in an address and
