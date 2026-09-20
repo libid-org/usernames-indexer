@@ -19,6 +19,7 @@ clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
 libid-contracts = "0.13"
 libid-identity = "0.13"
+libid-profiles = "0.13"
 libid-signer = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

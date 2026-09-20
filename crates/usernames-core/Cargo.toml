@@ -23,6 +23,7 @@ thiserror = "2"
 tracing.workspace = true
 
 [dev-dependencies]
+libid-profiles.workspace = true
 alloy = { workspace = true, features = ["node-bindings", "signer-local"] }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }

@@ -3475,6 +3475,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e34cb1cfbc917ed962fe7804f333912a3c55bd3970ee7f3f42bdfe44f916a107"
 
 [[package]]
+name = "libid-profiles"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76e8c3d3739085340d1dbc805d30d5c3f2c3967428fe0c51e5057a82dc459a9b"
+
+[[package]]
 name = "libid-signer"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5748,6 +5754,7 @@ dependencies = [
  "http-body-util",
  "libid-contracts",
  "libid-identity",
+ "libid-profiles",
  "serde",
  "serde_json",
  "sqlx",

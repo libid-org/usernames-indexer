@@ -319,6 +319,18 @@ mod tests {
         );
     }
 
+    /// The registry is the launch profile set, no more and no less: every
+    /// platform a ceremony can prove is one this side can name, and nothing
+    /// is named here that no ceremony proves.
+    #[test]
+    fn the_registry_is_the_launch_profile_set() {
+        let launch: std::collections::BTreeSet<&str> =
+            libid_profiles::LAUNCH.iter().map(|p| p.platform).collect();
+        let known: std::collections::BTreeSet<&str> =
+            KnownPlatform::ALL.iter().map(|p| p.key()).collect();
+        assert_eq!(known, launch);
+    }
+
     #[test]
     fn parse_accepts_keys_and_hex_and_names_the_keys_it_knows() {
         let by_key = Platform::parse("x").unwrap();
