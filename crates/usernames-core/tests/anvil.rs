@@ -34,7 +34,13 @@ use usernames_core::{
 };
 
 mod common;
-use common::get;
+
+/// A request scoped to this suite's chain: the store is shared with the
+/// read-model suite's chain.
+async fn get(store: &ChainStore, path: &str) -> (StatusCode, serde_json::Value) {
+    let separator = if path.contains('?') { '&' } else { '?' };
+    common::get(store, &format!("{path}{separator}chain={CHAIN}")).await
+}
 
 sol! {
     /// The event surface of IdentityNames behind bare emit functions; source
@@ -232,6 +238,14 @@ async fn indexes_a_real_chain_end_to_end() {
 
     let latest = provider.get_block_number().await.expect("latest");
 
+    // What the binary does before its loop: take the chain's writer lease and
+    // prepare the chain, which records the contract the rows come from.
+    let writer = store.acquire_writer().await.expect("writer lease");
+    store
+        .prepare(&writer, *mock.address())
+        .await
+        .expect("prepare");
+
     // Run the real loop: no start override (detection must find the deploy
     // block), a tiny window so catch-up spans several chunks, no
     // confirmation lag on a chain that cannot reorg.
@@ -264,45 +278,42 @@ async fn indexes_a_real_chain_end_to_end() {
     }
     cancel.cancel();
     let _ = task.await;
+    writer.release().await.expect("the lease releases");
 
     // Detection ran once and its answer was cached — and it is the right one.
     let cached = store.deploy_block(*mock.address()).await.expect("metadata");
     assert_eq!(cached, Some(deploy_block), "cached deployment block");
 
-    let contract = *mock.address();
-
     // alice_1 retired, alice_2 resolves, and the id followed the rename.
-    let (status, _) = get(&store, contract, "/v1/resolve/handle/x/alice_1").await;
+    let (status, _) = get(&store, "/v1/resolve/handle/x/alice_1").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let (status, body) = get(&store, contract, "/v1/resolve/handle/x/alice_2").await;
+    let (status, body) = get(&store, "/v1/resolve/handle/x/alice_2").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["owner"], alice.to_string().as_str());
-    assert_eq!(body["idAgrees"], true);
-    assert_eq!(body["ceremonyVersion"], 1);
-    let (_, body) = get(&store, contract, "/v1/resolve/id/x/111").await;
-    assert_eq!(body["handle"], "alice_2");
+    let binding = &body["bindings"][0];
+    assert_eq!(binding["chainId"], CHAIN);
+    assert_eq!(binding["owner"], alice.to_string().as_str());
+    assert_eq!(binding["idAgrees"], true);
+    assert_eq!(binding["ceremonyVersion"], 1);
+    let (_, body) = get(&store, "/v1/resolve/id/x/111").await;
+    assert_eq!(body["bindings"][0]["handle"], "alice_2");
 
     // The Google identity resolves through the URL-encoded raw form.
-    let (status, body) = get(
-        &store,
-        contract,
-        "/v1/resolve/handle/google/A.B%2Btag%40Example.COM",
-    )
-    .await;
+    let (status, body) =
+        get(&store, "/v1/resolve/handle/google/A.B%2Btag%40Example.COM").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["handle"], "a.b+tag@example.com");
-    assert_eq!(body["userId"], "999");
+    assert_eq!(body["bindings"][0]["userId"], "999");
 
     // Reverse: both identities, neither displayed (x was unpublished, google
     // never was).
-    let (_, body) = get(&store, contract, &format!("/v1/resolve/address/{alice}")).await;
+    let (_, body) = get(&store, &format!("/v1/resolve/address/{alice}")).await;
     let identities = body["identities"].as_array().unwrap();
     assert_eq!(identities.len(), 2, "{body}");
     assert!(identities.iter().all(|i| i["published"] == false), "{body}");
     assert!(identities.iter().all(|i| i["resolves"] == true), "{body}");
 
     // Search sees the current handle, not the retired one.
-    let (_, body) = get(&store, contract, "/v1/search?q=alice&platform=x").await;
+    let (_, body) = get(&store, "/v1/search?q=alice&platform=x").await;
     let handles: Vec<&str> = body["hits"]
         .as_array()
         .unwrap()
@@ -311,8 +322,21 @@ async fn indexes_a_real_chain_end_to_end() {
         .collect();
     assert_eq!(handles, ["alice_2"], "{body}");
 
-    // Ops metadata filled from the admin events.
-    let (_, body) = get(&store, contract, "/v1/status").await;
+    // Ops metadata filled from the admin events, on this chain's entry of
+    // the status.
+    let (_, status_body) = common::get(&store, "/v1/status").await;
+    let body = status_body["chains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["chainId"] == CHAIN)
+        .unwrap_or_else(|| panic!("chain {CHAIN} is listed: {status_body}"))
+        .clone();
+    assert_eq!(
+        body["contract"],
+        mock.address().to_string().as_str(),
+        "{body}"
+    );
     // The loop reports beside every target it sets, with an expiry in the
     // future, and the API surfaces both: this is what tells a caught-up
     // index from one whose indexer stopped.

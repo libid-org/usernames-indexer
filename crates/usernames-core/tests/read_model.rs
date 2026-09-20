@@ -34,6 +34,8 @@ use usernames_core::{
 
 /// One chain id for every test; arbitrary, only consistency matters.
 const CHAIN: i64 = 31337;
+/// A second chain in the same store, for the reads that span chains.
+const OTHER_CHAIN: i64 = 31338;
 
 static DB_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -59,18 +61,20 @@ async fn test_store_with(
     db::MIGRATOR.run(&pool).await.expect("migrations failed");
     // Scoped to this suite's chain, like the anvil suite scopes to its own:
     // neither depends on cargo happening to run test binaries sequentially.
-    for table in db::PROJECTION_TABLES {
-        sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
-            .bind(CHAIN)
+    for chain in [CHAIN, OTHER_CHAIN] {
+        for table in db::PROJECTION_TABLES {
+            sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
+                .bind(chain)
+                .execute(&pool)
+                .await
+                .expect("cleanup failed");
+        }
+        sqlx::query("DELETE FROM names.chain_metadata WHERE chain_id = $1")
+            .bind(chain)
             .execute(&pool)
             .await
-            .expect("cleanup failed");
+            .expect("metadata cleanup failed");
     }
-    sqlx::query("DELETE FROM names.chain_metadata WHERE chain_id = $1")
-        .bind(CHAIN)
-        .execute(&pool)
-        .await
-        .expect("metadata cleanup failed");
     Some((ChainStore::new(pool.clone(), CHAIN), pool, guard))
 }
 
@@ -127,8 +131,12 @@ fn retire(platform: B256, handle: &str, owner: Address) -> NamesEvent {
     }
 }
 
+/// A request scoped to this suite's chain: the store is shared with the
+/// anvil suite's chain, and an unscoped read would see both. The reads that
+/// span chains have their own test below.
 async fn get(store: &ChainStore, path: &str) -> (StatusCode, serde_json::Value) {
-    common::get(store, addr(0xCC), path).await
+    let separator = if path.contains('?') { '&' } else { '?' };
+    common::get(store, &format!("{path}{separator}chain={CHAIN}")).await
 }
 
 #[tokio::test]
@@ -143,10 +151,12 @@ async fn bind_resolves_all_three_directions() {
 
     let (status, body) = get(&store, "/v1/resolve/handle/x/alice_1").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["owner"], alice.to_string().as_str());
-    assert_eq!(body["userId"], "111");
-    assert_eq!(body["idAgrees"], true);
-    assert_eq!(body["ceremonyVersion"], 1);
+    let binding = &body["bindings"][0];
+    assert_eq!(binding["chainId"], CHAIN);
+    assert_eq!(binding["owner"], alice.to_string().as_str());
+    assert_eq!(binding["userId"], "111");
+    assert_eq!(binding["idAgrees"], true);
+    assert_eq!(binding["ceremonyVersion"], 1);
 
     // The path normalizes the way the chain did: raw form finds the same row.
     let (status, body) = get(&store, "/v1/resolve/handle/x/@Alice_1").await;
@@ -155,9 +165,10 @@ async fn bind_resolves_all_three_directions() {
 
     let (status, body) = get(&store, "/v1/resolve/id/x/111").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["owner"], alice.to_string().as_str());
-    assert_eq!(body["handle"], "alice_1");
-    assert_eq!(body["published"], true);
+    let binding = &body["bindings"][0];
+    assert_eq!(binding["owner"], alice.to_string().as_str());
+    assert_eq!(binding["handle"], "alice_1");
+    assert_eq!(binding["published"], true);
 
     let (status, body) = get(&store, &format!("/v1/resolve/address/{alice}")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -187,11 +198,11 @@ async fn rename_retires_the_previous_handle() {
 
     let (status, body) = get(&store, "/v1/resolve/handle/x/alice_2").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["owner"], alice.to_string().as_str());
+    assert_eq!(body["bindings"][0]["owner"], alice.to_string().as_str());
 
     let (status, body) = get(&store, "/v1/resolve/id/x/111").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["handle"], "alice_2");
+    assert_eq!(body["bindings"][0]["handle"], "alice_2");
 
     // The retired node keeps its watermark, mirroring the contract's
     // stale-proof gate.
@@ -222,16 +233,18 @@ async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
     // The handle resolves to Bob now, and idAgrees pairs it with Bob's id.
     let (status, body) = get(&store, "/v1/resolve/handle/x/popular").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["owner"], bob.to_string().as_str());
-    assert_eq!(body["userId"], "222");
-    assert_eq!(body["idAgrees"], true);
+    let binding = &body["bindings"][0];
+    assert_eq!(binding["owner"], bob.to_string().as_str());
+    assert_eq!(binding["userId"], "222");
+    assert_eq!(binding["idAgrees"], true);
 
     // Alice's id still resolves to her wallet, but the handle is no longer
     // hers to display: the node points at Bob's id.
     let (status, body) = get(&store, "/v1/resolve/id/x/111").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["owner"], alice.to_string().as_str());
-    assert_eq!(body["handle"], serde_json::Value::Null);
+    let binding = &body["bindings"][0];
+    assert_eq!(binding["owner"], alice.to_string().as_str());
+    assert_eq!(binding["handle"], serde_json::Value::Null);
 }
 
 #[tokio::test]
@@ -412,10 +425,16 @@ async fn api_refuses_to_answer_before_the_first_window() {
     assert_eq!(body["error"]["code"], "not_synced", "{body}");
     let (status, _) = get(&store, "/v1/search?q=ali").await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    // Status still answers — it is how a caller learns the sync state.
-    let (status, body) = get(&store, "/v1/status").await;
+    // Status still answers — it is how a caller learns the sync state: the
+    // chain is simply not among those the store holds.
+    let (status, body) = common::get(&store, "/v1/status").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["lastIndexedBlock"], serde_json::Value::Null);
+    let listed = body["chains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["chainId"] == CHAIN);
+    assert!(!listed, "{body}");
 }
 
 #[tokio::test]
@@ -504,13 +523,16 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_only_in_the_journ
 
     // The Proof Verifier is the chain's one verification component; the
     // status reports it so an operator need not ask the RPC.
-    let (status, body) = get(&store, "/v1/status").await;
+    let (status, body) = common::get(&store, "/v1/status").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        body["proofVerifier"],
-        addr(0xEE).to_string().as_str(),
-        "{body}"
-    );
+    let chain = body["chains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["chainId"] == CHAIN)
+        .unwrap_or_else(|| panic!("chain {CHAIN} is listed: {body}"))
+        .clone();
+    assert_eq!(chain["proofVerifier"], addr(0xEE).to_string().as_str());
 
     // The ceremony's own events are journaled with the payload an operator
     // asks by, and project nothing.
@@ -575,6 +597,76 @@ async fn unconfigured_platform_and_impossible_text_name_their_codes() {
     let (status, body) = get(&store, "/v1/resolve/handle/x/a%20b").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["error"]["code"], "handle_impossible", "{body}");
+}
+
+/// A wallet is the same address on every chain; its bindings are not. With
+/// no chain named, a read answers from every chain the store holds and each
+/// result says which one it is from; `?chain=` narrows to one.
+#[tokio::test]
+async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
+    let Some((store, pool, _guard)) = test_store().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let other = ChainStore::new(pool.clone(), OTHER_CHAIN);
+    let x = nodes::Platform::from_key("x").unwrap().id();
+    let (alice, bob) = (addr(0xA1), addr(0xB2));
+    // The same handle, held by different wallets on the two chains.
+    apply(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
+    apply(&other, 1, bind(bob, x, "999", "alice_1", 1000, false)).await;
+
+    let (status, body) = common::get(&store, "/v1/resolve/handle/x/alice_1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let bindings = body["bindings"].as_array().unwrap();
+    let chains: Vec<i64> = bindings
+        .iter()
+        .map(|b| b["chainId"].as_i64().unwrap())
+        .collect();
+    assert_eq!(chains, [CHAIN, OTHER_CHAIN], "{body}");
+    assert_eq!(bindings[1]["owner"], bob.to_string().as_str());
+
+    let (status, body) = common::get(
+        &store,
+        &format!("/v1/resolve/handle/x/alice_1?chain={OTHER_CHAIN}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["bindings"].as_array().unwrap().len(), 1, "{body}");
+    assert_eq!(body["bindings"][0]["owner"], bob.to_string().as_str());
+
+    // An address is asked without a chain; each identity names its own.
+    let (_, body) = common::get(&store, &format!("/v1/resolve/address/{bob}")).await;
+    let identities = body["identities"].as_array().unwrap();
+    assert!(
+        identities.iter().any(|i| i["chainId"] == OTHER_CHAIN),
+        "{body}"
+    );
+    assert!(identities.iter().all(|i| i["chainId"] != CHAIN), "{body}");
+
+    // Search too, and a hit says where it lives.
+    let (_, body) = common::get(&store, "/v1/search?q=alice_1&platform=x").await;
+    let hit_chains: Vec<i64> = body["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|h| h["handle"] == "alice_1")
+        .map(|h| h["chainId"].as_i64().unwrap())
+        .collect();
+    assert!(
+        hit_chains.contains(&CHAIN) && hit_chains.contains(&OTHER_CHAIN),
+        "{body}"
+    );
+
+    // A chain nobody indexed is not an error to ask about; it has nothing
+    // to answer from, and says so.
+    let (status, body) =
+        common::get(&store, "/v1/resolve/handle/x/alice_1?chain=424242").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["code"], "not_synced", "{body}");
+    let (status, body) =
+        common::get(&store, "/v1/resolve/handle/x/alice_1?chain=eden").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_chain", "{body}");
 }
 
 // ─── The replay gate ────────────────────────────────────────────────────────

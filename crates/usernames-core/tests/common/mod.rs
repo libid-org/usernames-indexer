@@ -1,7 +1,6 @@
 //! Plumbing both integration suites share: drive one request through the
 //! real router and hand back the status plus the parsed body.
 
-use alloy::primitives::Address;
 use axum::{
     body::Body,
     http::{
@@ -13,17 +12,16 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 use usernames_core::{
     api,
-    db::ChainStore,
+    db::{
+        ChainStore,
+        Store,
+    },
 };
 
 /// One GET against the same axum router a caller would hit. A non-JSON body
 /// comes back as a JSON string, so a failed assertion still prints something.
-pub async fn get(
-    store: &ChainStore,
-    contract: Address,
-    path: &str,
-) -> (StatusCode, serde_json::Value) {
-    let state = api::AppState::new(store.clone(), contract);
+pub async fn get(store: &ChainStore, path: &str) -> (StatusCode, serde_json::Value) {
+    let state = api::AppState::new(Store::new(store.pool().clone()));
     let response = api::router(state)
         .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
         .await

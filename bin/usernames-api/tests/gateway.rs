@@ -763,7 +763,9 @@ async fn the_merged_router_keeps_both_halves_intact() {
     bind(&store, "alice", owner).await;
 
     let app = usernames_api::build_router(
-        usernames_core::api::AppState::new(store.clone(), Address::ZERO),
+        usernames_core::api::AppState::new(usernames_core::db::Store::new(
+            store.pool().clone(),
+        )),
         Some(config),
     );
 

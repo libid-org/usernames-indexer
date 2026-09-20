@@ -31,24 +31,35 @@ use crate::{
     db::{
         self,
         ChainStore,
+        Store,
     },
     nodes,
 };
 
-/// What every handler needs.
+/// What every handler needs: the store. Which chains it holds, and which
+/// contract each was indexed from, is read from what the indexers wrote.
 #[derive(Clone)]
 pub struct AppState {
-    /// The chain-scoped store every query goes through.
-    store: ChainStore,
-    /// The watched contract, echoed in `/v1/status`.
-    contract: Address,
+    store: Store,
 }
 
 impl AppState {
-    /// State for one deployment: the chain the store is scoped to is the
-    /// chain this API serves.
-    pub fn new(store: ChainStore, contract: Address) -> Self {
-        Self { store, contract }
+    /// State over one database, however many chains it holds.
+    pub fn new(store: Store) -> Self {
+        Self { store }
+    }
+
+    /// The chains a request reads from — the one `?chain=` names, or all —
+    /// once an indexer has committed a first window there. Asked per
+    /// request: the indexer may wipe and replay a chain at any moment, and a
+    /// cached answer would then be served over an empty read model as
+    /// authoritative-looking 404s.
+    async fn synced(&self, chain: Option<i64>) -> Result<(), ApiError> {
+        if self.store.synced(chain).await? {
+            Ok(())
+        } else {
+            Err(ApiError::not_synced(chain))
+        }
     }
 }
 
@@ -104,12 +115,17 @@ impl ApiError {
         }
     }
 
-    fn not_synced() -> Self {
+    fn not_synced(chain: Option<i64>) -> Self {
+        let message = match chain {
+            Some(chain) => {
+                format!("no indexer has finished a first window on chain {chain}")
+            }
+            None => "no indexer has finished a first window on any chain".to_string(),
+        };
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: "not_synced",
-            message: "the indexer has not finished a first window on this chain yet"
-                .into(),
+            message,
             source: None,
         }
     }
@@ -157,24 +173,26 @@ fn reject_nul(raw: &str, what: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Resolution answers come from an index, and an index that has never
-/// committed a window would serve authoritative-looking 404s for names that
-/// are bound on chain. Refuse to answer until the first window landed.
-async fn ensure_synced(state: &AppState) -> Result<(), ApiError> {
-    // Asked every request, deliberately. This used to be memoized in a
-    // `OnceLock` on the reasoning that the only wipe — `prepare`, on a version
-    // bump or a contract change — ran before the API started, so the fact could
-    // never un-happen. That held while one process was both halves. It does
-    // not now: the indexer is a separate process and may wipe and replay a
-    // chain at any moment, including while this one holds a cached `true`.
-    //
-    // The cached answer would then be served over an empty read model, and a
-    // name that exists on chain would come back as a 404 rather than the 503
-    // that says "ask again later". A single indexed lookup per request is a
-    // small price for not lying about it.
-    match state.store.cursor().await? {
-        Some(_) => Ok(()),
-        None => Err(ApiError::not_synced()),
+/// `?chain=8453` narrows a read to one chain; absent, every chain the store
+/// holds answers, and each result says which chain it is from.
+#[derive(Deserialize)]
+struct ChainFilter {
+    chain: Option<String>,
+}
+
+impl ChainFilter {
+    fn parse(&self) -> Result<Option<i64>, ApiError> {
+        self.chain
+            .as_deref()
+            .map(|raw| {
+                raw.parse().map_err(|_| {
+                    ApiError::bad_request(
+                        "invalid_chain",
+                        format!("{raw:?} is not a chain id"),
+                    )
+                })
+            })
+            .transpose()
     }
 }
 
@@ -196,11 +214,13 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// One chain the store holds, as its indexer last left it.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Status {
+struct ChainStatus {
     chain_id: i64,
-    contract: String,
+    /// The contract the rows were indexed from, as the indexer recorded it.
+    contract: Option<String>,
     last_indexed_block: Option<u64>,
     chain_head_block: Option<u64>,
     /// Blocks between the head the loop last saw and the cursor. Small and
@@ -219,37 +239,56 @@ struct Status {
     /// `ProofVerifierConfigured`: the one contract that checks every claim
     /// on this chain. Absent until the indexer has seen one.
     proof_verifier: Option<String>,
+}
+
+impl ChainStatus {
+    async fn of(store: &ChainStore) -> Result<Self, ApiError> {
+        let last = store.cursor().await?;
+        let head = store.chain_head().await?;
+        let position = store.index_position().await?;
+        Ok(Self {
+            chain_id: store.chain_id(),
+            contract: store.contract().await?.map(|c| c.to_string()),
+            last_indexed_block: last,
+            chain_head_block: head,
+            lag_blocks: head.map(|h| h.saturating_sub(last.unwrap_or(0))),
+            indexer_reported_at: position.reported_at,
+            report_valid_for: position.valid_for,
+            last_window_error: store.window_error().await?,
+            proof_verifier: store
+                .proof_verifier()
+                .await?
+                .map(|verifier| verifier.to_string()),
+        })
+    }
+}
+
+/// Every chain the store holds. Empty on a database no indexer has touched,
+/// and still a 200: the status is how a caller learns that.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Status {
+    chains: Vec<ChainStatus>,
     indexer_version: &'static str,
 }
 
+/// `GET /v1/status` — every chain in the store, as its indexer last left it.
 async fn status(State(state): State<AppState>) -> Result<Json<Status>, ApiError> {
-    let last = state.store.cursor().await?;
-    let head = state.store.chain_head().await?;
-    let position = state.store.index_position().await?;
+    let mut chains = Vec::new();
+    for chain_id in state.store.known_chains().await? {
+        chains.push(ChainStatus::of(&state.store.chain(chain_id)).await?);
+    }
     Ok(Json(Status {
-        chain_id: state.store.chain_id(),
-        contract: state.contract.to_string(),
-        last_indexed_block: last,
-        chain_head_block: head,
-        lag_blocks: head.map(|h| h.saturating_sub(last.unwrap_or(0))),
-        indexer_reported_at: position.reported_at,
-        report_valid_for: position.valid_for,
-        last_window_error: state.store.window_error().await?,
-        proof_verifier: state
-            .store
-            .proof_verifier()
-            .await?
-            .map(|verifier| verifier.to_string()),
+        chains,
         indexer_version: db::INDEXER_VERSION,
     }))
 }
 
+/// One chain's answer to `resolveHandle`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct HandleResolution {
-    platform: Option<&'static str>,
-    platform_id: String,
-    handle: String,
+struct HandleBinding {
+    chain_id: i64,
     handle_node: String,
     owner: String,
     observed_at: i64,
@@ -261,15 +300,28 @@ struct HandleResolution {
     id_agrees: bool,
 }
 
-/// `GET /v1/resolve/handle/{platform}/{handle}` — the wallet a handle
-/// resolves to, the way `resolveHandle` would answer it.
+/// A handle and the wallet it resolves to on each chain it is bound on.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HandleResolution {
+    platform: Option<&'static str>,
+    platform_id: String,
+    handle: String,
+    bindings: Vec<HandleBinding>,
+}
+
+/// `GET /v1/resolve/handle/{platform}/{handle}?chain=` — the wallet a handle
+/// resolves to, the way `resolveHandle` would answer it, on every chain it
+/// is bound on or the one named.
 async fn resolve_handle(
     State(state): State<AppState>,
     Path((platform, handle)): Path<(String, String)>,
+    Query(filter): Query<ChainFilter>,
 ) -> Result<Json<HandleResolution>, ApiError> {
     let platform = parse_platform(&platform)?;
     reject_nul(&handle, "handle")?;
-    ensure_synced(&state).await?;
+    let chain = filter.parse()?;
+    state.synced(chain).await?;
 
     // Normalize the way the chain did before it keyed the handle. Text the
     // platform could never hold mirrors the contract's `resolveHandle`,
@@ -285,27 +337,42 @@ async fn resolve_handle(
         }
     };
 
-    let row = state
+    let rows = state
         .store
-        .resolve_handle(platform.id(), &normalized)
+        .resolve_handle(chain, platform.id(), &normalized)
         .await?;
-    let Some(row) = row else {
+    if rows.is_empty() {
         // Distinguish the contract's UnknownPlatform revert from its
         // zero-address answer: an unwired platform is a different fact than
         // an unclaimed handle.
-        if !state.store.platform_wired(platform.id()).await? {
+        if !state.store.platform_wired(chain, platform.id()).await? {
             return Err(ApiError::not_found(
                 "platform_not_configured",
-                "this platform is not configured on this chain",
+                "this platform is not configured on any chain in scope",
             ));
         }
         return Err(ApiError::not_found(
             "handle_not_bound",
             format!("{:?} is not bound", normalized.as_str()),
         ));
-    };
-    let id_agrees = row.id_agrees();
-    let Some(owner) = row.owner else {
+    }
+    let bindings: Vec<HandleBinding> = rows
+        .iter()
+        .filter_map(|row| {
+            let owner = row.owner.as_deref()?;
+            Some(HandleBinding {
+                chain_id: row.chain_id,
+                handle_node: b256_from_db(&row.handle_node),
+                owner: address_from_db(owner),
+                observed_at: row.observed_at,
+                ceremony_version: row.ceremony_version,
+                user_id: row.user_id.clone(),
+                id_node: b256_from_db(&row.id_node),
+                id_agrees: row.id_agrees(),
+            })
+        })
+        .collect();
+    if bindings.is_empty() {
         return Err(ApiError::not_found(
             "handle_retired",
             format!(
@@ -313,28 +380,21 @@ async fn resolve_handle(
                 normalized.as_str()
             ),
         ));
-    };
+    }
 
     Ok(Json(HandleResolution {
         platform: platform.key(),
         platform_id: platform.id().to_string(),
-        handle: row.handle,
-        handle_node: b256_from_db(&row.handle_node),
-        owner: address_from_db(&owner),
-        observed_at: row.observed_at,
-        ceremony_version: row.ceremony_version,
-        user_id: row.user_id,
-        id_node: b256_from_db(&row.id_node),
-        id_agrees,
+        handle: normalized.as_str().to_string(),
+        bindings,
     }))
 }
 
+/// One chain's answer to `resolveId`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct IdResolution {
-    platform: Option<&'static str>,
-    platform_id: String,
-    user_id: String,
+struct IdBinding {
+    chain_id: i64,
     id_node: String,
     owner: String,
     observed_at: i64,
@@ -346,48 +406,73 @@ struct IdResolution {
     published: bool,
 }
 
-/// `GET /v1/resolve/id/{platform}/{user_id}` — the wallet an account id
-/// resolves to, the way `resolveId` would answer it. The id is matched
-/// byte-verbatim, exactly as the chain keys it.
+/// An account id and the wallet it resolves to on each chain it is bound on.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IdResolution {
+    platform: Option<&'static str>,
+    platform_id: String,
+    user_id: String,
+    bindings: Vec<IdBinding>,
+}
+
+/// `GET /v1/resolve/id/{platform}/{user_id}?chain=` — the wallet an account
+/// id resolves to, the way `resolveId` would answer it, on every chain it is
+/// bound on or the one named. The id is matched byte-verbatim, exactly as
+/// the chain keys it.
 async fn resolve_id(
     State(state): State<AppState>,
     Path((platform, user_id)): Path<(String, String)>,
+    Query(filter): Query<ChainFilter>,
 ) -> Result<Json<IdResolution>, ApiError> {
     let platform = parse_platform(&platform)?;
     reject_nul(&user_id, "userId")?;
-    ensure_synced(&state).await?;
+    let chain = filter.parse()?;
+    state.synced(chain).await?;
 
-    let row = state.store.resolve_id(platform.id(), &user_id).await?;
-    let Some(row) = row else {
-        if !state.store.platform_wired(platform.id()).await? {
+    let rows = state
+        .store
+        .resolve_id(chain, platform.id(), &user_id)
+        .await?;
+    if rows.is_empty() {
+        if !state.store.platform_wired(chain, platform.id()).await? {
             return Err(ApiError::not_found(
                 "platform_not_configured",
-                "this platform is not configured on this chain",
+                "this platform is not configured on any chain in scope",
             ));
         }
         return Err(ApiError::not_found(
             "id_not_bound",
             format!("{user_id:?} is not bound"),
         ));
-    };
+    }
 
     Ok(Json(IdResolution {
         platform: platform.key(),
         platform_id: platform.id().to_string(),
-        id_node: b256_from_db(&row.id_node),
-        owner: address_from_db(&row.owner),
-        observed_at: row.observed_at,
-        ceremony_version: row.ceremony_version,
-        handle: row.presentable_handle().map(str::to_string),
-        handle_node: b256_from_db(&row.handle_node),
-        published: row.displayed(),
-        user_id: row.user_id,
+        user_id,
+        bindings: rows
+            .iter()
+            .map(|row| IdBinding {
+                chain_id: row.chain_id,
+                id_node: b256_from_db(&row.id_node),
+                owner: address_from_db(&row.owner),
+                observed_at: row.observed_at,
+                ceremony_version: row.ceremony_version,
+                handle: row.presentable_handle().map(str::to_string),
+                handle_node: b256_from_db(&row.handle_node),
+                published: row.displayed(),
+            })
+            .collect(),
     }))
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AddressIdentity {
+    /// The chain the identity was proved on: a wallet is the same address
+    /// everywhere, its bindings are not.
+    chain_id: i64,
     platform: Option<&'static str>,
     platform_id: String,
     user_id: String,
@@ -408,31 +493,37 @@ struct AddressResolution {
     identities: Vec<AddressIdentity>,
 }
 
-/// `GET /v1/resolve/address/{address}` — every identity a wallet proved,
-/// with the published flag that mirrors `primaryOf`'s reverse display.
+/// `GET /v1/resolve/address/{address}?chain=` — every identity a wallet
+/// proved, on every chain the store holds or the one named, with the
+/// published flag that mirrors `primaryOf`'s reverse display.
 async fn resolve_address(
     State(state): State<AppState>,
     Path(address): Path<String>,
+    Query(filter): Query<ChainFilter>,
 ) -> Result<Json<AddressResolution>, ApiError> {
     let address = parse_address(&address)?;
-    ensure_synced(&state).await?;
+    let chain = filter.parse()?;
+    state.synced(chain).await?;
 
-    let rows = state.store.identities_of(address).await?;
-    let mut identities = Vec::with_capacity(rows.len());
-    for row in rows {
-        let platform_id = B256::from_slice(&row.platform_id);
-        identities.push(AddressIdentity {
-            platform: nodes::Platform::key_of(platform_id),
-            platform_id: platform_id.to_string(),
-            handle: row.presentable_handle().map(str::to_string),
-            handle_node: b256_from_db(&row.handle_node),
-            observed_at: row.observed_at,
-            ceremony_version: row.ceremony_version,
-            resolves: row.handle_still_owned(),
-            published: row.displayed(),
-            user_id: row.user_id,
-        });
-    }
+    let rows = state.store.identities_of(chain, address).await?;
+    let identities = rows
+        .iter()
+        .map(|row| {
+            let platform_id = B256::from_slice(&row.platform_id);
+            AddressIdentity {
+                chain_id: row.chain_id,
+                platform: nodes::Platform::key_of(platform_id),
+                platform_id: platform_id.to_string(),
+                user_id: row.user_id.clone(),
+                handle: row.presentable_handle().map(str::to_string),
+                handle_node: b256_from_db(&row.handle_node),
+                observed_at: row.observed_at,
+                ceremony_version: row.ceremony_version,
+                resolves: row.handle_still_owned(),
+                published: row.displayed(),
+            }
+        })
+        .collect();
 
     Ok(Json(AddressResolution {
         address: address.to_string(),
@@ -444,12 +535,14 @@ async fn resolve_address(
 struct SearchParams {
     q: String,
     platform: Option<String>,
+    chain: Option<String>,
     limit: Option<i64>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SearchHit {
+    chain_id: i64,
     platform: Option<&'static str>,
     platform_id: String,
     handle: String,
@@ -465,14 +558,19 @@ struct SearchResults {
     hits: Vec<SearchHit>,
 }
 
-/// `GET /v1/search?q=gre&platform=x&limit=10` — matching variants for a
-/// partial handle, exact first, then prefix, then substring and fuzzy.
+/// `GET /v1/search?q=gre&platform=x&chain=8453&limit=10` — matching variants
+/// for a partial handle, exact first, then prefix, then substring and fuzzy,
+/// across every chain the store holds or the one named.
 async fn search(
     State(state): State<AppState>,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<SearchResults>, ApiError> {
     reject_nul(&params.q, "q")?;
-    ensure_synced(&state).await?;
+    let chain = ChainFilter {
+        chain: params.chain,
+    }
+    .parse()?;
+    state.synced(chain).await?;
     let query = nodes::fold_search_query(&params.q);
     if query.is_empty() {
         return Err(ApiError::bad_request(
@@ -490,20 +588,23 @@ async fn search(
 
     let rows = state
         .store
-        .search_handles(platform_id, &query, limit)
+        .search_handles(chain, platform_id, &query, limit)
         .await?;
-    let mut hits = Vec::with_capacity(rows.len());
-    for row in rows {
-        let platform_id = B256::from_slice(&row.platform_id);
-        hits.push(SearchHit {
-            platform: nodes::Platform::key_of(platform_id),
-            platform_id: platform_id.to_string(),
-            handle: row.handle,
-            owner: address_from_db(&row.owner),
-            user_id: row.user_id,
-            published: row.published,
-        });
-    }
+    let hits = rows
+        .iter()
+        .map(|row| {
+            let platform_id = B256::from_slice(&row.platform_id);
+            SearchHit {
+                chain_id: row.chain_id,
+                platform: nodes::Platform::key_of(platform_id),
+                platform_id: platform_id.to_string(),
+                handle: row.handle.clone(),
+                owner: address_from_db(&row.owner),
+                user_id: row.user_id.clone(),
+                published: row.published,
+            }
+        })
+        .collect();
 
     Ok(Json(SearchResults { query, hits }))
 }

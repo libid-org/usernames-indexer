@@ -22,7 +22,7 @@ reverse display without guessing.
 
 ```sh
 docker compose up -d postgres          # listens on 127.0.0.1:55432
-cp .env.example .env                   # fill in RPC_URL, IDENTITY_NAMES_ADDRESS, CHAIN_ID
+cp .env.example .env                   # fill in RPC_URL and IDENTITY_NAMES_ADDRESS
 cargo run -p usernames-indexer         # the write half
 cargo run -p usernames-api             # the read half, in another shell
 ```
@@ -46,8 +46,8 @@ the indexer's knobs is the point rather than an omission:
 |---|---|---|---|
 | `DATABASE_URL` | both | — | Postgres connection string |
 | `RPC_URL` | indexer | — | JSON-RPC endpoint of the chain to follow. Prefer a single node or a sticky endpoint: a load balancer that mixes lagged replicas can answer `eth_getLogs` for blocks a backend has not seen, and events dropped that way past the confirmation margin are gone until a re-index. The loop re-checks the backend's height before committing a window, which narrows but cannot close that hole. |
-| `IDENTITY_NAMES_ADDRESS` | both | — | The IdentityNames **ERC1967 proxy** (the implementation changes on upgrade; the proxy is the one that emits). The API echoes it in `/v1/status`; set it to the same value the indexer runs with, or the status names a contract those rows did not come from |
-| `CHAIN_ID` | both | unset / **required** | Indexer: refuse to start unless the RPC reports this chain id. API: **required** for `/v1/*` — that half talks to no chain, so it cannot discover which chain's rows it serves. The ENS gateway serves every chain in the store and does not read it |
+| `IDENTITY_NAMES_ADDRESS` | indexer | — | The IdentityNames **ERC1967 proxy** (the implementation changes on upgrade; the proxy is the one that emits). The indexer records it per chain, and `/v1/status` reports it from there |
+| `CHAIN_ID` | indexer | unset | Refuse to start unless the RPC reports this chain id. The API takes none: it serves every chain the store holds, and a request narrows with `?chain=` |
 | `CONFIRMATIONS` | indexer | `5` | Blocks behind the head to stay (shallow-reorg protection) |
 | `POLL_INTERVAL_SECS` | indexer | `5` | Poll cadence, and the retry delay after a failure |
 | `STALE_AFTER_SECS` | indexer | four poll intervals + 60 | How long readers may trust this indexer's last report; the ENS gateway refuses this chain once it expires. Must exceed `POLL_INTERVAL_SECS`, and at most a year |
@@ -59,12 +59,16 @@ the indexer's knobs is the point rather than an omission:
 
 | Endpoint | Answers |
 |---|---|
-| `GET /v1/resolve/handle/{platform}/{handle}` | The wallet a handle resolves to (`resolveHandle`), plus the account id it pairs with and whether the pair agrees (`resolvePair`) |
-| `GET /v1/resolve/id/{platform}/{userId}` | The wallet an account id resolves to (`resolveId`), plus the handle that account currently holds |
-| `GET /v1/resolve/address/{address}` | Every identity a wallet proved, with `resolves` and `published` flags (`primaryOf`'s reverse display) |
+| `GET /v1/resolve/handle/{platform}/{handle}` | The wallet a handle resolves to (`resolveHandle`) on each chain it is bound on, each with the account id it pairs with and whether the pair agrees (`resolvePair`) |
+| `GET /v1/resolve/id/{platform}/{userId}` | The wallet an account id resolves to (`resolveId`) on each chain it is bound on, each with the handle that account currently holds |
+| `GET /v1/resolve/address/{address}` | Every identity a wallet proved on every chain, with `resolves` and `published` flags (`primaryOf`'s reverse display) |
 | `GET /v1/search?q=gre&platform=x&limit=10` | Matching variants for a partial handle: exact, then prefix, then substring, then trigram-fuzzy |
-| `GET /v1/status` | Chain id, contract, last indexed block, chain head, lag, when the indexer last reported and how long that report is still good, last window error, the Proof Verifier the contract is wired to, read-model version |
+| `GET /v1/status` | Every chain the store holds: chain id, contract, last indexed block, chain head, lag, when the indexer last reported and how long that report is still good, last window error, the Proof Verifier the contract is wired to; and the read-model version |
 | `GET /health` | Liveness |
+
+Every read spans every chain the store holds, and every result carries its
+`chainId`; `?chain=8453` narrows a read to one chain. Nothing about chains
+or contracts is configured on the API: the indexers wrote it.
 
 `{platform}` is a short key (`x`, `github`, `google`) or a 0x-hex 32-byte
 platform id. With a known key, the handle in the path is normalized exactly
@@ -126,7 +130,8 @@ schedule. Every row involved is keyed by chain: one chain's dead indexer
 expires that chain alone, and the others keep answering.
 
 `GET /ens/status` lists every served chain with its position and whether it
-would be refused right now; `/v1/status` reports the API's own chain. Both are
+would be refused right now; `/v1/status` lists them as the indexers left
+them. Both are
 for alerting. A readiness probe may look at the STATUS CODE of `/v1/status`,
 which is 200 whenever the database answers, but never at a chain's `stale`,
 `reportValidFor` or `lagBlocks`: one stopped indexer would take every chain
@@ -255,9 +260,8 @@ run a container that looks healthy while doing half the job.
 
 **Upgrading from the single-image build:** the `usernames-indexer` image keeps
 its name and keeps indexing, but it no longer serves the API. Deploy
-`usernames-api` alongside it, pointed at the same database and the same
-`IDENTITY_NAMES_ADDRESS`, with `CHAIN_ID` set — the reader cannot discover the
-chain on its own. Nothing in the database changes and no re-index is needed.
+`usernames-api` alongside it, pointed at the same database; it needs nothing
+else. Nothing in the database changes and no re-index is needed.
 
 Probes belong to the API: `GET /health` for liveness; for readiness gate on
 the status code of `GET /v1/status`, which is 200 whenever the database
@@ -271,7 +275,7 @@ fail readiness on those fields: one stopped indexer would take every chain
 out of rotation.
 
 `docker compose up -d --build` runs the full stack locally against the
-compose Postgres — set `RPC_URL`, `IDENTITY_NAMES_ADDRESS` and `CHAIN_ID` in
+compose Postgres — set `RPC_URL` and `IDENTITY_NAMES_ADDRESS` in
 `.env` first.
 
 ## Caveats worth knowing
