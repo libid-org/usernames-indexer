@@ -105,7 +105,7 @@ verifies the signature and returns the record. Both on-chain halves are `view`.
 | Variable | Default | Meaning |
 |---|---|---|
 | `ENS_SIGNER_KEY` | unset | A hex secp256k1 key, or an AWS KMS key id, alias (`alias/…`) or ARN, told apart by shape; with KMS the private material never enters the process, and region and credentials come from the ambient AWS chain (IRSA in the cluster). Setting it mounts the route; startup logs the signer address the resolver must trust |
-| `ENS_RESOLVER_ADDRESS` | — | Required with a key. Every answer is signed for this address, whatever `{sender}` the path carries; a request naming another resolver is refused with a 400, so a value that fell behind a `setResolver` is a visible error rather than a signature the resolver rejects |
+| `ENS_RESOLVER_ADDRESS` | — | Required with a key. The one `HandleResolver` on the ENS chain; it answers for every indexed chain, since the request's coin type picks the chain. Every answer is signed for this address, whatever `{sender}` the path carries; a request naming another resolver is refused with a 400, so a value that fell behind a `setResolver` is a visible error rather than a signature the resolver rejects |
 | `ENS_TTL_SECS` | `300` | How long an answer stays good; the resolver enforces it |
 | `ENS_MAX_LAG_BLOCKS` | `32` | How far behind the chain the index may be and still assert anything. The target is set at the top of a cycle and the cursor catches up chunk by chunk, so this must exceed the blocks any served chain produces in one of its indexer's poll intervals |
 

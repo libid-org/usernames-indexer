@@ -65,9 +65,14 @@ pub struct Config {
     #[arg(long, env = "ENS_SIGNER_KEY", hide_env_values = true)]
     pub ens_signer_key: Option<String>,
 
-    /// The resolver this gateway answers for. Required with a signing key:
-    /// the signature binds an answer to one resolver, and signing for a
-    /// caller-supplied one would lend this key to any contract that asked.
+    /// The resolver this gateway answers for: the one `HandleResolver` on
+    /// the ENS chain. It serves every chain the store holds, because the
+    /// request's coin type picks the chain, not the resolver. Nothing the
+    /// indexer watches names it, so it cannot come from the store.
+    ///
+    /// Required with a signing key: the signature binds an answer to one
+    /// resolver, and signing for a caller-supplied one would lend this key
+    /// to any contract that asked.
     #[arg(long, env = "ENS_RESOLVER_ADDRESS")]
     pub ens_resolver_address: Option<Address>,
 
