@@ -15,12 +15,21 @@ use alloy::primitives::{
     U256,
 };
 use axum::http::StatusCode;
+use common::Reply;
+use serde::de::DeserializeOwned;
 use sqlx::PgPool;
 use tokio::sync::{
     Mutex,
     MutexGuard,
 };
 use usernames_core::{
+    api::model::{
+        AddressResolution,
+        HandleResolution,
+        IdResolution,
+        SearchResults,
+        Status,
+    },
     db::{
         self,
         ChainStore,
@@ -29,7 +38,10 @@ use usernames_core::{
         LogPosition,
         NamesEvent,
     },
-    nodes,
+    nodes::{
+        self,
+        KnownPlatform,
+    },
 };
 
 /// One chain id for every test; arbitrary, only consistency matters.
@@ -134,9 +146,17 @@ fn retire(platform: B256, handle: &str, owner: Address) -> NamesEvent {
 /// A request scoped to this suite's chain: the store is shared with the
 /// anvil suite's chain, and an unscoped read would see both. The reads that
 /// span chains have their own test below.
-async fn get(store: &ChainStore, path: &str) -> (StatusCode, serde_json::Value) {
+async fn get<T: DeserializeOwned>(store: &ChainStore, path: &str) -> Reply<T> {
     let separator = if path.contains('?') { '&' } else { '?' };
     common::get(store, &format!("{path}{separator}chain={CHAIN}")).await
+}
+
+/// The one binding a resolution carries in these single-chain scenarios.
+fn only<T: std::fmt::Debug>(bindings: &[T]) -> &T {
+    match bindings {
+        [one] => one,
+        many => panic!("one binding expected: {many:?}"),
+    }
 }
 
 #[tokio::test]
@@ -149,32 +169,35 @@ async fn bind_resolves_all_three_directions() {
     let alice = addr(0xA1);
     apply(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
 
-    let (status, body) = get(&store, "/v1/resolve/handle/x/alice_1").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let binding = &body["bindings"][0];
-    assert_eq!(binding["chainId"], CHAIN);
-    assert_eq!(binding["owner"], alice.to_string().as_str());
-    assert_eq!(binding["userId"], "111");
-    assert_eq!(binding["idAgrees"], true);
-    assert_eq!(binding["ceremonyVersion"], 1);
+    let resolved: HandleResolution =
+        get(&store, "/v1/resolve/handle/x/alice_1").await.answer();
+    let binding = only(&resolved.bindings);
+    assert_eq!(binding.chain_id, CHAIN);
+    assert_eq!(binding.owner, alice);
+    assert_eq!(binding.user_id.as_deref(), Some("111"));
+    assert!(binding.id_agrees);
+    assert_eq!(binding.ceremony_version, 1);
 
     // The path normalizes the way the chain did: raw form finds the same row.
-    let (status, body) = get(&store, "/v1/resolve/handle/x/@Alice_1").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["handle"], "alice_1");
+    let resolved: HandleResolution =
+        get(&store, "/v1/resolve/handle/x/@Alice_1").await.answer();
+    assert_eq!(resolved.handle, "alice_1");
+    assert_eq!(resolved.platform, Some(KnownPlatform::X));
 
-    let (status, body) = get(&store, "/v1/resolve/id/x/111").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let binding = &body["bindings"][0];
-    assert_eq!(binding["owner"], alice.to_string().as_str());
-    assert_eq!(binding["handle"], "alice_1");
-    assert_eq!(binding["published"], true);
+    let resolved: IdResolution = get(&store, "/v1/resolve/id/x/111").await.answer();
+    let binding = only(&resolved.bindings);
+    assert_eq!(binding.owner, alice);
+    assert_eq!(binding.handle.as_deref(), Some("alice_1"));
+    assert!(binding.published);
 
-    let (status, body) = get(&store, &format!("/v1/resolve/address/{alice}")).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["identities"][0]["handle"], "alice_1");
-    assert_eq!(body["identities"][0]["published"], true);
-    assert_eq!(body["identities"][0]["resolves"], true);
+    let resolved: AddressResolution =
+        get(&store, &format!("/v1/resolve/address/{alice}"))
+            .await
+            .answer();
+    let identity = only(&resolved.identities);
+    assert_eq!(identity.handle.as_deref(), Some("alice_1"));
+    assert!(identity.published);
+    assert!(identity.resolves);
 }
 
 #[tokio::test]
@@ -190,19 +213,22 @@ async fn rename_retires_the_previous_handle() {
     apply(&store, 2, retire(x, "alice_1", alice)).await;
     apply(&store, 3, bind(alice, x, "111", "alice_2", 2000, true)).await;
 
-    let (status, body) = get(&store, "/v1/resolve/handle/x/alice_1").await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     // The code is the machine-readable half: a UI renders "retired"
     // differently from "never claimed" without parsing prose.
-    assert_eq!(body["error"]["code"], "handle_retired", "{body}");
+    let refusal = get::<HandleResolution>(&store, "/v1/resolve/handle/x/alice_1")
+        .await
+        .refusal();
+    assert_eq!(
+        refusal,
+        (StatusCode::NOT_FOUND, "handle_retired".to_string())
+    );
 
-    let (status, body) = get(&store, "/v1/resolve/handle/x/alice_2").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["bindings"][0]["owner"], alice.to_string().as_str());
+    let resolved: HandleResolution =
+        get(&store, "/v1/resolve/handle/x/alice_2").await.answer();
+    assert_eq!(only(&resolved.bindings).owner, alice);
 
-    let (status, body) = get(&store, "/v1/resolve/id/x/111").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["bindings"][0]["handle"], "alice_2");
+    let resolved: IdResolution = get(&store, "/v1/resolve/id/x/111").await.answer();
+    assert_eq!(only(&resolved.bindings).handle.as_deref(), Some("alice_2"));
 
     // The retired node keeps its watermark, mirroring the contract's
     // stale-proof gate.
@@ -231,20 +257,19 @@ async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
     apply(&store, 2, bind(bob, x, "222", "popular", 2000, false)).await;
 
     // The handle resolves to Bob now, and idAgrees pairs it with Bob's id.
-    let (status, body) = get(&store, "/v1/resolve/handle/x/popular").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let binding = &body["bindings"][0];
-    assert_eq!(binding["owner"], bob.to_string().as_str());
-    assert_eq!(binding["userId"], "222");
-    assert_eq!(binding["idAgrees"], true);
+    let resolved: HandleResolution =
+        get(&store, "/v1/resolve/handle/x/popular").await.answer();
+    let binding = only(&resolved.bindings);
+    assert_eq!(binding.owner, bob);
+    assert_eq!(binding.user_id.as_deref(), Some("222"));
+    assert!(binding.id_agrees);
 
     // Alice's id still resolves to her wallet, but the handle is no longer
     // hers to display: the node points at Bob's id.
-    let (status, body) = get(&store, "/v1/resolve/id/x/111").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let binding = &body["bindings"][0];
-    assert_eq!(binding["owner"], alice.to_string().as_str());
-    assert_eq!(binding["handle"], serde_json::Value::Null);
+    let resolved: IdResolution = get(&store, "/v1/resolve/id/x/111").await.answer();
+    let binding = only(&resolved.bindings);
+    assert_eq!(binding.owner, alice);
+    assert_eq!(binding.handle, None);
 }
 
 #[tokio::test]
@@ -260,9 +285,11 @@ async fn publish_flag_is_the_post_state() {
     apply(&store, 2, retire(x, "alice_1", alice)).await;
     apply(&store, 3, bind(alice, x, "111", "alice_2", 2000, false)).await;
 
-    let (status, body) = get(&store, &format!("/v1/resolve/address/{alice}")).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["identities"][0]["published"], false);
+    let resolved: AddressResolution =
+        get(&store, &format!("/v1/resolve/address/{alice}"))
+            .await
+            .answer();
+    assert!(!only(&resolved.identities).published);
 
     // And NameUnpublished after a published bind does the same.
     apply(&store, 4, retire(x, "alice_2", alice)).await;
@@ -276,8 +303,16 @@ async fn publish_flag_is_the_post_state() {
         },
     )
     .await;
-    let (_, body) = get(&store, &format!("/v1/resolve/address/{alice}")).await;
-    assert_eq!(body["identities"][0]["published"], false);
+    let resolved: AddressResolution =
+        get(&store, &format!("/v1/resolve/address/{alice}"))
+            .await
+            .answer();
+    assert!(!only(&resolved.identities).published);
+}
+
+/// The handles a search answered with, in its order.
+fn handles_of(results: &SearchResults) -> Vec<&str> {
+    results.hits.iter().map(|h| h.handle.as_str()).collect()
 }
 
 #[tokio::test]
@@ -299,95 +334,86 @@ async fn search_ranks_exact_prefix_substring() {
     )
     .await;
 
-    let (status, body) = get(&store, "/v1/search?q=ali").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let handles: Vec<&str> = body["hits"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|h| h["handle"].as_str().unwrap())
-        .collect();
+    let results: SearchResults = get(&store, "/v1/search?q=ali").await.answer();
     // Exact first, then prefix alphabetically, then substring.
-    assert_eq!(handles, ["ali", "alice_1", "alicorn", "malice"]);
+    assert_eq!(
+        handles_of(&results),
+        ["ali", "alice_1", "alicorn", "malice"]
+    );
     // And the hit carries the right binding, not just the right string.
-    let exact = &body["hits"][0];
-    assert_eq!(exact["owner"], addr(1).to_string().as_str(), "{body}");
-    assert_eq!(exact["userId"], "1", "{body}");
-    assert_eq!(exact["published"], false, "{body}");
-    assert_eq!(body["hits"][1]["published"], true, "{body}");
+    let exact = &results.hits[0];
+    assert_eq!(exact.owner, addr(1));
+    assert_eq!(exact.user_id.as_deref(), Some("1"));
+    assert!(!exact.published);
+    assert!(results.hits[1].published);
+    assert_eq!(results.query.as_deref(), Some("ali"));
 
     // Pages walk the same ranked list; a short page is the last one.
-    let (_, body) = get(&store, "/v1/search?q=ali&limit=2&offset=1").await;
-    assert_eq!(body["limit"], 2);
-    assert_eq!(body["offset"], 1);
-    let page: Vec<&str> = body["hits"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|h| h["handle"].as_str().unwrap())
-        .collect();
-    assert_eq!(page, ["alice_1", "alicorn"]);
-    let (_, body) = get(&store, "/v1/search?q=ali&limit=2&offset=3").await;
-    assert_eq!(body["hits"].as_array().unwrap().len(), 1, "{body}");
+    let page: SearchResults = get(&store, "/v1/search?q=ali&limit=2&offset=1")
+        .await
+        .answer();
+    assert_eq!((page.limit, page.offset), (2, 1));
+    assert_eq!(handles_of(&page), ["alice_1", "alicorn"]);
+    let page: SearchResults = get(&store, "/v1/search?q=ali&limit=2&offset=3")
+        .await
+        .answer();
+    assert_eq!(page.hits.len(), 1, "{page:?}");
 
     // The platform filter narrows to that keyspace.
-    let (_, body) = get(&store, "/v1/search?q=ali&platform=github").await;
-    let handles: Vec<&str> = body["hits"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|h| h["handle"].as_str().unwrap())
-        .collect();
-    assert_eq!(handles, ["alicorn"]);
+    let results: SearchResults = get(&store, "/v1/search?q=ali&platform=github")
+        .await
+        .answer();
+    assert_eq!(handles_of(&results), ["alicorn"]);
+    assert_eq!(results.hits[0].platform, Some(KnownPlatform::GitHub));
 
     // Search folds the way normalization does: case and a leading @ vanish.
-    let (_, body) = get(&store, "/v1/search?q=%40ALI").await;
-    assert_eq!(body["hits"].as_array().unwrap().len(), 4);
+    let results: SearchResults = get(&store, "/v1/search?q=%40ALI").await.answer();
+    assert_eq!(results.hits.len(), 4);
 
     // A wallet's handles, alone or narrowed by text; the two intersect.
-    let handles_of = |body: &serde_json::Value| -> Vec<String> {
-        body["hits"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|h| h["handle"].as_str().unwrap().to_string())
-            .collect()
-    };
-    let (status, body) = get(&store, &format!("/v1/search?owner={}", addr(2))).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(handles_of(&body), ["alice_1"]);
-    assert_eq!(body["owner"], addr(2).to_string().as_str());
-    assert_eq!(body["query"], serde_json::Value::Null);
-    let (_, body) = get(&store, &format!("/v1/search?q=ali&owner={}", addr(1))).await;
-    assert_eq!(handles_of(&body), ["ali"]);
-    let (_, body) = get(&store, &format!("/v1/search?q=bob&owner={}", addr(1))).await;
-    assert!(handles_of(&body).is_empty(), "{body}");
+    let results: SearchResults = get(&store, &format!("/v1/search?owner={}", addr(2)))
+        .await
+        .answer();
+    assert_eq!(handles_of(&results), ["alice_1"]);
+    assert_eq!(results.owner, Some(addr(2)));
+    assert_eq!(results.query, None);
+    let results: SearchResults =
+        get(&store, &format!("/v1/search?q=ali&owner={}", addr(1)))
+            .await
+            .answer();
+    assert_eq!(handles_of(&results), ["ali"]);
+    let results: SearchResults =
+        get(&store, &format!("/v1/search?q=bob&owner={}", addr(1)))
+            .await
+            .answer();
+    assert!(results.hits.is_empty(), "{results:?}");
 
     // Neither text nor wallet is not a question, and a wallet must parse.
-    let (status, body) = get(&store, "/v1/search").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["error"]["code"], "invalid_argument", "{body}");
-    let (status, body) = get(&store, "/v1/search?owner=nobody").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["error"]["code"], "invalid_address", "{body}");
+    let refusal = get::<SearchResults>(&store, "/v1/search").await.refusal();
+    assert_eq!(
+        refusal,
+        (StatusCode::BAD_REQUEST, "invalid_argument".to_string())
+    );
+    let refusal = get::<SearchResults>(&store, "/v1/search?owner=nobody")
+        .await
+        .refusal();
+    assert_eq!(
+        refusal,
+        (StatusCode::BAD_REQUEST, "invalid_address".to_string())
+    );
 
     // A retired handle stops matching. Its fuzzy neighbors still do — that
     // is what the trigram branch is for — but the retired name itself is
     // gone from the results.
     apply(&store, 6, retire(x, "alice_1", addr(2))).await;
-    let (_, body) = get(&store, "/v1/search?q=alice_1").await;
-    let handles: Vec<&str> = body["hits"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|h| h["handle"].as_str().unwrap())
-        .collect();
+    let results: SearchResults = get(&store, "/v1/search?q=alice_1").await.answer();
+    let handles = handles_of(&results);
     assert!(!handles.contains(&"alice_1"), "{handles:?}");
     assert!(!handles.is_empty(), "fuzzy neighbors should still match");
 
     // LIKE metacharacters match themselves, not everything.
-    let (_, body) = get(&store, "/v1/search?q=%25").await;
-    assert_eq!(body["hits"].as_array().unwrap().len(), 0);
+    let results: SearchResults = get(&store, "/v1/search?q=%25").await.answer();
+    assert!(results.hits.is_empty());
 }
 
 #[tokio::test]
@@ -409,8 +435,9 @@ async fn replay_converges_instead_of_duplicating() {
             .await
             .expect("count");
     assert_eq!(journal, 1);
-    let (status, body) = get(&store, "/v1/resolve/handle/x/alice_1").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    let resolved: HandleResolution =
+        get(&store, "/v1/resolve/handle/x/alice_1").await.answer();
+    assert_eq!(only(&resolved.bindings).owner, alice);
 
     // The journal conflict gates every projection write, so the one counter
     // that is not naturally convergent cannot drift on a replay either.
@@ -438,19 +465,22 @@ async fn unclaimed_names_on_a_configured_platform_are_coded_404s() {
         return;
     };
     let x = nodes::Platform::from_key("x").unwrap().id();
-    // The platform row EXISTS — this is the branch the absent-platform test
-    // cannot reach, and the one that shipped a decode 500: the wired check
-    // read `SELECT 1` (INT4 on the wire) as i64, so it failed exactly when
-    // a row was found.
+    // The platform row EXISTS — the branch the absent-platform test cannot
+    // reach, and the one that once shipped a decode 500.
     apply(&store, 1, NamesEvent::PlatformConfigured { platform_id: x }).await;
 
-    let (status, body) = get(&store, "/v1/resolve/handle/x/zzz").await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert_eq!(body["error"]["code"], "handle_not_bound", "{body}");
+    let refusal = get::<HandleResolution>(&store, "/v1/resolve/handle/x/zzz")
+        .await
+        .refusal();
+    assert_eq!(
+        refusal,
+        (StatusCode::NOT_FOUND, "handle_not_bound".to_string())
+    );
 
-    let (status, body) = get(&store, "/v1/resolve/id/x/999999").await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert_eq!(body["error"]["code"], "id_not_bound", "{body}");
+    let refusal = get::<IdResolution>(&store, "/v1/resolve/id/x/999999")
+        .await
+        .refusal();
+    assert_eq!(refusal, (StatusCode::NOT_FOUND, "id_not_bound".to_string()));
 }
 
 #[tokio::test]
@@ -461,21 +491,24 @@ async fn api_refuses_to_answer_before_the_first_window() {
     };
     // No window ever committed: resolution must say "not synced", never an
     // authoritative-looking "not bound".
-    let (status, body) = get(&store, "/v1/resolve/handle/x/alice_1").await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert_eq!(body["error"]["code"], "not_synced", "{body}");
-    let (status, _) = get(&store, "/v1/search?q=ali").await;
+    let refusal = get::<HandleResolution>(&store, "/v1/resolve/handle/x/alice_1")
+        .await
+        .refusal();
+    assert_eq!(
+        refusal,
+        (StatusCode::SERVICE_UNAVAILABLE, "not_synced".to_string())
+    );
+    let (status, _) = get::<SearchResults>(&store, "/v1/search?q=ali")
+        .await
+        .refusal();
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     // Status still answers — it is how a caller learns the sync state: the
     // chain is simply not among those the store holds.
-    let (status, body) = common::get(&store, "/v1/status").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let listed = body["chains"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|c| c["chainId"] == CHAIN);
-    assert!(!listed, "{body}");
+    let status: Status = common::get(&store, "/v1/status").await.answer();
+    assert!(
+        status.chains.iter().all(|c| c.chain_id != CHAIN),
+        "{status:?}"
+    );
 }
 
 #[tokio::test]
@@ -505,10 +538,16 @@ async fn nul_bytes_neither_stall_the_indexer_nor_crash_the_api() {
     assert_eq!(stored, "evil\u{fffd}id");
 
     // And a NUL in a query is a 400, not a 500.
-    let (status, body) = get(&store, "/v1/resolve/id/x/evil%00id").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"]["code"], "invalid_argument", "{body}");
-    let (status, _) = get(&store, "/v1/search?q=evil%00").await;
+    let refusal = get::<IdResolution>(&store, "/v1/resolve/id/x/evil%00id")
+        .await
+        .refusal();
+    assert_eq!(
+        refusal,
+        (StatusCode::BAD_REQUEST, "invalid_argument".to_string())
+    );
+    let (status, _) = get::<SearchResults>(&store, "/v1/search?q=evil%00")
+        .await
+        .refusal();
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -564,16 +603,13 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_only_in_the_journ
 
     // The Proof Verifier is the chain's one verification component; the
     // status reports it so an operator need not ask the RPC.
-    let (status, body) = common::get(&store, "/v1/status").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let chain = body["chains"]
-        .as_array()
-        .unwrap()
+    let status: Status = common::get(&store, "/v1/status").await.answer();
+    let chain = status
+        .chains
         .iter()
-        .find(|c| c["chainId"] == CHAIN)
-        .unwrap_or_else(|| panic!("chain {CHAIN} is listed: {body}"))
-        .clone();
-    assert_eq!(chain["proofVerifier"], addr(0xEE).to_string().as_str());
+        .find(|c| c.chain_id == CHAIN)
+        .unwrap_or_else(|| panic!("chain {CHAIN} is listed: {status:?}"));
+    assert_eq!(chain.proof_verifier, Some(addr(0xEE)));
 
     // The ceremony's own events are journaled with the payload an operator
     // asks by, and project nothing.
@@ -624,20 +660,32 @@ async fn unconfigured_platform_and_impossible_text_name_their_codes() {
     // unclaimed handle — the contract's UnknownPlatform revert versus its
     // zero-address answer — and the code says which, on both resolve paths.
     let foreign = B256::repeat_byte(7);
-    let (status, body) =
-        get(&store, &format!("/v1/resolve/handle/{foreign}/alice_1")).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert_eq!(body["error"]["code"], "platform_not_configured", "{body}");
-    let (status, body) = get(&store, &format!("/v1/resolve/id/{foreign}/111")).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert_eq!(body["error"]["code"], "platform_not_configured", "{body}");
+    let refusal =
+        get::<HandleResolution>(&store, &format!("/v1/resolve/handle/{foreign}/alice_1"))
+            .await
+            .refusal();
+    assert_eq!(
+        refusal,
+        (StatusCode::NOT_FOUND, "platform_not_configured".to_string())
+    );
+    let refusal = get::<IdResolution>(&store, &format!("/v1/resolve/id/{foreign}/111"))
+        .await
+        .refusal();
+    assert_eq!(
+        refusal,
+        (StatusCode::NOT_FOUND, "platform_not_configured".to_string())
+    );
 
     // Text X's rules can never hold (an interior space) mirrors the
     // contract's deliberate zero-address answer: "no such handle can exist",
     // a 404 with its own code — not "you asked wrong".
-    let (status, body) = get(&store, "/v1/resolve/handle/x/a%20b").await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert_eq!(body["error"]["code"], "handle_impossible", "{body}");
+    let refusal = get::<HandleResolution>(&store, "/v1/resolve/handle/x/a%20b")
+        .await
+        .refusal();
+    assert_eq!(
+        refusal,
+        (StatusCode::NOT_FOUND, "handle_impossible".to_string())
+    );
 }
 
 /// A wallet is the same address on every chain; its bindings are not. With
@@ -656,58 +704,75 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
     apply(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
     apply(&other, 1, bind(bob, x, "999", "alice_1", 1000, false)).await;
 
-    let (status, body) = common::get(&store, "/v1/resolve/handle/x/alice_1").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let bindings = body["bindings"].as_array().unwrap();
-    let chains: Vec<i64> = bindings
-        .iter()
-        .map(|b| b["chainId"].as_i64().unwrap())
-        .collect();
-    assert_eq!(chains, [CHAIN, OTHER_CHAIN], "{body}");
-    assert_eq!(bindings[1]["owner"], bob.to_string().as_str());
+    let resolved: HandleResolution = common::get(&store, "/v1/resolve/handle/x/alice_1")
+        .await
+        .answer();
+    let chains: Vec<i64> = resolved.bindings.iter().map(|b| b.chain_id).collect();
+    assert_eq!(chains, [CHAIN, OTHER_CHAIN], "{resolved:?}");
+    assert_eq!(resolved.bindings[1].owner, bob);
 
-    let (status, body) = common::get(
+    let resolved: HandleResolution = common::get(
         &store,
         &format!("/v1/resolve/handle/x/alice_1?chain={OTHER_CHAIN}"),
     )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["bindings"].as_array().unwrap().len(), 1, "{body}");
-    assert_eq!(body["bindings"][0]["owner"], bob.to_string().as_str());
+    .await
+    .answer();
+    assert_eq!(only(&resolved.bindings).owner, bob);
 
     // An address is asked without a chain; each identity names its own.
-    let (_, body) = common::get(&store, &format!("/v1/resolve/address/{bob}")).await;
-    let identities = body["identities"].as_array().unwrap();
+    let resolved: AddressResolution =
+        common::get(&store, &format!("/v1/resolve/address/{bob}"))
+            .await
+            .answer();
     assert!(
-        identities.iter().any(|i| i["chainId"] == OTHER_CHAIN),
-        "{body}"
+        resolved
+            .identities
+            .iter()
+            .any(|i| i.chain_id == OTHER_CHAIN),
+        "{resolved:?}"
     );
-    assert!(identities.iter().all(|i| i["chainId"] != CHAIN), "{body}");
+    assert!(
+        resolved.identities.iter().all(|i| i.chain_id != CHAIN),
+        "{resolved:?}"
+    );
 
     // Search too, and a hit says where it lives.
-    let (_, body) = common::get(&store, "/v1/search?q=alice_1&platform=x").await;
-    let hit_chains: Vec<i64> = body["hits"]
-        .as_array()
-        .unwrap()
+    let results: SearchResults = common::get(&store, "/v1/search?q=alice_1&platform=x")
+        .await
+        .answer();
+    let hit_chains: Vec<i64> = results
+        .hits
         .iter()
-        .filter(|h| h["handle"] == "alice_1")
-        .map(|h| h["chainId"].as_i64().unwrap())
+        .filter(|h| h.handle == "alice_1")
+        .map(|h| h.chain_id)
         .collect();
     assert!(
         hit_chains.contains(&CHAIN) && hit_chains.contains(&OTHER_CHAIN),
-        "{body}"
+        "{results:?}"
     );
 
     // A chain nobody indexed is not an error to ask about; it has nothing
     // to answer from, and says so.
-    let (status, body) =
-        common::get(&store, "/v1/resolve/handle/x/alice_1?chain=424242").await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert_eq!(body["error"]["code"], "not_synced", "{body}");
-    let (status, body) =
-        common::get(&store, "/v1/resolve/handle/x/alice_1?chain=eden").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["error"]["code"], "invalid_chain", "{body}");
+    let refusal = common::get::<HandleResolution>(
+        &store,
+        "/v1/resolve/handle/x/alice_1?chain=424242",
+    )
+    .await
+    .refusal();
+    assert_eq!(
+        refusal,
+        (StatusCode::SERVICE_UNAVAILABLE, "not_synced".to_string())
+    );
+    let refusal = common::get::<HandleResolution>(
+        &store,
+        "/v1/resolve/handle/x/alice_1?chain=eden",
+    )
+    .await
+    .refusal();
+    assert_eq!(
+        refusal,
+        (StatusCode::BAD_REQUEST, "invalid_chain".to_string())
+    );
 }
 
 // ─── The replay gate ────────────────────────────────────────────────────────

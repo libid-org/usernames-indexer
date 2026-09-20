@@ -1,5 +1,9 @@
 //! The read API. Resolution answers exactly what the contract's resolvers
 //! answer, from the projections; search is the one thing the chain cannot do.
+//! The answers' shapes live in [`model`]; the handlers here only translate
+//! HTTP to store calls and rows to those shapes.
+
+pub mod model;
 
 use std::str::FromStr;
 
@@ -22,11 +26,9 @@ use axum::{
     Json,
     Router,
 };
-use serde::{
-    Deserialize,
-    Serialize,
-};
+use serde::Deserialize;
 
+use self::model::*;
 use crate::{
     db::{
         self,
@@ -149,9 +151,12 @@ impl IntoResponse for ApiError {
         if let Some(e) = &self.source {
             tracing::error!(%e, "query failed");
         }
-        let body = serde_json::json!({
-            "error": { "code": self.code, "message": self.message }
-        });
+        let body = ErrorBody {
+            error: ErrorDetail {
+                code: self.code.to_string(),
+                message: self.message,
+            },
+        };
         (self.status, Json(body)).into_response()
     }
 }
@@ -202,43 +207,8 @@ fn parse_address(raw: &str) -> Result<Address, ApiError> {
     })
 }
 
-fn address_from_db(bytes: &[u8]) -> String {
-    Address::from_slice(bytes).to_string()
-}
-
-fn b256_from_db(bytes: &[u8]) -> String {
-    B256::from_slice(bytes).to_string()
-}
-
 async fn health() -> &'static str {
     "ok"
-}
-
-/// One chain the store holds, as its indexer last left it.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ChainStatus {
-    chain_id: i64,
-    /// The contract the rows were indexed from, as the indexer recorded it.
-    contract: Option<String>,
-    last_indexed_block: Option<u64>,
-    chain_head_block: Option<u64>,
-    /// Blocks between the head the loop last saw and the cursor. Small and
-    /// steady is healthy; growing means the loop is stalled or starved —
-    /// `last_window_error` says which.
-    lag_blocks: Option<u64>,
-    /// Unix seconds at which the indexer last reported. `lag_blocks` cannot
-    /// show a stopped loop — its two terms are both that loop's writes and
-    /// freeze together — so watch this and `report_valid_for` too.
-    indexer_reported_at: Option<u64>,
-    /// Seconds until the indexer's last report expires, negative once it
-    /// has: past zero the ENS gateway refuses this chain's index.
-    report_valid_for: Option<i64>,
-    last_window_error: Option<String>,
-    /// The Proof Verifier the contract is wired to, from its
-    /// `ProofVerifierConfigured`: the one contract that checks every claim
-    /// on this chain. Absent until the indexer has seen one.
-    proof_verifier: Option<String>,
 }
 
 impl ChainStatus {
@@ -248,28 +218,16 @@ impl ChainStatus {
         let position = store.index_position().await?;
         Ok(Self {
             chain_id: store.chain_id(),
-            contract: store.contract().await?.map(|c| c.to_string()),
+            contract: store.contract().await?,
             last_indexed_block: last,
             chain_head_block: head,
             lag_blocks: head.map(|h| h.saturating_sub(last.unwrap_or(0))),
             indexer_reported_at: position.reported_at,
             report_valid_for: position.valid_for,
             last_window_error: store.window_error().await?,
-            proof_verifier: store
-                .proof_verifier()
-                .await?
-                .map(|verifier| verifier.to_string()),
+            proof_verifier: store.proof_verifier().await?,
         })
     }
-}
-
-/// Every chain the store holds. Empty on a database no indexer has touched,
-/// and still a 200: the status is how a caller learns that.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct Status {
-    chains: Vec<ChainStatus>,
-    indexer_version: &'static str,
 }
 
 /// `GET /v1/status` — every chain in the store, as its indexer last left it.
@@ -280,34 +238,8 @@ async fn status(State(state): State<AppState>) -> Result<Json<Status>, ApiError>
     }
     Ok(Json(Status {
         chains,
-        indexer_version: db::INDEXER_VERSION,
+        indexer_version: db::INDEXER_VERSION.to_string(),
     }))
-}
-
-/// One chain's answer to `resolveHandle`.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct HandleBinding {
-    chain_id: i64,
-    handle_node: String,
-    owner: String,
-    observed_at: i64,
-    ceremony_version: i64,
-    user_id: Option<String>,
-    id_node: String,
-    /// Mirrors `resolvePair`: the account id this handle points back at still
-    /// resolves to the same wallet.
-    id_agrees: bool,
-}
-
-/// A handle and the wallet it resolves to on each chain it is bound on.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct HandleResolution {
-    platform: Option<&'static str>,
-    platform_id: String,
-    handle: String,
-    bindings: Vec<HandleBinding>,
 }
 
 /// `GET /v1/resolve/handle/{platform}/{handle}?chain=` — the wallet a handle
@@ -362,12 +294,12 @@ async fn resolve_handle(
             let owner = row.owner.as_deref()?;
             Some(HandleBinding {
                 chain_id: row.chain_id,
-                handle_node: b256_from_db(&row.handle_node),
-                owner: address_from_db(owner),
+                handle_node: B256::from_slice(&row.handle_node),
+                owner: Address::from_slice(owner),
                 observed_at: row.observed_at,
                 ceremony_version: row.ceremony_version,
                 user_id: row.user_id.clone(),
-                id_node: b256_from_db(&row.id_node),
+                id_node: B256::from_slice(&row.id_node),
                 id_agrees: row.id_agrees(),
             })
         })
@@ -383,37 +315,11 @@ async fn resolve_handle(
     }
 
     Ok(Json(HandleResolution {
-        platform: platform.key(),
-        platform_id: platform.id().to_string(),
+        platform: platform.known(),
+        platform_id: platform.id(),
         handle: normalized.as_str().to_string(),
         bindings,
     }))
-}
-
-/// One chain's answer to `resolveId`.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct IdBinding {
-    chain_id: i64,
-    id_node: String,
-    owner: String,
-    observed_at: i64,
-    ceremony_version: i64,
-    /// The handle this account last proved, when the node it points at is
-    /// still the account's — the `handleOfId`/`idOfHandle` round trip.
-    handle: Option<String>,
-    handle_node: String,
-    published: bool,
-}
-
-/// An account id and the wallet it resolves to on each chain it is bound on.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct IdResolution {
-    platform: Option<&'static str>,
-    platform_id: String,
-    user_id: String,
-    bindings: Vec<IdBinding>,
 }
 
 /// `GET /v1/resolve/id/{platform}/{user_id}?chain=` — the wallet an account
@@ -448,49 +354,23 @@ async fn resolve_id(
     }
 
     Ok(Json(IdResolution {
-        platform: platform.key(),
-        platform_id: platform.id().to_string(),
+        platform: platform.known(),
+        platform_id: platform.id(),
         user_id,
         bindings: rows
             .iter()
             .map(|row| IdBinding {
                 chain_id: row.chain_id,
-                id_node: b256_from_db(&row.id_node),
-                owner: address_from_db(&row.owner),
+                id_node: B256::from_slice(&row.id_node),
+                owner: Address::from_slice(&row.owner),
                 observed_at: row.observed_at,
                 ceremony_version: row.ceremony_version,
                 handle: row.presentable_handle().map(str::to_string),
-                handle_node: b256_from_db(&row.handle_node),
+                handle_node: B256::from_slice(&row.handle_node),
                 published: row.displayed(),
             })
             .collect(),
     }))
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AddressIdentity {
-    /// The chain the identity was proved on: a wallet is the same address
-    /// everywhere, its bindings are not.
-    chain_id: i64,
-    platform: Option<&'static str>,
-    platform_id: String,
-    user_id: String,
-    handle: Option<String>,
-    handle_node: String,
-    observed_at: i64,
-    ceremony_version: i64,
-    /// Whether the handle still resolves to this wallet.
-    resolves: bool,
-    /// Whether this is the wallet's displayed name on the platform.
-    published: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AddressResolution {
-    address: String,
-    identities: Vec<AddressIdentity>,
 }
 
 /// `GET /v1/resolve/address/{address}?chain=` — every identity a wallet
@@ -512,11 +392,11 @@ async fn resolve_address(
             let platform_id = B256::from_slice(&row.platform_id);
             AddressIdentity {
                 chain_id: row.chain_id,
-                platform: nodes::Platform::key_of(platform_id),
-                platform_id: platform_id.to_string(),
+                platform: nodes::Platform::known_of(platform_id),
+                platform_id,
                 user_id: row.user_id.clone(),
                 handle: row.presentable_handle().map(str::to_string),
-                handle_node: b256_from_db(&row.handle_node),
+                handle_node: B256::from_slice(&row.handle_node),
                 observed_at: row.observed_at,
                 ceremony_version: row.ceremony_version,
                 resolves: row.handle_still_owned(),
@@ -526,7 +406,7 @@ async fn resolve_address(
         .collect();
 
     Ok(Json(AddressResolution {
-        address: address.to_string(),
+        address,
         identities,
     }))
 }
@@ -547,31 +427,6 @@ const SEARCH_MAX_LIMIT: i64 = 50;
 /// database repeats per request; a client that far in wants a narrower
 /// query.
 const SEARCH_MAX_OFFSET: i64 = 10_000;
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SearchHit {
-    chain_id: i64,
-    platform: Option<&'static str>,
-    platform_id: String,
-    handle: String,
-    owner: String,
-    user_id: Option<String>,
-    published: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SearchResults {
-    /// The folded text the hits were matched against, when there was one.
-    query: Option<String>,
-    /// The wallet the hits are linked to, when one was asked for.
-    owner: Option<String>,
-    /// The page, as served: a page shorter than `limit` is the last one.
-    limit: i64,
-    offset: i64,
-    hits: Vec<SearchHit>,
-}
 
 /// `GET /v1/search?q=gre&platform=x&owner=0x…&chain=8453&limit=10&offset=0`
 /// — live handles matching a partial query (exact first, then prefix,
@@ -627,10 +482,10 @@ async fn search(
             let platform_id = B256::from_slice(&row.platform_id);
             SearchHit {
                 chain_id: row.chain_id,
-                platform: nodes::Platform::key_of(platform_id),
-                platform_id: platform_id.to_string(),
+                platform: nodes::Platform::known_of(platform_id),
+                platform_id,
                 handle: row.handle.clone(),
-                owner: address_from_db(&row.owner),
+                owner: Address::from_slice(&row.owner),
                 user_id: row.user_id.clone(),
                 published: row.published,
             }
@@ -639,7 +494,7 @@ async fn search(
 
     Ok(Json(SearchResults {
         query,
-        owner: owner.map(|o| o.to_string()),
+        owner,
         limit,
         offset,
         hits,

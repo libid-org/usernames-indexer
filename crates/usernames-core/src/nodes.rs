@@ -39,7 +39,10 @@ fn platform_id(domain: &str) -> B256 {
 /// exhaustive `match` on this type is what makes the compiler say so instead of
 /// a test noticing later. Adding a platform is a variant here plus its rules in
 /// `libid-identity`; everything that must follow stops compiling until it does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum KnownPlatform {
     /// X, formerly Twitter.
     X,

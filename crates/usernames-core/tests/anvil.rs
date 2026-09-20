@@ -23,8 +23,16 @@ use alloy::{
     sol,
 };
 use axum::http::StatusCode;
+use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
 use usernames_core::{
+    api::model::{
+        AddressResolution,
+        HandleResolution,
+        IdResolution,
+        SearchResults,
+        Status,
+    },
     db::{
         self,
         ChainStore,
@@ -34,10 +42,11 @@ use usernames_core::{
 };
 
 mod common;
+use common::Reply;
 
 /// A request scoped to this suite's chain: the store is shared with the
 /// read-model suite's chain.
-async fn get(store: &ChainStore, path: &str) -> (StatusCode, serde_json::Value) {
+async fn get<T: DeserializeOwned>(store: &ChainStore, path: &str) -> Reply<T> {
     let separator = if path.contains('?') { '&' } else { '?' };
     common::get(store, &format!("{path}{separator}chain={CHAIN}")).await
 }
@@ -285,80 +294,75 @@ async fn indexes_a_real_chain_end_to_end() {
     assert_eq!(cached, Some(deploy_block), "cached deployment block");
 
     // alice_1 retired, alice_2 resolves, and the id followed the rename.
-    let (status, _) = get(&store, "/v1/resolve/handle/x/alice_1").await;
+    let (status, _) = get::<HandleResolution>(&store, "/v1/resolve/handle/x/alice_1")
+        .await
+        .refusal();
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let (status, body) = get(&store, "/v1/resolve/handle/x/alice_2").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let binding = &body["bindings"][0];
-    assert_eq!(binding["chainId"], CHAIN);
-    assert_eq!(binding["owner"], alice.to_string().as_str());
-    assert_eq!(binding["idAgrees"], true);
-    assert_eq!(binding["ceremonyVersion"], 1);
-    let (_, body) = get(&store, "/v1/resolve/id/x/111").await;
-    assert_eq!(body["bindings"][0]["handle"], "alice_2");
+    let resolved: HandleResolution =
+        get(&store, "/v1/resolve/handle/x/alice_2").await.answer();
+    let binding = &resolved.bindings[0];
+    assert_eq!(binding.chain_id, CHAIN as i64);
+    assert_eq!(binding.owner, alice);
+    assert!(binding.id_agrees);
+    assert_eq!(binding.ceremony_version, 1);
+    let resolved: IdResolution = get(&store, "/v1/resolve/id/x/111").await.answer();
+    assert_eq!(resolved.bindings[0].handle.as_deref(), Some("alice_2"));
 
     // The Google identity resolves through the URL-encoded raw form.
-    let (status, body) =
-        get(&store, "/v1/resolve/handle/google/A.B%2Btag%40Example.COM").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["handle"], "a.b+tag@example.com");
-    assert_eq!(body["bindings"][0]["userId"], "999");
+    let resolved: HandleResolution =
+        get(&store, "/v1/resolve/handle/google/A.B%2Btag%40Example.COM")
+            .await
+            .answer();
+    assert_eq!(resolved.handle, "a.b+tag@example.com");
+    assert_eq!(resolved.bindings[0].user_id.as_deref(), Some("999"));
 
     // Reverse: both identities, neither displayed (x was unpublished, google
     // never was).
-    let (_, body) = get(&store, &format!("/v1/resolve/address/{alice}")).await;
-    let identities = body["identities"].as_array().unwrap();
-    assert_eq!(identities.len(), 2, "{body}");
-    assert!(identities.iter().all(|i| i["published"] == false), "{body}");
-    assert!(identities.iter().all(|i| i["resolves"] == true), "{body}");
+    let resolved: AddressResolution =
+        get(&store, &format!("/v1/resolve/address/{alice}"))
+            .await
+            .answer();
+    assert_eq!(resolved.identities.len(), 2, "{resolved:?}");
+    assert!(
+        resolved.identities.iter().all(|i| !i.published),
+        "{resolved:?}"
+    );
+    assert!(
+        resolved.identities.iter().all(|i| i.resolves),
+        "{resolved:?}"
+    );
 
     // Search sees the current handle, not the retired one.
-    let (_, body) = get(&store, "/v1/search?q=alice&platform=x").await;
-    let handles: Vec<&str> = body["hits"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|h| h["handle"].as_str().unwrap())
-        .collect();
-    assert_eq!(handles, ["alice_2"], "{body}");
+    let results: SearchResults =
+        get(&store, "/v1/search?q=alice&platform=x").await.answer();
+    let handles: Vec<&str> = results.hits.iter().map(|h| h.handle.as_str()).collect();
+    assert_eq!(handles, ["alice_2"], "{results:?}");
 
     // Ops metadata filled from the admin events, on this chain's entry of
     // the status.
-    let (_, status_body) = common::get(&store, "/v1/status").await;
-    let body = status_body["chains"]
-        .as_array()
-        .unwrap()
+    let status: Status = common::get(&store, "/v1/status").await.answer();
+    let chain = status
+        .chains
         .iter()
-        .find(|c| c["chainId"] == CHAIN)
-        .unwrap_or_else(|| panic!("chain {CHAIN} is listed: {status_body}"))
-        .clone();
-    assert_eq!(
-        body["contract"],
-        mock.address().to_string().as_str(),
-        "{body}"
-    );
+        .find(|c| c.chain_id == CHAIN as i64)
+        .unwrap_or_else(|| panic!("chain {CHAIN} is listed: {status:?}"));
+    assert_eq!(chain.contract, Some(*mock.address()));
     // The loop reports beside every target it sets, with an expiry in the
     // future, and the API surfaces both: this is what tells a caught-up
     // index from one whose indexer stopped.
     assert!(
-        body["indexerReportedAt"].as_u64().is_some(),
-        "no report after a real loop ran: {body}"
+        chain.indexer_reported_at.is_some(),
+        "no report after a real loop ran: {chain:?}"
     );
     assert!(
-        body["reportValidFor"].as_i64().is_some_and(|s| s > 0),
-        "a fresh report must still be valid: {body}"
+        chain.report_valid_for.is_some_and(|s| s > 0),
+        "a fresh report must still be valid: {chain:?}"
     );
     assert!(
-        body["lastIndexedBlock"]
-            .as_u64()
-            .is_some_and(|b| b >= latest),
-        "{body}"
+        chain.last_indexed_block.is_some_and(|b| b >= latest),
+        "{chain:?}"
     );
-    assert_eq!(
-        body["proofVerifier"],
-        verifier.to_string().as_str(),
-        "{body}"
-    );
+    assert_eq!(chain.proof_verifier, Some(verifier));
     let platform_key: Option<String> = sqlx::query_scalar(
         "SELECT platform_key FROM names.platforms WHERE chain_id = $1 AND platform_id = $2",
     )
