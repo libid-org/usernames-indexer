@@ -38,8 +38,7 @@ use usernames_core::{
     ens,
 };
 
-mod common;
-use common::*;
+use usernames_fixtures::*;
 
 /// This suite's own chain, so it does not collide with the others.
 const CHAIN: i64 = 31341;

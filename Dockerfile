@@ -23,16 +23,17 @@ WORKDIR /app
 # are unchanged, even when sources change.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/usernames-core/Cargo.toml crates/usernames-core/
+COPY crates/usernames-fixtures/Cargo.toml crates/usernames-fixtures/
 COPY bin/usernames-indexer/Cargo.toml bin/usernames-indexer/
 COPY bin/usernames-api/Cargo.toml bin/usernames-api/
-RUN mkdir -p crates/usernames-core/src bin/usernames-indexer/src bin/usernames-api/src \
-    && touch crates/usernames-core/src/lib.rs \
+RUN mkdir -p crates/usernames-core/src crates/usernames-fixtures/src bin/usernames-indexer/src bin/usernames-api/src \
+    && touch crates/usernames-core/src/lib.rs crates/usernames-fixtures/src/lib.rs \
     && for b in usernames-indexer usernames-api; do \
          echo 'fn main() {}' > "bin/$b/src/main.rs"; \
          touch "bin/$b/src/lib.rs"; \
        done \
     && cargo build --release --workspace \
-    && rm -rf crates/usernames-core/src bin/usernames-indexer/src bin/usernames-api/src
+    && rm -rf crates/usernames-core/src crates/usernames-fixtures/src bin/usernames-indexer/src bin/usernames-api/src
 
 # ── Layer 2: the real build ──────────────────────────────────────────────────
 # The migrations are embedded at compile time (sqlx::migrate!), so they are
@@ -40,6 +41,7 @@ RUN mkdir -p crates/usernames-core/src bin/usernames-indexer/src bin/usernames-a
 # crate that calls the macro.
 COPY crates/usernames-core/src crates/usernames-core/src
 COPY crates/usernames-core/migrations crates/usernames-core/migrations
+COPY crates/usernames-fixtures/src crates/usernames-fixtures/src
 COPY bin/usernames-indexer/src bin/usernames-indexer/src
 COPY bin/usernames-api/src bin/usernames-api/src
 RUN find crates bin -name '*.rs' -exec touch {} + \

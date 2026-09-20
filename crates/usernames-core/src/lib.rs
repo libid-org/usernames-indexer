@@ -14,6 +14,7 @@
 //! dependency one.
 
 #![deny(missing_docs)]
+#![deny(dead_code)]
 
 pub mod api;
 pub mod chain;

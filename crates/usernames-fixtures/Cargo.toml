@@ -1,0 +1,13 @@
+[package]
+name = "usernames-fixtures"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Request fixtures the usernames-api integration suites share. Tests only; it ships in no image."
+publish = false
+
+[dependencies]
+alloy.workspace = true
+usernames-core.workspace = true

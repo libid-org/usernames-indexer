@@ -1,22 +1,18 @@
-//! Fixtures both integration suites build requests from.
+//! Request fixtures the API's integration suites build from.
 //!
 //! One copy on purpose. These were written twice, and the pair drifted the
 //! first time the read model gained a field a fixture had to record: the fix
 //! had to find every copy. Anything a request must look like belongs here, so
-//! the next such change is one edit.
+//! the next such change is one edit. Tests only; it ships in no image.
 
-// Each integration binary compiles this module separately, so whatever the one
-// being built does not call reads as dead. The alternative is splitting the
-// fixtures by which suite happens to use them, which is how they drifted apart
-// in the first place.
-#![allow(dead_code)]
+#![deny(missing_docs)]
+#![deny(dead_code)]
 
 use alloy::{
     primitives::{
         Address,
         B256,
     },
-    sol,
     sol_types::SolCall,
 };
 use usernames_core::{
@@ -28,14 +24,23 @@ use usernames_core::{
     nodes,
 };
 
-sol! {
-    /// ENSIP-10, as the resolver forwards it.
-    function resolve(bytes name, bytes data) external view returns (bytes);
-    /// ENSIP-11's multichain form.
-    function addr(bytes32 node, uint256 coinType) external view returns (bytes);
-    /// The pre-ENSIP-11 form, which implies coin type 60.
-    function addr(bytes32 node) external view returns (address);
+mod calls {
+    use alloy::sol;
+
+    sol! {
+        /// ENSIP-10, as the resolver forwards it.
+        function resolve(bytes name, bytes data) external view returns (bytes);
+        /// ENSIP-11's multichain form.
+        function addr(bytes32 node, uint256 coinType) external view returns (bytes);
+        /// The pre-ENSIP-11 form, which implies coin type 60.
+        function addr(bytes32 node) external view returns (address);
+    }
 }
+use calls::{
+    addr_0Call,
+    addr_1Call,
+    resolveCall,
+};
 
 /// `alice.x` becomes `alice.x.handles.link`, in DNS wire format.
 pub fn wire_name(labels: &[&str]) -> Vec<u8> {

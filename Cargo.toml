@@ -10,6 +10,7 @@ repository = "https://github.com/libid-org/usernames-indexer"
 
 [workspace.dependencies]
 usernames-core = { path = "crates/usernames-core" }
+usernames-fixtures = { path = "crates/usernames-fixtures" }
 
 alloy = { version = "1", features = ["contract", "providers", "transport-http", "network", "serde"] }
 anyhow = "1"

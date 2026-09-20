@@ -27,15 +27,11 @@ use alloy::{
     primitives::{
         Address,
         Bytes,
-        U256,
     },
     providers::ProviderBuilder,
     signers::local::PrivateKeySigner,
     sol,
-    sol_types::{
-        SolCall,
-        SolError,
-    },
+    sol_types::SolError,
 };
 use axum::{
     body::Body,
@@ -54,8 +50,7 @@ use usernames_core::db::{
     ChainStore,
 };
 
-mod common;
-use common::*;
+use usernames_fixtures::*;
 
 sol! {
     /// ERC-3668. The resolver reverts with this rather than returning, which
@@ -85,9 +80,6 @@ sol! {
         function supportsInterface(bytes4 interfaceId) external pure returns (bool);
         function MAX_LIFETIME() external view returns (uint256);
     }
-
-    /// ENSIP-11, as the client asks for it.
-    function addr(bytes32 node, uint256 coinType) external view returns (bytes memory);
 }
 
 const CHAIN: i64 = 31343;
@@ -230,17 +222,10 @@ async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> 
     }));
 
     // ── 1. the wallet asks the resolver, and is told where to look ───
-    let labels = ["alice", "x", "handles", "link"].map(String::from);
     let name = Bytes::from(wire_name(&["alice", "x"]));
-    let inner = Bytes::from(
-        addrCall {
-            // The namehash of the same name, as a wallet sends it: the gateway
-            // checks that the request's two halves describe one name.
-            node: usernames_core::ens::Name::from_labels(labels.to_vec()).node(),
-            coinType: U256::from(0x8000_0000u64 | CHAIN as u64),
-        }
-        .abi_encode(),
-    );
+    // The namehash of the same name rides inside, as a wallet sends it: the
+    // gateway checks that the request's two halves describe one name.
+    let inner = Bytes::from(addr_call(&["alice", "x"], 0x8000_0000u64 | CHAIN as u64));
     let err = resolver
         .resolve(name.clone(), inner.clone())
         .call()

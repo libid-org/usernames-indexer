@@ -11,6 +11,7 @@
 //! which is why readiness must gate on `/v1/status` rather than `/health`.
 
 #![deny(missing_docs)]
+#![deny(dead_code)]
 
 pub mod ens;
 

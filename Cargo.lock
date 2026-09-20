@@ -5041,6 +5041,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "usernames-core",
+ "usernames-fixtures",
 ]
 
 [[package]]
@@ -5061,6 +5062,14 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+]
+
+[[package]]
+name = "usernames-fixtures"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "usernames-core",
 ]
 
 [[package]]

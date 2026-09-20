@@ -27,6 +27,7 @@ sqlx.workspace = true
 tower-http.workspace = true
 
 [dev-dependencies]
+usernames-fixtures.workspace = true
 alloy = { workspace = true, features = ["signer-local", "node-bindings"] }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }

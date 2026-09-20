@@ -7,6 +7,7 @@
 //! behind a healthy-looking endpoint — it exits, and the supervisor notices.
 
 #![deny(missing_docs)]
+#![deny(dead_code)]
 
 use alloy::{
     primitives::Address,
