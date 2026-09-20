@@ -1220,18 +1220,23 @@ impl Store {
         .await
     }
 
-    /// Live handles matching a folded partial query: exact first, then
-    /// prefix, then substring, then trigram-fuzzy, across the chains in
-    /// scope. LIKE-escaping is this method's problem, not the caller's — it
-    /// exists so the query text matches itself, which is SQL knowledge.
+    /// Live handles a search lists, across the chains in scope: those a
+    /// wallet holds, those matching a folded partial query — exact first,
+    /// then prefix, then substring, then trigram-fuzzy — or both. Without a
+    /// query every ranking term is NULL for every row, and the order falls
+    /// through to handle and chain. LIKE-escaping is this method's problem,
+    /// not the caller's — it exists so the query text matches itself, which
+    /// is SQL knowledge.
     pub async fn search_handles(
         &self,
         chain: Option<i64>,
         platform_id: Option<B256>,
-        folded_query: &str,
+        owner: Option<Address>,
+        folded_query: Option<&str>,
         limit: i64,
+        offset: i64,
     ) -> Result<Vec<SearchRow>, sqlx::Error> {
-        let like = escape_like(folded_query);
+        let like = folded_query.map(escape_like);
         sqlx::query_as(
             r#"SELECT h.chain_id, h.platform_id, h.handle, h.owner, i.user_id,
                       (p.handle IS NOT NULL) AS published
@@ -1244,21 +1249,25 @@ impl Store {
                WHERE ($1::bigint IS NULL OR h.chain_id = $1)
                  AND h.owner IS NOT NULL
                  AND ($2::bytea IS NULL OR h.platform_id = $2)
-                 AND (h.handle LIKE '%' || $3 || '%' ESCAPE '\'
-                      OR h.handle % $4)
-               ORDER BY (h.handle = $4) DESC,
-                        (h.handle LIKE $3 || '%' ESCAPE '\') DESC,
-                        (h.handle LIKE '%' || $3 || '%' ESCAPE '\') DESC,
-                        similarity(h.handle, $4) DESC,
+                 AND ($3::bytea IS NULL OR h.owner = $3)
+                 AND ($4::text IS NULL
+                      OR h.handle LIKE '%' || $4 || '%' ESCAPE '\'
+                      OR h.handle % $5)
+               ORDER BY (h.handle = $5) DESC,
+                        (h.handle LIKE $4 || '%' ESCAPE '\') DESC,
+                        (h.handle LIKE '%' || $4 || '%' ESCAPE '\') DESC,
+                        similarity(h.handle, $5) DESC,
                         h.handle ASC,
                         h.chain_id ASC
-               LIMIT $5"#,
+               LIMIT $6 OFFSET $7"#,
         )
         .bind(chain)
         .bind(platform_id.as_ref().map(|p| p.as_slice().to_vec()))
-        .bind(&like)
+        .bind(owner.map(|o| o.as_slice().to_vec()))
+        .bind(like)
         .bind(folded_query)
         .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await
     }

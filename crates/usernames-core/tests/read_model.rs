@@ -316,6 +316,20 @@ async fn search_ranks_exact_prefix_substring() {
     assert_eq!(exact["published"], false, "{body}");
     assert_eq!(body["hits"][1]["published"], true, "{body}");
 
+    // Pages walk the same ranked list; a short page is the last one.
+    let (_, body) = get(&store, "/v1/search?q=ali&limit=2&offset=1").await;
+    assert_eq!(body["limit"], 2);
+    assert_eq!(body["offset"], 1);
+    let page: Vec<&str> = body["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["handle"].as_str().unwrap())
+        .collect();
+    assert_eq!(page, ["alice_1", "alicorn"]);
+    let (_, body) = get(&store, "/v1/search?q=ali&limit=2&offset=3").await;
+    assert_eq!(body["hits"].as_array().unwrap().len(), 1, "{body}");
+
     // The platform filter narrows to that keyspace.
     let (_, body) = get(&store, "/v1/search?q=ali&platform=github").await;
     let handles: Vec<&str> = body["hits"]
@@ -329,6 +343,33 @@ async fn search_ranks_exact_prefix_substring() {
     // Search folds the way normalization does: case and a leading @ vanish.
     let (_, body) = get(&store, "/v1/search?q=%40ALI").await;
     assert_eq!(body["hits"].as_array().unwrap().len(), 4);
+
+    // A wallet's handles, alone or narrowed by text; the two intersect.
+    let handles_of = |body: &serde_json::Value| -> Vec<String> {
+        body["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["handle"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let (status, body) = get(&store, &format!("/v1/search?owner={}", addr(2))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(handles_of(&body), ["alice_1"]);
+    assert_eq!(body["owner"], addr(2).to_string().as_str());
+    assert_eq!(body["query"], serde_json::Value::Null);
+    let (_, body) = get(&store, &format!("/v1/search?q=ali&owner={}", addr(1))).await;
+    assert_eq!(handles_of(&body), ["ali"]);
+    let (_, body) = get(&store, &format!("/v1/search?q=bob&owner={}", addr(1))).await;
+    assert!(handles_of(&body).is_empty(), "{body}");
+
+    // Neither text nor wallet is not a question, and a wallet must parse.
+    let (status, body) = get(&store, "/v1/search").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_argument", "{body}");
+    let (status, body) = get(&store, "/v1/search?owner=nobody").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_address", "{body}");
 
     // A retired handle stops matching. Its fuzzy neighbors still do — that
     // is what the trigram branch is for — but the retired name itself is

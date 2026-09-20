@@ -533,11 +533,20 @@ async fn resolve_address(
 
 #[derive(Deserialize)]
 struct SearchParams {
-    q: String,
+    q: Option<String>,
     platform: Option<String>,
+    owner: Option<String>,
     chain: Option<String>,
     limit: Option<i64>,
+    offset: Option<i64>,
 }
+
+/// The page size a search may ask for: at most this many hits per request.
+const SEARCH_MAX_LIMIT: i64 = 50;
+/// How far into a ranked list a search may page. Deeper pages are a scan the
+/// database repeats per request; a client that far in wants a narrower
+/// query.
+const SEARCH_MAX_OFFSET: i64 = 10_000;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -554,31 +563,53 @@ struct SearchHit {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SearchResults {
-    query: String,
+    /// The folded text the hits were matched against, when there was one.
+    query: Option<String>,
+    /// The wallet the hits are linked to, when one was asked for.
+    owner: Option<String>,
+    /// The page, as served: a page shorter than `limit` is the last one.
+    limit: i64,
+    offset: i64,
     hits: Vec<SearchHit>,
 }
 
-/// `GET /v1/search?q=gre&platform=x&chain=8453&limit=10` — matching variants
-/// for a partial handle, exact first, then prefix, then substring and fuzzy,
-/// across every chain the store holds or the one named.
+/// `GET /v1/search?q=gre&platform=x&owner=0x…&chain=8453&limit=10&offset=0`
+/// — live handles matching a partial query (exact first, then prefix,
+/// substring and fuzzy), linked to a wallet, or both, across every chain
+/// the store holds or the one named. One of `q` and `owner` is required;
+/// `limit` and `offset` page through the ranked list.
 async fn search(
     State(state): State<AppState>,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<SearchResults>, ApiError> {
-    reject_nul(&params.q, "q")?;
     let chain = ChainFilter {
         chain: params.chain,
     }
     .parse()?;
     state.synced(chain).await?;
-    let query = nodes::fold_search_query(&params.q);
-    if query.is_empty() {
+    let query = match params.q.as_deref() {
+        Some(raw) => {
+            reject_nul(raw, "q")?;
+            let folded = nodes::fold_search_query(raw);
+            if folded.is_empty() {
+                return Err(ApiError::bad_request(
+                    "invalid_argument",
+                    "q must be nonempty",
+                ));
+            }
+            Some(folded)
+        }
+        None => None,
+    };
+    let owner = params.owner.as_deref().map(parse_address).transpose()?;
+    if query.is_none() && owner.is_none() {
         return Err(ApiError::bad_request(
             "invalid_argument",
-            "q must be nonempty",
+            "q or owner is required",
         ));
     }
-    let limit = params.limit.unwrap_or(10).clamp(1, 50);
+    let limit = params.limit.unwrap_or(10).clamp(1, SEARCH_MAX_LIMIT);
+    let offset = params.offset.unwrap_or(0).clamp(0, SEARCH_MAX_OFFSET);
     let platform_id = params
         .platform
         .as_deref()
@@ -588,7 +619,7 @@ async fn search(
 
     let rows = state
         .store
-        .search_handles(chain, platform_id, &query, limit)
+        .search_handles(chain, platform_id, owner, query.as_deref(), limit, offset)
         .await?;
     let hits = rows
         .iter()
@@ -606,5 +637,11 @@ async fn search(
         })
         .collect();
 
-    Ok(Json(SearchResults { query, hits }))
+    Ok(Json(SearchResults {
+        query,
+        owner: owner.map(|o| o.to_string()),
+        limit,
+        offset,
+        hits,
+    }))
 }
