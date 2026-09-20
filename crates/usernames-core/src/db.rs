@@ -40,7 +40,7 @@ use crate::{
 /// Bump on any change to what the indexer writes. A mismatch at startup
 /// clears the chain's rows and cursor, so the next loop replays the chain
 /// from the deployment block — the re-index IS the migration.
-pub const INDEXER_VERSION: &str = "2";
+pub const INDEXER_VERSION: &str = "1";
 
 /// Every projection table, in one place. [`ChainStore::prepare`] clears them
 /// for a replay and the tests clean them between scenarios; a single list
