@@ -1015,8 +1015,6 @@ pub struct HandleRow {
     pub id_node: Vec<u8>,
     /// The plaintext account id behind that node, when it was ever bound.
     pub user_id: Option<String>,
-    /// The wallet that account id currently resolves to.
-    pub id_owner: Option<Vec<u8>>,
 }
 
 impl HandleRow {
@@ -1027,15 +1025,6 @@ impl HandleRow {
             .as_deref()
             .and_then(|bytes| <[u8; 20]>::try_from(bytes).ok())
             .map(Address::from)
-    }
-
-    /// Mirrors `resolvePair`: the account id this handle points back at
-    /// still resolves to the same wallet.
-    pub fn id_agrees(&self) -> bool {
-        match &self.owner {
-            Some(owner) => self.id_owner.as_deref() == Some(owner.as_slice()),
-            None => false,
-        }
     }
 }
 
@@ -1263,8 +1252,7 @@ fn handle_lookup(
 ) -> Statement {
     let mut statement = QueryBuilder::new(format!(
         "{prefix}SELECT h.chain_id, h.handle, h.handle_node, h.owner, h.observed_at,
-                h.ceremony_version, h.id_node,
-                i.user_id, i.owner AS id_owner
+                h.ceremony_version, h.id_node, i.user_id
          FROM names.handles h
          LEFT JOIN names.ids i
            ON i.chain_id = h.chain_id AND i.id_node = h.id_node

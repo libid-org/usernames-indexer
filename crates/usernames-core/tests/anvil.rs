@@ -303,7 +303,6 @@ async fn indexes_a_real_chain_end_to_end() {
     let binding = &resolved.bindings[0];
     assert_eq!(binding.chain_id, CHAIN as i64);
     assert_eq!(binding.owner, alice);
-    assert!(binding.id_agrees);
     assert_eq!(binding.ceremony_version, 1);
     let resolved: IdResolution = get(&store, "/v1/resolve/id/x/111").await.answer();
     assert_eq!(resolved.bindings[0].handle.as_deref(), Some("alice_2"));

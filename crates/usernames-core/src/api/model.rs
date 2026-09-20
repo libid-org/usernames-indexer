@@ -96,9 +96,6 @@ pub struct HandleBinding {
     pub user_id: Option<String>,
     /// The account id node the handle points back at (`idOfHandle`).
     pub id_node: B256,
-    /// Mirrors `resolvePair`: the account id this handle points back at still
-    /// resolves to the same wallet.
-    pub id_agrees: bool,
 }
 
 /// `GET /v1/resolve/handle/{platform}/{handle}`: the handle and the wallet it

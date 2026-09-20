@@ -300,7 +300,6 @@ async fn resolve_handle(
                 ceremony_version: row.ceremony_version,
                 user_id: row.user_id.clone(),
                 id_node: B256::from_slice(&row.id_node),
-                id_agrees: row.id_agrees(),
             })
         })
         .collect();

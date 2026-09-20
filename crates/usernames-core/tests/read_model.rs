@@ -175,7 +175,6 @@ async fn bind_resolves_all_three_directions() {
     assert_eq!(binding.chain_id, CHAIN);
     assert_eq!(binding.owner, alice);
     assert_eq!(binding.user_id.as_deref(), Some("111"));
-    assert!(binding.id_agrees);
     assert_eq!(binding.ceremony_version, 1);
 
     // The path normalizes the way the chain did: raw form finds the same row.
@@ -256,13 +255,12 @@ async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
     apply(&store, 1, bind(alice, x, "111", "popular", 1000, false)).await;
     apply(&store, 2, bind(bob, x, "222", "popular", 2000, false)).await;
 
-    // The handle resolves to Bob now, and idAgrees pairs it with Bob's id.
+    // The handle resolves to Bob now, paired with Bob's id.
     let resolved: HandleResolution =
         get(&store, "/v1/resolve/handle/x/popular").await.answer();
     let binding = only(&resolved.bindings);
     assert_eq!(binding.owner, bob);
     assert_eq!(binding.user_id.as_deref(), Some("222"));
-    assert!(binding.id_agrees);
 
     // Alice's id still resolves to her wallet, but the handle is no longer
     // hers to display: the node points at Bob's id.
