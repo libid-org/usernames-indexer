@@ -235,9 +235,9 @@ pub fn fold_search_query(raw: &str) -> String {
 }
 
 static ID_NODE_V1: LazyLock<B256> =
-    LazyLock::new(|| keccak256(b"dyaka.identity.id-node.v1"));
+    LazyLock::new(|| keccak256(b"libid.identity.id-node.v1"));
 static HANDLE_NODE_V1: LazyLock<B256> =
-    LazyLock::new(|| keccak256(b"dyaka.identity.handle-node.v1"));
+    LazyLock::new(|| keccak256(b"libid.identity.handle-node.v1"));
 
 fn node(tag: B256, platform: B256, inner: B256) -> B256 {
     let mut buf = [0u8; 96];
@@ -278,15 +278,15 @@ mod tests {
         let cases = [
             (
                 "x",
-                "c35cd221f653c2881299fd15eafb60135268d945ad58b7bdbceefea1e2274375",
+                "7521d1cadbcfa91eec65aa16715b94ffc1c9654ba57ea2ef1a2127bca1127a83",
             ),
             (
                 "github",
-                "6e6b76ab962fcaebc5bd2f6ba8868866bc6159e1d6481c3376a7383217a84337",
+                "07a17bd3c7c8d7b88e93a4d9007e3bc230b0a586a434de0bed6500e9f343deb7",
             ),
             (
                 "google",
-                "c96cebdfd032a45e92ae16d7e629a9b0e5781858be9e7a108f37acdcc2347b08",
+                "8f2f90d8304f6eb382d037c47a041d8c8b4d18bdd8b082fa32828e016a584ca7",
             ),
         ];
         for (key, expected) in cases {
@@ -301,18 +301,18 @@ mod tests {
         let google = Platform::from_key("google").unwrap().id();
         assert_eq!(
             hex::encode(handle_node(x, &NormalizedHandle::from_chain("alice_1"))),
-            "46a9cdc4134b422003a300cf0b1b318812b07e1f11cec6f5240a3dcf63fa745f"
+            "1c43d5d3cf3d99e9d5b6e8c74c23d14bcbb6a743712cf7fa7c15750c4fc2150d"
         );
         assert_eq!(
             hex::encode(id_node(x, "12345")),
-            "6d6f828075247b9577269f5991a029e7cf90da5c388e62a4f1b4359da480a5a5"
+            "c3a98b9fbd2be3063e652d3d506b3de70b8952e60901fc25bdec89cde86b2214"
         );
         assert_eq!(
             hex::encode(handle_node(
                 google,
                 &NormalizedHandle::from_chain("a.b+tag@example.com")
             )),
-            "510cacc46b1c93510291235a2326a96fbb5fa3ff9ba71e1fcc1fba3e27d2d45c"
+            "71618d5985c306d64050b15d17f41078c448fc30a93982df14ffd6bbcb4db534"
         );
     }
 

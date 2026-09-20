@@ -39,20 +39,14 @@ use crate::{
 /// Bump on any change to what the indexer writes. A mismatch at startup
 /// clears the chain's rows and cursor, so the next loop replays the chain
 /// from the deployment block — the re-index IS the migration.
-pub const INDEXER_VERSION: &str = "1";
+pub const INDEXER_VERSION: &str = "2";
 
 /// Every projection table, in one place. [`ChainStore::prepare`] clears them
 /// for a replay and the tests clean them between scenarios; a single list
 /// means a new table cannot be wiped in one place and silently survive in
 /// another.
-pub const PROJECTION_TABLES: &[&str] = &[
-    "events",
-    "ids",
-    "handles",
-    "published",
-    "platforms",
-    "verifiers",
-];
+pub const PROJECTION_TABLES: &[&str] =
+    &["events", "ids", "handles", "published", "platforms"];
 
 // The chain_metadata keys. Chain scoping is the table's chain_id column;
 // only the deployment-block cache still carries anything in its key.
@@ -64,6 +58,7 @@ const TARGET_KEY: &str = "target";
 const TARGET_REPORTED_AT_KEY: &str = "target_reported_at";
 const TARGET_VALID_UNTIL_KEY: &str = "target_valid_until";
 const WINDOW_ERROR_KEY: &str = "window_error";
+const PROOF_VERIFIER_KEY: &str = "proof_verifier";
 
 /// The mirror's standing, as [`ChainStore::mirror_position`] reads it, every
 /// moment by the database's clock.
@@ -570,6 +565,13 @@ impl ChainStore {
         self.get_metadata(WINDOW_ERROR_KEY).await
     }
 
+    /// The Proof Verifier the contract was last pointed at, as its
+    /// `ProofVerifierConfigured` reported it. `None` until one is indexed.
+    pub async fn proof_verifier(&self) -> Result<Option<Address>, sqlx::Error> {
+        let value = self.get_metadata(PROOF_VERIFIER_KEY).await?;
+        Ok(value.and_then(|v| v.parse().ok()))
+    }
+
     /// The last fully-processed block, if any window ever committed.
     pub async fn cursor(&self) -> Result<Option<u64>, sqlx::Error> {
         let value = self.get_metadata(CURSOR_KEY).await?;
@@ -737,7 +739,7 @@ impl Window {
                 handle,
                 observed_at,
                 published,
-                version,
+                ceremony_version,
             } => {
                 // Self-check: this build's constants against the chain's
                 // topics. The emitted nodes win either way — the chain
@@ -761,12 +763,12 @@ impl Window {
                 sqlx::query(
                     r#"INSERT INTO names.ids
                            (chain_id, id_node, platform_id, user_id, owner,
-                            observed_at, version, handle_node, block_number, log_index)
+                            observed_at, ceremony_version, handle_node, block_number, log_index)
                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                        ON CONFLICT (chain_id, id_node) DO UPDATE SET
                            owner = EXCLUDED.owner,
                            observed_at = EXCLUDED.observed_at,
-                           version = EXCLUDED.version,
+                           ceremony_version = EXCLUDED.ceremony_version,
                            handle_node = EXCLUDED.handle_node,
                            block_number = EXCLUDED.block_number,
                            log_index = EXCLUDED.log_index,
@@ -778,7 +780,7 @@ impl Window {
                 .bind(&user_id)
                 .bind(owner.as_slice())
                 .bind(observed)
-                .bind(i64::from(*version))
+                .bind(i64::from(*ceremony_version))
                 .bind(handle_node.as_slice())
                 .bind(block)
                 .bind(log_index)
@@ -788,13 +790,13 @@ impl Window {
                 sqlx::query(
                     r#"INSERT INTO names.handles
                            (chain_id, handle_node, platform_id, handle, owner,
-                            observed_at, version, id_node, block_number, log_index)
+                            observed_at, ceremony_version, id_node, block_number, log_index)
                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                        ON CONFLICT (chain_id, handle_node) DO UPDATE SET
                            handle = EXCLUDED.handle,
                            owner = EXCLUDED.owner,
                            observed_at = EXCLUDED.observed_at,
-                           version = EXCLUDED.version,
+                           ceremony_version = EXCLUDED.ceremony_version,
                            id_node = EXCLUDED.id_node,
                            block_number = EXCLUDED.block_number,
                            log_index = EXCLUDED.log_index,
@@ -806,7 +808,7 @@ impl Window {
                 .bind(&handle)
                 .bind(owner.as_slice())
                 .bind(observed)
-                .bind(i64::from(*version))
+                .bind(i64::from(*ceremony_version))
                 .bind(id_node.as_slice())
                 .bind(block)
                 .bind(log_index)
@@ -851,12 +853,14 @@ impl Window {
                 handle_node,
                 owner: _,
             } => {
-                // Mirror the contract exactly: owner and version zero out,
-                // the observed-at watermark and the id back-pointer stay.
+                // Mirror the contract: the owner clears; the observed-at
+                // watermark and the id back-pointer stay. So does the
+                // ceremony version — the contract never stored one, and this
+                // row is the only record of which version proved the binding
+                // being retired.
                 sqlx::query(
                     r#"UPDATE names.handles SET
                            owner = NULL,
-                           version = 0,
                            block_number = $3,
                            log_index = $4,
                            updated_at = now()
@@ -918,66 +922,25 @@ impl Window {
                 }
             }
 
-            NamesEvent::VerifierConfigured {
-                platform_id,
-                version,
-                verifier,
-                max_future_observation,
-            } => {
+            NamesEvent::ProofVerifierConfigured { verifier } => {
                 sqlx::query(
-                    r#"INSERT INTO names.verifiers
-                           (chain_id, platform_id, version, verifier, max_future_observation, retired)
-                       VALUES ($1, $2, $3, $4, $5, false)
-                       ON CONFLICT (chain_id, platform_id, version) DO UPDATE SET
-                           verifier = EXCLUDED.verifier,
-                           max_future_observation = EXCLUDED.max_future_observation,
-                           retired = false,
-                           updated_at = now()"#,
+                    r#"INSERT INTO names.chain_metadata (chain_id, key, value)
+                       VALUES ($1, $2, $3)
+                       ON CONFLICT (chain_id, key) DO UPDATE SET value = EXCLUDED.value"#,
                 )
                 .bind(chain_id)
-                .bind(platform_id.as_slice())
-                .bind(i64::from(*version))
-                .bind(verifier.as_slice())
-                .bind(as_i64(*max_future_observation, "maxFutureObservation")?)
+                .bind(PROOF_VERIFIER_KEY)
+                .bind(verifier.to_string().to_lowercase())
                 .execute(&mut **tx)
                 .await?;
             }
 
-            NamesEvent::VerifierRetired {
-                platform_id,
-                version,
-            } => {
-                sqlx::query(
-                    r#"UPDATE names.verifiers SET retired = true, updated_at = now()
-                       WHERE chain_id = $1 AND platform_id = $2 AND version = $3"#,
-                )
-                .bind(chain_id)
-                .bind(platform_id.as_slice())
-                .bind(i64::from(*version))
-                .execute(&mut **tx)
-                .await?;
-            }
-
-            NamesEvent::LatestVersionChanged {
-                platform_id,
-                version,
-            } => {
-                let key = nodes::Platform::key_of(*platform_id);
-                sqlx::query(
-                    r#"INSERT INTO names.platforms
-                           (chain_id, platform_id, platform_key, latest_version)
-                       VALUES ($1, $2, $3, $4)
-                       ON CONFLICT (chain_id, platform_id) DO UPDATE SET
-                           latest_version = EXCLUDED.latest_version,
-                           updated_at = now()"#,
-                )
-                .bind(chain_id)
-                .bind(platform_id.as_slice())
-                .bind(key)
-                .bind(i64::from(*version))
-                .execute(&mut **tx)
-                .await?;
-            }
+            // Journal only. What a claim's ceremony carried beyond the
+            // binding — which client authenticated it, what fee it paid —
+            // answers an operator's question after the fact, and the journal
+            // row beside the claim's `IdentityBound` is where it is asked.
+            // Nothing resolves by it.
+            NamesEvent::CeremonyBound { .. } | NamesEvent::ClaimFeePaid { .. } => {}
         }
 
         Ok(true)
@@ -993,7 +956,7 @@ impl Window {
 /// or the ones it missed answer from a shape that no longer exists. A caller
 /// appends its own `WHERE`, which is the only part that actually differs.
 const IDENTITY_PROJECTION: &str = r#"SELECT i.platform_id, i.user_id, i.id_node, i.owner,
-                      i.observed_at, i.version, i.handle_node,
+                      i.observed_at, i.ceremony_version, i.handle_node,
                       h.handle, h.owner AS handle_owner, h.id_node AS handle_id_node,
                       (p.handle IS NOT NULL) AS published
                FROM names.ids i
@@ -1022,8 +985,10 @@ pub struct HandleRow {
     pub owner: Option<Vec<u8>>,
     /// The proof-freshness watermark, kept even through retirement.
     pub observed_at: i64,
-    /// The proof version; 0 after retirement, like the contract.
-    pub version: i64,
+    /// The ceremony version that proved the last binding at this node. Kept
+    /// through retirement: the contract never stored it, and this row is its
+    /// only record.
+    pub ceremony_version: i64,
     /// The account id node this handle points back at (`idOfHandle`).
     pub id_node: Vec<u8>,
     /// The plaintext account id behind that node, when it was ever bound.
@@ -1067,8 +1032,8 @@ pub struct IdentityRow {
     pub owner: Vec<u8>,
     /// The proof-freshness watermark.
     pub observed_at: i64,
-    /// The proof version.
-    pub version: i64,
+    /// The ceremony version that proved the binding.
+    pub ceremony_version: i64,
     /// The handle node this account last proved (`handleOfId`).
     pub handle_node: Vec<u8>,
     /// The handle string at that node, when the node was ever bound.
@@ -1159,7 +1124,7 @@ impl ChainStore {
     ) -> Result<Option<HandleRow>, sqlx::Error> {
         sqlx::query_as(
             r#"SELECT h.handle, h.handle_node, h.owner, h.observed_at,
-                      h.version, h.id_node,
+                      h.ceremony_version, h.id_node,
                       i.user_id, i.owner AS id_owner
                FROM names.handles h
                LEFT JOIN names.ids i

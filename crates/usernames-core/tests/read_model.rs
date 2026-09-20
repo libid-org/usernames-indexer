@@ -10,7 +10,9 @@ mod common;
 
 use alloy::primitives::{
     Address,
+    Bytes,
     B256,
+    U256,
 };
 use axum::http::StatusCode;
 use sqlx::PgPool;
@@ -110,7 +112,7 @@ fn bind(
         handle: handle.into(),
         observed_at,
         published,
-        version: 1,
+        ceremony_version: 1,
     }
 }
 
@@ -144,6 +146,7 @@ async fn bind_resolves_all_three_directions() {
     assert_eq!(body["owner"], alice.to_string().as_str());
     assert_eq!(body["userId"], "111");
     assert_eq!(body["idAgrees"], true);
+    assert_eq!(body["ceremonyVersion"], 1);
 
     // The path normalizes the way the chain did: raw form finds the same row.
     let (status, body) = get(&store, "/v1/resolve/handle/x/@Alice_1").await;
@@ -450,45 +453,46 @@ async fn nul_bytes_neither_stall_the_indexer_nor_crash_the_api() {
 }
 
 #[tokio::test]
-async fn platform_and_verifier_events_land_in_ops_tables() {
+async fn admin_events_land_in_ops_metadata_and_ceremony_events_only_in_the_journal() {
     let Some((store, pool, _guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
     let x = nodes::Platform::from_key("x").unwrap().id();
+    let digest = B256::repeat_byte(0xD1);
     apply(&store, 1, NamesEvent::PlatformConfigured { platform_id: x }).await;
     apply(
         &store,
         2,
-        NamesEvent::VerifierConfigured {
-            platform_id: x,
-            version: 1,
+        NamesEvent::ProofVerifierConfigured {
             verifier: addr(0xEE),
-            max_future_observation: 300,
         },
     )
     .await;
     apply(
         &store,
         3,
-        NamesEvent::LatestVersionChanged {
+        NamesEvent::CeremonyBound {
+            authorization_digest: digest,
+            owner: addr(0xA1),
             platform_id: x,
-            version: 1,
+            client_identifier: Bytes::from_static(b"client-a"),
         },
     )
     .await;
     apply(
         &store,
         4,
-        NamesEvent::VerifierRetired {
-            platform_id: x,
-            version: 1,
+        NamesEvent::ClaimFeePaid {
+            authorization_digest: digest,
+            receiver: addr(0xFE),
+            amount: U256::from(1_000u64),
         },
     )
     .await;
 
-    let (key, latest): (Option<String>, Option<i64>) = sqlx::query_as(
-        "SELECT platform_key, latest_version FROM names.platforms
+    let key: Option<String> = sqlx::query_scalar(
+        "SELECT platform_key FROM names.platforms
          WHERE chain_id = $1 AND platform_id = $2",
     )
     .bind(CHAIN)
@@ -497,18 +501,51 @@ async fn platform_and_verifier_events_land_in_ops_tables() {
     .await
     .expect("platform row");
     assert_eq!(key.as_deref(), Some("x"));
-    assert_eq!(latest, Some(1));
 
-    let retired: bool = sqlx::query_scalar(
-        "SELECT retired FROM names.verifiers
-         WHERE chain_id = $1 AND platform_id = $2 AND version = 1",
+    // The Proof Verifier is the chain's one verification component; the
+    // status reports it so an operator need not ask the RPC.
+    let (status, body) = get(&store, "/v1/status").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["proofVerifier"],
+        addr(0xEE).to_string().as_str(),
+        "{body}"
+    );
+
+    // The ceremony's own events are journaled with the payload an operator
+    // asks by, and project nothing.
+    let journal: Vec<(String, String)> = sqlx::query_as(
+        "SELECT kind, payload::text FROM names.events
+         WHERE chain_id = $1 AND block_number >= 3 ORDER BY block_number",
     )
     .bind(CHAIN)
-    .bind(x.as_slice())
-    .fetch_one(&pool)
+    .fetch_all(&pool)
     .await
-    .expect("verifier row");
-    assert!(retired);
+    .expect("journal rows");
+    let payloads: Vec<(&str, serde_json::Value)> = journal
+        .iter()
+        .map(|(kind, payload)| {
+            (
+                kind.as_str(),
+                serde_json::from_str(payload).expect("journal payload is JSON"),
+            )
+        })
+        .collect();
+    assert_eq!(payloads[0].0, "ceremony_bound");
+    assert_eq!(payloads[0].1["clientIdentifier"], "0x636c69656e742d61");
+    assert_eq!(
+        payloads[0].1["authorizationDigest"],
+        digest.to_string().as_str()
+    );
+    assert_eq!(payloads[1].0, "claim_fee_paid");
+    assert_eq!(payloads[1].1["amount"], "1000");
+    let bound: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM names.ids WHERE chain_id = $1")
+            .bind(CHAIN)
+            .fetch_one(&pool)
+            .await
+            .expect("ids count");
+    assert_eq!(bound, 0, "a ceremony event alone binds nothing");
 }
 
 #[tokio::test]
