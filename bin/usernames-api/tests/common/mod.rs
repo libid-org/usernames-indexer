@@ -115,7 +115,7 @@ pub async fn bind(store: &ChainStore, handle: &str, owner: Address) {
         .expect("apply");
     window.commit(1).await.expect("commit");
     // The indexer records both every cycle, and the gateway refuses to answer
-    // from a mirror that cannot say how far behind it is. Staleness is measured
+    // from an index that cannot say how far behind it is. Staleness is measured
     // against the TARGET — the block the cursor chases — so that is the one a
     // fixture must record.
     store.set_chain_head(1).await;

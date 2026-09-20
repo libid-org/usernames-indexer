@@ -739,12 +739,12 @@ async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
         "the target write landed"
     );
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let position = store.mirror_position().await.expect("position");
+    let position = store.index_position().await.expect("position");
     assert_eq!(position.target, Some(5));
     assert!(position.valid_for.is_some_and(|s| s < 0), "{position:?}");
 
     store.touch_chain_target(120).await;
-    let position = store.mirror_position().await.expect("position");
+    let position = store.index_position().await.expect("position");
     assert_eq!(
         position.target,
         Some(5),

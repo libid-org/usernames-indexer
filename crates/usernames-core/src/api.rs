@@ -157,7 +157,7 @@ fn reject_nul(raw: &str, what: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Resolution answers come from a mirror, and a mirror that has never
+/// Resolution answers come from an index, and an index that has never
 /// committed a window would serve authoritative-looking 404s for names that
 /// are bound on chain. Refuse to answer until the first window landed.
 async fn ensure_synced(state: &AppState) -> Result<(), ApiError> {
@@ -212,7 +212,7 @@ struct Status {
     /// freeze together — so watch this and `report_valid_for` too.
     indexer_reported_at: Option<u64>,
     /// Seconds until the indexer's last report expires, negative once it
-    /// has: past zero the ENS gateway refuses this chain's mirror.
+    /// has: past zero the ENS gateway refuses this chain's index.
     report_valid_for: Option<i64>,
     last_window_error: Option<String>,
     /// The Proof Verifier the contract is wired to, from its
@@ -225,7 +225,7 @@ struct Status {
 async fn status(State(state): State<AppState>) -> Result<Json<Status>, ApiError> {
     let last = state.store.cursor().await?;
     let head = state.store.chain_head().await?;
-    let position = state.store.mirror_position().await?;
+    let position = state.store.index_position().await?;
     Ok(Json(Status {
         chain_id: state.store.chain_id(),
         contract: state.contract.to_string(),

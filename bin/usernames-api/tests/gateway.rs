@@ -97,7 +97,7 @@ async fn gateway_parts(
 
     // Every chain starts SYNCED AND EMPTY, which is a different state from
     // never indexed: an empty window is committed so a cursor exists, and the
-    // head is recorded. A mirror with neither cannot say how far behind it is,
+    // head is recorded. An index with neither cannot say how far behind it is,
     // and the gateway refuses rather than signing a null — correct in
     // production, and previously invisible here because "unknown" was read as
     // "fresh".
@@ -396,9 +396,9 @@ async fn a_request_for_another_resolver_is_refused_not_signed() {
 }
 
 #[tokio::test]
-async fn a_stale_mirror_refuses_rather_than_signing_a_null() {
+async fn a_stale_index_refuses_rather_than_signing_a_null() {
     // The distinction the lag gate exists for: a signed null asserts that no
-    // binding exists, and a mirror this far behind has not earned that.
+    // binding exists, and an index this far behind has not earned that.
     let (router, store, _g) = gateway_or_skip!(0);
     bind(&store, "alice", Address::from([0xbe; 20])).await;
     // Far ahead of the cursor, as the TARGET: that is the quantity the gate
@@ -458,7 +458,7 @@ async fn one_gateway_answers_for_every_chain_it_serves() {
     }
 }
 
-/// A mirror that cannot report its own position must refuse, not deny.
+/// An index that cannot report its own position must refuse, not deny.
 ///
 /// This is the fail-open the lag gate closes. `chain_head` and `cursor` are
 /// both absent on a fresh database, and again while `prepare` replays a chain
@@ -467,11 +467,11 @@ async fn one_gateway_answers_for_every_chain_it_serves() {
 /// this" for every name, cached by wallets for the whole `ENS_TTL_SECS`
 /// window.
 #[tokio::test]
-async fn a_mirror_that_cannot_report_its_position_refuses() {
+async fn an_index_that_cannot_report_its_position_refuses() {
     let (router, store, _g) = gateway_or_skip!(32);
     bind(&store, "alice", Address::from([0xbe; 20])).await;
 
-    // Wipe what the mirror knows about its own progress, leaving the binding
+    // Wipe what the index knows about its own progress, leaving the binding
     // in place: the rows say one thing, the cursor says nothing.
     sqlx::query("DELETE FROM names.chain_metadata WHERE chain_id = $1")
         .bind(CHAIN)

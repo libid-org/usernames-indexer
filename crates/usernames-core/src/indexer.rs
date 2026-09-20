@@ -44,7 +44,7 @@ pub struct IndexerConfig {
     pub start_block: Option<u64>,
     /// How long readers may trust a report this loop makes, in seconds. Set
     /// beside every target and renewed per committed chunk; a reader that
-    /// finds it expired treats the mirror as stale. It has to cover a poll
+    /// finds it expired treats the index as stale. It has to cover a poll
     /// interval, a slow chunk and a missed cycle, which is why the CLI derives
     /// it from `poll_interval_secs` when nothing sets it.
     pub stale_after_secs: u64,

@@ -1,7 +1,7 @@
 //! The read model behind the usernames indexer and its read API.
 //!
 //! Two binaries stand on this crate and neither contains logic of its own:
-//! `usernames-indexer` runs [`indexer`], the polling loop that mirrors
+//! `usernames-indexer` runs [`indexer`], the polling loop that indexes
 //! `IdentityNames` storage into Postgres from its events alone, and
 //! `usernames-api` serves [`api`], which answers resolution (handle ->
 //! wallet, account id -> wallet, wallet -> identities) and partial-handle

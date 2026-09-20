@@ -60,10 +60,10 @@ const TARGET_VALID_UNTIL_KEY: &str = "target_valid_until";
 const WINDOW_ERROR_KEY: &str = "window_error";
 const PROOF_VERIFIER_KEY: &str = "proof_verifier";
 
-/// The mirror's standing, as [`ChainStore::mirror_position`] reads it, every
+/// The index's standing, as [`ChainStore::index_position`] reads it, every
 /// moment by the database's clock.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct MirrorPosition {
+pub struct IndexPosition {
     /// The block the indexer last set out to reach.
     pub target: Option<u64>,
     /// The block the cursor has committed through.
@@ -404,9 +404,9 @@ impl ChainStore {
     /// questions. The head is how far the CHAIN has grown, which is what
     /// `/v1/status` reports. This is how far the indexer INTENDS to get, and
     /// it is the only honest thing to measure a cursor against: the cursor is
-    /// never advanced past it, so a fully caught-up mirror sits exactly here
+    /// never advanced past it, so a fully caught-up index sits exactly here
     /// and `CONFIRMATIONS` blocks behind the head. Comparing the cursor to the
-    /// head instead makes a healthy mirror look permanently late by the
+    /// head instead makes a healthy index look permanently late by the
     /// confirmation depth.
     ///
     /// Record the target, when it was reported, and how long readers may
@@ -494,12 +494,12 @@ impl ChainStore {
         }
     }
 
-    /// Where the mirror stands, in one read: the target, the cursor, when the
+    /// Where the index stands, in one read: the target, the cursor, when the
     /// indexer last reported and how long that report is still good — the
     /// last by the database's clock, the same one that stamped it. One
     /// statement, so the four are a snapshot and one round trip on the
     /// gateway's hot path.
-    pub async fn mirror_position(&self) -> Result<MirrorPosition, sqlx::Error> {
+    pub async fn index_position(&self) -> Result<IndexPosition, sqlx::Error> {
         let rows: Vec<(String, String, i64)> = sqlx::query_as(
             r#"SELECT key, value, EXTRACT(EPOCH FROM now())::bigint
                FROM names.chain_metadata
@@ -512,7 +512,7 @@ impl ChainStore {
         .bind(TARGET_VALID_UNTIL_KEY)
         .fetch_all(&self.pool)
         .await?;
-        let mut position = MirrorPosition::default();
+        let mut position = IndexPosition::default();
         for (key, value, now) in rows {
             if key == TARGET_KEY {
                 position.target = value.parse().ok();

@@ -82,10 +82,10 @@ pub struct Config {
     #[arg(long, env = "ENS_TTL_SECS", default_value_t = 300)]
     pub ens_ttl_secs: u64,
 
-    /// How far behind the chain the mirror may be and still assert anything.
+    /// How far behind the chain the index may be and still assert anything.
     /// Past it the gateway refuses UNSIGNED rather than signing a null: a
     /// signed null is an authoritative "nobody holds this", and a stale
-    /// mirror has not earned the right to say that.
+    /// index has not earned the right to say that.
     #[arg(long, env = "ENS_MAX_LAG_BLOCKS", default_value_t = 32)]
     pub ens_max_lag_blocks: u64,
 }

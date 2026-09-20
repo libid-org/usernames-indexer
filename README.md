@@ -3,7 +3,7 @@
 Indexes [`IdentityNames`](https://github.com/libid-org/libid-contracts/blob/main/solidity/contracts/identity/IdentityNames.sol)
 events into Postgres and serves resolution and search over the claimed
 handles. **Two binaries over one read model**: `usernames-indexer`, a polling
-loop that mirrors the contract's storage from its events alone, and
+loop that indexes the contract's storage from its events alone, and
 `usernames-api`, which serves what the loop wrote. They are separate because
 they scale and fail differently — one writer per chain holds a Postgres
 advisory lease, while readers are stateless and horizontal — and because a
@@ -15,7 +15,7 @@ where the read model, the event decoding and the loop itself live.
 The contract was designed for exactly this: `IdentityBound` carries the
 plaintext `userId` and the normalized `handle` next to their storage nodes,
 so the read model needs no on-chain strings, and the `published` flag plus
-`NameUnpublished` are emitted precisely so an off-chain mirror can reproduce
+`NameUnpublished` are emitted precisely so an off-chain index can reproduce
 reverse display without guessing.
 
 ## Running
@@ -103,14 +103,14 @@ verifies the signature and returns the record. Both on-chain halves are `view`.
 | `ENS_SIGNER_KEY` | unset | The signing key, hex. Setting it mounts the route |
 | `ENS_RESOLVER_ADDRESS` | — | Required with a key. Every answer is signed for this address, whatever `{sender}` the path carries; a request naming another resolver is refused with a 400, so a value that fell behind a `setResolver` is a visible error rather than a signature the resolver rejects |
 | `ENS_TTL_SECS` | `300` | How long an answer stays good; the resolver enforces it |
-| `ENS_MAX_LAG_BLOCKS` | `32` | How far behind the chain the mirror may be and still assert anything. The target is set at the top of a cycle and the cursor catches up chunk by chunk, so this must exceed the blocks any served chain produces in one of its indexer's poll intervals |
+| `ENS_MAX_LAG_BLOCKS` | `32` | How far behind the chain the index may be and still assert anything. The target is set at the top of a cycle and the cursor catches up chunk by chunk, so this must exceed the blocks any served chain produces in one of its indexer's poll intervals |
 
 **Null is an answer; stale is not.** A name nobody holds gets a *signed* null —
 a wallet has to trust "nobody holds this" as much as it trusts an address, or
-every unclaimed name looks like an outage. A mirror further behind than
+every unclaimed name looks like an outage. An index further behind than
 `ENS_MAX_LAG_BLOCKS` gets an *unsigned* 503 instead, so the client falls through
 to the next endpoint in the resolver's `urls`. Signing a null from a stale
-mirror would assert the absence of a binding that may already exist.
+index would assert the absence of a binding that may already exist.
 
 **Two bounds, because one cannot see the other's failure.** `ENS_MAX_LAG_BLOCKS`
 measures the cursor against the target — and both are the indexer's own

@@ -1,4 +1,4 @@
-//! The write half: mirror `IdentityNames` events into Postgres, and serve
+//! The write half: index `IdentityNames` events into Postgres, and serve
 //! nothing.
 //!
 //! One process per chain, holding that chain's writer lease for as long as it

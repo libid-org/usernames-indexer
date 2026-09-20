@@ -1,6 +1,6 @@
 //! End to end against a real chain: anvil runs, a mock contract with the
 //! exact IdentityNames event surface emits a scenario, and the indexer's own
-//! loop — deployment-block detection included — mirrors it into Postgres,
+//! loop — deployment-block detection included — indexes it into Postgres,
 //! where the API answers.
 //!
 //! Skips silently in exactly two cases: `DATABASE_URL` unset, or no `anvil`
@@ -315,7 +315,7 @@ async fn indexes_a_real_chain_end_to_end() {
     let (_, body) = get(&store, contract, "/v1/status").await;
     // The loop reports beside every target it sets, with an expiry in the
     // future, and the API surfaces both: this is what tells a caught-up
-    // mirror from one whose indexer stopped.
+    // index from one whose indexer stopped.
     assert!(
         body["indexerReportedAt"].as_u64().is_some(),
         "no report after a real loop ran: {body}"
