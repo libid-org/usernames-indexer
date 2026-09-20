@@ -2859,9 +2859,9 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libid-contracts"
-version = "0.6.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be42e6b2836d626be1897180bb9b13622e090b528cba5e9bc60cf695fff296b6"
+checksum = "73d368cfec1317d28535f7cbf3503bdf105a62603507988ae4452dbc0e5c4cdf"
 dependencies = [
  "alloy",
  "include_dir",
@@ -2873,9 +2873,9 @@ dependencies = [
 
 [[package]]
 name = "libid-identity"
-version = "0.6.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62de3861fdedff71a230a6ec03ea08aa56ef4ef24aadd0bf0517361b9c684800"
+checksum = "e34cb1cfbc917ed962fe7804f333912a3c55bd3970ee7f3f42bdfe44f916a107"
 
 [[package]]
 name = "libm"
@@ -5021,7 +5021,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "usernames-indexer"
+name = "usernames-api"
 version = "0.1.0"
 dependencies = [
  "alloy",
@@ -5029,9 +5029,8 @@ dependencies = [
  "axum",
  "clap",
  "dotenvy",
+ "hex",
  "http-body-util",
- "libid-contracts",
- "libid-identity",
  "serde",
  "serde_json",
  "sqlx",
@@ -5041,7 +5040,43 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "usernames-core",
+]
+
+[[package]]
+name = "usernames-core"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "axum",
+ "http-body-util",
+ "libid-contracts",
+ "libid-identity",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+]
+
+[[package]]
+name = "usernames-indexer"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "clap",
+ "dotenvy",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
  "url",
+ "usernames-core",
 ]
 
 [[package]]
