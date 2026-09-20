@@ -9,8 +9,8 @@ pragma solidity ^0.8.20;
 ///      resolver at `handles.link` serve every name beneath it without a
 ///      registry entry per user.
 ///
-///      Declared here rather than vendored, the way `IIdentityVerifier` and
-///      `INotary` are: one function does not justify a dependency.
+///      Declared here rather than vendored: one function does not justify a
+///      dependency on the ENS contracts package.
 interface IExtendedResolver {
     /// @param name DNS wire format, e.g. `\x05alice\x01x\x07handles\x04link\x00`.
     /// @param data The resolution call the client wanted to make, such as

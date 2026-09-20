@@ -193,6 +193,23 @@ contract HandleResolver is IExtendedResolver, IERC165, Ownable2Step {
     /// @dev A client checks `0x9061b923` before it will hand this contract a
     ///      name it did not find an exact entry for. Answer no, and wildcard
     ///      resolution never reaches here.
+    ///
+    ///      ERC-7996 (`0x582de3e7`) is NOT announced, and that is load-bearing.
+    ///      The ENS universal resolver reads that id as leave to call a resolver
+    ///      directly instead of through the batch gateway (ENSIP-22). Called
+    ///      directly, it catches the `OffchainLookup` from `resolve` and raises
+    ///      it again under its own address, so the `{sender}` a client fills
+    ///      into the URL is the universal resolver rather than this contract.
+    ///      A gateway that signs for the address in the URL then signs for the
+    ///      wrong target and `resolveWithProof` refuses every answer. Through
+    ///      the batch gateway the original sender survives (ENSIP-21), which is
+    ///      why the reference gateway scheme works today.
+    ///
+    ///      Announce ERC-7996 only from a deployment whose gateway signs for a
+    ///      configured resolver address whatever the URL says. That deployment
+    ///      may also declare `eth.ens.resolver.extended.multicall`, so one
+    ///      signed answer carries a whole profile. Both mean a new deployment:
+    ///      this contract is immutable, and replacing it is `setResolver`.
     function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
         return interfaceId == type(IExtendedResolver).interfaceId || interfaceId == type(IERC165).interfaceId;
     }
