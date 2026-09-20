@@ -1,7 +1,13 @@
 //! The read API. Resolution answers exactly what the contract's resolvers
 //! answer, from the projections; search is the one thing the chain cannot do.
 
-use std::str::FromStr;
+use std::{
+    str::FromStr,
+    sync::{
+        Arc,
+        OnceLock,
+    },
+};
 
 use alloy::primitives::{
     Address,
@@ -26,6 +32,10 @@ use serde::{
     Deserialize,
     Serialize,
 };
+use tower_http::cors::{
+    Any,
+    CorsLayer,
+};
 
 use crate::{
     db::{
@@ -42,22 +52,26 @@ pub struct AppState {
     store: ChainStore,
     /// The watched contract, echoed in `/v1/status`.
     contract: Address,
+    /// Set once the first committed window has been observed. Within a
+    /// process lifetime the fact never un-happens — the only wipe (prepare)
+    /// runs before the API starts — so after the first success the sync gate
+    /// is a memory read instead of a query per request.
+    synced: Arc<OnceLock<()>>,
 }
 
 impl AppState {
     /// State for one deployment: the chain the store is scoped to is the
     /// chain this API serves.
     pub fn new(store: ChainStore, contract: Address) -> Self {
-        Self { store, contract }
+        Self {
+            store,
+            contract,
+            synced: Arc::new(OnceLock::new()),
+        }
     }
 }
 
-/// The routes, without middleware.
-///
-/// No CORS layer here on purpose: a `layer` wraps only the routes already on
-/// the router it is called on, so one applied inside this function cannot
-/// cover anything a caller merges afterwards. The binary mounts every route
-/// first and applies CORS once over the whole thing.
+/// The router, ready to serve.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -69,6 +83,13 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/resolve/id/{platform}/{user_id}", get(resolve_id))
         .route("/v1/resolve/address/{address}", get(resolve_address))
         .route("/v1/search", get(search))
+        // A read-only public resolver: any origin may GET. This is what lets
+        // a browser UI (handle.link) call the API cross-origin at all.
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([axum::http::Method::GET]),
+        )
         .with_state(state)
 }
 
@@ -161,19 +182,14 @@ fn reject_nul(raw: &str, what: &str) -> Result<(), ApiError> {
 /// committed a window would serve authoritative-looking 404s for names that
 /// are bound on chain. Refuse to answer until the first window landed.
 async fn ensure_synced(state: &AppState) -> Result<(), ApiError> {
-    // Asked every request, deliberately. This used to be memoized in a
-    // `OnceLock` on the reasoning that the only wipe — `prepare`, on a version
-    // bump or a contract change — ran before the API started, so the fact could
-    // never un-happen. That held while one process was both halves. It does
-    // not now: the indexer is a separate process and may wipe and replay a
-    // chain at any moment, including while this one holds a cached `true`.
-    //
-    // The cached answer would then be served over an empty read model, and a
-    // name that exists on chain would come back as a 404 rather than the 503
-    // that says "ask again later". A single indexed lookup per request is a
-    // small price for not lying about it.
+    if state.synced.get().is_some() {
+        return Ok(());
+    }
     match state.store.cursor().await? {
-        Some(_) => Ok(()),
+        Some(_) => {
+            let _ = state.synced.set(());
+            Ok(())
+        }
         None => Err(ApiError::not_synced()),
     }
 }
@@ -207,39 +223,20 @@ struct Status {
     /// steady is healthy; growing means the loop is stalled or starved —
     /// `last_window_error` says which.
     lag_blocks: Option<u64>,
-    /// Unix seconds at which the indexer last reported. `lag_blocks` cannot
-    /// show a stopped loop — its two terms are both that loop's writes and
-    /// freeze together — so watch this and `report_valid_for` too.
-    indexer_reported_at: Option<u64>,
-    /// Seconds until the indexer's last report expires, negative once it
-    /// has: past zero the ENS gateway refuses this chain's mirror.
-    report_valid_for: Option<i64>,
     last_window_error: Option<String>,
-    /// The Proof Verifier the contract is wired to, from its
-    /// `ProofVerifierConfigured`: the one contract that checks every claim
-    /// on this chain. Absent until the indexer has seen one.
-    proof_verifier: Option<String>,
     indexer_version: &'static str,
 }
 
 async fn status(State(state): State<AppState>) -> Result<Json<Status>, ApiError> {
     let last = state.store.cursor().await?;
     let head = state.store.chain_head().await?;
-    let position = state.store.mirror_position().await?;
     Ok(Json(Status {
         chain_id: state.store.chain_id(),
         contract: state.contract.to_string(),
         last_indexed_block: last,
         chain_head_block: head,
         lag_blocks: head.map(|h| h.saturating_sub(last.unwrap_or(0))),
-        indexer_reported_at: position.reported_at,
-        report_valid_for: position.valid_for,
         last_window_error: state.store.window_error().await?,
-        proof_verifier: state
-            .store
-            .proof_verifier()
-            .await?
-            .map(|verifier| verifier.to_string()),
         indexer_version: db::INDEXER_VERSION,
     }))
 }
@@ -253,7 +250,7 @@ struct HandleResolution {
     handle_node: String,
     owner: String,
     observed_at: i64,
-    ceremony_version: i64,
+    version: i64,
     user_id: Option<String>,
     id_node: String,
     /// Mirrors `resolvePair`: the account id this handle points back at still
@@ -322,7 +319,7 @@ async fn resolve_handle(
         handle_node: b256_from_db(&row.handle_node),
         owner: address_from_db(&owner),
         observed_at: row.observed_at,
-        ceremony_version: row.ceremony_version,
+        version: row.version,
         user_id: row.user_id,
         id_node: b256_from_db(&row.id_node),
         id_agrees,
@@ -338,7 +335,7 @@ struct IdResolution {
     id_node: String,
     owner: String,
     observed_at: i64,
-    ceremony_version: i64,
+    version: i64,
     /// The handle this account last proved, when the node it points at is
     /// still the account's — the `handleOfId`/`idOfHandle` round trip.
     handle: Option<String>,
@@ -377,7 +374,7 @@ async fn resolve_id(
         id_node: b256_from_db(&row.id_node),
         owner: address_from_db(&row.owner),
         observed_at: row.observed_at,
-        ceremony_version: row.ceremony_version,
+        version: row.version,
         handle: row.presentable_handle().map(str::to_string),
         handle_node: b256_from_db(&row.handle_node),
         published: row.displayed(),
@@ -394,7 +391,7 @@ struct AddressIdentity {
     handle: Option<String>,
     handle_node: String,
     observed_at: i64,
-    ceremony_version: i64,
+    version: i64,
     /// Whether the handle still resolves to this wallet.
     resolves: bool,
     /// Whether this is the wallet's displayed name on the platform.
@@ -427,7 +424,7 @@ async fn resolve_address(
             handle: row.presentable_handle().map(str::to_string),
             handle_node: b256_from_db(&row.handle_node),
             observed_at: row.observed_at,
-            ceremony_version: row.ceremony_version,
+            version: row.version,
             resolves: row.handle_still_owned(),
             published: row.displayed(),
             user_id: row.user_id,

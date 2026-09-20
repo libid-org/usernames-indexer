@@ -10,9 +10,7 @@ mod common;
 
 use alloy::primitives::{
     Address,
-    Bytes,
     B256,
-    U256,
 };
 use axum::http::StatusCode;
 use sqlx::PgPool;
@@ -20,7 +18,7 @@ use tokio::sync::{
     Mutex,
     MutexGuard,
 };
-use usernames_core::{
+use usernames_indexer::{
     db::{
         self,
         ChainStore,
@@ -38,25 +36,17 @@ const CHAIN: i64 = 31337;
 static DB_LOCK: Mutex<()> = Mutex::const_new(());
 
 async fn test_store() -> Option<(ChainStore, PgPool, MutexGuard<'static, ()>)> {
-    test_store_with(1).await
-}
-
-/// The same, with room for more than one connection.
-///
-/// Not needed by the lease any more — it opens its own session outside the pool
-/// precisely so it cannot starve one — but kept for a test that wants
-/// concurrent queries of its own.
-async fn test_store_with(
-    max_connections: u32,
-) -> Option<(ChainStore, PgPool, MutexGuard<'static, ()>)> {
     let guard = DB_LOCK.lock().await;
     let url = std::env::var("DATABASE_URL").ok()?;
     let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(max_connections)
+        .max_connections(1)
         .connect(&url)
         .await
         .expect("DATABASE_URL is set but connecting failed");
-    db::MIGRATOR.run(&pool).await.expect("migrations failed");
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("migrations failed");
     // Scoped to this suite's chain, like the anvil suite scopes to its own:
     // neither depends on cargo happening to run test binaries sequentially.
     for table in db::PROJECTION_TABLES {
@@ -112,7 +102,7 @@ fn bind(
         handle: handle.into(),
         observed_at,
         published,
-        ceremony_version: 1,
+        version: 1,
     }
 }
 
@@ -146,7 +136,6 @@ async fn bind_resolves_all_three_directions() {
     assert_eq!(body["owner"], alice.to_string().as_str());
     assert_eq!(body["userId"], "111");
     assert_eq!(body["idAgrees"], true);
-    assert_eq!(body["ceremonyVersion"], 1);
 
     // The path normalizes the way the chain did: raw form finds the same row.
     let (status, body) = get(&store, "/v1/resolve/handle/x/@Alice_1").await;
@@ -453,46 +442,45 @@ async fn nul_bytes_neither_stall_the_indexer_nor_crash_the_api() {
 }
 
 #[tokio::test]
-async fn admin_events_land_in_ops_metadata_and_ceremony_events_only_in_the_journal() {
+async fn platform_and_verifier_events_land_in_ops_tables() {
     let Some((store, pool, _guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
     let x = nodes::Platform::from_key("x").unwrap().id();
-    let digest = B256::repeat_byte(0xD1);
     apply(&store, 1, NamesEvent::PlatformConfigured { platform_id: x }).await;
     apply(
         &store,
         2,
-        NamesEvent::ProofVerifierConfigured {
+        NamesEvent::VerifierConfigured {
+            platform_id: x,
+            version: 1,
             verifier: addr(0xEE),
+            max_future_observation: 300,
         },
     )
     .await;
     apply(
         &store,
         3,
-        NamesEvent::CeremonyBound {
-            authorization_digest: digest,
-            owner: addr(0xA1),
+        NamesEvent::LatestVersionChanged {
             platform_id: x,
-            client_identifier: Bytes::from_static(b"client-a"),
+            version: 1,
         },
     )
     .await;
     apply(
         &store,
         4,
-        NamesEvent::ClaimFeePaid {
-            authorization_digest: digest,
-            receiver: addr(0xFE),
-            amount: U256::from(1_000u64),
+        NamesEvent::VerifierRetired {
+            platform_id: x,
+            version: 1,
         },
     )
     .await;
 
-    let key: Option<String> = sqlx::query_scalar(
-        "SELECT platform_key FROM names.platforms
+    let (key, latest): (Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT platform_key, latest_version FROM names.platforms
          WHERE chain_id = $1 AND platform_id = $2",
     )
     .bind(CHAIN)
@@ -501,51 +489,18 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_only_in_the_journ
     .await
     .expect("platform row");
     assert_eq!(key.as_deref(), Some("x"));
+    assert_eq!(latest, Some(1));
 
-    // The Proof Verifier is the chain's one verification component; the
-    // status reports it so an operator need not ask the RPC.
-    let (status, body) = get(&store, "/v1/status").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        body["proofVerifier"],
-        addr(0xEE).to_string().as_str(),
-        "{body}"
-    );
-
-    // The ceremony's own events are journaled with the payload an operator
-    // asks by, and project nothing.
-    let journal: Vec<(String, String)> = sqlx::query_as(
-        "SELECT kind, payload::text FROM names.events
-         WHERE chain_id = $1 AND block_number >= 3 ORDER BY block_number",
+    let retired: bool = sqlx::query_scalar(
+        "SELECT retired FROM names.verifiers
+         WHERE chain_id = $1 AND platform_id = $2 AND version = 1",
     )
     .bind(CHAIN)
-    .fetch_all(&pool)
+    .bind(x.as_slice())
+    .fetch_one(&pool)
     .await
-    .expect("journal rows");
-    let payloads: Vec<(&str, serde_json::Value)> = journal
-        .iter()
-        .map(|(kind, payload)| {
-            (
-                kind.as_str(),
-                serde_json::from_str(payload).expect("journal payload is JSON"),
-            )
-        })
-        .collect();
-    assert_eq!(payloads[0].0, "ceremony_bound");
-    assert_eq!(payloads[0].1["clientIdentifier"], "0x636c69656e742d61");
-    assert_eq!(
-        payloads[0].1["authorizationDigest"],
-        digest.to_string().as_str()
-    );
-    assert_eq!(payloads[1].0, "claim_fee_paid");
-    assert_eq!(payloads[1].1["amount"], "1000");
-    let bound: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM names.ids WHERE chain_id = $1")
-            .bind(CHAIN)
-            .fetch_one(&pool)
-            .await
-            .expect("ids count");
-    assert_eq!(bound, 0, "a ceremony event alone binds nothing");
+    .expect("verifier row");
+    assert!(retired);
 }
 
 #[tokio::test]
@@ -575,181 +530,4 @@ async fn unconfigured_platform_and_impossible_text_name_their_codes() {
     let (status, body) = get(&store, "/v1/resolve/handle/x/a%20b").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["error"]["code"], "handle_impossible", "{body}");
-}
-
-// ─── The replay gate ────────────────────────────────────────────────────────
-// `prepare` is the only thing in the process that deletes a chain's rows, and
-// it decides to on two conditions nothing else tests. It also carries one
-// deliberate exception — the deployment-block cache survives — which until now
-// existed as a comment.
-
-const OTHER_CONTRACT: Address = Address::new([0xcd; 20]);
-
-fn a_contract() -> Address {
-    Address::new([0xab; 20])
-}
-
-/// Bind one handle and note a deployment block, so a wipe has something to
-/// take and something to leave.
-async fn seed(store: &ChainStore) {
-    apply(
-        store,
-        1,
-        bind(
-            addr(1),
-            nodes::Platform::from_key("x").unwrap().id(),
-            "1",
-            "alice",
-            1,
-            true,
-        ),
-    )
-    .await;
-    store
-        .set_deploy_block(a_contract(), 4321)
-        .await
-        .expect("deploy block");
-}
-
-#[tokio::test]
-async fn preparing_an_unchanged_chain_keeps_everything() {
-    let Some((store, _pool, _g)) = test_store_with(2).await else {
-        return;
-    };
-    let writer = store.acquire_writer().await.expect("lease");
-    store.prepare(&writer, a_contract()).await.expect("first");
-    seed(&store).await;
-
-    // Same version, same contract: nothing to replay.
-    store.prepare(&writer, a_contract()).await.expect("second");
-    assert!(
-        store.cursor().await.unwrap().is_some(),
-        "the cursor survived"
-    );
-    assert!(
-        store
-            .resolve_handle(
-                nodes::Platform::from_key("x").unwrap().id(),
-                &nodes::NormalizedHandle::from_chain("alice"),
-            )
-            .await
-            .unwrap()
-            .is_some(),
-        "the binding survived"
-    );
-    writer.release().await.expect("the lease releases");
-}
-
-#[tokio::test]
-async fn watching_another_contract_clears_the_chain() {
-    // The old contract's bindings are not the new contract's bindings, so
-    // inheriting them would answer for an account nobody bound here.
-    let Some((store, _pool, _g)) = test_store_with(2).await else {
-        return;
-    };
-    let writer = store.acquire_writer().await.expect("lease");
-    store.prepare(&writer, a_contract()).await.expect("first");
-    seed(&store).await;
-
-    store
-        .prepare(&writer, OTHER_CONTRACT)
-        .await
-        .expect("repoint");
-
-    assert!(
-        store.cursor().await.unwrap().is_none(),
-        "the cursor must be gone so the scan restarts"
-    );
-    assert!(
-        store
-            .resolve_handle(
-                nodes::Platform::from_key("x").unwrap().id(),
-                &nodes::NormalizedHandle::from_chain("alice"),
-            )
-            .await
-            .unwrap()
-            .is_none(),
-        "the previous contract's binding must not survive"
-    );
-    writer.release().await.expect("the lease releases");
-}
-
-#[tokio::test]
-async fn the_deployment_block_cache_survives_a_replay() {
-    // The one carve-out, and the reason for it: the cache is keyed by
-    // contract, and `eth_getCode` history does not change shape with the read
-    // model. Losing it would re-run the binary search over the whole chain on
-    // every version bump.
-    let Some((store, _pool, _g)) = test_store_with(2).await else {
-        return;
-    };
-    let writer = store.acquire_writer().await.expect("lease");
-    store.prepare(&writer, a_contract()).await.expect("first");
-    seed(&store).await;
-
-    store
-        .prepare(&writer, OTHER_CONTRACT)
-        .await
-        .expect("repoint");
-
-    assert_eq!(
-        store.deploy_block(a_contract()).await.unwrap(),
-        Some(4321),
-        "the deployment-block cache is keyed by contract and must outlive the wipe"
-    );
-    writer.release().await.expect("the lease releases");
-}
-
-/// The lease must give the lock back, not merely stop being referenced.
-///
-/// It used to hold `pg_try_advisory_lock` on a POOLED connection, so dropping
-/// it returned a live session — lock still held — to the idle pool, where it
-/// sat for the idle timeout. A second indexer, or the next test, then blocked
-/// on a lock nobody was using. Two sequential leases on one chain is the
-/// smallest thing that would have caught it.
-#[tokio::test]
-async fn a_released_lease_frees_the_chain_for_the_next_holder() {
-    let Some((store, _pool, _g)) = test_store_with(2).await else {
-        return;
-    };
-    let first = store.acquire_writer().await.expect("first lease");
-    first.release().await.expect("release");
-
-    // Bounded, because the failure mode is a block rather than an error: on
-    // the old code this waits for the pool's idle timeout, not forever, and an
-    // unbounded await would look like a hung test rather than a broken lock.
-    let second =
-        tokio::time::timeout(std::time::Duration::from_secs(5), store.acquire_writer())
-            .await
-            .expect("the second lease was still blocked on the first")
-            .expect("second lease");
-    second.release().await.expect("release");
-}
-
-/// The report the indexer makes beside the target expires on its own
-/// schedule, by the database's clock, and a renewal moves the expiry without
-/// moving the target — which is what keeps a long catch-up alive.
-#[tokio::test]
-async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
-    let Some((store, _pool, _g)) = test_store().await else {
-        return;
-    };
-    assert!(
-        store.set_chain_target(5, 1).await,
-        "the target write landed"
-    );
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let position = store.mirror_position().await.expect("position");
-    assert_eq!(position.target, Some(5));
-    assert!(position.valid_for.is_some_and(|s| s < 0), "{position:?}");
-
-    store.touch_chain_target(120).await;
-    let position = store.mirror_position().await.expect("position");
-    assert_eq!(
-        position.target,
-        Some(5),
-        "a renewal must not move the target"
-    );
-    assert!(position.valid_for.is_some_and(|s| s > 0), "{position:?}");
-    assert!(position.reported_at.is_some(), "{position:?}");
 }
