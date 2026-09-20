@@ -20,12 +20,13 @@ use std::{
     sync::Arc,
 };
 
-use alloy::{
-    primitives::Address,
-    signers::local::PrivateKeySigner,
-};
+use alloy::primitives::Address;
 use axum::Router;
 use clap::Parser;
+use libid_signer::{
+    ManagedSigner,
+    SignerSource,
+};
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{
     Any,
@@ -65,10 +66,13 @@ pub struct Config {
     #[arg(long, env = "LISTEN_ADDR", default_value = "127.0.0.1:8080")]
     pub listen_addr: SocketAddr,
 
-    /// The ENS gateway's signing key, hex. Setting it is what turns the
-    /// CCIP-Read route on: unset, the route is not mounted at all rather than
-    /// mounted and failing, so a deployment that has not been given a key
-    /// serves 404 there instead of 500.
+    /// The ENS gateway's signing key: a hex secp256k1 key, or an AWS KMS key
+    /// id, alias or ARN, told apart by shape the way the notary's
+    /// `SIGNING_KEY` is. With KMS the private material never enters the
+    /// process; region and credentials come from the ambient AWS chain.
+    /// Setting it is what turns the CCIP-Read route on: unset, the route is
+    /// not mounted at all rather than mounted and failing, so a deployment
+    /// that has not been given a key serves 404 there instead of 500.
     #[arg(long, env = "ENS_SIGNER_KEY", hide_env_values = true)]
     pub ens_signer_key: Option<String>,
 
@@ -115,7 +119,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     // Configured BEFORE the port opens: it can refuse to start, and binding
     // first would accept connections the process is not yet able to serve.
-    let gateway = config.gateway(pool)?;
+    let gateway = config.gateway(pool).await?;
     match &gateway {
         Some(g) => info!(
             resolver = %g.resolver,
@@ -203,30 +207,30 @@ const BLOCK_TIMESTAMP_SLACK_SECS: u64 = 300;
 const MAX_TTL_SECS: u64 = RESOLVER_MAX_LIFETIME_SECS - BLOCK_TIMESTAMP_SLACK_SECS;
 
 impl Config {
-    /// The key this gateway signs with, and the resolver it signs for.
+    /// Where the gateway's key lives, and the resolver it signs for.
     ///
     /// `None` when no gateway runs: the key is what turns the route on. A key
     /// without a resolver is a usage error rather than a default, because
     /// there is no safe resolver to guess — signing for whatever address asked
-    /// would make this a signing oracle.
-    fn signing_identity(&self) -> anyhow::Result<Option<(PrivateKeySigner, Address)>> {
-        let Some(key) = self.ens_signer_key.as_deref() else {
+    /// would make this a signing oracle. Pure: nothing here reaches KMS, so a
+    /// misconfiguration is refused before any network is touched.
+    fn signing_identity(&self) -> anyhow::Result<Option<(SignerSource, Address)>> {
+        let Some(spec) = self.ens_signer_key.as_deref() else {
             return Ok(None);
         };
         let resolver = self.ens_resolver_address.ok_or_else(|| {
             anyhow::anyhow!("ENS_SIGNER_KEY is set but ENS_RESOLVER_ADDRESS is not")
         })?;
-        let signer: PrivateKeySigner = key
-            .trim_start_matches("0x")
-            .parse()
-            .map_err(|e| anyhow::anyhow!("ENS_SIGNER_KEY is not a private key: {e}"))?;
-        Ok(Some((signer, resolver)))
+        let source = SignerSource::from_spec(spec)
+            .map_err(|e| anyhow::anyhow!("ENS_SIGNER_KEY: {e}"))?;
+        Ok(Some((source, resolver)))
     }
 
     /// The gateway this configuration describes, or `None` when this
-    /// deployment runs none.
-    fn gateway(&self, pool: sqlx::PgPool) -> anyhow::Result<Option<ens::Config>> {
-        let Some((signer, resolver)) = self.signing_identity()? else {
+    /// deployment runs none. Every pure check runs before the signer is
+    /// built, because building the KMS one is a network call.
+    async fn gateway(&self, pool: sqlx::PgPool) -> anyhow::Result<Option<ens::Config>> {
+        let Some((source, resolver)) = self.signing_identity()? else {
             return Ok(None);
         };
 
@@ -244,6 +248,18 @@ impl Config {
             );
         }
 
+        let signer: ManagedSigner = source
+            .build_managed(None)
+            .await
+            .map_err(|e| anyhow::anyhow!("ENS_SIGNER_KEY: {e}"))?;
+        // The address is what the resolver's signer set must hold, and with
+        // KMS nothing but this line tells an operator what it is.
+        info!(
+            signer = %signer.address(),
+            via = %signer.describe(),
+            %resolver,
+            "ens gateway signer ready"
+        );
         Ok(Some(ens::Config {
             resolver,
             store: db::Store::new(pool),
@@ -289,8 +305,8 @@ mod tests {
 
     /// `ens::Config` holds a signer and so is not `Debug`; match rather than
     /// `expect_err`.
-    fn refusal(extra: &[&str]) -> String {
-        match config(extra).gateway(lazy_pool()) {
+    async fn refusal(extra: &[&str]) -> String {
+        match config(extra).gateway(lazy_pool()).await {
             Ok(_) => panic!("this configuration must be refused"),
             Err(e) => e.to_string(),
         }
@@ -310,14 +326,41 @@ mod tests {
         .expect("parse");
         let mounted = config
             .gateway(lazy_pool())
+            .await
             .expect("no key is not an error")
             .is_some();
         assert!(!mounted, "the route must not be mounted without a key");
     }
 
+    /// A hex value of the wrong length is a mangled key, not a KMS id; it
+    /// must be refused here, before anything is handed to AWS.
+    #[tokio::test]
+    async fn a_mangled_hex_key_is_refused_before_kms_is_asked() {
+        let config = Config::try_parse_from([
+            "usernames-api",
+            "--database-url",
+            "postgres://u:p@127.0.0.1:5432/db",
+            "--identity-names-address",
+            "0xe78b53a183dd51763df44beb2500ddab9bb0329e",
+            "--chain-id",
+            "1",
+            "--ens-signer-key",
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff",
+            "--ens-resolver-address",
+            "0x0000000000000000000000000000000000000001",
+        ])
+        .expect("parse");
+        let message = match config.gateway(lazy_pool()).await {
+            Ok(_) => panic!("a 63-digit key must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(message.contains("ENS_SIGNER_KEY"), "{message}");
+        assert!(message.contains("64"), "{message}");
+    }
+
     #[tokio::test]
     async fn a_ttl_the_resolver_would_reject_is_refused() {
-        let message = refusal(&["--ens-ttl-secs", "7200"]);
+        let message = refusal(&["--ens-ttl-secs", "7200"]).await;
         assert!(message.contains("MAX_LIFETIME"), "{message}");
     }
 
@@ -328,10 +371,10 @@ mod tests {
     #[tokio::test]
     async fn the_ttl_ceiling_leaves_the_chain_room_to_trail() {
         let at_ceiling = config(&["--ens-ttl-secs", &MAX_TTL_SECS.to_string()]);
-        assert!(at_ceiling.gateway(lazy_pool()).is_ok());
+        assert!(at_ceiling.gateway(lazy_pool()).await.is_ok());
 
         let message =
-            refusal(&["--ens-ttl-secs", &RESOLVER_MAX_LIFETIME_SECS.to_string()]);
+            refusal(&["--ens-ttl-secs", &RESOLVER_MAX_LIFETIME_SECS.to_string()]).await;
         assert!(message.contains("trail"), "{message}");
     }
 }

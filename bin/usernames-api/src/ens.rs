@@ -41,12 +41,9 @@
 
 use std::sync::Arc;
 
-use alloy::{
-    primitives::{
-        Address,
-        B256,
-    },
-    signers::Signer,
+use alloy::primitives::{
+    Address,
+    B256,
 };
 use axum::{
     extract::{
@@ -62,6 +59,7 @@ use axum::{
     Json,
     Router,
 };
+use libid_signer::ManagedSigner;
 use serde::Serialize;
 use tracing::{
     error,
@@ -108,14 +106,10 @@ pub struct Config {
     /// How far behind the chain an index may be and still assert anything.
     pub max_lag_blocks: u64,
     /// What signs an answer, pinned by the resolver's signer set; rotating it
-    /// is an owner transaction there, not a deploy here.
-    ///
-    /// Behind `dyn` because the key need not be local. A KMS signer reaches the
-    /// network to sign, so it satisfies only the async `Signer` — which is why
-    /// the call site awaits rather than signing in place. That costs a local
-    /// key nothing and leaves the signing path untouched when a deployment
-    /// stops holding its own secret.
-    pub signer: Arc<dyn Signer + Send + Sync>,
+    /// is an owner transaction there, not a deploy here. A local key or an
+    /// AWS KMS key, decided by the shape of `ENS_SIGNER_KEY`; the call site
+    /// awaits because the KMS one reaches the network to sign.
+    pub signer: Arc<ManagedSigner>,
 }
 
 impl Config {
@@ -301,16 +295,18 @@ impl Config {
             result,
             expires: Self::now().saturating_add(self.ttl_secs),
         };
+        // The digest is already the resolver's `makeSignatureHash`; no
+        // EIP-191 prefix goes on top of it.
         let signature = self
             .signer
-            .sign_hash(&B256::from(reply.digest(self.resolver, request)))
+            .sign_prehash(&reply.digest(self.resolver, request).0)
             .await
             // Through `internal`, like every other failure here: the raw
             // error went to an anonymous caller while the operator got no log
             // line — exactly inverted.
             .map_err(GatewayError::internal)?;
         Ok(GatewayResponse {
-            data: format!("0x{}", hex::encode(reply.encode(&signature.as_bytes()))),
+            data: format!("0x{}", hex::encode(reply.encode(&signature))),
         })
     }
 

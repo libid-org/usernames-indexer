@@ -39,6 +39,7 @@ use axum::{
     Router,
 };
 use http_body_util::BodyExt;
+use libid_signer::ManagedSigner;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
 use usernames_api::ens::{
@@ -218,7 +219,7 @@ async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> 
         store: db::Store::new(store.pool().clone()),
         ttl_secs: 300,
         max_lag_blocks: 32,
-        signer: std::sync::Arc::new(signer),
+        signer: std::sync::Arc::new(ManagedSigner::Local(signer)),
     }));
 
     // ── 1. the wallet asks the resolver, and is told where to look ───

@@ -20,6 +20,7 @@ use axum::{
     Router,
 };
 use http_body_util::BodyExt;
+use libid_signer::ManagedSigner;
 use sqlx::PgPool;
 use tokio::sync::{
     Mutex,
@@ -122,7 +123,9 @@ async fn gateway_parts(
         store: db::Store::new(pool.clone()),
         ttl_secs: 300,
         max_lag_blocks,
-        signer: std::sync::Arc::new(SIGNER_KEY.parse::<PrivateKeySigner>().expect("key")),
+        signer: std::sync::Arc::new(ManagedSigner::Local(
+            SIGNER_KEY.parse::<PrivateKeySigner>().expect("key"),
+        )),
     };
     Some((config, store, guard))
 }
