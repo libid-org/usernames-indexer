@@ -1,9 +1,7 @@
 //! Request fixtures the API's integration suites build from.
 //!
-//! One copy on purpose. These were written twice, and the pair drifted the
-//! first time the read model gained a field a fixture had to record: the fix
-//! had to find every copy. Anything a request must look like belongs here, so
-//! the next such change is one edit. Tests only; it ships in no image.
+//! Anything a request must look like lives here, so a read-model change that
+//! a fixture has to record is one edit.
 
 #![deny(missing_docs)]
 #![deny(dead_code)]

@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Serves handle/id/address resolution and search over the indexed read model. Reads only; it indexes nothing."
+description = "Serves handle, id and address resolution, search, and the ENS gateway over the indexed read model."
 publish = false
 
 [dependencies]

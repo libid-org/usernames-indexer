@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Indexes IdentityNames events into Postgres. The write half; it serves nothing."
+description = "Indexes IdentityNames events into Postgres."
 publish = false
 
 [dependencies]

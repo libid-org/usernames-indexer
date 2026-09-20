@@ -1,9 +1,8 @@
-//! The read half: serve resolution and search over the indexed read model,
-//! and index nothing.
+//! The read API: resolution, search and the ENS gateway over the indexed
+//! read model.
 //!
-//! Stateless and horizontal. It takes no writer lease, runs no migration and
-//! opens no RPC connection — the chain reaches it only through rows the
-//! indexer wrote. Several of these may serve one database. Both halves serve
+//! Stateless and horizontal: it reads the database the indexer writes and
+//! nothing else, so several of these may serve one database. Both halves serve
 //! every chain the store holds, read per request: `/v1` takes an optional
 //! `?chain=`, the ENS gateway is asked by coin type.
 //!

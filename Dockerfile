@@ -54,16 +54,13 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
     && useradd --system --uid 10001 usernames
 USER usernames
 
-# === The write half ===
-# Indexes and serves nothing, so it exposes no port. A stalled indexer exits
-# rather than idling behind a healthy-looking endpoint; the supervisor
-# restarts it.
+# === The indexer ===
+# Exposes no port: a stalled indexer exits and the supervisor restarts it.
 FROM runtime AS indexer
 COPY --from=builder /app/target/release/usernames-indexer /usr/local/bin/usernames-indexer
 ENTRYPOINT ["/usr/local/bin/usernames-indexer"]
 
-# === The read half ===
-# Reads and indexes nothing: no RPC_URL, no writer lease, no migration.
+# === The read API ===
 FROM runtime AS api
 COPY --from=builder /app/target/release/usernames-api /usr/local/bin/usernames-api
 # Inside a container the API must bind the container interface, not loopback.

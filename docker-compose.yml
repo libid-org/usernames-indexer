@@ -3,8 +3,8 @@
 # `docker compose up -d postgres` for the database alone (cargo run against
 # it); `docker compose up -d --build` for the full containerized stack.
 #
-# The two halves are separate images on purpose — see the Dockerfile. The
-# indexer writes and listens on nothing; the API listens and writes nothing.
+# The indexer and the API are separate images: the indexer writes the
+# database, the API serves it.
 services:
   indexer:
     build:

@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Request fixtures the usernames-api integration suites share. Tests only; it ships in no image."
+description = "Request fixtures the usernames-api integration suites share."
 publish = false
 
 [dependencies]

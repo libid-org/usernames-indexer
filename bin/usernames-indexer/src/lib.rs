@@ -1,10 +1,9 @@
-//! The write half: index `IdentityNames` events into Postgres, and serve
-//! nothing.
+//! The indexer: one process per chain, mirroring `IdentityNames` events into
+//! Postgres under that chain's writer lease.
 //!
-//! One process per chain, holding that chain's writer lease for as long as it
-//! lives. The read API is a separate binary over the same database; nothing
-//! here listens on a socket, so an indexer that stops advancing cannot hide
-//! behind a healthy-looking endpoint — it exits, and the supervisor notices.
+//! It exposes no port. An indexer that stops advancing exits, and the
+//! supervisor notices; the read API is a separate binary over the same
+//! database.
 
 #![deny(missing_docs)]
 #![deny(dead_code)]
