@@ -17,6 +17,7 @@ use sqlx::{
     Connection,
     PgPool,
     Postgres,
+    QueryBuilder,
     Transaction,
 };
 use tracing::{
@@ -1147,10 +1148,10 @@ impl Store {
         // decoding it as i64 fails exactly when a row IS found.
         sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM names.platforms
-              WHERE ($1::bigint IS NULL OR chain_id = $1) AND platform_id = $2)",
+              WHERE platform_id = $1 AND ($2::bigint IS NULL OR chain_id = $2))",
         )
-        .bind(chain)
         .bind(platform_id.as_slice())
+        .bind(chain)
         .fetch_one(&self.pool)
         .await
     }
@@ -1165,22 +1166,10 @@ impl Store {
         platform_id: B256,
         handle: &NormalizedHandle,
     ) -> Result<Vec<HandleRow>, sqlx::Error> {
-        sqlx::query_as(
-            r#"SELECT h.chain_id, h.handle, h.handle_node, h.owner, h.observed_at,
-                      h.ceremony_version, h.id_node,
-                      i.user_id, i.owner AS id_owner
-               FROM names.handles h
-               LEFT JOIN names.ids i
-                 ON i.chain_id = h.chain_id AND i.id_node = h.id_node
-               WHERE ($1::bigint IS NULL OR h.chain_id = $1)
-                 AND h.platform_id = $2 AND h.handle = $3
-               ORDER BY h.chain_id"#,
-        )
-        .bind(chain)
-        .bind(platform_id.as_slice())
-        .bind(handle.as_str())
-        .fetch_all(&self.pool)
-        .await
+        handle_lookup("", chain, platform_id, handle)
+            .build_query_as()
+            .fetch_all(&self.pool)
+            .await
     }
 
     /// The rows `resolveId` answers from, one per chain the account is bound
@@ -1191,16 +1180,10 @@ impl Store {
         platform_id: B256,
         user_id: &str,
     ) -> Result<Vec<IdentityRow>, sqlx::Error> {
-        sqlx::query_as(&format!(
-            "{IDENTITY_PROJECTION}WHERE ($1::bigint IS NULL OR i.chain_id = $1)
-                 AND i.platform_id = $2 AND i.user_id = $3
-               ORDER BY i.chain_id"
-        ))
-        .bind(chain)
-        .bind(platform_id.as_slice())
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await
+        id_lookup("", chain, platform_id, user_id)
+            .build_query_as()
+            .fetch_all(&self.pool)
+            .await
     }
 
     /// Every identity a wallet proved — `primaryOf`'s reverse display, chain
@@ -1210,23 +1193,15 @@ impl Store {
         chain: Option<i64>,
         owner: Address,
     ) -> Result<Vec<IdentityRow>, sqlx::Error> {
-        sqlx::query_as(&format!(
-            "{IDENTITY_PROJECTION}WHERE ($1::bigint IS NULL OR i.chain_id = $1) AND i.owner = $2
-               ORDER BY i.chain_id, i.platform_id, i.user_id"
-        ))
-        .bind(chain)
-        .bind(owner.as_slice())
-        .fetch_all(&self.pool)
-        .await
+        identities_lookup("", chain, owner)
+            .build_query_as()
+            .fetch_all(&self.pool)
+            .await
     }
 
     /// Live handles a search lists, across the chains in scope: those a
     /// wallet holds, those matching a folded partial query — exact first,
-    /// then prefix, then substring, then trigram-fuzzy — or both. Without a
-    /// query every ranking term is NULL for every row, and the order falls
-    /// through to handle and chain. LIKE-escaping is this method's problem,
-    /// not the caller's — it exists so the query text matches itself, which
-    /// is SQL knowledge.
+    /// then prefix, then substring, then trigram-fuzzy — or both.
     pub async fn search_handles(
         &self,
         chain: Option<i64>,
@@ -1236,40 +1211,10 @@ impl Store {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<SearchRow>, sqlx::Error> {
-        let like = folded_query.map(escape_like);
-        sqlx::query_as(
-            r#"SELECT h.chain_id, h.platform_id, h.handle, h.owner, i.user_id,
-                      (p.handle IS NOT NULL) AS published
-               FROM names.handles h
-               LEFT JOIN names.ids i
-                 ON i.chain_id = h.chain_id AND i.id_node = h.id_node
-               LEFT JOIN names.published p
-                 ON p.chain_id = h.chain_id AND p.owner = h.owner
-                    AND p.platform_id = h.platform_id AND p.handle = h.handle
-               WHERE ($1::bigint IS NULL OR h.chain_id = $1)
-                 AND h.owner IS NOT NULL
-                 AND ($2::bytea IS NULL OR h.platform_id = $2)
-                 AND ($3::bytea IS NULL OR h.owner = $3)
-                 AND ($4::text IS NULL
-                      OR h.handle LIKE '%' || $4 || '%' ESCAPE '\'
-                      OR h.handle % $5)
-               ORDER BY (h.handle = $5) DESC,
-                        (h.handle LIKE $4 || '%' ESCAPE '\') DESC,
-                        (h.handle LIKE '%' || $4 || '%' ESCAPE '\') DESC,
-                        similarity(h.handle, $5) DESC,
-                        h.handle ASC,
-                        h.chain_id ASC
-               LIMIT $6 OFFSET $7"#,
-        )
-        .bind(chain)
-        .bind(platform_id.as_ref().map(|p| p.as_slice().to_vec()))
-        .bind(owner.map(|o| o.as_slice().to_vec()))
-        .bind(like)
-        .bind(folded_query)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await
+        search_lookup("", chain, platform_id, owner, folded_query, limit, offset)
+            .build_query_as()
+            .fetch_all(&self.pool)
+            .await
     }
 }
 
@@ -1286,5 +1231,264 @@ impl ChainStore {
             .resolve_handle(Some(self.chain_id), platform_id, handle)
             .await?;
         Ok(rows.pop())
+    }
+}
+
+// ─── The read statements ────────────────────────────────────────────────────
+// Each read over the big tables composes its WHERE clause per request, so
+// every shape is its own prepared statement with its own plan. A fixed
+// `($1 IS NULL OR col = $1)` would not do: the generic plan a prepared
+// statement settles on cannot drop the branch, and the index the lookup was
+// written for goes unused. The builders take a prefix so the plan test can
+// put `EXPLAIN` in front of the exact statement the store runs.
+
+type Statement = QueryBuilder<'static, Postgres>;
+
+/// `AND column = chain`, when a chain is named.
+fn scoped(statement: &mut Statement, column: &'static str, chain: Option<i64>) {
+    if let Some(chain) = chain {
+        statement
+            .push(" AND ")
+            .push(column)
+            .push(" = ")
+            .push_bind(chain);
+    }
+}
+
+fn handle_lookup(
+    prefix: &str,
+    chain: Option<i64>,
+    platform_id: B256,
+    handle: &NormalizedHandle,
+) -> Statement {
+    let mut statement = QueryBuilder::new(format!(
+        "{prefix}SELECT h.chain_id, h.handle, h.handle_node, h.owner, h.observed_at,
+                h.ceremony_version, h.id_node,
+                i.user_id, i.owner AS id_owner
+         FROM names.handles h
+         LEFT JOIN names.ids i
+           ON i.chain_id = h.chain_id AND i.id_node = h.id_node
+         WHERE h.platform_id = "
+    ));
+    statement
+        .push_bind(platform_id.as_slice().to_vec())
+        .push(" AND h.handle = ")
+        .push_bind(handle.as_str().to_string());
+    scoped(&mut statement, "h.chain_id", chain);
+    statement.push(" ORDER BY h.chain_id");
+    statement
+}
+
+fn id_lookup(
+    prefix: &str,
+    chain: Option<i64>,
+    platform_id: B256,
+    user_id: &str,
+) -> Statement {
+    let mut statement = QueryBuilder::new(format!(
+        "{prefix}{IDENTITY_PROJECTION}WHERE i.platform_id = "
+    ));
+    statement
+        .push_bind(platform_id.as_slice().to_vec())
+        .push(" AND i.user_id = ")
+        .push_bind(user_id.to_string());
+    scoped(&mut statement, "i.chain_id", chain);
+    statement.push(" ORDER BY i.chain_id");
+    statement
+}
+
+fn identities_lookup(prefix: &str, chain: Option<i64>, owner: Address) -> Statement {
+    let mut statement =
+        QueryBuilder::new(format!("{prefix}{IDENTITY_PROJECTION}WHERE i.owner = "));
+    statement.push_bind(owner.as_slice().to_vec());
+    scoped(&mut statement, "i.chain_id", chain);
+    statement.push(" ORDER BY i.chain_id, i.platform_id, i.user_id");
+    statement
+}
+
+/// The search: live handles, narrowed by whatever the caller named, ranked
+/// by the text when there is one — exact, prefix, substring, then trigram
+/// similarity — and by handle and chain otherwise. LIKE-escaping happens
+/// here so the query text matches itself, which is SQL knowledge.
+fn search_lookup(
+    prefix: &str,
+    chain: Option<i64>,
+    platform_id: Option<B256>,
+    owner: Option<Address>,
+    folded_query: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Statement {
+    let mut statement = QueryBuilder::new(format!(
+        "{prefix}SELECT h.chain_id, h.platform_id, h.handle, h.owner, i.user_id,
+                (p.handle IS NOT NULL) AS published
+         FROM names.handles h
+         LEFT JOIN names.ids i
+           ON i.chain_id = h.chain_id AND i.id_node = h.id_node
+         LEFT JOIN names.published p
+           ON p.chain_id = h.chain_id AND p.owner = h.owner
+              AND p.platform_id = h.platform_id AND p.handle = h.handle
+         WHERE h.owner IS NOT NULL"
+    ));
+    scoped(&mut statement, "h.chain_id", chain);
+    if let Some(platform_id) = platform_id {
+        statement
+            .push(" AND h.platform_id = ")
+            .push_bind(platform_id.as_slice().to_vec());
+    }
+    if let Some(owner) = owner {
+        statement
+            .push(" AND h.owner = ")
+            .push_bind(owner.as_slice().to_vec());
+    }
+    match folded_query {
+        Some(query) => {
+            let like = escape_like(query);
+            statement
+                .push(" AND (h.handle LIKE '%' || ")
+                .push_bind(like.clone())
+                .push(r#" || '%' ESCAPE '\' OR h.handle % "#)
+                .push_bind(query.to_string())
+                .push(") ORDER BY (h.handle = ")
+                .push_bind(query.to_string())
+                .push(") DESC, (h.handle LIKE ")
+                .push_bind(like.clone())
+                .push(r#" || '%' ESCAPE '\') DESC, (h.handle LIKE '%' || "#)
+                .push_bind(like)
+                .push(r#" || '%' ESCAPE '\') DESC, similarity(h.handle, "#)
+                .push_bind(query.to_string())
+                .push(") DESC, h.handle ASC, h.chain_id ASC");
+        }
+        None => {
+            statement.push(" ORDER BY h.handle ASC, h.chain_id ASC");
+        }
+    }
+    statement
+        .push(" LIMIT ")
+        .push_bind(limit)
+        .push(" OFFSET ")
+        .push_bind(offset);
+    statement
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    /// Every read over the big tables seeks the index built for it, in every
+    /// shape the API asks it in. Sequential scans are switched off for the
+    /// session so the planner shows what it would use however small the
+    /// tables are; the index is named, not just "some index", because a
+    /// lookup missing its leading column walks a whole index and reads as
+    /// an index scan all the same — which is how the chain-less reads went
+    /// unnoticed while every index still led with `chain_id`. The text
+    /// search names no index: on a table this small the planner filters the
+    /// text off a narrower index rather than reading the trigram one, and
+    /// only the row count decides that.
+    #[tokio::test]
+    async fn every_read_over_the_big_tables_seeks_its_index() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = PgPool::connect(&url).await.expect("connect");
+        MIGRATOR.run(&pool).await.expect("migrations");
+        let mut conn = pool.acquire().await.expect("connection");
+        sqlx::query("SET enable_seqscan = off")
+            .execute(&mut *conn)
+            .await
+            .expect("session setting");
+
+        let platform = B256::repeat_byte(1);
+        let handle = NormalizedHandle::from_chain("alice");
+        let owner = Address::repeat_byte(2);
+        let shapes: Vec<(&str, Option<&str>, Statement)> = vec![
+            (
+                "handle, any chain",
+                Some("handles_platform_handle_chain_idx"),
+                handle_lookup("EXPLAIN ", None, platform, &handle),
+            ),
+            (
+                "handle, one chain",
+                Some("handles_platform_handle_chain_idx"),
+                handle_lookup("EXPLAIN ", Some(1), platform, &handle),
+            ),
+            (
+                "id, any chain",
+                Some("ids_platform_user_chain_idx"),
+                id_lookup("EXPLAIN ", None, platform, "111"),
+            ),
+            (
+                "id, one chain",
+                Some("ids_platform_user_chain_idx"),
+                id_lookup("EXPLAIN ", Some(1), platform, "111"),
+            ),
+            (
+                "wallet, any chain",
+                Some("ids_owner_chain_idx"),
+                identities_lookup("EXPLAIN ", None, owner),
+            ),
+            (
+                "wallet, one chain",
+                Some("ids_owner_chain_idx"),
+                identities_lookup("EXPLAIN ", Some(1), owner),
+            ),
+            (
+                "search by wallet, any chain",
+                Some("handles_owner_chain_idx"),
+                search_lookup("EXPLAIN ", None, None, Some(owner), None, 10, 0),
+            ),
+            (
+                "search by wallet on a platform, one chain",
+                Some("handles_owner_chain_idx"),
+                search_lookup(
+                    "EXPLAIN ",
+                    Some(1),
+                    Some(platform),
+                    Some(owner),
+                    None,
+                    10,
+                    0,
+                ),
+            ),
+            (
+                "search by text, any chain",
+                None,
+                search_lookup("EXPLAIN ", None, None, None, Some("ali"), 10, 0),
+            ),
+            (
+                "search by text on a platform, one chain",
+                None,
+                search_lookup(
+                    "EXPLAIN ",
+                    Some(1),
+                    Some(platform),
+                    None,
+                    Some("ali"),
+                    10,
+                    0,
+                ),
+            ),
+        ];
+        for (name, index, mut statement) in shapes {
+            let plan: Vec<String> = statement
+                .build_query_scalar()
+                .fetch_all(&mut *conn)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let plan = plan.join("\n");
+            if let Some(index) = index {
+                assert!(
+                    plan.contains(index),
+                    "{name} does not seek {index}:\n{plan}"
+                );
+            }
+            for table in ["handles", "ids"] {
+                assert!(
+                    !plan.contains(&format!("Seq Scan on {table}")),
+                    "{name} scans {table}:\n{plan}"
+                );
+            }
+        }
     }
 }
