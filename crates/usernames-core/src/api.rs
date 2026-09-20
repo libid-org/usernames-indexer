@@ -215,6 +215,10 @@ struct Status {
     /// has: past zero the ENS gateway refuses this chain's mirror.
     report_valid_for: Option<i64>,
     last_window_error: Option<String>,
+    /// The Proof Verifier the contract is wired to, from its
+    /// `ProofVerifierConfigured`: the one contract that checks every claim
+    /// on this chain. Absent until the indexer has seen one.
+    proof_verifier: Option<String>,
     indexer_version: &'static str,
 }
 
@@ -231,6 +235,11 @@ async fn status(State(state): State<AppState>) -> Result<Json<Status>, ApiError>
         indexer_reported_at: position.reported_at,
         report_valid_for: position.valid_for,
         last_window_error: state.store.window_error().await?,
+        proof_verifier: state
+            .store
+            .proof_verifier()
+            .await?
+            .map(|verifier| verifier.to_string()),
         indexer_version: db::INDEXER_VERSION,
     }))
 }
@@ -244,7 +253,7 @@ struct HandleResolution {
     handle_node: String,
     owner: String,
     observed_at: i64,
-    version: i64,
+    ceremony_version: i64,
     user_id: Option<String>,
     id_node: String,
     /// Mirrors `resolvePair`: the account id this handle points back at still
@@ -313,7 +322,7 @@ async fn resolve_handle(
         handle_node: b256_from_db(&row.handle_node),
         owner: address_from_db(&owner),
         observed_at: row.observed_at,
-        version: row.version,
+        ceremony_version: row.ceremony_version,
         user_id: row.user_id,
         id_node: b256_from_db(&row.id_node),
         id_agrees,
@@ -329,7 +338,7 @@ struct IdResolution {
     id_node: String,
     owner: String,
     observed_at: i64,
-    version: i64,
+    ceremony_version: i64,
     /// The handle this account last proved, when the node it points at is
     /// still the account's — the `handleOfId`/`idOfHandle` round trip.
     handle: Option<String>,
@@ -368,7 +377,7 @@ async fn resolve_id(
         id_node: b256_from_db(&row.id_node),
         owner: address_from_db(&row.owner),
         observed_at: row.observed_at,
-        version: row.version,
+        ceremony_version: row.ceremony_version,
         handle: row.presentable_handle().map(str::to_string),
         handle_node: b256_from_db(&row.handle_node),
         published: row.displayed(),
@@ -385,7 +394,7 @@ struct AddressIdentity {
     handle: Option<String>,
     handle_node: String,
     observed_at: i64,
-    version: i64,
+    ceremony_version: i64,
     /// Whether the handle still resolves to this wallet.
     resolves: bool,
     /// Whether this is the wallet's displayed name on the platform.
@@ -418,7 +427,7 @@ async fn resolve_address(
             handle: row.presentable_handle().map(str::to_string),
             handle_node: b256_from_db(&row.handle_node),
             observed_at: row.observed_at,
-            version: row.version,
+            ceremony_version: row.ceremony_version,
             resolves: row.handle_still_owned(),
             published: row.displayed(),
             user_id: row.user_id,

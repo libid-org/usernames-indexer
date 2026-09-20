@@ -63,7 +63,7 @@ the indexer's knobs is the point rather than an omission:
 | `GET /v1/resolve/id/{platform}/{userId}` | The wallet an account id resolves to (`resolveId`), plus the handle that account currently holds |
 | `GET /v1/resolve/address/{address}` | Every identity a wallet proved, with `resolves` and `published` flags (`primaryOf`'s reverse display) |
 | `GET /v1/search?q=gre&platform=x&limit=10` | Matching variants for a partial handle: exact, then prefix, then substring, then trigram-fuzzy |
-| `GET /v1/status` | Chain id, contract, last indexed block, chain head, lag, when the indexer last reported and how long that report is still good, last window error, read-model version |
+| `GET /v1/status` | Chain id, contract, last indexed block, chain head, lag, when the indexer last reported and how long that report is still good, last window error, the Proof Verifier the contract is wired to, read-model version |
 | `GET /health` | Liveness |
 
 `{platform}` is a short key (`x`, `github`, `google`) or a 0x-hex 32-byte
@@ -212,14 +212,18 @@ above 63. It could not have covered these accounts, or any others.
 Schema `names`, all tables keyed by `chain_id` (one process follows one
 chain; a second deployment can share the database):
 
-- `events` — append-only journal of every decoded log, the audit trail
+- `events` — append-only journal of every decoded log, the audit trail.
+  `CeremonyBound` and `ClaimFeePaid` live only here: which client
+  authenticated a claim and what fee it paid are an operator's questions,
+  and nothing resolves by them
 - `ids` — mirrors `byId` + `handleOfId`: account id → wallet, current handle
 - `handles` — mirrors `byHandle` + `idOfHandle`: handle node → wallet;
   `owner NULL` mirrors the contract's retirement, and the `observed_at`
   watermark survives it the way the contract keeps it
 - `published` — the display names; a row exists exactly while the contract's
   stored string is nonempty
-- `platforms`, `verifiers` — operational metadata from the admin events
+- `platforms` — one row per platform the contract configured; the Proof
+  Verifier it is wired to is chain metadata, reported by `/v1/status`
 
 Each poll window commits in one transaction — journal, projections and cursor
 together — and the journal's `(chain, block, log)` conflict gates the

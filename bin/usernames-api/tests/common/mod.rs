@@ -98,7 +98,7 @@ pub async fn bind(store: &ChainStore, handle: &str, owner: Address) {
         user_id: "42".into(),
         handle: handle.into(),
         observed_at: 1_700_000_000,
-        version: 1,
+        ceremony_version: 1,
         published: true,
     };
     let mut window = store.begin_window().await.expect("begin");
