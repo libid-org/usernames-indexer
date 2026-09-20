@@ -1,7 +1,35 @@
-//! Request fixtures the API's integration suites build from.
+//! Request fixtures for the `usernames-api` integration suites.
 //!
-//! Anything a request must look like lives here, so a read-model change that
-//! a fixture has to record is one edit.
+//! A wallet resolving `alice.x.handles.link` through ENS does not send that
+//! text. It sends the name in DNS wire form and its namehash, plus an
+//! ABI-encoded request for the `addr` record, wrapped in the ENSIP-10
+//! `resolve(name, data)` call that the resolver forwards to the gateway. The
+//! suites in `bin/usernames-api/tests` send hundreds of such requests, so
+//! this crate holds one builder per piece, and every suite sends the bytes a
+//! wallet would:
+//!
+//! - [`wire_name`] and [`namehash_of`]: the name as the wire and the resolver
+//!   carry it.
+//! - [`addr_call`] and [`legacy_addr_call`]: the record request, in the
+//!   ENSIP-11 multichain form and in the older form that means coin type 60.
+//! - [`resolve_call`]: the wrapped call the gateway receives.
+//! - [`bind`]: one binding written into the store the gateway answers from,
+//!   with its chain marked synced.
+//!
+//! `gateway.rs` drives the router in process with these; `end_to_end.rs`
+//! deploys the real `HandleResolver` on anvil and walks the protocol with
+//! them. Neither needs ENS or a network. It is a dev-dependency of
+//! `usernames-api` and nothing else links it. It is a crate rather than a
+//! `tests/common` module because each test binary compiles such a module on
+//! its own, and a helper one of them does not call reads as dead code there;
+//! a library's public items never do.
+//!
+//! To test against a real wallet instead of these suites, the resolver ENS
+//! holds for `handles.link` must name your gateway. On Sepolia that resolver
+//! is a `HandleResolver` whose URL is
+//! `http://127.0.0.1:8080/ens/{sender}/{data}.json`: a `usernames-api`
+//! running locally, with a signer the resolver trusts (`setSigner`), answers
+//! it. `setUrls` repoints it; both are calls by the resolver's owner.
 
 #![deny(missing_docs)]
 #![deny(dead_code)]

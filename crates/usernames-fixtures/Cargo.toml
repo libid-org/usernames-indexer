@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Request fixtures the usernames-api integration suites share."
+description = "Builders for the ENS gateway requests and store bindings the usernames-api integration suites send."
 publish = false
 
 [dependencies]
