@@ -32,22 +32,71 @@ fn platform_id(domain: &str) -> B256 {
     keccak256(domain.as_bytes())
 }
 
-/// Every platform this build knows, as (short key, domain). The single
-/// listing both lookup directions, the rules lookup and the parse error
-/// derive from — so adding a platform is one line here (plus its rules in
-/// handles.json via `libid-identity`), not three places that must agree.
-const REGISTRY: &[(&str, &str)] = &[
-    ("x", PLATFORM_X_DOMAIN),
-    ("github", PLATFORM_GITHUB_DOMAIN),
-    ("google", PLATFORM_GOOGLE_DOMAIN),
-];
+/// Every platform this build knows.
+///
+/// A closed set on purpose. The id derivation, the normalization rules and the
+/// ENS label transform each have to be written once per platform, and an
+/// exhaustive `match` on this type is what makes the compiler say so instead of
+/// a test noticing later. Adding a platform is a variant here plus its rules in
+/// `libid-identity`; everything that must follow stops compiling until it does.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum KnownPlatform {
+    /// X, formerly Twitter.
+    X,
+    /// GitHub.
+    GitHub,
+    /// Google, whose handles are addresses rather than bare names.
+    Google,
+}
 
-static KEY_BY_ID: LazyLock<HashMap<B256, &'static str>> = LazyLock::new(|| {
-    REGISTRY
-        .iter()
-        .map(|(key, domain)| (platform_id(domain), *key))
-        .collect()
-});
+impl KnownPlatform {
+    /// Every variant, in the order a listing shows them. A slice rather than
+    /// an array so adding one is a single line and not also an arity.
+    pub const ALL: &'static [Self] = &[Self::X, Self::GitHub, Self::Google];
+
+    /// The short key: what a name, a URL path and the API's JSON all call it.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::X => "x",
+            Self::GitHub => "github",
+            Self::Google => "google",
+        }
+    }
+
+    /// The domain whose keccak the chain keys this platform by.
+    const fn domain(self) -> &'static str {
+        match self {
+            Self::X => PLATFORM_X_DOMAIN,
+            Self::GitHub => PLATFORM_GITHUB_DOMAIN,
+            Self::Google => PLATFORM_GOOGLE_DOMAIN,
+        }
+    }
+
+    /// The platform a short key names, when this build knows it.
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|p| p.key() == key)
+    }
+
+    /// The 32-byte id the chain keys this platform by.
+    pub fn id(self) -> B256 {
+        platform_id(self.domain())
+    }
+
+    /// The normalization rules the chain applied before it keyed a handle.
+    ///
+    /// Looked up by the short key because `Rules::for_platform` lives in
+    /// `libid-identity` and takes one. The string hop stops at that crate
+    /// boundary rather than spreading from here.
+    pub fn rules(self) -> Option<libid_identity::Rules> {
+        libid_identity::Rules::for_platform(self.key())
+    }
+}
+
+static KNOWN_BY_ID: LazyLock<HashMap<B256, KnownPlatform>> =
+    LazyLock::new(|| KnownPlatform::ALL.iter().map(|p| (p.id(), *p)).collect());
 
 /// A platform reference that is neither a known key nor a 0x-hex 32-byte id.
 /// The message derives the key list from the registry, so it cannot rot as
@@ -60,8 +109,8 @@ pub struct UnknownPlatform {
 impl std::fmt::Display for UnknownPlatform {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "unknown platform {:?}: use ", self.raw)?;
-        for (key, _) in REGISTRY {
-            write!(f, "{key}, ")?;
+        for platform in KnownPlatform::ALL {
+            write!(f, "{}, ", platform.key())?;
         }
         write!(f, "or a 0x-hex platform id")
     }
@@ -75,19 +124,22 @@ impl std::error::Error for UnknownPlatform {}
 #[derive(Debug, Clone, Copy)]
 pub struct Platform {
     id: B256,
-    key: Option<&'static str>,
+    known: Option<KnownPlatform>,
+}
+
+impl From<KnownPlatform> for Platform {
+    fn from(known: KnownPlatform) -> Self {
+        Self {
+            id: known.id(),
+            known: Some(known),
+        }
+    }
 }
 
 impl Platform {
-    /// The platform for a short key from the registry.
+    /// The platform a short key names, when this build knows it.
     pub fn from_key(key: &str) -> Option<Self> {
-        REGISTRY
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(key, domain)| Self {
-                id: platform_id(domain),
-                key: Some(key),
-            })
+        KnownPlatform::from_key(key).map(Self::from)
     }
 
     /// A caller-supplied reference: a known key, or a 0x-hex id — which
@@ -99,7 +151,7 @@ impl Platform {
         if let Ok(id) = raw.parse::<B256>() {
             return Ok(Self {
                 id,
-                key: Self::key_of(id),
+                known: Self::known_of(id),
             });
         }
         Err(UnknownPlatform {
@@ -112,16 +164,27 @@ impl Platform {
         self.id
     }
 
-    /// The short key, when this build knows the id.
-    pub fn key(&self) -> Option<&'static str> {
-        self.key
+    /// The platform itself, when this build knows the id.
+    pub fn known(&self) -> Option<KnownPlatform> {
+        self.known
     }
 
-    /// The short key for a bare id — for rows read back from the database,
-    /// where only the id survives. An id outside the registry still indexes;
-    /// it just has no normalization rules or name on this side.
+    /// The short key, when this build knows the id. The API serializes this,
+    /// so the wire form stays a string even though the type behind it is not.
+    pub fn key(&self) -> Option<&'static str> {
+        self.known.map(KnownPlatform::key)
+    }
+
+    /// The platform for a bare id — for rows read back from the database,
+    /// where only the id survives. An id this build does not know still
+    /// indexes; it just has no normalization rules or name on this side.
+    pub fn known_of(id: B256) -> Option<KnownPlatform> {
+        KNOWN_BY_ID.get(&id).copied()
+    }
+
+    /// The short key for a bare id, for the same callers as [`Self::key`].
     pub fn key_of(id: B256) -> Option<&'static str> {
-        KEY_BY_ID.get(&id).copied()
+        Self::known_of(id).map(KnownPlatform::key)
     }
 
     /// Normalize a full handle exactly the way the chain did before it keyed
@@ -133,7 +196,7 @@ impl Platform {
         &self,
         raw: &str,
     ) -> Result<NormalizedHandle, libid_identity::HandleError> {
-        match self.key.and_then(libid_identity::Rules::for_platform) {
+        match self.known.and_then(KnownPlatform::rules) {
             Some(rules) => libid_identity::normalize(raw, rules).map(NormalizedHandle),
             None => Ok(NormalizedHandle(raw.to_string())),
         }
@@ -175,9 +238,9 @@ pub fn fold_search_query(raw: &str) -> String {
 }
 
 static ID_NODE_V1: LazyLock<B256> =
-    LazyLock::new(|| keccak256(b"dyaka.identity.id-node.v1"));
+    LazyLock::new(|| keccak256(b"libid.identity.id-node.v1"));
 static HANDLE_NODE_V1: LazyLock<B256> =
-    LazyLock::new(|| keccak256(b"dyaka.identity.handle-node.v1"));
+    LazyLock::new(|| keccak256(b"libid.identity.handle-node.v1"));
 
 fn node(tag: B256, platform: B256, inner: B256) -> B256 {
     let mut buf = [0u8; 96];
@@ -218,15 +281,15 @@ mod tests {
         let cases = [
             (
                 "x",
-                "c35cd221f653c2881299fd15eafb60135268d945ad58b7bdbceefea1e2274375",
+                "7521d1cadbcfa91eec65aa16715b94ffc1c9654ba57ea2ef1a2127bca1127a83",
             ),
             (
                 "github",
-                "6e6b76ab962fcaebc5bd2f6ba8868866bc6159e1d6481c3376a7383217a84337",
+                "07a17bd3c7c8d7b88e93a4d9007e3bc230b0a586a434de0bed6500e9f343deb7",
             ),
             (
                 "google",
-                "c96cebdfd032a45e92ae16d7e629a9b0e5781858be9e7a108f37acdcc2347b08",
+                "8f2f90d8304f6eb382d037c47a041d8c8b4d18bdd8b082fa32828e016a584ca7",
             ),
         ];
         for (key, expected) in cases {
@@ -241,19 +304,31 @@ mod tests {
         let google = Platform::from_key("google").unwrap().id();
         assert_eq!(
             hex::encode(handle_node(x, &NormalizedHandle::from_chain("alice_1"))),
-            "46a9cdc4134b422003a300cf0b1b318812b07e1f11cec6f5240a3dcf63fa745f"
+            "1c43d5d3cf3d99e9d5b6e8c74c23d14bcbb6a743712cf7fa7c15750c4fc2150d"
         );
         assert_eq!(
             hex::encode(id_node(x, "12345")),
-            "6d6f828075247b9577269f5991a029e7cf90da5c388e62a4f1b4359da480a5a5"
+            "c3a98b9fbd2be3063e652d3d506b3de70b8952e60901fc25bdec89cde86b2214"
         );
         assert_eq!(
             hex::encode(handle_node(
                 google,
                 &NormalizedHandle::from_chain("a.b+tag@example.com")
             )),
-            "510cacc46b1c93510291235a2326a96fbb5fa3ff9ba71e1fcc1fba3e27d2d45c"
+            "71618d5985c306d64050b15d17f41078c448fc30a93982df14ffd6bbcb4db534"
         );
+    }
+
+    /// The registry is the launch profile set, no more and no less: every
+    /// platform a ceremony can prove is one this side can name, and nothing
+    /// is named here that no ceremony proves.
+    #[test]
+    fn the_registry_is_the_launch_profile_set() {
+        let launch: std::collections::BTreeSet<&str> =
+            libid_profiles::LAUNCH.iter().map(|p| p.platform).collect();
+        let known: std::collections::BTreeSet<&str> =
+            KnownPlatform::ALL.iter().map(|p| p.key()).collect();
+        assert_eq!(known, launch);
     }
 
     #[test]
@@ -273,8 +348,8 @@ mod tests {
 
         // The refusal names every registered key, derived from the registry.
         let err = Platform::parse("myspace").unwrap_err().to_string();
-        for (key, _) in REGISTRY {
-            assert!(err.contains(key), "{err}");
+        for platform in KnownPlatform::ALL {
+            assert!(err.contains(platform.key()), "{err}");
         }
     }
 }

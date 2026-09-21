@@ -11,10 +11,6 @@ pragma solidity ^0.8.20;
 ///         libid-contracts/solidity/contracts/identity/IdentityNames.sol —
 ///         a drifted copy here fails the integration test against the
 ///         bindings, which come from the published crate.
-///
-///         Regenerate the bytecode embedded in tests/anvil.rs with:
-///           forge build (any foundry project containing only this file),
-///           then take .bytecode.object from out/MockIdentityNames.sol/MockIdentityNames.json
 contract MockIdentityNames {
     event IdentityBound(
         address indexed owner,
@@ -25,15 +21,15 @@ contract MockIdentityNames {
         string handle,
         uint64 observedAt,
         bool published,
-        uint32 version
+        uint16 ceremonyVersion
     );
+    event CeremonyBound(
+        bytes32 indexed authorizationDigest, address indexed owner, bytes32 indexed platformId, bytes clientIdentifier
+    );
+    event ClaimFeePaid(bytes32 indexed authorizationDigest, address indexed receiver, uint256 amount);
     event HandleRetired(bytes32 indexed platformId, bytes32 indexed handleNode, address indexed owner);
     event PlatformConfigured(bytes32 indexed platformId);
-    event VerifierConfigured(
-        bytes32 indexed platformId, uint32 indexed version, address verifier, uint64 maxFutureObservation
-    );
-    event VerifierRetired(bytes32 indexed platformId, uint32 indexed version);
-    event LatestVersionChanged(bytes32 indexed platformId, uint32 indexed version);
+    event ProofVerifierConfigured(address verifier);
     event NameUnpublished(address indexed owner, bytes32 indexed platformId);
 
     function emitIdentityBound(
@@ -45,11 +41,24 @@ contract MockIdentityNames {
         string calldata handle,
         uint64 observedAt,
         bool published,
-        uint32 version
+        uint16 ceremonyVersion
     ) external {
         emit IdentityBound(
-            owner, idNode, handleNode, platformId, userId, handle, observedAt, published, version
+            owner, idNode, handleNode, platformId, userId, handle, observedAt, published, ceremonyVersion
         );
+    }
+
+    function emitCeremonyBound(
+        bytes32 authorizationDigest,
+        address owner,
+        bytes32 platformId,
+        bytes calldata clientIdentifier
+    ) external {
+        emit CeremonyBound(authorizationDigest, owner, platformId, clientIdentifier);
+    }
+
+    function emitClaimFeePaid(bytes32 authorizationDigest, address receiver, uint256 amount) external {
+        emit ClaimFeePaid(authorizationDigest, receiver, amount);
     }
 
     function emitHandleRetired(bytes32 platformId, bytes32 handleNode, address owner) external {
@@ -60,21 +69,8 @@ contract MockIdentityNames {
         emit PlatformConfigured(platformId);
     }
 
-    function emitVerifierConfigured(
-        bytes32 platformId,
-        uint32 version,
-        address verifier,
-        uint64 maxFutureObservation
-    ) external {
-        emit VerifierConfigured(platformId, version, verifier, maxFutureObservation);
-    }
-
-    function emitVerifierRetired(bytes32 platformId, uint32 version) external {
-        emit VerifierRetired(platformId, version);
-    }
-
-    function emitLatestVersionChanged(bytes32 platformId, uint32 version) external {
-        emit LatestVersionChanged(platformId, version);
+    function emitProofVerifierConfigured(address verifier) external {
+        emit ProofVerifierConfigured(verifier);
     }
 
     function emitNameUnpublished(address owner, bytes32 platformId) external {

@@ -7,7 +7,9 @@
 use alloy::{
     primitives::{
         Address,
+        Bytes,
         B256,
+        U256,
     },
     rpc::types::Log,
     sol_types::SolEvent,
@@ -35,7 +37,8 @@ pub struct LogPosition {
 pub enum NamesEvent {
     /// A wallet proved an identity. The main event: carries the plaintext
     /// userId and normalized handle, so the read model needs no on-chain
-    /// strings.
+    /// strings. The ceremony version is logged and never stored on chain, so
+    /// this side is its only record.
     IdentityBound {
         owner: Address,
         id_node: B256,
@@ -45,7 +48,7 @@ pub enum NamesEvent {
         handle: String,
         observed_at: u64,
         published: bool,
-        version: u32,
+        ceremony_version: u16,
     },
     /// The account behind a handle proved a different one; the old node
     /// stops resolving but keeps its observed-at watermark.
@@ -58,17 +61,24 @@ pub enum NamesEvent {
     NameUnpublished { owner: Address, platform_id: B256 },
     /// A platform's keyspace was configured or reconfigured.
     PlatformConfigured { platform_id: B256 },
-    /// A proof version gained or replaced its verifier.
-    VerifierConfigured {
+    /// The contract was pointed at the Proof Verifier that checks every claim
+    /// and holds the version set the contract itself does not.
+    ProofVerifierConfigured { verifier: Address },
+    /// What a ceremony carried that the binding does not keep: the client the
+    /// platform authenticated, keyed by the digest that names the ceremony.
+    /// Emitted beside the `IdentityBound` of the same claim.
+    CeremonyBound {
+        authorization_digest: B256,
+        owner: Address,
         platform_id: B256,
-        version: u32,
-        verifier: Address,
-        max_future_observation: u64,
+        client_identifier: Bytes,
     },
-    /// A proof version stopped being accepted.
-    VerifierRetired { platform_id: B256, version: u32 },
-    /// The version plain `bind` now uses.
-    LatestVersionChanged { platform_id: B256, version: u32 },
+    /// The service fee a claim's own transaction data named was paid out.
+    ClaimFeePaid {
+        authorization_digest: B256,
+        receiver: Address,
+        amount: U256,
+    },
 }
 
 impl NamesEvent {
@@ -79,14 +89,15 @@ impl NamesEvent {
             Self::HandleRetired { .. } => "handle_retired",
             Self::NameUnpublished { .. } => "name_unpublished",
             Self::PlatformConfigured { .. } => "platform_configured",
-            Self::VerifierConfigured { .. } => "verifier_configured",
-            Self::VerifierRetired { .. } => "verifier_retired",
-            Self::LatestVersionChanged { .. } => "latest_version_changed",
+            Self::ProofVerifierConfigured { .. } => "proof_verifier_configured",
+            Self::CeremonyBound { .. } => "ceremony_bound",
+            Self::ClaimFeePaid { .. } => "claim_fee_paid",
         }
     }
 
     /// The journal payload. Bytes render as 0x-hex so the journal reads the
-    /// way explorers print the chain.
+    /// way explorers print the chain; a fee is a decimal string, because a
+    /// `uint256` does not fit a JSON number.
     pub fn payload(&self) -> serde_json::Value {
         match self {
             Self::IdentityBound {
@@ -98,7 +109,7 @@ impl NamesEvent {
                 handle,
                 observed_at,
                 published,
-                version,
+                ceremony_version,
             } => json!({
                 "owner": owner.to_string(),
                 "idNode": id_node.to_string(),
@@ -108,7 +119,7 @@ impl NamesEvent {
                 "handle": handle,
                 "observedAt": observed_at,
                 "published": published,
-                "version": version,
+                "ceremonyVersion": ceremony_version,
             }),
             Self::HandleRetired {
                 platform_id,
@@ -126,30 +137,28 @@ impl NamesEvent {
             Self::PlatformConfigured { platform_id } => json!({
                 "platformId": platform_id.to_string(),
             }),
-            Self::VerifierConfigured {
-                platform_id,
-                version,
-                verifier,
-                max_future_observation,
-            } => json!({
-                "platformId": platform_id.to_string(),
-                "version": version,
+            Self::ProofVerifierConfigured { verifier } => json!({
                 "verifier": verifier.to_string(),
-                "maxFutureObservation": max_future_observation,
             }),
-            Self::VerifierRetired {
+            Self::CeremonyBound {
+                authorization_digest,
+                owner,
                 platform_id,
-                version,
+                client_identifier,
             } => json!({
+                "authorizationDigest": authorization_digest.to_string(),
+                "owner": owner.to_string(),
                 "platformId": platform_id.to_string(),
-                "version": version,
+                "clientIdentifier": client_identifier.to_string(),
             }),
-            Self::LatestVersionChanged {
-                platform_id,
-                version,
+            Self::ClaimFeePaid {
+                authorization_digest,
+                receiver,
+                amount,
             } => json!({
-                "platformId": platform_id.to_string(),
-                "version": version,
+                "authorizationDigest": authorization_digest.to_string(),
+                "receiver": receiver.to_string(),
+                "amount": amount.to_string(),
             }),
         }
     }
@@ -191,6 +200,14 @@ impl std::error::Error for DecodeError {
     }
 }
 
+/// The payload of a log whose topic named `E`. Failing here is
+/// [`DecodeError::Payload`], never `Ok(None)`: the topic was recognized.
+fn payload_of<E: SolEvent>(log: &Log, event: &'static str) -> Result<E, DecodeError> {
+    log.log_decode::<E>()
+        .map(|decoded| decoded.inner.data)
+        .map_err(|source| DecodeError::Payload { event, source })
+}
+
 /// Decode one log from the contract. `Ok(None)` is a topic this indexer does
 /// not know — legal, because an upgraded contract may emit new events before
 /// this build learns them. A log that names a known topic but fails to decode
@@ -212,13 +229,7 @@ pub fn decode(log: &Log) -> Result<Option<(NamesEvent, LogPosition)>, DecodeErro
     };
 
     let event = if topic0 == IdentityNames::IdentityBound::SIGNATURE_HASH {
-        let ev = log
-            .log_decode::<IdentityNames::IdentityBound>()
-            .map_err(|e| DecodeError::Payload {
-                event: "IdentityBound",
-                source: e,
-            })?;
-        let d = ev.inner.data;
+        let d: IdentityNames::IdentityBound = payload_of(log, "IdentityBound")?;
         NamesEvent::IdentityBound {
             owner: d.owner,
             id_node: d.idNode,
@@ -228,84 +239,80 @@ pub fn decode(log: &Log) -> Result<Option<(NamesEvent, LogPosition)>, DecodeErro
             handle: d.handle,
             observed_at: d.observedAt,
             published: d.published,
-            version: d.version,
+            ceremony_version: d.ceremonyVersion,
         }
     } else if topic0 == IdentityNames::HandleRetired::SIGNATURE_HASH {
-        let ev = log
-            .log_decode::<IdentityNames::HandleRetired>()
-            .map_err(|e| DecodeError::Payload {
-                event: "HandleRetired",
-                source: e,
-            })?;
-        let d = ev.inner.data;
+        let d: IdentityNames::HandleRetired = payload_of(log, "HandleRetired")?;
         NamesEvent::HandleRetired {
             platform_id: d.platformId,
             handle_node: d.handleNode,
             owner: d.owner,
         }
     } else if topic0 == IdentityNames::NameUnpublished::SIGNATURE_HASH {
-        let ev = log
-            .log_decode::<IdentityNames::NameUnpublished>()
-            .map_err(|e| DecodeError::Payload {
-                event: "NameUnpublished",
-                source: e,
-            })?;
-        let d = ev.inner.data;
+        let d: IdentityNames::NameUnpublished = payload_of(log, "NameUnpublished")?;
         NamesEvent::NameUnpublished {
             owner: d.owner,
             platform_id: d.platformId,
         }
     } else if topic0 == IdentityNames::PlatformConfigured::SIGNATURE_HASH {
-        let ev = log
-            .log_decode::<IdentityNames::PlatformConfigured>()
-            .map_err(|e| DecodeError::Payload {
-                event: "PlatformConfigured",
-                source: e,
-            })?;
+        let d: IdentityNames::PlatformConfigured = payload_of(log, "PlatformConfigured")?;
         NamesEvent::PlatformConfigured {
-            platform_id: ev.inner.data.platformId,
-        }
-    } else if topic0 == IdentityNames::VerifierConfigured::SIGNATURE_HASH {
-        let ev = log
-            .log_decode::<IdentityNames::VerifierConfigured>()
-            .map_err(|e| DecodeError::Payload {
-                event: "VerifierConfigured",
-                source: e,
-            })?;
-        let d = ev.inner.data;
-        NamesEvent::VerifierConfigured {
             platform_id: d.platformId,
-            version: d.version,
+        }
+    } else if topic0 == IdentityNames::ProofVerifierConfigured::SIGNATURE_HASH {
+        let d: IdentityNames::ProofVerifierConfigured =
+            payload_of(log, "ProofVerifierConfigured")?;
+        NamesEvent::ProofVerifierConfigured {
             verifier: d.verifier,
-            max_future_observation: d.maxFutureObservation,
         }
-    } else if topic0 == IdentityNames::VerifierRetired::SIGNATURE_HASH {
-        let ev = log
-            .log_decode::<IdentityNames::VerifierRetired>()
-            .map_err(|e| DecodeError::Payload {
-                event: "VerifierRetired",
-                source: e,
-            })?;
-        let d = ev.inner.data;
-        NamesEvent::VerifierRetired {
+    } else if topic0 == IdentityNames::CeremonyBound::SIGNATURE_HASH {
+        let d: IdentityNames::CeremonyBound = payload_of(log, "CeremonyBound")?;
+        NamesEvent::CeremonyBound {
+            authorization_digest: d.authorizationDigest,
+            owner: d.owner,
             platform_id: d.platformId,
-            version: d.version,
+            client_identifier: d.clientIdentifier,
         }
-    } else if topic0 == IdentityNames::LatestVersionChanged::SIGNATURE_HASH {
-        let ev = log
-            .log_decode::<IdentityNames::LatestVersionChanged>()
-            .map_err(|e| DecodeError::Payload {
-                event: "LatestVersionChanged",
-                source: e,
-            })?;
-        let d = ev.inner.data;
-        NamesEvent::LatestVersionChanged {
-            platform_id: d.platformId,
-            version: d.version,
+    } else if topic0 == IdentityNames::ClaimFeePaid::SIGNATURE_HASH {
+        let d: IdentityNames::ClaimFeePaid = payload_of(log, "ClaimFeePaid")?;
+        NamesEvent::ClaimFeePaid {
+            authorization_digest: d.authorizationDigest,
+            receiver: d.receiver,
+            amount: d.amount,
         }
     } else {
         return Ok(None);
     };
 
     Ok(Some((event, position)))
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::b256;
+
+    use super::*;
+
+    /// Fixed points from `cast keccak` over the event signatures in
+    /// `IdentityNames.sol`, so a crate binding that drifts from the contract
+    /// fails against numbers this code never produced.
+    #[test]
+    fn topics_match_the_contract() {
+        assert_eq!(
+            IdentityNames::IdentityBound::SIGNATURE_HASH,
+            b256!("8ae08d06a548b84d8340ef35ae06cd4c34983cd87b5554e6c818b8180530950c")
+        );
+        assert_eq!(
+            IdentityNames::CeremonyBound::SIGNATURE_HASH,
+            b256!("f0f0b831e902ded46acfd6caf87649edb445c2e2733992b2e79cd1420719c19c")
+        );
+        assert_eq!(
+            IdentityNames::ClaimFeePaid::SIGNATURE_HASH,
+            b256!("86eeb882525d52c6bf9923371ee6b2753b7ca825db260239939bfa88f1c530eb")
+        );
+        assert_eq!(
+            IdentityNames::ProofVerifierConfigured::SIGNATURE_HASH,
+            b256!("01970f3cbef68f8ac95615ab5c75299e421a83a787173408d693928ed40b6574")
+        );
+    }
 }

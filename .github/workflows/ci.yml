@@ -12,7 +12,7 @@ env:
   RUST_VERSION: 1.97.1
   # Must match rust-version in Cargo.toml — the msrv job is what keeps that
   # manifest claim from rotting.
-  RUST_MSRV: 1.94.1
+  RUST_MSRV: 1.95
   NIGHTLY: nightly-2025-07-01
   FOUNDRY_VERSION: v1.7.1
 
