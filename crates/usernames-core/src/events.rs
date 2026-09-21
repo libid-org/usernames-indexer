@@ -12,18 +12,10 @@ use alloy::{
         U256,
     },
     rpc::types::Log,
-    sol,
     sol_types::SolEvent,
 };
 use libid_contracts::bindings::identity::IdentityNames;
 use serde_json::json;
-
-sol! {
-    /// `IdentityNames.ClaimFeePaid`, verbatim from the contract. The 0.13.0
-    /// bindings leave it out (libid-contracts#49 adds it); once a release
-    /// carries it, this block goes and the crate's event takes its place.
-    event ClaimFeePaid(bytes32 indexed authorizationDigest, address indexed receiver, uint256 amount);
-}
 
 /// Where in the chain a log sat. The pair (block, log index) is the natural
 /// id every table keys provenance by.
@@ -281,8 +273,8 @@ pub fn decode(log: &Log) -> Result<Option<(NamesEvent, LogPosition)>, DecodeErro
             platform_id: d.platformId,
             client_identifier: d.clientIdentifier,
         }
-    } else if topic0 == ClaimFeePaid::SIGNATURE_HASH {
-        let d: ClaimFeePaid = payload_of(log, "ClaimFeePaid")?;
+    } else if topic0 == IdentityNames::ClaimFeePaid::SIGNATURE_HASH {
+        let d: IdentityNames::ClaimFeePaid = payload_of(log, "ClaimFeePaid")?;
         NamesEvent::ClaimFeePaid {
             authorization_digest: d.authorizationDigest,
             receiver: d.receiver,
@@ -302,8 +294,7 @@ mod tests {
     use super::*;
 
     /// Fixed points from `cast keccak` over the event signatures in
-    /// `IdentityNames.sol` at libid-contracts v0.13.0, so a binding that
-    /// drifts from the contract — the crate's, or the one declared here —
+    /// `IdentityNames.sol`, so a crate binding that drifts from the contract
     /// fails against numbers this code never produced.
     #[test]
     fn topics_match_the_contract() {
@@ -316,7 +307,7 @@ mod tests {
             b256!("f0f0b831e902ded46acfd6caf87649edb445c2e2733992b2e79cd1420719c19c")
         );
         assert_eq!(
-            ClaimFeePaid::SIGNATURE_HASH,
+            IdentityNames::ClaimFeePaid::SIGNATURE_HASH,
             b256!("86eeb882525d52c6bf9923371ee6b2753b7ca825db260239939bfa88f1c530eb")
         );
         assert_eq!(

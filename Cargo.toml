@@ -17,7 +17,7 @@ anyhow = "1"
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
-libid-contracts = "0.13"
+libid-contracts = "0.13.1"
 libid-identity = "0.13"
 libid-profiles = "0.13"
 libid-signer = "0.6"
