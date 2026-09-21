@@ -972,10 +972,16 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
         .await
         .expect("prepared");
     store
-        .set_chain_names(&writer, &[name("alpha"), name("alpha-testnet"), name("alpha")])
+        .set_chain_names(
+            &writer,
+            &[name("alpha"), name("alpha-testnet"), name("alpha")],
+        )
         .await
         .expect("declared");
-    assert_eq!(store.chain_names().await.unwrap(), ["alpha", "alpha-testnet"]);
+    assert_eq!(
+        store.chain_names().await.unwrap(),
+        ["alpha", "alpha-testnet"]
+    );
 
     // Declaring again replaces the set.
     store
