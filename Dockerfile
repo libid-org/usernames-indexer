@@ -41,6 +41,7 @@ RUN mkdir -p crates/usernames-core/src crates/usernames-fixtures/src bin/usernam
 # crate that calls the macro.
 COPY crates/usernames-core/src crates/usernames-core/src
 COPY crates/usernames-core/migrations crates/usernames-core/migrations
+COPY crates/usernames-core/sql crates/usernames-core/sql
 COPY crates/usernames-fixtures/src crates/usernames-fixtures/src
 COPY bin/usernames-indexer/src bin/usernames-indexer/src
 COPY bin/usernames-api/src bin/usernames-api/src

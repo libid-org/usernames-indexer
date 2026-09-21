@@ -104,21 +104,17 @@ impl Store {
     /// Every chain an indexer has touched, cursor or not: what `/v1/status`
     /// lists, so a chain still in its first window is visible there.
     pub async fn known_chains(&self) -> Result<Vec<i64>, sqlx::Error> {
-        sqlx::query_scalar(
-            "SELECT DISTINCT chain_id FROM names.chain_metadata ORDER BY chain_id",
-        )
-        .fetch_all(&self.pool)
-        .await
+        sqlx::query_scalar(sql::KNOWN_CHAINS)
+            .fetch_all(&self.pool)
+            .await
     }
 
     /// Every chain an indexer has written into this store, by cursor.
     pub async fn indexed_chains(&self) -> Result<Vec<i64>, sqlx::Error> {
-        sqlx::query_scalar(
-            "SELECT chain_id FROM names.chain_metadata WHERE key = $1 ORDER BY chain_id",
-        )
-        .bind(CURSOR_KEY)
-        .fetch_all(&self.pool)
-        .await
+        sqlx::query_scalar(sql::INDEXED_CHAINS)
+            .bind(CURSOR_KEY)
+            .fetch_all(&self.pool)
+            .await
     }
 }
 
@@ -256,26 +252,20 @@ impl ChainStore {
     }
 
     async fn get_metadata(&self, key: &str) -> Result<Option<String>, sqlx::Error> {
-        sqlx::query_scalar(
-            "SELECT value FROM names.chain_metadata WHERE chain_id = $1 AND key = $2",
-        )
-        .bind(self.chain_id)
-        .bind(key)
-        .fetch_optional(&self.pool)
-        .await
+        sqlx::query_scalar(sql::GET_METADATA)
+            .bind(self.chain_id)
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
     }
 
     async fn set_metadata(&self, key: &str, value: &str) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"INSERT INTO names.chain_metadata (chain_id, key, value)
-               VALUES ($1, $2, $3)
-               ON CONFLICT (chain_id, key) DO UPDATE SET value = EXCLUDED.value"#,
-        )
-        .bind(self.chain_id)
-        .bind(key)
-        .bind(value)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query(sql::UPSERT_METADATA)
+            .bind(self.chain_id)
+            .bind(key)
+            .bind(value)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -357,32 +347,20 @@ impl ChainStore {
                 .execute(&mut *tx)
                 .await?;
         }
-        // Everything the chain accumulated goes, by column, so a key added
-        // later is cleared by default instead of surviving a replay because
-        // this list forgot it. The one deliberate carve-out is the
-        // deployment-block cache: it is keyed by contract, and eth_getCode
-        // history does not change shape with the read model.
-        sqlx::query(
-            r#"DELETE FROM names.chain_metadata
-               WHERE chain_id = $1 AND key NOT LIKE 'deploy_block:%'"#,
-        )
-        .bind(self.chain_id)
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query(sql::CLEAR_CHAIN_METADATA)
+            .bind(self.chain_id)
+            .execute(&mut *tx)
+            .await?;
         for (key, value) in [
             (SCHEMA_VERSION_KEY, INDEXER_VERSION.to_string()),
             (CONTRACT_KEY, contract_now),
         ] {
-            sqlx::query(
-                r#"INSERT INTO names.chain_metadata (chain_id, key, value)
-                   VALUES ($1, $2, $3)
-                   ON CONFLICT (chain_id, key) DO UPDATE SET value = EXCLUDED.value"#,
-            )
-            .bind(self.chain_id)
-            .bind(key)
-            .bind(value)
-            .execute(&mut *tx)
-            .await?;
+            sqlx::query(sql::UPSERT_METADATA)
+                .bind(self.chain_id)
+                .bind(key)
+                .bind(value)
+                .execute(&mut *tx)
+                .await?;
         }
         tx.commit().await?;
         info!(
@@ -430,21 +408,15 @@ impl ChainStore {
     /// later in the same cycle can decline to vouch for a target that never
     /// made it.
     pub async fn set_chain_target(&self, target: u64, valid_for_secs: u64) -> bool {
-        let written = sqlx::query(
-            r#"INSERT INTO names.chain_metadata (chain_id, key, value)
-               VALUES ($1, $2, $3),
-                      ($1, $4, EXTRACT(EPOCH FROM now())::bigint::text),
-                      ($1, $5, (EXTRACT(EPOCH FROM now())::bigint + $6)::text)
-               ON CONFLICT (chain_id, key) DO UPDATE SET value = EXCLUDED.value"#,
-        )
-        .bind(self.chain_id)
-        .bind(TARGET_KEY)
-        .bind(target.to_string())
-        .bind(TARGET_REPORTED_AT_KEY)
-        .bind(TARGET_VALID_UNTIL_KEY)
-        .bind(Self::valid_for_bind(valid_for_secs))
-        .execute(&self.pool)
-        .await;
+        let written = sqlx::query(sql::SET_CHAIN_TARGET)
+            .bind(self.chain_id)
+            .bind(TARGET_KEY)
+            .bind(target.to_string())
+            .bind(TARGET_REPORTED_AT_KEY)
+            .bind(TARGET_VALID_UNTIL_KEY)
+            .bind(Self::valid_for_bind(valid_for_secs))
+            .execute(&self.pool)
+            .await;
         match written {
             Ok(_) => true,
             Err(e) => {
@@ -459,18 +431,13 @@ impl ChainStore {
     /// that the loop is alive and the chain reachable; without this a healthy
     /// backfill would expire.
     pub async fn touch_chain_target(&self, valid_for_secs: u64) {
-        let touched = sqlx::query(
-            r#"INSERT INTO names.chain_metadata (chain_id, key, value)
-               VALUES ($1, $2, EXTRACT(EPOCH FROM now())::bigint::text),
-                      ($1, $3, (EXTRACT(EPOCH FROM now())::bigint + $4)::text)
-               ON CONFLICT (chain_id, key) DO UPDATE SET value = EXCLUDED.value"#,
-        )
-        .bind(self.chain_id)
-        .bind(TARGET_REPORTED_AT_KEY)
-        .bind(TARGET_VALID_UNTIL_KEY)
-        .bind(Self::valid_for_bind(valid_for_secs))
-        .execute(&self.pool)
-        .await;
+        let touched = sqlx::query(sql::TOUCH_CHAIN_TARGET)
+            .bind(self.chain_id)
+            .bind(TARGET_REPORTED_AT_KEY)
+            .bind(TARGET_VALID_UNTIL_KEY)
+            .bind(Self::valid_for_bind(valid_for_secs))
+            .execute(&self.pool)
+            .await;
         if let Err(e) = touched {
             warn!(%e, "failed to renew the chain target's report");
         }
@@ -511,18 +478,14 @@ impl ChainStore {
     /// statement, so the four are a snapshot and one round trip on the
     /// gateway's hot path.
     pub async fn index_position(&self) -> Result<IndexPosition, sqlx::Error> {
-        let rows: Vec<(String, String, i64)> = sqlx::query_as(
-            r#"SELECT key, value, EXTRACT(EPOCH FROM now())::bigint
-               FROM names.chain_metadata
-               WHERE chain_id = $1 AND key IN ($2, $3, $4, $5)"#,
-        )
-        .bind(self.chain_id)
-        .bind(TARGET_KEY)
-        .bind(CURSOR_KEY)
-        .bind(TARGET_REPORTED_AT_KEY)
-        .bind(TARGET_VALID_UNTIL_KEY)
-        .fetch_all(&self.pool)
-        .await?;
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(sql::INDEX_POSITION)
+            .bind(self.chain_id)
+            .bind(TARGET_KEY)
+            .bind(CURSOR_KEY)
+            .bind(TARGET_REPORTED_AT_KEY)
+            .bind(TARGET_VALID_UNTIL_KEY)
+            .fetch_all(&self.pool)
+            .await?;
         let mut position = IndexPosition::default();
         for (key, value, now) in rows {
             if key == TARGET_KEY {
@@ -557,14 +520,12 @@ impl ChainStore {
     pub async fn set_window_error(&self, error: Option<&str>) {
         let result = match error {
             Some(msg) => self.set_metadata(WINDOW_ERROR_KEY, msg).await,
-            None => sqlx::query(
-                "DELETE FROM names.chain_metadata WHERE chain_id = $1 AND key = $2",
-            )
-            .bind(self.chain_id)
-            .bind(WINDOW_ERROR_KEY)
-            .execute(&self.pool)
-            .await
-            .map(|_| ()),
+            None => sqlx::query(sql::DELETE_METADATA)
+                .bind(self.chain_id)
+                .bind(WINDOW_ERROR_KEY)
+                .execute(&self.pool)
+                .await
+                .map(|_| ()),
         };
         if let Err(e) = result {
             warn!(%e, "failed to record the window error state");
@@ -692,16 +653,12 @@ impl Window {
     /// transaction: the cursor and the writes it stands for land together or
     /// not at all.
     pub async fn commit(mut self, through_block: u64) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"INSERT INTO names.chain_metadata (chain_id, key, value)
-               VALUES ($1, $2, $3)
-               ON CONFLICT (chain_id, key) DO UPDATE SET value = EXCLUDED.value"#,
-        )
-        .bind(self.chain_id)
-        .bind(CURSOR_KEY)
-        .bind(through_block.to_string())
-        .execute(&mut *self.tx)
-        .await?;
+        sqlx::query(sql::UPSERT_METADATA)
+            .bind(self.chain_id)
+            .bind(CURSOR_KEY)
+            .bind(through_block.to_string())
+            .execute(&mut *self.tx)
+            .await?;
         self.tx.commit().await
     }
 
@@ -727,19 +684,15 @@ impl Window {
                 "journal payload contained a NUL byte; stored with U+FFFD in its place"
             );
         }
-        let journaled = sqlx::query(
-            r#"INSERT INTO names.events (chain_id, block_number, log_index, tx_hash, kind, payload)
-               VALUES ($1, $2, $3, $4, $5, $6)
-               ON CONFLICT (chain_id, block_number, log_index) DO NOTHING"#,
-        )
-        .bind(chain_id)
-        .bind(block)
-        .bind(log_index)
-        .bind(pos.tx_hash.as_slice())
-        .bind(event.kind())
-        .bind(payload)
-        .execute(&mut **tx)
-        .await?;
+        let journaled = sqlx::query(sql::JOURNAL_EVENT)
+            .bind(chain_id)
+            .bind(block)
+            .bind(log_index)
+            .bind(pos.tx_hash.as_slice())
+            .bind(event.kind())
+            .bind(payload)
+            .execute(&mut **tx)
+            .await?;
         if journaled.rows_affected() == 0 {
             // Running the projection writes again would be harmless for the
             // upserts but would double-count `configured_count`, so the
@@ -778,60 +731,33 @@ impl Window {
                 let observed = as_i64(*observed_at, "observedAt")?;
                 let user_id = sanitize(user_id, "userId");
                 let handle = sanitize(handle, "handle");
-                sqlx::query(
-                    r#"INSERT INTO names.ids
-                           (chain_id, id_node, platform_id, user_id, owner,
-                            observed_at, ceremony_version, handle_node, block_number, log_index)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                       ON CONFLICT (chain_id, id_node) DO UPDATE SET
-                           owner = EXCLUDED.owner,
-                           observed_at = EXCLUDED.observed_at,
-                           ceremony_version = EXCLUDED.ceremony_version,
-                           handle_node = EXCLUDED.handle_node,
-                           block_number = EXCLUDED.block_number,
-                           log_index = EXCLUDED.log_index,
-                           updated_at = now()"#,
-                )
-                .bind(chain_id)
-                .bind(id_node.as_slice())
-                .bind(platform_id.as_slice())
-                .bind(&user_id)
-                .bind(owner.as_slice())
-                .bind(observed)
-                .bind(i64::from(*ceremony_version))
-                .bind(handle_node.as_slice())
-                .bind(block)
-                .bind(log_index)
-                .execute(&mut **tx)
-                .await?;
+                sqlx::query(sql::UPSERT_ID)
+                    .bind(chain_id)
+                    .bind(id_node.as_slice())
+                    .bind(platform_id.as_slice())
+                    .bind(&user_id)
+                    .bind(owner.as_slice())
+                    .bind(observed)
+                    .bind(i64::from(*ceremony_version))
+                    .bind(handle_node.as_slice())
+                    .bind(block)
+                    .bind(log_index)
+                    .execute(&mut **tx)
+                    .await?;
 
-                sqlx::query(
-                    r#"INSERT INTO names.handles
-                           (chain_id, handle_node, platform_id, handle, owner,
-                            observed_at, ceremony_version, id_node, block_number, log_index)
-                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                       ON CONFLICT (chain_id, handle_node) DO UPDATE SET
-                           handle = EXCLUDED.handle,
-                           owner = EXCLUDED.owner,
-                           observed_at = EXCLUDED.observed_at,
-                           ceremony_version = EXCLUDED.ceremony_version,
-                           id_node = EXCLUDED.id_node,
-                           block_number = EXCLUDED.block_number,
-                           log_index = EXCLUDED.log_index,
-                           updated_at = now()"#,
-                )
-                .bind(chain_id)
-                .bind(handle_node.as_slice())
-                .bind(platform_id.as_slice())
-                .bind(&handle)
-                .bind(owner.as_slice())
-                .bind(observed)
-                .bind(i64::from(*ceremony_version))
-                .bind(id_node.as_slice())
-                .bind(block)
-                .bind(log_index)
-                .execute(&mut **tx)
-                .await?;
+                sqlx::query(sql::UPSERT_HANDLE)
+                    .bind(chain_id)
+                    .bind(handle_node.as_slice())
+                    .bind(platform_id.as_slice())
+                    .bind(&handle)
+                    .bind(owner.as_slice())
+                    .bind(observed)
+                    .bind(i64::from(*ceremony_version))
+                    .bind(id_node.as_slice())
+                    .bind(block)
+                    .bind(log_index)
+                    .execute(&mut **tx)
+                    .await?;
 
                 // The event's flag is the post-state of the contract's
                 // published string: true upserts, false deletes. Deleting on
@@ -840,29 +766,20 @@ impl Window {
                 // caller passed false, and the flag already accounts for
                 // that.
                 if *published {
-                    sqlx::query(
-                        r#"INSERT INTO names.published (chain_id, owner, platform_id, handle)
-                           VALUES ($1, $2, $3, $4)
-                           ON CONFLICT (chain_id, owner, platform_id) DO UPDATE SET
-                               handle = EXCLUDED.handle,
-                               updated_at = now()"#,
-                    )
-                    .bind(chain_id)
-                    .bind(owner.as_slice())
-                    .bind(platform_id.as_slice())
-                    .bind(&handle)
-                    .execute(&mut **tx)
-                    .await?;
+                    sqlx::query(sql::PUBLISH)
+                        .bind(chain_id)
+                        .bind(owner.as_slice())
+                        .bind(platform_id.as_slice())
+                        .bind(&handle)
+                        .execute(&mut **tx)
+                        .await?;
                 } else {
-                    sqlx::query(
-                        r#"DELETE FROM names.published
-                           WHERE chain_id = $1 AND owner = $2 AND platform_id = $3"#,
-                    )
-                    .bind(chain_id)
-                    .bind(owner.as_slice())
-                    .bind(platform_id.as_slice())
-                    .execute(&mut **tx)
-                    .await?;
+                    sqlx::query(sql::UNPUBLISH)
+                        .bind(chain_id)
+                        .bind(owner.as_slice())
+                        .bind(platform_id.as_slice())
+                        .execute(&mut **tx)
+                        .await?;
                 }
             }
 
@@ -871,58 +788,33 @@ impl Window {
                 handle_node,
                 owner: _,
             } => {
-                // Mirror the contract: the owner clears; the observed-at
-                // watermark and the id back-pointer stay. So does the
-                // ceremony version — the contract never stored one, and this
-                // row is the only record of which version proved the binding
-                // being retired.
-                sqlx::query(
-                    r#"UPDATE names.handles SET
-                           owner = NULL,
-                           block_number = $3,
-                           log_index = $4,
-                           updated_at = now()
-                       WHERE chain_id = $1 AND handle_node = $2"#,
-                )
-                .bind(chain_id)
-                .bind(handle_node.as_slice())
-                .bind(block)
-                .bind(log_index)
-                .execute(&mut **tx)
-                .await?;
+                sqlx::query(sql::RETIRE_HANDLE)
+                    .bind(chain_id)
+                    .bind(handle_node.as_slice())
+                    .bind(block)
+                    .bind(log_index)
+                    .execute(&mut **tx)
+                    .await?;
             }
 
             NamesEvent::NameUnpublished { owner, platform_id } => {
-                sqlx::query(
-                    r#"DELETE FROM names.published
-                       WHERE chain_id = $1 AND owner = $2 AND platform_id = $3"#,
-                )
-                .bind(chain_id)
-                .bind(owner.as_slice())
-                .bind(platform_id.as_slice())
-                .execute(&mut **tx)
-                .await?;
+                sqlx::query(sql::UNPUBLISH)
+                    .bind(chain_id)
+                    .bind(owner.as_slice())
+                    .bind(platform_id.as_slice())
+                    .execute(&mut **tx)
+                    .await?;
             }
 
             NamesEvent::PlatformConfigured { platform_id } => {
                 let key = nodes::Platform::key_of(*platform_id);
-                let reconfigured: bool = sqlx::query_scalar(
-                    r#"INSERT INTO names.platforms
-                           (chain_id, platform_id, platform_key, configured_count, last_configured_block)
-                       VALUES ($1, $2, $3, 1, $4)
-                       ON CONFLICT (chain_id, platform_id) DO UPDATE SET
-                           platform_key = EXCLUDED.platform_key,
-                           configured_count = names.platforms.configured_count + 1,
-                           last_configured_block = EXCLUDED.last_configured_block,
-                           updated_at = now()
-                       RETURNING configured_count > 1"#,
-                )
-                .bind(chain_id)
-                .bind(platform_id.as_slice())
-                .bind(key)
-                .bind(block)
-                .fetch_one(&mut **tx)
-                .await?;
+                let reconfigured: bool = sqlx::query_scalar(sql::CONFIGURE_PLATFORM)
+                    .bind(chain_id)
+                    .bind(platform_id.as_slice())
+                    .bind(key)
+                    .bind(block)
+                    .fetch_one(&mut **tx)
+                    .await?;
                 if reconfigured {
                     // setPlatform ran again. If the rules changed, every
                     // handle node on the platform is re-keyed on chain, and
@@ -941,16 +833,12 @@ impl Window {
             }
 
             NamesEvent::ProofVerifierConfigured { verifier } => {
-                sqlx::query(
-                    r#"INSERT INTO names.chain_metadata (chain_id, key, value)
-                       VALUES ($1, $2, $3)
-                       ON CONFLICT (chain_id, key) DO UPDATE SET value = EXCLUDED.value"#,
-                )
-                .bind(chain_id)
-                .bind(PROOF_VERIFIER_KEY)
-                .bind(verifier.to_string().to_lowercase())
-                .execute(&mut **tx)
-                .await?;
+                sqlx::query(sql::UPSERT_METADATA)
+                    .bind(chain_id)
+                    .bind(PROOF_VERIFIER_KEY)
+                    .bind(verifier.to_string().to_lowercase())
+                    .execute(&mut **tx)
+                    .await?;
             }
 
             // Journal only. What a claim's ceremony carried beyond the
@@ -965,30 +853,11 @@ impl Window {
     }
 }
 
-/// The projection every `names.ids` read shares: the row itself, the handle it
-/// points at, and whether that pair is displayed.
-///
-/// Written once because it was written three times. The joins encode which
-/// columns of which table a row is assembled from, so a change to
-/// `names.published` — the one most likely to move — has to reach every reader
-/// or the ones it missed answer from a shape that no longer exists. A caller
-/// appends its own `WHERE`, which is the only part that actually differs.
-const IDENTITY_PROJECTION: &str = r#"SELECT i.chain_id, i.platform_id, i.user_id, i.id_node, i.owner,
-                      i.observed_at, i.ceremony_version, i.handle_node,
-                      h.handle, h.owner AS handle_owner, h.id_node AS handle_id_node,
-                      (p.handle IS NOT NULL) AS published
-               FROM names.ids i
-               LEFT JOIN names.handles h
-                 ON h.chain_id = i.chain_id AND h.handle_node = i.handle_node
-               LEFT JOIN names.published p
-                 ON p.chain_id = i.chain_id AND p.owner = i.owner
-                    AND p.platform_id = i.platform_id AND p.handle = h.handle
-               "#;
-
 // ─── The read side ──────────────────────────────────────────────────────────
-// The same store the writer uses answers the API's queries, so all SQL —
-// and the join shapes the projections were designed for — lives in one
-// module. Every read spans the chains the store holds, or one of them when
+// The same store the writer uses answers the API's queries, so every
+// statement — and the join shapes the projections were designed for — is
+// one file under `sql/`, bound here. Every read spans the chains the store
+// holds, or one of them when
 // the caller names it: `chain` is `None` for every chain, and every row says
 // which chain it came from. Handlers translate HTTP to these calls and rows
 // to JSON; they do not own queries.
@@ -1115,14 +984,11 @@ impl Store {
     /// or on any chain when none is. Before that there is nothing to answer
     /// from, and a 404 would claim more than the store knows.
     pub async fn synced(&self, chain: Option<i64>) -> Result<bool, sqlx::Error> {
-        sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM names.chain_metadata
-              WHERE key = $1 AND ($2::bigint IS NULL OR chain_id = $2))",
-        )
-        .bind(CURSOR_KEY)
-        .bind(chain)
-        .fetch_one(&self.pool)
-        .await
+        sqlx::query_scalar(sql::SYNCED)
+            .bind(CURSOR_KEY)
+            .bind(chain)
+            .fetch_one(&self.pool)
+            .await
     }
 
     /// Whether any chain in scope ever configured this platform — the
@@ -1133,16 +999,11 @@ impl Store {
         chain: Option<i64>,
         platform_id: B256,
     ) -> Result<bool, sqlx::Error> {
-        // EXISTS, not `SELECT 1`: a bare literal is INT4 on the wire, and
-        // decoding it as i64 fails exactly when a row IS found.
-        sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM names.platforms
-              WHERE platform_id = $1 AND ($2::bigint IS NULL OR chain_id = $2))",
-        )
-        .bind(platform_id.as_slice())
-        .bind(chain)
-        .fetch_one(&self.pool)
-        .await
+        sqlx::query_scalar(sql::PLATFORM_WIRED)
+            .bind(platform_id.as_slice())
+            .bind(chain)
+            .fetch_one(&self.pool)
+            .await
     }
 
     /// The rows `resolveHandle` answers from, one per chain the handle is
@@ -1251,12 +1112,8 @@ fn handle_lookup(
     handle: &NormalizedHandle,
 ) -> Statement {
     let mut statement = QueryBuilder::new(format!(
-        "{prefix}SELECT h.chain_id, h.handle, h.handle_node, h.owner, h.observed_at,
-                h.ceremony_version, h.id_node, i.user_id
-         FROM names.handles h
-         LEFT JOIN names.ids i
-           ON i.chain_id = h.chain_id AND i.id_node = h.id_node
-         WHERE h.platform_id = "
+        "{prefix}{} WHERE h.platform_id = ",
+        sql::HANDLE_PROJECTION
     ));
     statement
         .push_bind(platform_id.as_slice().to_vec())
@@ -1274,7 +1131,8 @@ fn id_lookup(
     user_id: &str,
 ) -> Statement {
     let mut statement = QueryBuilder::new(format!(
-        "{prefix}{IDENTITY_PROJECTION}WHERE i.platform_id = "
+        "{prefix}{} WHERE i.platform_id = ",
+        sql::IDENTITY_PROJECTION
     ));
     statement
         .push_bind(platform_id.as_slice().to_vec())
@@ -1286,8 +1144,10 @@ fn id_lookup(
 }
 
 fn identities_lookup(prefix: &str, chain: Option<i64>, owner: Address) -> Statement {
-    let mut statement =
-        QueryBuilder::new(format!("{prefix}{IDENTITY_PROJECTION}WHERE i.owner = "));
+    let mut statement = QueryBuilder::new(format!(
+        "{prefix}{} WHERE i.owner = ",
+        sql::IDENTITY_PROJECTION
+    ));
     statement.push_bind(owner.as_slice().to_vec());
     scoped(&mut statement, "i.chain_id", chain);
     statement.push(" ORDER BY i.chain_id, i.platform_id, i.user_id");
@@ -1307,17 +1167,7 @@ fn search_lookup(
     limit: i64,
     offset: i64,
 ) -> Statement {
-    let mut statement = QueryBuilder::new(format!(
-        "{prefix}SELECT h.chain_id, h.platform_id, h.handle, h.owner, i.user_id,
-                (p.handle IS NOT NULL) AS published
-         FROM names.handles h
-         LEFT JOIN names.ids i
-           ON i.chain_id = h.chain_id AND i.id_node = h.id_node
-         LEFT JOIN names.published p
-           ON p.chain_id = h.chain_id AND p.owner = h.owner
-              AND p.platform_id = h.platform_id AND p.handle = h.handle
-         WHERE h.owner IS NOT NULL"
-    ));
+    let mut statement = QueryBuilder::new(format!("{prefix}{}", sql::SEARCH_PROJECTION));
     scoped(&mut statement, "h.chain_id", chain);
     if let Some(platform_id) = platform_id {
         statement
@@ -1357,6 +1207,45 @@ fn search_lookup(
         .push(" OFFSET ")
         .push_bind(offset);
     statement
+}
+
+/// Every statement the store runs, one file each under `sql/`, named by
+/// what it does. The Rust beside a use binds the parameters and says why;
+/// the file says what. Read at compile time, so a missing file fails the
+/// build rather than a request.
+mod sql {
+    pub const KNOWN_CHAINS: &str = include_str!("../sql/known_chains.sql");
+    pub const INDEXED_CHAINS: &str = include_str!("../sql/indexed_chains.sql");
+    pub const GET_METADATA: &str = include_str!("../sql/get_metadata.sql");
+    pub const UPSERT_METADATA: &str = include_str!("../sql/upsert_metadata.sql");
+    pub const DELETE_METADATA: &str = include_str!("../sql/delete_metadata.sql");
+    pub const CLEAR_CHAIN_METADATA: &str =
+        include_str!("../sql/clear_chain_metadata.sql");
+    pub const SET_CHAIN_TARGET: &str = include_str!("../sql/set_chain_target.sql");
+    pub const TOUCH_CHAIN_TARGET: &str = include_str!("../sql/touch_chain_target.sql");
+    pub const INDEX_POSITION: &str = include_str!("../sql/index_position.sql");
+    pub const JOURNAL_EVENT: &str = include_str!("../sql/journal_event.sql");
+    pub const UPSERT_ID: &str = include_str!("../sql/upsert_id.sql");
+    pub const UPSERT_HANDLE: &str = include_str!("../sql/upsert_handle.sql");
+    pub const PUBLISH: &str = include_str!("../sql/publish.sql");
+    pub const UNPUBLISH: &str = include_str!("../sql/unpublish.sql");
+    pub const RETIRE_HANDLE: &str = include_str!("../sql/retire_handle.sql");
+    pub const CONFIGURE_PLATFORM: &str = include_str!("../sql/configure_platform.sql");
+    pub const SYNCED: &str = include_str!("../sql/synced.sql");
+    pub const PLATFORM_WIRED: &str = include_str!("../sql/platform_wired.sql");
+    /// The projection every `names.ids` read shares: the row itself, the
+    /// handle it points at, and whether that pair is displayed. Written once
+    /// because it was written three times: the joins encode which columns
+    /// of which table a row is assembled from, so a change to
+    /// `names.published` — the one most likely to move — has to reach every
+    /// reader. A caller appends its own `WHERE`, the only part that differs.
+    pub const IDENTITY_PROJECTION: &str = include_str!("../sql/identity_projection.sql");
+    /// The projection every `names.handles` read shares: the row and the id
+    /// it points back at. A caller appends its `WHERE`.
+    pub const HANDLE_PROJECTION: &str = include_str!("../sql/handle_projection.sql");
+    /// Live handles with their id and display flag; the caller narrows,
+    /// orders and pages.
+    pub const SEARCH_PROJECTION: &str = include_str!("../sql/search_projection.sql");
 }
 
 #[cfg(test)]
