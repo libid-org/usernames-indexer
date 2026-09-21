@@ -338,6 +338,30 @@ async fn a_chain_label_narrows_and_never_widens() {
     assert_eq!(verify(&body, &theirs), None);
 }
 
+/// A chain may go by several names, and each one names it alike: the
+/// unlabelled form and every declared label resolve to the same binding.
+#[tokio::test]
+async fn every_name_a_chain_declares_resolves_it() {
+    let Some((router, store, _g)) = gateway_over(&[EDEN], 32).await else {
+        return;
+    };
+    let owner = Address::from([0xbe; 20]);
+    bind(&store, "alice", owner).await;
+    declare_names(&store, &["eden", "eden-testnet"]).await;
+    let coin = 0x8000_0000 | EDEN as u64;
+
+    for labels in [
+        ["alice", "x"].as_slice(),
+        ["alice", "x", "eden"].as_slice(),
+        ["alice", "x", "eden-testnet"].as_slice(),
+    ] {
+        let call = resolve_call(&wire_name(labels), &addr_call(labels, coin));
+        let (status, body) = ask(&router, RESOLVER, &call).await;
+        assert_eq!(status, StatusCode::OK, "{labels:?}: {body}");
+        assert_eq!(verify(&body, &call), Some(owner), "{labels:?}");
+    }
+}
+
 #[tokio::test]
 async fn a_record_that_is_not_addr_degrades_to_null() {
     // A client asking for `text()` must not see an error on a name that

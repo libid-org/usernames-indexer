@@ -983,6 +983,12 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
         ["alpha", "alpha-testnet"]
     );
 
+    // Both names resolve to this chain.
+    let reader = db::Store::new(pool.clone());
+    for declared in ["alpha", "alpha-testnet"] {
+        assert_eq!(reader.chain_named(declared).await.unwrap(), Some(CHAIN));
+    }
+
     // Declaring again replaces the set.
     store
         .set_chain_names(&writer, &[name("alpha")])
@@ -1006,9 +1012,9 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
     );
     assert_eq!(other.chain_names().await.unwrap(), Vec::<String>::new());
 
-    // A name resolves to its chain, and a name nobody declared to none.
-    let reader = db::Store::new(pool.clone());
+    // A dropped name resolves to no chain, like one nobody declared.
     assert_eq!(reader.chain_named("alpha").await.unwrap(), Some(CHAIN));
+    assert_eq!(reader.chain_named("alpha-testnet").await.unwrap(), None);
     assert_eq!(reader.chain_named("beta").await.unwrap(), None);
 
     // Supervision sees the declaration.
