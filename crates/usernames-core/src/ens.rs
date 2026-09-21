@@ -13,8 +13,10 @@
 //! ```
 //!
 //! The parse runs right to left, because a Gmail local part contributes a
-//! variable number of labels. Platform names and chain names are closed sets
-//! that never overlap, which is what keeps it unambiguous.
+//! variable number of labels. Platform keys are a closed set and a chain name
+//! is never one of them — [`ChainName`] refuses it where a deployment declares
+//! it — which is what keeps the parse unambiguous. Which chains have names,
+//! and which, is the store's to say: each chain's indexer writes its own.
 //!
 //! # Which chain
 //!
@@ -54,40 +56,41 @@ use crate::nodes::{
 /// The domain every name sits under, as labels.
 pub const DOMAIN: [&str; 2] = ["handles", "link"];
 
-/// A chain a name may narrow to, by label — `alice.x.base.handles.link`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KnownChain {
-    /// The chain id, as the chain reports it.
-    pub id: u64,
-    /// What the chain is called in a name.
-    pub label: &'static str,
+/// A name a chain goes by in a name: the `base` in `alice.x.base.handles.link`.
+///
+/// Checked here, once, where a deployment declares it, so the store only ever
+/// holds names the parse can read back: a label a wallet could send, and
+/// never a platform key — the parse decides "platform or chain" by the
+/// platform keys, so an overlap would make one name mean two things.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ChainName(String);
+
+/// Why a string cannot name a chain.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ChainNameError {
+    /// Not a label: lowercase ASCII letters, digits and hyphens only.
+    #[error("chain name {0:?} is not a label: lowercase ascii letters, digits and hyphens only")]
+    Malformed(String),
+    /// A platform key, which the parse would read as the platform.
+    #[error("chain name {0:?} is a platform key")]
+    Platform(String),
 }
 
-/// The labels the gateway ANSWERS for, and the one place a chain's label is
-/// defined: the parser carries whatever label it finds, and a name naming a
-/// label not here is answered as a name nobody holds. Never overlaps the
-/// platform keys, which is what lets the parse tell the two apart. The
-/// gateway serves whatever chains the store holds; a chain absent here is
-/// still served under its coin type, and cannot be named by label. Adding
-/// one is a release, not a deploy.
-pub const KNOWN_CHAINS: [KnownChain; 2] = [
-    KnownChain {
-        id: 3_735_928_814,
-        label: "eden",
-    },
-    KnownChain {
-        id: 8453,
-        label: "base",
-    },
-];
+impl ChainName {
+    /// Accept a name a chain may go by.
+    pub fn parse(name: &str) -> Result<Self, ChainNameError> {
+        if !Name::label_is_wellformed(name) {
+            return Err(ChainNameError::Malformed(name.to_string()));
+        }
+        if KnownPlatform::from_key(name).is_some() {
+            return Err(ChainNameError::Platform(name.to_string()));
+        }
+        Ok(Self(name.to_string()))
+    }
 
-impl KnownChain {
-    /// The label a chain carries in a name, if it has one.
-    pub fn label_of(chain_id: u64) -> Option<&'static str> {
-        KNOWN_CHAINS
-            .iter()
-            .find(|chain| chain.id == chain_id)
-            .map(|chain| chain.label)
+    /// The name, as the label it appears as.
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -395,7 +398,7 @@ impl Name {
 
     /// The alphabet a handle-derived label may use: what X and GitHub reduce
     /// to after the substitution, and what Gmail's local part already is. A
-    /// chain label must satisfy it too, which the `KNOWN_CHAINS` test pins.
+    /// chain name must satisfy it too, which [`ChainName::parse`] enforces.
     pub fn label_is_wellformed(label: &str) -> bool {
         !label.is_empty()
             && label
@@ -995,32 +998,34 @@ mod tests {
 }
 
 #[cfg(test)]
-mod known_chains {
+mod chain_names {
     use super::*;
 
-    /// The table is the grammar's closed set: every label well-formed, no two
-    /// chains sharing a label or a coin type, and no label a platform could be
-    /// mistaken for — the parse decides "platform or chain" by the platform
-    /// keys, so an overlap would make one name mean two things.
+    /// A chain name is a label the parse can read back, and never a platform
+    /// key — the parse decides "platform or chain" by the platform keys, so
+    /// an overlap would make one name mean two things.
     #[test]
-    fn chain_labels_form_a_closed_set_apart_from_the_platforms() {
-        for (i, KnownChain { id, label }) in KNOWN_CHAINS.iter().enumerate() {
-            assert!(Name::label_is_wellformed(label), "{label}");
-            assert!(
-                KnownPlatform::from_key(label).is_none(),
-                "{label} is a platform"
+    fn a_chain_name_is_a_label_apart_from_the_platforms() {
+        for ok in ["eden", "base", "op-mainnet", "l2"] {
+            assert_eq!(
+                ChainName::parse(ok).map(|n| n.as_str().to_string()),
+                Ok(ok.to_string())
             );
-            assert_eq!(KnownChain::label_of(*id), Some(*label));
-            for KnownChain {
-                id: other_id,
-                label: other_label,
-            } in &KNOWN_CHAINS[i + 1..]
-            {
-                assert_ne!(id, other_id);
-                assert_ne!(label, other_label);
-                assert!(!CoinType::shared_by(*id, *other_id), "{id} and {other_id}");
-            }
         }
-        assert_eq!(KnownChain::label_of(31341), None);
+        for platform in KnownPlatform::ALL {
+            let key = Platform::from(*platform)
+                .key()
+                .expect("a known platform has a key");
+            assert_eq!(
+                ChainName::parse(key),
+                Err(ChainNameError::Platform(key.to_string()))
+            );
+        }
+        for bad in ["", "Base", "eth main", "eth_main", "bäse", "x.y"] {
+            assert!(
+                matches!(ChainName::parse(bad), Err(ChainNameError::Malformed(_))),
+                "{bad:?}"
+            );
+        }
     }
 }

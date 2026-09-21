@@ -48,6 +48,7 @@ the indexer's knobs is the point rather than an omission:
 | `RPC_URL` | indexer | — | JSON-RPC endpoint of the chain to follow. Prefer a single node or a sticky endpoint: a load balancer that mixes lagged replicas can answer `eth_getLogs` for blocks a backend has not seen, and events dropped that way past the confirmation margin are gone until a re-index. The loop re-checks the backend's height before committing a window, which narrows but cannot close that hole. |
 | `IDENTITY_NAMES_ADDRESS` | indexer | — | The IdentityNames **ERC1967 proxy** (the implementation changes on upgrade; the proxy is the one that emits). The indexer records it per chain, and `/v1/status` reports it from there |
 | `CHAIN_ID` | indexer | unset | Refuse to start unless the RPC reports this chain id. The API takes none: it serves every chain the store holds, and a request narrows with `?chain=` |
+| `CHAIN_NAMES` | indexer | — | Required. The names this chain goes by in an ENS name, comma-separated: the `base` in `alice.x.base.handles.link`. Labels only, never a platform key. Written to the store at every start for the gateway to read; a name belongs to one chain across the store, and declaring one another chain holds refuses to start |
 | `CONFIRMATIONS` | indexer | `5` | Blocks behind the head to stay (shallow-reorg protection) |
 | `POLL_INTERVAL_SECS` | indexer | `5` | Poll cadence, and the retry delay after a failure |
 | `STALE_AFTER_SECS` | indexer | four poll intervals + 60 | How long readers may trust this indexer's last report; the ENS gateway refuses this chain once it expires. Must exceed `POLL_INTERVAL_SECS`, and at most a year |
@@ -93,7 +94,7 @@ than present and failing.
 
 ```
 GET /ens/{sender}/{data}.json   ->  { "data": "0x…" }
-GET /ens/status                 ->  { "chains": [ { "chainId", "label", "lagBlocks",
+GET /ens/status                 ->  { "chains": [ { "chainId", "names", "lagBlocks",
                                       "indexerReportedAt", "reportValidFor",
                                       "ambiguous", "stale" } ] }
 ```
@@ -158,14 +159,15 @@ deny a binding the next endpoint existed to serve.
 So the answers divide three ways: an address or a signed null for a chain in
 the store, a signed null for a coin type naming no EVM chain at all, and an
 unsigned 503 for an EVM chain the store does not hold. Only the last lets the
-walk continue, which is exactly when it should. A chain's label in a name
-(`alice.x.base.handles.link`) comes from one table in `usernames-core`, the
-closed set the grammar needs — not from configuration. To name a chain, add it
-to `KNOWN_CHAINS` in `crates/usernames-core/src/ens.rs`; the `known_chains`
-test keeps the set closed, so that is a release, not a deploy. A chain not
-listed is served by coin type and cannot be named by label. To stop serving a
-chain, delete its `names.chain_metadata` rows (and its projection rows); the
-gateway stops listing it on the next request. A database shared by
+walk continue, which is exactly when it should. A chain's names in a name
+(`alice.x.base.handles.link`) are the chain's own metadata: its indexer writes
+them from `CHAIN_NAMES` at every start, replacing what it declared before, and
+the gateway reads them per request. A name belongs to one chain across the
+store — an indexer declaring a name another chain holds refuses to start — and
+is never a platform key, so the parse stays unambiguous. A label naming no
+chain in the store is a name nobody holds. To stop serving a chain, delete its
+`names.chain_metadata` and `names.chain_names` rows (and its projection rows);
+the gateway stops listing it on the next request. A database shared by
 deployments is a served set shared by their gateways — give a gateway its own
 database to narrow it.
 

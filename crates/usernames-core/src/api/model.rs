@@ -41,6 +41,9 @@ pub struct ErrorDetail {
 pub struct ChainStatus {
     /// The chain.
     pub chain_id: i64,
+    /// The names the chain goes by in an ENS name, as its indexer declared
+    /// them.
+    pub names: Vec<String>,
     /// The contract the rows were indexed from, as the indexer recorded it.
     pub contract: Option<Address>,
     /// The cursor: the last block whose window committed.

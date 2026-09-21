@@ -93,6 +93,11 @@ async fn gateway_parts(
             .execute(&pool)
             .await
             .expect("metadata cleanup");
+        sqlx::query("DELETE FROM names.chain_names WHERE chain_id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("names cleanup");
     }
 
     // Every chain starts SYNCED AND EMPTY, which is a different state from
@@ -128,6 +133,21 @@ async fn gateway_parts(
         )),
     };
     Some((config, store, guard))
+}
+
+/// What a chain's indexer does at startup: declare the names the chain goes
+/// by. The gateway learns them from the store and nowhere else.
+async fn declare_names(store: &ChainStore, names: &[&str]) {
+    let names: Vec<_> = names
+        .iter()
+        .map(|name| ens::ChainName::parse(name).expect("a chain name"))
+        .collect();
+    let writer = store.acquire_writer().await.expect("lease");
+    store
+        .set_chain_names(&writer, &names)
+        .await
+        .expect("names declared");
+    writer.release().await.expect("release");
 }
 
 /// The gateway route alone, which is what most of these tests exercise.
@@ -298,6 +318,7 @@ async fn a_chain_label_narrows_and_never_widens() {
         return;
     };
     bind(&store, "alice", Address::from([0xbe; 20])).await;
+    declare_names(&store, &["eden"]).await;
     let coin = 0x8000_0000 | EDEN as u64;
 
     // Our label: answered.
@@ -583,11 +604,11 @@ async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
     assert!(valid_for_of(CHAIN).is_some_and(|s| s > 0), "{status}");
 }
 
-/// A chain outside `KNOWN_CHAINS` is served under its coin type and cannot be
-/// named by label: the unlabelled name answers, and any label at all is a
+/// A chain has only the names its indexer declared. With none declared, the
+/// unlabelled name answers under its coin type, and any label at all is a
 /// name nobody holds.
 #[tokio::test]
-async fn a_chain_without_a_label_answers_only_the_unlabelled_name() {
+async fn a_chain_with_no_declared_name_answers_only_the_unlabelled_name() {
     let (router, store, _g) = gateway_or_skip!(32);
     let here = Address::from([0xbe; 20]);
     bind(&store, "alice", here).await;
@@ -709,6 +730,7 @@ async fn the_eden_testnet_resolves_despite_its_chain_id() {
     };
     let owner = Address::from([0xed; 20]);
     bind(&store, "alice", owner).await;
+    declare_names(&store, &["eden"]).await;
 
     // Exactly what a wallet on eden sends: `0x80000000 | 3735928814`, which is
     // 3735928814 itself.

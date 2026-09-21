@@ -218,6 +218,7 @@ impl ChainStatus {
         let position = store.index_position().await?;
         Ok(Self {
             chain_id: store.chain_id(),
+            names: store.chain_names().await?,
             contract: store.contract().await?,
             last_indexed_block: last,
             chain_head_block: head,

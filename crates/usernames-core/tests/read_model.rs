@@ -34,6 +34,7 @@ use usernames_core::{
         self,
         ChainStore,
     },
+    ens,
     events::{
         LogPosition,
         NamesEvent,
@@ -86,6 +87,11 @@ async fn test_store_with(
             .execute(&pool)
             .await
             .expect("metadata cleanup failed");
+        sqlx::query("DELETE FROM names.chain_names WHERE chain_id = $1")
+            .bind(chain)
+            .execute(&pool)
+            .await
+            .expect("names cleanup failed");
     }
     Some((ChainStore::new(pool.clone(), CHAIN), pool, guard))
 }
@@ -948,4 +954,66 @@ async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
     );
     assert!(position.valid_for.is_some_and(|s| s > 0), "{position:?}");
     assert!(position.reported_at.is_some(), "{position:?}");
+}
+
+/// A chain's names are its indexer's declaration: a set, replaced whole on
+/// each start, owned by one chain across the store, and listed on
+/// `/v1/status`.
+#[tokio::test]
+async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
+    let Some((store, pool, _g)) = test_store_with(2).await else {
+        return;
+    };
+    let name = |s: &str| ens::ChainName::parse(s).unwrap();
+    let writer = store.acquire_writer().await.expect("lease");
+    // In the indexer's order: the chain is prepared, then named.
+    store
+        .prepare(&writer, a_contract())
+        .await
+        .expect("prepared");
+    store
+        .set_chain_names(&writer, &[name("alpha"), name("alpha-testnet"), name("alpha")])
+        .await
+        .expect("declared");
+    assert_eq!(store.chain_names().await.unwrap(), ["alpha", "alpha-testnet"]);
+
+    // Declaring again replaces the set.
+    store
+        .set_chain_names(&writer, &[name("alpha")])
+        .await
+        .expect("declared again");
+    assert_eq!(store.chain_names().await.unwrap(), ["alpha"]);
+
+    // Another chain cannot take a name this one holds, and writes nothing.
+    let other = ChainStore::new(pool.clone(), OTHER_CHAIN);
+    let other_writer = other.acquire_writer().await.expect("other lease");
+    let refused = other
+        .set_chain_names(&other_writer, &[name("beta"), name("alpha")])
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(db::ChainNamesError::Taken { ref name, chain_id })
+                if name == "alpha" && chain_id == CHAIN
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(other.chain_names().await.unwrap(), Vec::<String>::new());
+
+    // A name resolves to its chain, and a name nobody declared to none.
+    let reader = db::Store::new(pool.clone());
+    assert_eq!(reader.chain_named("alpha").await.unwrap(), Some(CHAIN));
+    assert_eq!(reader.chain_named("beta").await.unwrap(), None);
+
+    // Supervision sees the declaration.
+    let status: Status = get(&store, "/v1/status").await.answer();
+    let row = status
+        .chains
+        .iter()
+        .find(|c| c.chain_id == CHAIN)
+        .expect("this chain is listed");
+    assert_eq!(row.names, ["alpha"]);
+
+    other_writer.release().await.expect("release");
+    writer.release().await.expect("release");
 }

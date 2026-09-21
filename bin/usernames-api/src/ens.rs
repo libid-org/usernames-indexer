@@ -75,7 +75,6 @@ use usernames_core::{
         AddrShape,
         CoinType,
         EnsError,
-        KnownChain,
         Name,
         Record,
         Reply,
@@ -195,10 +194,16 @@ impl Config {
             return Ok(null);
         };
 
-        // A chain label narrows and never widens: a label naming another chain
-        // is simply not this chain's name.
+        // A chain label narrows and never widens: a label naming another
+        // chain, or no chain any indexer declared, is simply not this chain's
+        // name.
         if let Some(label) = &query.chain_label {
-            if KnownChain::label_of(indexed.chain_id()) != Some(label.as_str()) {
+            let named = self
+                .store
+                .chain_named(label)
+                .await
+                .map_err(GatewayError::internal)?;
+            if named != Some(indexed.chain_id()) {
                 return Ok(null);
             }
         }
@@ -350,7 +355,13 @@ impl Config {
         let indexed = self.indexed_chains().await?;
         let mut chains = Vec::with_capacity(indexed.len());
         for &chain_id in &indexed {
-            let position = self.indexed_chain(chain_id).position().await;
+            let chain = self.indexed_chain(chain_id);
+            let position = chain.position().await;
+            let names = chain
+                .0
+                .chain_names()
+                .await
+                .map_err(GatewayError::internal)?;
             let lag = Lag::of(position);
             // What the gate sees: a chain sharing its coin type with another
             // in the store is refused for that coin type however fresh either
@@ -360,7 +371,7 @@ impl Config {
                 .any(|other| CoinType::shared_by(chain_id, *other));
             chains.push(ChainStatus {
                 chain_id,
-                label: KnownChain::label_of(chain_id).map(str::to_string),
+                names,
                 lag_blocks: lag.blocks(),
                 indexer_reported_at: position.and_then(|p| p.reported_at),
                 report_valid_for: position.and_then(|p| p.valid_for),
@@ -388,8 +399,8 @@ struct IndexedChain(ChainStore);
 
 impl IndexedChain {
     /// The chain this is the index of.
-    fn chain_id(&self) -> u64 {
-        u64::try_from(self.0.chain_id()).expect("came from a u64")
+    fn chain_id(&self) -> i64 {
+        self.0.chain_id()
     }
 
     /// The owner a name resolves to, as of whatever block this chain's
@@ -613,7 +624,8 @@ pub fn router(state: GatewayState) -> Router {
 #[serde(rename_all = "camelCase")]
 struct ChainStatus {
     chain_id: u64,
-    label: Option<String>,
+    /// The names the chain goes by in a name, as its indexer declared them.
+    names: Vec<String>,
     /// Blocks between the indexer's target and its cursor.
     lag_blocks: Option<u64>,
     /// Unix seconds at which the indexer last reported.

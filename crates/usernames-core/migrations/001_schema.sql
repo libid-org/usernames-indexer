@@ -119,3 +119,16 @@ CREATE TABLE IF NOT EXISTS names.platforms (
 );
 CREATE INDEX IF NOT EXISTS platforms_platform_idx
     ON names.platforms (platform_id);
+
+-- The names a chain goes by in an ENS name: the `base` in
+-- `alice.x.base.handles.link`. Each chain's indexer writes its own from its
+-- configuration at every start, replacing what it declared before. The
+-- primary key is the name, not (chain_id, name): a name belongs to one chain
+-- across the whole store, which is what lets a label mean one thing.
+CREATE TABLE IF NOT EXISTS names.chain_names (
+    name       TEXT        PRIMARY KEY,
+    chain_id   BIGINT      NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS chain_names_chain_idx
+    ON names.chain_names (chain_id);

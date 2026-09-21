@@ -187,6 +187,24 @@ impl From<sqlx::Error> for ApplyError {
     }
 }
 
+/// Why a chain's names could not be declared.
+#[derive(Debug, thiserror::Error)]
+pub enum ChainNamesError {
+    /// Another chain in the store already goes by this name. Nothing was
+    /// written: a name has to mean one chain, and the deployment that
+    /// declared it second is the one to fix.
+    #[error("chain name {name:?} already belongs to chain {chain_id}")]
+    Taken {
+        /// The name both chains claimed.
+        name: String,
+        /// The chain that holds it.
+        chain_id: i64,
+    },
+    /// The database refused or the connection failed.
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
 /// A held per-chain writer lease. One process indexes one chain at a time:
 /// the Postgres advisory lock lives on this dedicated connection for the
 /// process's lifetime, so a second instance — a rolling-deploy overlap, a
@@ -455,6 +473,58 @@ impl ChainStore {
     /// whole statement, target included.
     fn valid_for_bind(valid_for_secs: u64) -> i64 {
         i64::try_from(valid_for_secs.min(MAX_VALID_FOR_SECS)).unwrap_or(i64::MAX)
+    }
+
+    /// Declare the names this chain goes by in an ENS name, replacing whatever
+    /// it declared before. Under the writer lease like [`Self::prepare`], and
+    /// for the same reason: the check-clear-write must not race another
+    /// instance of this chain. A name another chain holds refuses the whole
+    /// set, so a misconfigured deployment writes nothing rather than half.
+    pub async fn set_chain_names(
+        &self,
+        lease: &WriterLease,
+        names: &[crate::ens::ChainName],
+    ) -> Result<(), ChainNamesError> {
+        assert_eq!(
+            lease.chain_id, self.chain_id,
+            "writer lease locks chain {}, but this store names chain {}",
+            lease.chain_id, self.chain_id
+        );
+        let mut wanted: Vec<String> =
+            names.iter().map(|n| n.as_str().to_string()).collect();
+        wanted.sort();
+        wanted.dedup();
+
+        let mut tx = self.pool.begin().await?;
+        let taken: Vec<(String, i64)> = sqlx::query_as(sql::CHAIN_NAMES_TAKEN)
+            .bind(&wanted)
+            .bind(self.chain_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        if let Some((name, chain_id)) = taken.into_iter().next() {
+            return Err(ChainNamesError::Taken { name, chain_id });
+        }
+        sqlx::query(sql::CLEAR_CHAIN_NAMES)
+            .bind(self.chain_id)
+            .execute(&mut *tx)
+            .await?;
+        for name in &wanted {
+            sqlx::query(sql::INSERT_CHAIN_NAME)
+                .bind(name)
+                .bind(self.chain_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The names this chain goes by, as its indexer declared them.
+    pub async fn chain_names(&self) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar(sql::CHAIN_NAMES)
+            .bind(self.chain_id)
+            .fetch_all(&self.pool)
+            .await
     }
 
     /// Set when the report expires, as absolute Unix seconds.
@@ -980,6 +1050,14 @@ fn escape_like(raw: &str) -> String {
 }
 
 impl Store {
+    /// The chain a name belongs to, if any chain's indexer declared it.
+    pub async fn chain_named(&self, name: &str) -> Result<Option<i64>, sqlx::Error> {
+        sqlx::query_scalar(sql::CHAIN_NAMED)
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await
+    }
+
     /// Whether an indexer has committed a first window — on the chain named,
     /// or on any chain when none is. Before that there is nothing to answer
     /// from, and a 404 would claim more than the store knows.
@@ -1231,6 +1309,11 @@ mod sql {
     pub const UNPUBLISH: &str = include_str!("../sql/unpublish.sql");
     pub const RETIRE_HANDLE: &str = include_str!("../sql/retire_handle.sql");
     pub const CONFIGURE_PLATFORM: &str = include_str!("../sql/configure_platform.sql");
+    pub const CHAIN_NAMES_TAKEN: &str = include_str!("../sql/chain_names_taken.sql");
+    pub const CLEAR_CHAIN_NAMES: &str = include_str!("../sql/clear_chain_names.sql");
+    pub const INSERT_CHAIN_NAME: &str = include_str!("../sql/insert_chain_name.sql");
+    pub const CHAIN_NAMES: &str = include_str!("../sql/chain_names.sql");
+    pub const CHAIN_NAMED: &str = include_str!("../sql/chain_named.sql");
     pub const SYNCED: &str = include_str!("../sql/synced.sql");
     pub const PLATFORM_WIRED: &str = include_str!("../sql/platform_wired.sql");
     /// The projection every `names.ids` read shares: the row itself, the

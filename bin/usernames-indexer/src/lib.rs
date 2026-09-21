@@ -21,6 +21,7 @@ use tracing::info;
 use url::Url;
 use usernames_core::{
     db,
+    ens::ChainName,
     indexer,
 };
 
@@ -47,6 +48,14 @@ pub struct Config {
     /// deployment that sets it cannot silently index the wrong chain.
     #[arg(long, env = "CHAIN_ID")]
     pub chain_id: Option<u64>,
+
+    /// The names this chain goes by in an ENS name, comma-separated: the
+    /// `base` in `alice.x.base.handles.link`. Labels only — lowercase ASCII
+    /// letters, digits and hyphens — and never a platform key. Written to the
+    /// store at every start for the gateway to read, replacing what this
+    /// chain declared before; a name belongs to one chain across the store.
+    #[arg(long, env = "CHAIN_NAMES", value_delimiter = ',', required = true)]
+    pub chain_names: Vec<String>,
 
     /// Blocks behind the head to stay; shallow-reorg protection.
     #[arg(long, env = "CONFIRMATIONS", default_value_t = 5)]
@@ -109,6 +118,12 @@ pub async fn run() -> anyhow::Result<()> {
         "STALE_AFTER_SECS ({stale_after_secs}) is more than a year; a report nobody \
          expects to expire is not a report"
     );
+    let chain_names = config
+        .chain_names
+        .iter()
+        .map(|name| ChainName::parse(name.trim()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("CHAIN_NAMES: {e}"))?;
 
     let provider: RootProvider = RootProvider::new_http(config.rpc_url.clone());
     let reported = provider.get_chain_id().await?;
@@ -131,6 +146,7 @@ pub async fn run() -> anyhow::Result<()> {
     // still-running older pod.
     let writer = store.acquire_writer().await?;
     store.prepare(&writer, contract).await?;
+    store.set_chain_names(&writer, &chain_names).await?;
 
     let cancel = CancellationToken::new();
     let indexer = indexer::Indexer::new(
