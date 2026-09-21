@@ -1,6 +1,6 @@
 //! The polling loop: window the chain, decode, apply, advance.
 //!
-//! Each window commits through [`db::Window`] — journal rows, projection
+//! Each window commits through [`crate::db::Window`] — journal rows, projection
 //! writes and the cursor together — so a crash replays a whole window instead
 //! of resuming inside one, and every write in the window is an idempotent
 //! upsert so the replay converges.
