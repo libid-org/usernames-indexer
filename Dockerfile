@@ -12,7 +12,7 @@
 # Pin the builder to bookworm so its glibc matches the bookworm-slim runtime
 # below. A bare `-slim` tag floats to newer Debian, producing binaries that
 # need a newer glibc than the runtime image carries.
-FROM rust:1.97-slim-bookworm AS builder
+FROM rust:1.98-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y pkg-config && rm -rf /var/lib/apt/lists/*
 
