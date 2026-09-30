@@ -75,6 +75,8 @@ or contracts is configured on the API: the indexers wrote it.
 platform id. With a known key, the handle in the path is normalized exactly
 the way the chain normalized it before keying (`libid-identity`); `{userId}`
 is always matched byte-verbatim, because the contract never normalizes ids.
+A Google `{userId}` is the id the chain binds: `0x` and 64 lowercase hex
+digits of SHA-256(`"libid.google-user-id" || sub`), not the `sub`.
 
 Errors share one envelope — `{ "error": { "code", "message" } }`. The `code`
 is stable and machine-readable; the prose is for humans and may be reworded.

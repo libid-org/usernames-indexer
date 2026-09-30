@@ -89,6 +89,12 @@ sol! {
 /// database, and chain_id keying is exactly the isolation this exercises.
 const CHAIN: u64 = 43117;
 
+/// A Google account id as the chain binds it: `0x` and the hex SHA-256 of
+/// `"libid.google-user-id" || sub`. This is libid-contracts'
+/// `GooglePlatformVerifier` test vector for the sub `123456789012345678901`.
+const GOOGLE_USER_ID: &str =
+    "0x20078023c9d4bf6bffc2580ec36446075d10c8453cecbe4f1cb3d326b2b35560";
+
 #[tokio::test]
 async fn indexes_a_real_chain_end_to_end() {
     let Ok(url) = std::env::var("DATABASE_URL") else {
@@ -219,13 +225,13 @@ async fn indexes_a_real_chain_end_to_end() {
     .unwrap();
     mock.emitIdentityBound(
         alice,
-        nodes::id_node(google, "999"),
+        nodes::id_node(google, GOOGLE_USER_ID),
         nodes::handle_node(
             google,
             &nodes::NormalizedHandle::from_chain("a.b+tag@example.com"),
         ),
         google,
-        "999".into(),
+        GOOGLE_USER_ID.into(),
         "a.b+tag@example.com".into(),
         3000,
         false,
@@ -313,7 +319,19 @@ async fn indexes_a_real_chain_end_to_end() {
             .await
             .answer();
     assert_eq!(resolved.handle, "a.b+tag@example.com");
-    assert_eq!(resolved.bindings[0].user_id.as_deref(), Some("999"));
+    assert_eq!(
+        resolved.bindings[0].user_id.as_deref(),
+        Some(GOOGLE_USER_ID)
+    );
+    let resolved: IdResolution =
+        get(&store, &format!("/v1/resolve/id/google/{GOOGLE_USER_ID}"))
+            .await
+            .answer();
+    assert_eq!(resolved.bindings[0].owner, alice);
+    assert_eq!(
+        resolved.bindings[0].handle.as_deref(),
+        Some("a.b+tag@example.com")
+    );
 
     // Reverse: both identities, neither displayed (x was unpublished, google
     // never was).
