@@ -911,12 +911,12 @@ impl Window {
                     .await?;
             }
 
-            // Journal only. What a claim's ceremony carried beyond the
-            // binding — which client authenticated it, what fee it paid —
+            // Journal only. What a ceremony carried beyond the binding it
+            // proved — which client authenticated it, what fee it paid —
             // answers an operator's question after the fact, and the journal
-            // row beside the claim's `IdentityBound` is where it is asked.
+            // row beside the binding's `IdentityBound` is where it is asked.
             // Nothing resolves by it.
-            NamesEvent::CeremonyBound { .. } | NamesEvent::ClaimFeePaid { .. } => {}
+            NamesEvent::CeremonyBound { .. } | NamesEvent::BindFeePaid { .. } => {}
         }
 
         Ok(true)

@@ -75,6 +75,8 @@ or contracts is configured on the API: the indexers wrote it.
 platform id. With a known key, the handle in the path is normalized exactly
 the way the chain normalized it before keying (`libid-identity`); `{userId}`
 is always matched byte-verbatim, because the contract never normalizes ids.
+A Google `{userId}` is the id the chain binds: `0x` and 64 lowercase hex
+digits of SHA-256(`"libid.google-user-id" || sub`), not the `sub`.
 
 Errors share one envelope — `{ "error": { "code", "message" } }`. The `code`
 is stable and machine-readable; the prose is for humans and may be reworded.
@@ -217,8 +219,8 @@ Schema `names`, all tables keyed by `chain_id` (one process follows one
 chain; a second deployment can share the database):
 
 - `events` — append-only journal of every decoded log, the audit trail.
-  `CeremonyBound` and `ClaimFeePaid` live only here: which client
-  authenticated a claim and what fee it paid are an operator's questions,
+  `CeremonyBound` and `BindFeePaid` live only here: which client
+  authenticated a binding and what fee it paid are an operator's questions,
   and nothing resolves by them
 - `ids` — mirrors `byId` + `handleOfId`: account id → wallet, current handle
 - `handles` — mirrors `byHandle` + `idOfHandle`: handle node → wallet;
@@ -261,6 +263,14 @@ run a container that looks healthy while doing half the job.
 its name and keeps indexing, but it no longer serves the API. Deploy
 `usernames-api` alongside it, pointed at the same database; it needs nothing
 else. Nothing in the database changes and no re-index is needed.
+
+**Upgrading from 0.2:** the journal kind of the fee event is `bind_fee_paid`,
+declared in `001_schema.sql`, so the indexer refuses a database 0.2 migrated
+(`migration 1 was previously applied but has been modified`). Start it on a
+fresh database, or stop it and run
+`DROP SCHEMA names CASCADE; DROP TABLE _sqlx_migrations;` first; that keeps
+`pg_trgm`, which a least-privilege role cannot create. Every chain then
+replays from its contract's deployment block.
 
 Probes belong to the API: `GET /health` for liveness; for readiness gate on
 the status code of `GET /v1/status`, which is 200 whenever the database

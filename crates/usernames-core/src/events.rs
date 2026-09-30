@@ -66,15 +66,15 @@ pub enum NamesEvent {
     ProofVerifierConfigured { verifier: Address },
     /// What a ceremony carried that the binding does not keep: the client the
     /// platform authenticated, keyed by the digest that names the ceremony.
-    /// Emitted beside the `IdentityBound` of the same claim.
+    /// Emitted beside the `IdentityBound` of the same binding.
     CeremonyBound {
         authorization_digest: B256,
         owner: Address,
         platform_id: B256,
         client_identifier: Bytes,
     },
-    /// The service fee a claim's own transaction data named was paid out.
-    ClaimFeePaid {
+    /// The service fee a binding's own transaction data named was paid out.
+    BindFeePaid {
         authorization_digest: B256,
         receiver: Address,
         amount: U256,
@@ -91,7 +91,7 @@ impl NamesEvent {
             Self::PlatformConfigured { .. } => "platform_configured",
             Self::ProofVerifierConfigured { .. } => "proof_verifier_configured",
             Self::CeremonyBound { .. } => "ceremony_bound",
-            Self::ClaimFeePaid { .. } => "claim_fee_paid",
+            Self::BindFeePaid { .. } => "bind_fee_paid",
         }
     }
 
@@ -151,7 +151,7 @@ impl NamesEvent {
                 "platformId": platform_id.to_string(),
                 "clientIdentifier": client_identifier.to_string(),
             }),
-            Self::ClaimFeePaid {
+            Self::BindFeePaid {
                 authorization_digest,
                 receiver,
                 amount,
@@ -273,9 +273,9 @@ pub fn decode(log: &Log) -> Result<Option<(NamesEvent, LogPosition)>, DecodeErro
             platform_id: d.platformId,
             client_identifier: d.clientIdentifier,
         }
-    } else if topic0 == IdentityNames::ClaimFeePaid::SIGNATURE_HASH {
-        let d: IdentityNames::ClaimFeePaid = payload_of(log, "ClaimFeePaid")?;
-        NamesEvent::ClaimFeePaid {
+    } else if topic0 == IdentityNames::BindFeePaid::SIGNATURE_HASH {
+        let d: IdentityNames::BindFeePaid = payload_of(log, "BindFeePaid")?;
+        NamesEvent::BindFeePaid {
             authorization_digest: d.authorizationDigest,
             receiver: d.receiver,
             amount: d.amount,
@@ -307,8 +307,8 @@ mod tests {
             b256!("f0f0b831e902ded46acfd6caf87649edb445c2e2733992b2e79cd1420719c19c")
         );
         assert_eq!(
-            IdentityNames::ClaimFeePaid::SIGNATURE_HASH,
-            b256!("86eeb882525d52c6bf9923371ee6b2753b7ca825db260239939bfa88f1c530eb")
+            IdentityNames::BindFeePaid::SIGNATURE_HASH,
+            b256!("471f5d0665e5719861746aa9077ef4997ae3d84cad4f349f5e7cc2cfe74be599")
         );
         assert_eq!(
             IdentityNames::ProofVerifierConfigured::SIGNATURE_HASH,
