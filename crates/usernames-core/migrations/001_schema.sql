@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS names.events (
     kind         TEXT        NOT NULL CHECK (kind IN (
         'identity_bound', 'handle_retired', 'name_unpublished',
         'platform_configured', 'proof_verifier_configured',
-        'ceremony_bound', 'claim_fee_paid'
+        'ceremony_bound', 'bind_fee_paid'
     )),
     payload      JSONB       NOT NULL,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),

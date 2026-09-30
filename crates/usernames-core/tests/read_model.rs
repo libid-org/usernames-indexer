@@ -586,7 +586,7 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_only_in_the_journ
     apply(
         &store,
         4,
-        NamesEvent::ClaimFeePaid {
+        NamesEvent::BindFeePaid {
             authorization_digest: digest,
             receiver: addr(0xFE),
             amount: U256::from(1_000u64),
@@ -640,7 +640,7 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_only_in_the_journ
         payloads[0].1["authorizationDigest"],
         digest.to_string().as_str()
     );
-    assert_eq!(payloads[1].0, "claim_fee_paid");
+    assert_eq!(payloads[1].0, "bind_fee_paid");
     assert_eq!(payloads[1].1["amount"], "1000");
     let bound: i64 =
         sqlx::query_scalar("SELECT count(*) FROM names.ids WHERE chain_id = $1")

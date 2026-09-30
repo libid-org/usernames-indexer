@@ -26,7 +26,7 @@ contract MockIdentityNames {
     event CeremonyBound(
         bytes32 indexed authorizationDigest, address indexed owner, bytes32 indexed platformId, bytes clientIdentifier
     );
-    event ClaimFeePaid(bytes32 indexed authorizationDigest, address indexed receiver, uint256 amount);
+    event BindFeePaid(bytes32 indexed authorizationDigest, address indexed receiver, uint256 amount);
     event HandleRetired(bytes32 indexed platformId, bytes32 indexed handleNode, address indexed owner);
     event PlatformConfigured(bytes32 indexed platformId);
     event ProofVerifierConfigured(address verifier);
@@ -57,8 +57,8 @@ contract MockIdentityNames {
         emit CeremonyBound(authorizationDigest, owner, platformId, clientIdentifier);
     }
 
-    function emitClaimFeePaid(bytes32 authorizationDigest, address receiver, uint256 amount) external {
-        emit ClaimFeePaid(authorizationDigest, receiver, amount);
+    function emitBindFeePaid(bytes32 authorizationDigest, address receiver, uint256 amount) external {
+        emit BindFeePaid(authorizationDigest, receiver, amount);
     }
 
     function emitHandleRetired(bytes32 platformId, bytes32 handleNode, address owner) external {
