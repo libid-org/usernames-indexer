@@ -1,6 +1,6 @@
 # usernames-indexer
 
-Indexes [`IdentityNames`](https://github.com/libid-org/libid-contracts/blob/main/solidity/contracts/identity/IdentityNames.sol)
+Indexes [`IdentityRegistry`](https://github.com/libid-org/libid-contracts/blob/main/solidity/contracts/identity/IdentityRegistry.sol)
 events into Postgres and serves resolution and search over the claimed
 handles. **Two binaries over one read model**: `usernames-indexer`, a polling
 loop that indexes the contract's storage from its events alone, and
@@ -13,9 +13,9 @@ Neither binary contains logic: both stand on the `usernames-core` library,
 where the read model, the event decoding and the loop itself live.
 
 The contract was designed for exactly this: `IdentityBound` carries the
-plaintext `userId` and the normalized `handle` next to their storage nodes,
+plaintext `id` and the normalized `handle` next to their storage nodes,
 so the read model needs no on-chain strings, and the `published` flag plus
-`NameUnpublished` are emitted precisely so an off-chain index can reproduce
+`HandleUnpublished` are emitted precisely so an off-chain index can reproduce
 reverse display without guessing.
 
 ## Running
@@ -46,7 +46,7 @@ the indexer's knobs is the point rather than an omission:
 |---|---|---|---|
 | `DATABASE_URL` | both | — | Postgres connection string |
 | `RPC_URL` | indexer | — | JSON-RPC endpoint of the chain to follow. Prefer a single node or a sticky endpoint: a load balancer that mixes lagged replicas can answer `eth_getLogs` for blocks a backend has not seen, and events dropped that way past the confirmation margin are gone until a re-index. The loop re-checks the backend's height before committing a window, which narrows but cannot close that hole. |
-| `IDENTITY_NAMES_ADDRESS` | indexer | — | The IdentityNames **ERC1967 proxy** (the implementation changes on upgrade; the proxy is the one that emits). The indexer records it per chain, and `/v1/status` reports it from there |
+| `IDENTITY_NAMES_ADDRESS` | indexer | — | The IdentityRegistry **ERC1967 proxy** (the implementation changes on upgrade; the proxy is the one that emits). The indexer records it per chain, and `/v1/status` reports it from there |
 | `CHAIN_ID` | indexer | unset | Refuse to start unless the RPC reports this chain id. The API takes none: it serves every chain the store holds, and a request narrows with `?chain=` |
 | `CHAIN_NAMES` | indexer | — | Required. The names this chain goes by in an ENS name, comma-separated: the `base` in `alice.x.base.handles.link`. Labels only, never a platform key. Written to the store at every start for the gateway to read; a name belongs to one chain across the store, and declaring one another chain holds refuses to start |
 | `CONFIRMATIONS` | indexer | `5` | Blocks behind the head to stay (shallow-reorg protection) |
@@ -62,7 +62,7 @@ the indexer's knobs is the point rather than an omission:
 |---|---|
 | `GET /v1/resolve/handle/{platform}/{handle}` | The wallet a handle resolves to (`resolveHandle`) on each chain it is bound on, each with the account id it pairs with |
 | `GET /v1/resolve/id/{platform}/{userId}` | The wallet an account id resolves to (`resolveId`) on each chain it is bound on, each with the handle that account currently holds |
-| `GET /v1/resolve/address/{address}` | Every identity a wallet proved on every chain, with `resolves` and `published` flags (`primaryOf`'s reverse display) |
+| `GET /v1/resolve/address/{address}` | Every identity a wallet proved on every chain, with `resolves` and `published` flags (`publishedHandleOf`'s reverse display) |
 | `GET /v1/search?q=gre&platform=x&owner=0x…&limit=10&offset=0` | Live handles matching a partial query (exact, then prefix, then substring, then trigram-fuzzy), linked to a wallet, or both; one of `q` and `owner` is required. `limit` (1..50, default 10) and `offset` (up to 10000) page the ranked list; a page shorter than `limit` is the last |
 | `GET /v1/status` | Every chain the store holds: chain id, contract, last indexed block, chain head, lag, when the indexer last reported and how long that report is still good, last window error, the Proof Verifier the contract is wired to; and the read-model version |
 | `GET /health` | Liveness |
@@ -222,8 +222,8 @@ chain; a second deployment can share the database):
   `CeremonyBound` and `BindFeePaid` live only here: which client
   authenticated a binding and what fee it paid are an operator's questions,
   and nothing resolves by them
-- `ids` — mirrors `byId` + `handleOfId`: account id → wallet, current handle
-- `handles` — mirrors `byHandle` + `idOfHandle`: handle node → wallet;
+- `ids` — mirrors `idBindings` + `handleNodeById`: id → holder, current handle
+- `handles` — mirrors `handleBindings` + `idNodeByHandle`: handle node → holder;
   `owner NULL` mirrors the contract's retirement, and the `observed_at`
   watermark survives it the way the contract keeps it
 - `published` — the display names; a row exists exactly while the contract's
@@ -271,6 +271,12 @@ fresh database, or stop it and run
 `DROP SCHEMA names CASCADE; DROP TABLE _sqlx_migrations;` first; that keeps
 `pg_trgm`, which a least-privilege role cannot create. Every chain then
 replays from its contract's deployment block.
+
+**Upgrading from 0.3:** `IdentityRegistry` 0.15 is a fresh deployment, and
+`001_schema.sql` admits its `handle_unpublished` journal kind, so the indexer
+refuses a database 0.3 migrated, as above. Start it on a fresh database with
+`IDENTITY_NAMES_ADDRESS` set to the 0.15 registry; it indexes from that
+registry's deployment block.
 
 Probes belong to the API: `GET /health` for liveness; for readiness gate on
 the status code of `GET /v1/status`, which is 200 whenever the database

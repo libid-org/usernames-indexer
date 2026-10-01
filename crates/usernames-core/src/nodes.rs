@@ -1,6 +1,6 @@
 //! The platform registry and node derivation, mirroring `IdentityNodes.sol`.
 //!
-//! Every key in the contract's storage is a keccak of three 32-byte words:
+//! Every node the contract stores under is a keccak of three 32-byte words:
 //! a version tag, the platform id, and the keccak of the string. `abi.encode`
 //! of three static `bytes32` values is their plain concatenation, so no ABI
 //! machinery is needed here.
@@ -20,16 +20,16 @@ use alloy::primitives::{
     B256,
 };
 use libid_identity::handle_vectors::{
-    PLATFORM_GITHUB_DOMAIN,
-    PLATFORM_GOOGLE_DOMAIN,
-    PLATFORM_X_DOMAIN,
+    PLATFORM_GITHUB_KEY,
+    PLATFORM_GOOGLE_KEY,
+    PLATFORM_X_KEY,
 };
 
-/// keccak256 of a platform's domain string is its id. Private on purpose:
-/// [`Platform`] is the one entry point for naming platforms, so a caller
-/// cannot conjure an id from a domain the registry does not know.
-fn platform_id(domain: &str) -> B256 {
-    keccak256(domain.as_bytes())
+/// keccak256 of a platform key is its id. [`Platform`] is the one entry
+/// point for naming platforms, so this stays private: a caller cannot
+/// conjure an id from a key the registry does not know.
+fn platform_id(key: &str) -> B256 {
+    keccak256(key.as_bytes())
 }
 
 /// Every platform this build knows.
@@ -57,21 +57,13 @@ impl KnownPlatform {
     /// an array so adding one is a single line and not also an arity.
     pub const ALL: &'static [Self] = &[Self::X, Self::GitHub, Self::Google];
 
-    /// The short key: what a name, a URL path and the API's JSON all call it.
+    /// The short key: the platform key, whose keccak is the platform id, and
+    /// what a name, a URL path and the API's JSON all call the platform.
     pub const fn key(self) -> &'static str {
         match self {
-            Self::X => "x",
-            Self::GitHub => "github",
-            Self::Google => "google",
-        }
-    }
-
-    /// The domain whose keccak the chain keys this platform by.
-    const fn domain(self) -> &'static str {
-        match self {
-            Self::X => PLATFORM_X_DOMAIN,
-            Self::GitHub => PLATFORM_GITHUB_DOMAIN,
-            Self::Google => PLATFORM_GOOGLE_DOMAIN,
+            Self::X => PLATFORM_X_KEY,
+            Self::GitHub => PLATFORM_GITHUB_KEY,
+            Self::Google => PLATFORM_GOOGLE_KEY,
         }
     }
 
@@ -82,16 +74,16 @@ impl KnownPlatform {
 
     /// The 32-byte id the chain keys this platform by.
     pub fn id(self) -> B256 {
-        platform_id(self.domain())
+        platform_id(self.key())
     }
 
     /// The normalization rules the chain applied before it keyed a handle.
     ///
-    /// Looked up by the short key because `Rules::for_platform` lives in
+    /// Looked up by the short key because `rules_for` lives in
     /// `libid-identity` and takes one. The string hop stops at that crate
     /// boundary rather than spreading from here.
     pub fn rules(self) -> Option<libid_identity::Rules> {
-        libid_identity::Rules::for_platform(self.key())
+        libid_identity::rules_for(self.key())
     }
 }
 
@@ -208,7 +200,7 @@ impl Platform {
 /// and [`NormalizedHandle::from_chain`] for text the chain itself emitted,
 /// which is normalized by definition. What cannot happen is hashing raw user
 /// input by accident: [`handle_node`] refuses plain strings, because a raw
-/// handle writes a key no reader will find.
+/// handle writes a node no reader will find.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedHandle(String);
 
@@ -250,15 +242,15 @@ fn node(tag: B256, platform: B256, inner: B256) -> B256 {
     keccak256(buf)
 }
 
-/// The storage key for an account id. The id is hashed byte-verbatim: the
+/// The node an id is stored under. The id is hashed byte-verbatim: the
 /// contract never normalizes it, so neither does this.
-pub fn id_node(platform: B256, user_id: &str) -> B256 {
-    node(*ID_NODE_V1, platform, keccak256(user_id.as_bytes()))
+pub fn id_node(platform: B256, id: &str) -> B256 {
+    node(*ID_NODE_V1, platform, keccak256(id.as_bytes()))
 }
 
-/// The storage key for a handle. Demanding [`NormalizedHandle`] instead of a
-/// plain string is what keeps "hashed a raw handle" a compile error rather
-/// than a key no reader will ever find.
+/// The node a handle is stored under. Demanding [`NormalizedHandle`]
+/// instead of a plain string is what keeps "hashed a raw handle" a compile
+/// error rather than a node no reader will ever find.
 pub fn handle_node(platform: B256, handle: &NormalizedHandle) -> B256 {
     node(
         *HANDLE_NODE_V1,

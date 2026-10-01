@@ -115,22 +115,22 @@ async fn apply(store: &ChainStore, seq: u64, event: NamesEvent) {
 }
 
 fn bind(
-    owner: Address,
+    holder: Address,
     platform: B256,
-    user_id: &str,
+    id: &str,
     handle: &str,
     observed_at: u64,
     published: bool,
 ) -> NamesEvent {
     NamesEvent::IdentityBound {
-        owner,
-        id_node: nodes::id_node(platform, user_id),
+        holder,
+        id_node: nodes::id_node(platform, id),
         handle_node: nodes::handle_node(
             platform,
             &nodes::NormalizedHandle::from_chain(handle),
         ),
         platform_id: platform,
-        user_id: user_id.into(),
+        id: id.into(),
         handle: handle.into(),
         observed_at,
         published,
@@ -138,14 +138,14 @@ fn bind(
     }
 }
 
-fn retire(platform: B256, handle: &str, owner: Address) -> NamesEvent {
+fn retire(platform: B256, handle: &str, holder: Address) -> NamesEvent {
     NamesEvent::HandleRetired {
         platform_id: platform,
         handle_node: nodes::handle_node(
             platform,
             &nodes::NormalizedHandle::from_chain(handle),
         ),
-        owner,
+        holder,
     }
 }
 
@@ -295,14 +295,14 @@ async fn publish_flag_is_the_post_state() {
             .answer();
     assert!(!only(&resolved.identities).published);
 
-    // And NameUnpublished after a published bind does the same.
+    // And HandleUnpublished after a published bind does the same.
     apply(&store, 4, retire(x, "alice_2", alice)).await;
     apply(&store, 5, bind(alice, x, "111", "alice_3", 3000, true)).await;
     apply(
         &store,
         6,
-        NamesEvent::NameUnpublished {
-            owner: alice,
+        NamesEvent::HandleUnpublished {
+            holder: alice,
             platform_id: x,
         },
     )
@@ -522,7 +522,7 @@ async fn nul_bytes_neither_stall_the_indexer_nor_crash_the_api() {
         return;
     };
     let x = nodes::Platform::from_key("x").unwrap().id();
-    // An adversarial platform emits a userId with a NUL byte. The window must
+    // An adversarial platform emits an id with a NUL byte. The window must
     // apply — lossily, loudly — rather than stall the chain forever behind a
     // value Postgres cannot store.
     apply(
@@ -577,7 +577,7 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_only_in_the_journ
         3,
         NamesEvent::CeremonyBound {
             authorization_digest: digest,
-            owner: addr(0xA1),
+            holder: addr(0xA1),
             platform_id: x,
             client_identifier: Bytes::from_static(b"client-a"),
         },

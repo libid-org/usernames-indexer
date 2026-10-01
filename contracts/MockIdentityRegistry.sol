@@ -2,67 +2,67 @@
 pragma solidity ^0.8.20;
 
 /// @notice Test double for the indexer: the exact event surface of
-///         IdentityNames, each behind a function that just emits it. The
+///         IdentityRegistry, each behind a function that just emits it. The
 ///         integration test deploys this on anvil and replays scenarios, so
 ///         the indexer decodes REAL ABI-encoded logs rather than values a
 ///         Rust test constructed for itself.
 ///
 ///         Event signatures are copied verbatim from
-///         libid-contracts/solidity/contracts/identity/IdentityNames.sol —
+///         libid-contracts/solidity/contracts/identity/IdentityRegistry.sol —
 ///         a drifted copy here fails the integration test against the
 ///         bindings, which come from the published crate.
-contract MockIdentityNames {
+contract MockIdentityRegistry {
     event IdentityBound(
-        address indexed owner,
+        address indexed holder,
         bytes32 indexed idNode,
         bytes32 indexed handleNode,
         bytes32 platformId,
-        string userId,
+        string id,
         string handle,
         uint64 observedAt,
         bool published,
         uint16 ceremonyVersion
     );
     event CeremonyBound(
-        bytes32 indexed authorizationDigest, address indexed owner, bytes32 indexed platformId, bytes clientIdentifier
+        bytes32 indexed authorizationDigest, address indexed holder, bytes32 indexed platformId, bytes clientIdentifier
     );
     event BindFeePaid(bytes32 indexed authorizationDigest, address indexed receiver, uint256 amount);
-    event HandleRetired(bytes32 indexed platformId, bytes32 indexed handleNode, address indexed owner);
+    event HandleRetired(bytes32 indexed platformId, bytes32 indexed handleNode, address indexed holder);
     event PlatformConfigured(bytes32 indexed platformId);
     event ProofVerifierConfigured(address verifier);
-    event NameUnpublished(address indexed owner, bytes32 indexed platformId);
+    event HandleUnpublished(address indexed holder, bytes32 indexed platformId);
 
     function emitIdentityBound(
-        address owner,
+        address holder,
         bytes32 idNode,
         bytes32 handleNode,
         bytes32 platformId,
-        string calldata userId,
+        string calldata id,
         string calldata handle,
         uint64 observedAt,
         bool published,
         uint16 ceremonyVersion
     ) external {
         emit IdentityBound(
-            owner, idNode, handleNode, platformId, userId, handle, observedAt, published, ceremonyVersion
+            holder, idNode, handleNode, platformId, id, handle, observedAt, published, ceremonyVersion
         );
     }
 
     function emitCeremonyBound(
         bytes32 authorizationDigest,
-        address owner,
+        address holder,
         bytes32 platformId,
         bytes calldata clientIdentifier
     ) external {
-        emit CeremonyBound(authorizationDigest, owner, platformId, clientIdentifier);
+        emit CeremonyBound(authorizationDigest, holder, platformId, clientIdentifier);
     }
 
     function emitBindFeePaid(bytes32 authorizationDigest, address receiver, uint256 amount) external {
         emit BindFeePaid(authorizationDigest, receiver, amount);
     }
 
-    function emitHandleRetired(bytes32 platformId, bytes32 handleNode, address owner) external {
-        emit HandleRetired(platformId, handleNode, owner);
+    function emitHandleRetired(bytes32 platformId, bytes32 handleNode, address holder) external {
+        emit HandleRetired(platformId, handleNode, holder);
     }
 
     function emitPlatformConfigured(bytes32 platformId) external {
@@ -73,7 +73,7 @@ contract MockIdentityNames {
         emit ProofVerifierConfigured(verifier);
     }
 
-    function emitNameUnpublished(address owner, bytes32 platformId) external {
-        emit NameUnpublished(owner, platformId);
+    function emitHandleUnpublished(address holder, bytes32 platformId) external {
+        emit HandleUnpublished(holder, platformId);
     }
 }

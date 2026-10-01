@@ -1,4 +1,4 @@
-//! Decoding `IdentityNames` logs into one typed stream.
+//! Decoding `IdentityRegistry` logs into one typed stream.
 //!
 //! The enum exists so the apply path and its tests speak decoded values, not
 //! `alloy` logs: a test builds a `NamesEvent` directly and never touches RPC
@@ -14,7 +14,7 @@ use alloy::{
     rpc::types::Log,
     sol_types::SolEvent,
 };
-use libid_contracts::bindings::identity::IdentityNames;
+use libid_contracts::bindings::identity::IdentityRegistry;
 use serde_json::json;
 
 /// Where in the chain a log sat. The pair (block, log index) is the natural
@@ -29,37 +29,37 @@ pub struct LogPosition {
     pub tx_hash: B256,
 }
 
-/// One decoded `IdentityNames` event. Field names track the Solidity event
+/// One decoded `IdentityRegistry` event. Field names track the Solidity event
 /// parameters one to one, so they carry no docs of their own — the contract's
 /// natspec is the reference.
 #[derive(Debug, Clone)]
 #[allow(missing_docs)]
 pub enum NamesEvent {
-    /// A wallet proved an identity. The main event: carries the plaintext
-    /// userId and normalized handle, so the read model needs no on-chain
+    /// A holder proved an identity. The main event: carries the plaintext
+    /// id and normalized handle, so the read model needs no on-chain
     /// strings. The ceremony version is logged and never stored on chain, so
     /// this side is its only record.
     IdentityBound {
-        owner: Address,
+        holder: Address,
         id_node: B256,
         handle_node: B256,
         platform_id: B256,
-        user_id: String,
+        id: String,
         handle: String,
         observed_at: u64,
         published: bool,
         ceremony_version: u16,
     },
-    /// The account behind a handle proved a different one; the old node
+    /// The identity behind a handle proved a different one; the old node
     /// stops resolving but keeps its observed-at watermark.
     HandleRetired {
         platform_id: B256,
         handle_node: B256,
-        owner: Address,
+        holder: Address,
     },
-    /// A wallet withdrew its displayed handle.
-    NameUnpublished { owner: Address, platform_id: B256 },
-    /// A platform's keyspace was configured or reconfigured.
+    /// A holder withdrew its published handle.
+    HandleUnpublished { holder: Address, platform_id: B256 },
+    /// A platform's handle rules were configured or reconfigured.
     PlatformConfigured { platform_id: B256 },
     /// The contract was pointed at the Proof Verifier that checks every claim
     /// and holds the version set the contract itself does not.
@@ -69,7 +69,7 @@ pub enum NamesEvent {
     /// Emitted beside the `IdentityBound` of the same binding.
     CeremonyBound {
         authorization_digest: B256,
-        owner: Address,
+        holder: Address,
         platform_id: B256,
         client_identifier: Bytes,
     },
@@ -87,7 +87,7 @@ impl NamesEvent {
         match self {
             Self::IdentityBound { .. } => "identity_bound",
             Self::HandleRetired { .. } => "handle_retired",
-            Self::NameUnpublished { .. } => "name_unpublished",
+            Self::HandleUnpublished { .. } => "handle_unpublished",
             Self::PlatformConfigured { .. } => "platform_configured",
             Self::ProofVerifierConfigured { .. } => "proof_verifier_configured",
             Self::CeremonyBound { .. } => "ceremony_bound",
@@ -101,21 +101,21 @@ impl NamesEvent {
     pub fn payload(&self) -> serde_json::Value {
         match self {
             Self::IdentityBound {
-                owner,
+                holder,
                 id_node,
                 handle_node,
                 platform_id,
-                user_id,
+                id,
                 handle,
                 observed_at,
                 published,
                 ceremony_version,
             } => json!({
-                "owner": owner.to_string(),
+                "holder": holder.to_string(),
                 "idNode": id_node.to_string(),
                 "handleNode": handle_node.to_string(),
                 "platformId": platform_id.to_string(),
-                "userId": user_id,
+                "id": id,
                 "handle": handle,
                 "observedAt": observed_at,
                 "published": published,
@@ -124,14 +124,17 @@ impl NamesEvent {
             Self::HandleRetired {
                 platform_id,
                 handle_node,
-                owner,
+                holder,
             } => json!({
                 "platformId": platform_id.to_string(),
                 "handleNode": handle_node.to_string(),
-                "owner": owner.to_string(),
+                "holder": holder.to_string(),
             }),
-            Self::NameUnpublished { owner, platform_id } => json!({
-                "owner": owner.to_string(),
+            Self::HandleUnpublished {
+                holder,
+                platform_id,
+            } => json!({
+                "holder": holder.to_string(),
                 "platformId": platform_id.to_string(),
             }),
             Self::PlatformConfigured { platform_id } => json!({
@@ -142,12 +145,12 @@ impl NamesEvent {
             }),
             Self::CeremonyBound {
                 authorization_digest,
-                owner,
+                holder,
                 platform_id,
                 client_identifier,
             } => json!({
                 "authorizationDigest": authorization_digest.to_string(),
-                "owner": owner.to_string(),
+                "holder": holder.to_string(),
                 "platformId": platform_id.to_string(),
                 "clientIdentifier": client_identifier.to_string(),
             }),
@@ -228,53 +231,55 @@ pub fn decode(log: &Log) -> Result<Option<(NamesEvent, LogPosition)>, DecodeErro
         return Ok(None);
     };
 
-    let event = if topic0 == IdentityNames::IdentityBound::SIGNATURE_HASH {
-        let d: IdentityNames::IdentityBound = payload_of(log, "IdentityBound")?;
+    let event = if topic0 == IdentityRegistry::IdentityBound::SIGNATURE_HASH {
+        let d: IdentityRegistry::IdentityBound = payload_of(log, "IdentityBound")?;
         NamesEvent::IdentityBound {
-            owner: d.owner,
+            holder: d.holder,
             id_node: d.idNode,
             handle_node: d.handleNode,
             platform_id: d.platformId,
-            user_id: d.userId,
+            id: d.id,
             handle: d.handle,
             observed_at: d.observedAt,
             published: d.published,
             ceremony_version: d.ceremonyVersion,
         }
-    } else if topic0 == IdentityNames::HandleRetired::SIGNATURE_HASH {
-        let d: IdentityNames::HandleRetired = payload_of(log, "HandleRetired")?;
+    } else if topic0 == IdentityRegistry::HandleRetired::SIGNATURE_HASH {
+        let d: IdentityRegistry::HandleRetired = payload_of(log, "HandleRetired")?;
         NamesEvent::HandleRetired {
             platform_id: d.platformId,
             handle_node: d.handleNode,
-            owner: d.owner,
+            holder: d.holder,
         }
-    } else if topic0 == IdentityNames::NameUnpublished::SIGNATURE_HASH {
-        let d: IdentityNames::NameUnpublished = payload_of(log, "NameUnpublished")?;
-        NamesEvent::NameUnpublished {
-            owner: d.owner,
+    } else if topic0 == IdentityRegistry::HandleUnpublished::SIGNATURE_HASH {
+        let d: IdentityRegistry::HandleUnpublished =
+            payload_of(log, "HandleUnpublished")?;
+        NamesEvent::HandleUnpublished {
+            holder: d.holder,
             platform_id: d.platformId,
         }
-    } else if topic0 == IdentityNames::PlatformConfigured::SIGNATURE_HASH {
-        let d: IdentityNames::PlatformConfigured = payload_of(log, "PlatformConfigured")?;
+    } else if topic0 == IdentityRegistry::PlatformConfigured::SIGNATURE_HASH {
+        let d: IdentityRegistry::PlatformConfigured =
+            payload_of(log, "PlatformConfigured")?;
         NamesEvent::PlatformConfigured {
             platform_id: d.platformId,
         }
-    } else if topic0 == IdentityNames::ProofVerifierConfigured::SIGNATURE_HASH {
-        let d: IdentityNames::ProofVerifierConfigured =
+    } else if topic0 == IdentityRegistry::ProofVerifierConfigured::SIGNATURE_HASH {
+        let d: IdentityRegistry::ProofVerifierConfigured =
             payload_of(log, "ProofVerifierConfigured")?;
         NamesEvent::ProofVerifierConfigured {
             verifier: d.verifier,
         }
-    } else if topic0 == IdentityNames::CeremonyBound::SIGNATURE_HASH {
-        let d: IdentityNames::CeremonyBound = payload_of(log, "CeremonyBound")?;
+    } else if topic0 == IdentityRegistry::CeremonyBound::SIGNATURE_HASH {
+        let d: IdentityRegistry::CeremonyBound = payload_of(log, "CeremonyBound")?;
         NamesEvent::CeremonyBound {
             authorization_digest: d.authorizationDigest,
-            owner: d.owner,
+            holder: d.holder,
             platform_id: d.platformId,
             client_identifier: d.clientIdentifier,
         }
-    } else if topic0 == IdentityNames::BindFeePaid::SIGNATURE_HASH {
-        let d: IdentityNames::BindFeePaid = payload_of(log, "BindFeePaid")?;
+    } else if topic0 == IdentityRegistry::BindFeePaid::SIGNATURE_HASH {
+        let d: IdentityRegistry::BindFeePaid = payload_of(log, "BindFeePaid")?;
         NamesEvent::BindFeePaid {
             authorization_digest: d.authorizationDigest,
             receiver: d.receiver,
@@ -289,30 +294,76 @@ pub fn decode(log: &Log) -> Result<Option<(NamesEvent, LogPosition)>, DecodeErro
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::b256;
+    use alloy::primitives::{
+        b256,
+        LogData,
+    };
 
     use super::*;
 
+    const HOLDER: Address = Address::repeat_byte(0xA1);
+    const PLATFORM: B256 = B256::repeat_byte(0x0C);
+
+    /// A log carrying `data`, as the RPC returns it once mined.
+    fn mined(data: LogData) -> Log {
+        Log {
+            inner: alloy::primitives::Log {
+                address: Address::repeat_byte(0x11),
+                data,
+            },
+            block_number: Some(7),
+            log_index: Some(3),
+            transaction_hash: Some(B256::repeat_byte(0x22)),
+            ..Log::default()
+        }
+    }
+
     /// Fixed points from `cast keccak` over the event signatures in
-    /// `IdentityNames.sol`, so a crate binding that drifts from the contract
+    /// `IdentityRegistry.sol`, so a crate binding that drifts from the contract
     /// fails against numbers this code never produced.
     #[test]
     fn topics_match_the_contract() {
         assert_eq!(
-            IdentityNames::IdentityBound::SIGNATURE_HASH,
+            IdentityRegistry::IdentityBound::SIGNATURE_HASH,
             b256!("8ae08d06a548b84d8340ef35ae06cd4c34983cd87b5554e6c818b8180530950c")
         );
         assert_eq!(
-            IdentityNames::CeremonyBound::SIGNATURE_HASH,
+            IdentityRegistry::CeremonyBound::SIGNATURE_HASH,
             b256!("f0f0b831e902ded46acfd6caf87649edb445c2e2733992b2e79cd1420719c19c")
         );
         assert_eq!(
-            IdentityNames::BindFeePaid::SIGNATURE_HASH,
+            IdentityRegistry::BindFeePaid::SIGNATURE_HASH,
             b256!("471f5d0665e5719861746aa9077ef4997ae3d84cad4f349f5e7cc2cfe74be599")
         );
         assert_eq!(
-            IdentityNames::ProofVerifierConfigured::SIGNATURE_HASH,
+            IdentityRegistry::ProofVerifierConfigured::SIGNATURE_HASH,
             b256!("01970f3cbef68f8ac95615ab5c75299e421a83a787173408d693928ed40b6574")
         );
+        assert_eq!(
+            IdentityRegistry::HandleUnpublished::SIGNATURE_HASH,
+            b256!("327d843d48b64b6d010abe26e340d8c8eb34e327aa886c7fafbb4a024eccc3f8")
+        );
+    }
+
+    #[test]
+    fn handle_unpublished_decodes() {
+        let log = mined(
+            IdentityRegistry::HandleUnpublished {
+                holder: HOLDER,
+                platformId: PLATFORM,
+            }
+            .encode_log_data(),
+        );
+        let (event, position) = decode(&log).unwrap().expect("a known topic");
+        assert!(
+            matches!(
+                event,
+                NamesEvent::HandleUnpublished { holder, platform_id }
+                    if holder == HOLDER && platform_id == PLATFORM
+            ),
+            "{event:?}"
+        );
+        assert_eq!(event.kind(), "handle_unpublished");
+        assert_eq!((position.block_number, position.log_index), (7, 3));
     }
 }

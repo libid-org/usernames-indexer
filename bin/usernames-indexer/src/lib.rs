@@ -1,4 +1,4 @@
-//! The indexer: one process per chain, mirroring `IdentityNames` events into
+//! The indexer: one process per chain, mirroring `IdentityRegistry` events into
 //! Postgres under that chain's writer lease.
 //!
 //! It exposes no port. An indexer that stops advancing exits, and the
@@ -38,7 +38,7 @@ pub struct Config {
     #[arg(long, env = "RPC_URL", hide_env_values = true)]
     pub rpc_url: Url,
 
-    /// The IdentityNames ERC1967 proxy address. Typed as an address so
+    /// The IdentityRegistry ERC1967 proxy address. Typed as an address so
     /// garbage is a usage error before anything connects, not a mid-startup
     /// failure.
     #[arg(long, env = "IDENTITY_NAMES_ADDRESS")]
