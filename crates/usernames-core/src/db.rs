@@ -1431,15 +1431,75 @@ mod sql {
 mod plan_tests {
     use super::*;
 
+    /// Rows in the shape production holds them, on the chain every probe
+    /// names: 5000 per table over 1000 addresses and three platforms, the
+    /// probes' platform among them and the probes' address, node and handle
+    /// nowhere. A probe's chain and platform then select little and its
+    /// address or node select almost nothing, the way they do in production.
+    const VOLUME: &str = r#"
+        INSERT INTO names.handles
+            (chain_id, handle_node, platform_id, handle, owner,
+             observed_at, ceremony_version, id_node, block_number, log_index)
+        SELECT 1, sha256(('node' || i)::bytea),
+               CASE i % 3 WHEN 0 THEN decode(repeat('01', 32), 'hex')
+                          ELSE sha256(('platform' || i % 3)::bytea) END,
+               'handle' || i,
+               substring(sha256(('address' || i % 1000)::bytea) FROM 1 FOR 20),
+               1, 1, sha256(('id' || i)::bytea), i, 0
+        FROM generate_series(1, 5000) i;
+        INSERT INTO names.ids
+            (chain_id, id_node, platform_id, user_id, owner,
+             observed_at, ceremony_version, handle_node, block_number, log_index)
+        SELECT 1, id_node, platform_id, 'user' || block_number, owner,
+               1, 1, handle_node, block_number, 0
+        FROM names.handles WHERE chain_id = 1;
+        INSERT INTO names.published (chain_id, owner, platform_id, handle)
+        SELECT DISTINCT ON (owner, platform_id) 1, owner, platform_id, handle
+        FROM names.handles WHERE chain_id = 1;
+        INSERT INTO names.events
+            (chain_id, block_number, log_index, tx_hash, kind, payload)
+        SELECT 1, i, 0, sha256(('tx' || i)::bytea), 'deposited', '{}'
+        FROM generate_series(1, 5000) i;
+        INSERT INTO names.address_events
+            (chain_id, address, block_number, log_index, block_time, roles)
+        SELECT 1, substring(sha256(('address' || i % 1000)::bytea) FROM 1 FOR 20),
+               i, 0, i, ARRAY['depositor']
+        FROM generate_series(1, 5000) i;
+        INSERT INTO names.handle_events
+            (chain_id, block_number, log_index, handle_node, platform_id, block_time)
+        SELECT 1, i, 0, sha256(('node' || i % 1000)::bytea),
+               sha256('platform1'::bytea), i
+        FROM generate_series(1, 5000) i;
+        INSERT INTO names.escrow_held
+            (chain_id, handle_node, token, platform_id, held, round,
+             block_number, log_index)
+        SELECT 1, sha256(('node' || i)::bytea),
+               substring(sha256(('token' || i % 5)::bytea) FROM 1 FOR 20),
+               sha256('platform1'::bytea), i, 0, i, 0
+        FROM generate_series(1, 5000) i;
+        INSERT INTO names.escrow_refundable
+            (refund_to, chain_id, handle_node, token, round, amount)
+        SELECT substring(sha256(('address' || i % 1000)::bytea) FROM 1 FOR 20), 1,
+               sha256(('node' || i)::bytea),
+               substring(sha256(('token' || i % 5)::bytea) FROM 1 FOR 20), 0, i
+        FROM generate_series(1, 5000) i;
+        ANALYZE names.handles, names.ids, names.published, names.events,
+                names.address_events, names.handle_events, names.escrow_held,
+                names.escrow_refundable;
+    "#;
+
     /// Every read over the big tables seeks the index built for it, in every
-    /// shape the API asks it in. Sequential scans are switched off for the
-    /// session so the planner shows what it would use however small the
-    /// tables are; the index is named, not just "some index", because a
-    /// lookup missing its leading column walks a whole index and reads as
-    /// an index scan all the same — which is how the chain-less reads went
-    /// unnoticed while every index still led with `chain_id`. The text
-    /// search names no index: on a table this small the planner filters the
-    /// text off a narrower index rather than reading the trigram one, and
+    /// shape the API asks it in. The index is named, not just "some index",
+    /// because a lookup missing its leading column walks a whole index and
+    /// reads as an index scan all the same — which is how the chain-less
+    /// reads went unnoticed while every index still led with `chain_id`.
+    ///
+    /// The plans are taken over [`VOLUME`], inside a transaction that rolls
+    /// back with its statistics. On a handful of rows every index costs the
+    /// same and the planner's pick follows whatever an earlier suite left
+    /// behind; sequential scans stay switched off so none hides behind a
+    /// table that small. The text search names no index: the planner filters
+    /// the text off a narrower index rather than reading the trigram one, and
     /// only the row count decides that.
     #[tokio::test]
     async fn every_read_over_the_big_tables_seeks_its_index() {
@@ -1449,11 +1509,15 @@ mod plan_tests {
         };
         let pool = PgPool::connect(&url).await.expect("connect");
         MIGRATOR.run(&pool).await.expect("migrations");
-        let mut conn = pool.acquire().await.expect("connection");
-        sqlx::query("SET enable_seqscan = off")
+        let mut conn = pool.begin().await.expect("transaction");
+        sqlx::query("SET LOCAL enable_seqscan = off")
             .execute(&mut *conn)
             .await
             .expect("session setting");
+        sqlx::raw_sql(VOLUME)
+            .execute(&mut *conn)
+            .await
+            .expect("the volume loads");
 
         let platform = B256::repeat_byte(1);
         let handle = NormalizedHandle::from_chain("alice");
@@ -1552,9 +1616,12 @@ mod plan_tests {
                     Some("address_events_history_idx"),
                     history::address_history_lookup("EXPLAIN ", None, owner, None, 21),
                 ),
+                // One chain: the key seeks (chain, address) and sorts the
+                // few rows an address holds there. An address with many
+                // takes the time-ordered index instead, by its statistics.
                 (
                     "address history, one chain, past a cursor",
-                    Some("address_events_history_idx"),
+                    Some("address_events_pkey"),
                     history::address_history_lookup(
                         "EXPLAIN ",
                         Some(1),
@@ -1639,5 +1706,8 @@ mod plan_tests {
                 );
             }
         }
+        // Explicit, though dropping it would too: nothing the probes loaded
+        // may outlive them, statistics included.
+        conn.rollback().await.expect("rollback")
     }
 }
