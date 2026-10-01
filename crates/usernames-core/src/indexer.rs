@@ -11,10 +11,6 @@ use alloy::{
     rpc::types::Filter,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{
-    info,
-    warn,
-};
 
 use crate::{
     chain,
@@ -115,12 +111,12 @@ impl<P: Provider> Indexer<P> {
         match self.store.deploy_block(self.config.contract).await {
             Ok(Some(block)) => return Some(block),
             Ok(None) => {}
-            Err(e) => warn!(%e, "failed to read the cached deployment block"),
+            Err(e) => tracing::warn!(%e, "failed to read the cached deployment block"),
         }
         let latest = match self.provider.get_block_number().await {
             Ok(n) => n,
             Err(e) => {
-                warn!(%e, "no latest block for deployment detection; retrying next cycle");
+                tracing::warn!(%e, "no latest block for deployment detection; retrying next cycle");
                 return None;
             }
         };
@@ -128,13 +124,13 @@ impl<P: Provider> Indexer<P> {
             .await
         {
             Ok(Some(block)) => {
-                info!(block, "detected contract deployment block");
+                tracing::info!(block, "detected contract deployment block");
                 if let Err(e) = self
                     .store
                     .set_deploy_block(self.config.contract, block)
                     .await
                 {
-                    warn!(%e, "failed to cache the deployment block");
+                    tracing::warn!(%e, "failed to cache the deployment block");
                 }
                 Some(block)
             }
@@ -143,13 +139,13 @@ impl<P: Provider> Indexer<P> {
                 // contract may simply not be deployed yet. Scanning from
                 // genesis is slow but never wrong, and the next fresh cycle
                 // re-checks.
-                warn!(
+                tracing::warn!(
                     "the contract has no code at the chain head; scanning from genesis"
                 );
                 Some(0)
             }
             Err(e) => {
-                warn!(%e, "deployment detection failed on RPC; retrying next cycle");
+                tracing::warn!(%e, "deployment detection failed on RPC; retrying next cycle");
                 None
             }
         }
@@ -195,7 +191,7 @@ impl<P: Provider> Indexer<P> {
                     // upgradeable, so this is survivable — but it is not
                     // silent, because a new event type usually means the read
                     // model is due for a version bump.
-                    warn!(
+                    tracing::warn!(
                         emitter = %log.address(),
                         topic0 = ?log.topic0(),
                         block = log.block_number,
@@ -214,7 +210,7 @@ impl<P: Provider> Indexer<P> {
     /// Run until cancelled. Never returns early on an RPC or database error:
     /// those log, sleep one interval, and retry the same window.
     pub async fn run(self, cancel: CancellationToken) {
-        info!(
+        tracing::info!(
             contract = %self.config.contract,
             escrow = ?self.config.escrow,
             chain_id = self.store.chain_id(),
@@ -224,7 +220,7 @@ impl<P: Provider> Indexer<P> {
 
         loop {
             if cancel.is_cancelled() {
-                info!("usernames indexer shutting down");
+                tracing::info!("usernames indexer shutting down");
                 return;
             }
 
@@ -238,7 +234,7 @@ impl<P: Provider> Indexer<P> {
                     }
                 },
                 Err(e) => {
-                    warn!(%e, "failed to read the cursor");
+                    tracing::warn!(%e, "failed to read the cursor");
                     sleep_or_cancel(&cancel, self.config.poll_interval_secs).await;
                     continue;
                 }
@@ -247,7 +243,7 @@ impl<P: Provider> Indexer<P> {
             let latest = match self.provider.get_block_number().await {
                 Ok(n) => n,
                 Err(e) => {
-                    warn!(%e, "failed to get the latest block");
+                    tracing::warn!(%e, "failed to get the latest block");
                     sleep_or_cancel(&cancel, self.config.poll_interval_secs).await;
                     continue;
                 }
@@ -298,7 +294,7 @@ impl<P: Provider> Indexer<P> {
                         }
                     }
                     Err(e) => {
-                        warn!(%e, chunk_from, chunk_to, "window failed; will retry");
+                        tracing::warn!(%e, chunk_from, chunk_to, "window failed; will retry");
                         // Surfaced in /v1/status: a deterministic failure here
                         // (an undecodable log, say) stalls the cursor by
                         // design — integrity over progress — and a stall must
@@ -317,7 +313,7 @@ impl<P: Provider> Indexer<P> {
                 self.store.set_window_error(None).await;
             }
             if total > 0 {
-                info!(
+                tracing::info!(
                     events = total,
                     through_block = head.min(chunk_from.saturating_sub(1)),
                     "indexed"

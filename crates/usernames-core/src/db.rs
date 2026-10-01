@@ -20,11 +20,6 @@ use sqlx::{
     QueryBuilder,
     Transaction,
 };
-use tracing::{
-    error,
-    info,
-    warn,
-};
 
 use crate::{
     events::{
@@ -327,7 +322,7 @@ impl ChainStore {
                 .fetch_one(&mut conn)
                 .await?;
         if !taken {
-            warn!(
+            tracing::warn!(
                 chain_id = self.chain_id,
                 "another indexer holds this chain's writer lock; waiting"
             );
@@ -382,7 +377,7 @@ impl ChainStore {
         if version_ok && contract_ok && escrow_ok {
             return Ok(());
         }
-        warn!(
+        tracing::warn!(
             chain_id = self.chain_id,
             version_from = version.as_deref().unwrap_or("<none>"),
             version_to = INDEXER_VERSION,
@@ -420,7 +415,7 @@ impl ChainStore {
                 .await?;
         }
         tx.commit().await?;
-        info!(
+        tracing::info!(
             chain_id = self.chain_id,
             version = INDEXER_VERSION,
             "replay armed; starts next cycle"
@@ -433,7 +428,7 @@ impl ChainStore {
     /// window.
     pub async fn set_chain_head(&self, head: u64) {
         if let Err(e) = self.set_metadata(HEAD_KEY, &head.to_string()).await {
-            warn!(%e, "failed to record the chain head");
+            tracing::warn!(%e, "failed to record the chain head");
         }
     }
 
@@ -477,7 +472,7 @@ impl ChainStore {
         match written {
             Ok(_) => true,
             Err(e) => {
-                warn!(%e, "failed to record the chain target");
+                tracing::warn!(%e, "failed to record the chain target");
                 false
             }
         }
@@ -496,7 +491,7 @@ impl ChainStore {
             .execute(&self.pool)
             .await;
         if let Err(e) = touched {
-            warn!(%e, "failed to renew the chain target's report");
+            tracing::warn!(%e, "failed to renew the chain target's report");
         }
     }
 
@@ -577,7 +572,7 @@ impl ChainStore {
             .set_metadata(TARGET_VALID_UNTIL_KEY, &secs.to_string())
             .await
         {
-            warn!(%e, "failed to record when the chain target's report expires");
+            tracing::warn!(%e, "failed to record when the chain target's report expires");
         }
     }
 
@@ -637,7 +632,7 @@ impl ChainStore {
                 .map(|_| ()),
         };
         if let Err(e) = result {
-            warn!(%e, "failed to record the window error state");
+            tracing::warn!(%e, "failed to record the window error state");
         }
     }
 
@@ -712,7 +707,7 @@ impl ChainStore {
 /// chain actually keys — stay exact.
 fn sanitize(value: &str, what: &str) -> String {
     if value.contains('\0') {
-        error!(
+        tracing::error!(
             what,
             "string contains a NUL byte; storing with U+FFFD in its place"
         );
@@ -796,7 +791,7 @@ impl Window {
 
         let mut payload = event.payload();
         if sanitize_json(&mut payload) {
-            error!(
+            tracing::error!(
                 kind = event.kind(),
                 "journal payload contained a NUL byte; stored with U+FFFD in its place"
             );
@@ -841,14 +836,14 @@ impl Window {
                 // platform ids or hashing drifted and resolution-by-string is
                 // broken until fixed.
                 if nodes::id_node(*platform_id, id) != *id_node {
-                    error!(%id_node, id, "recomputed idNode disagrees with the emitted topic");
+                    tracing::error!(%id_node, id, "recomputed idNode disagrees with the emitted topic");
                 }
                 if nodes::handle_node(
                     *platform_id,
                     &nodes::NormalizedHandle::from_chain(handle),
                 ) != *handle_node
                 {
-                    error!(%handle_node, handle, "recomputed handleNode disagrees with the emitted topic");
+                    tracing::error!(%handle_node, handle, "recomputed handleNode disagrees with the emitted topic");
                 }
 
                 let observed = as_i64(*observed_at, "observedAt")?;
@@ -949,7 +944,7 @@ impl Window {
                     // rules payload, so the honest move is to say so loudly
                     // and keep indexing by node — node lookups stay exact
                     // either way.
-                    warn!(
+                    tracing::warn!(
                         %platform_id,
                         block,
                         "platform reconfigured on chain; if its rules changed, \

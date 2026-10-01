@@ -61,10 +61,6 @@ use axum::{
 };
 use libid_signer::ManagedSigner;
 use serde::Serialize;
-use tracing::{
-    error,
-    warn,
-};
 use usernames_core::{
     db::{
         ChainStore,
@@ -259,7 +255,7 @@ impl Config {
             [chain_id] => ChainMatch::One(self.indexed_chain(*chain_id)),
             [] => ChainMatch::None,
             both => {
-                warn!(
+                tracing::warn!(
                     chains = ?both,
                     %coin_type,
                     "two indexed chains share one coin type"
@@ -338,7 +334,7 @@ impl Config {
             .parse()
             .map_err(|_| GatewayError::bad_request("sender is not an address"))?;
         if sender != self.resolver {
-            warn!(
+            tracing::warn!(
                 %sender,
                 resolver = %self.resolver,
                 "refusing a request that names another resolver"
@@ -576,7 +572,7 @@ impl Answer {
                 "two indexed chains share coin type {coin_type}; not answering"
             ))),
             Self::TooStale(why) => {
-                warn!(?why, "refusing to answer from a stale index");
+                tracing::warn!(?why, "refusing to answer from a stale index");
                 Err(GatewayError::unavailable(why.message()))
             }
         }
@@ -696,7 +692,7 @@ impl GatewayError {
     /// INSTEAD of logging it — which is what this used to do — leaves the
     /// operator with nothing while the caller has everything.
     fn internal(e: impl std::fmt::Display) -> Self {
-        error!(cause = %e, "gateway lookup failed");
+        tracing::error!(cause = %e, "gateway lookup failed");
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: "lookup failed".into(),

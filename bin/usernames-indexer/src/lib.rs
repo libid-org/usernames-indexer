@@ -17,7 +17,6 @@ use alloy::{
 };
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
 use url::Url;
 use usernames_core::{
     chain,
@@ -185,12 +184,12 @@ pub async fn run() -> anyhow::Result<()> {
             stale_after_secs,
         },
     );
-    info!(chain_id, %contract, ?escrow, "indexing");
+    tracing::info!(chain_id, %contract, ?escrow, "indexing");
     let mut task = tokio::spawn(indexer.run(cancel.clone()));
 
     tokio::select! {
         r = tokio::signal::ctrl_c() => {
-            info!("shutting down");
+            tracing::info!("shutting down");
             cancel.cancel();
             let _ = task.await;
             r?;

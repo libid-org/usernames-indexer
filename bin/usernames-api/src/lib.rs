@@ -32,7 +32,6 @@ use tower_http::cors::{
     Any,
     CorsLayer,
 };
-use tracing::info;
 use usernames_core::{
     api,
     db,
@@ -111,17 +110,19 @@ pub async fn run() -> anyhow::Result<()> {
     // first would accept connections the process is not yet able to serve.
     let gateway = config.gateway(pool).await?;
     match &gateway {
-        Some(g) => info!(
+        Some(g) => tracing::info!(
             resolver = %g.resolver,
             route = %format!("{}/{{sender}}/{{data}}", ens::ROUTE_PREFIX),
             "ENS gateway configured"
         ),
-        None => info!("ENS gateway not configured; the CCIP-Read route is absent"),
+        None => {
+            tracing::info!("ENS gateway not configured; the CCIP-Read route is absent")
+        }
     }
     let app = build_router(api::AppState::new(store), gateway);
 
     let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
-    info!(addr = %config.listen_addr, "read API listening");
+    tracing::info!(addr = %config.listen_addr, "read API listening");
 
     let shutdown = cancel.clone();
     let mut task = tokio::spawn(async move {
@@ -132,7 +133,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     tokio::select! {
         r = tokio::signal::ctrl_c() => {
-            info!("shutting down");
+            tracing::info!("shutting down");
             cancel.cancel();
             let _ = task.await;
             r?;
@@ -244,7 +245,7 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("ENS_SIGNER_KEY: {e}"))?;
         // The address is what the resolver's signer set must hold, and with
         // KMS nothing but this line tells an operator what it is.
-        info!(
+        tracing::info!(
             signer = %signer.address(),
             via = %signer.describe(),
             %resolver,
