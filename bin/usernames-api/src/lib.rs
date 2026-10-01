@@ -190,8 +190,8 @@ const RESOLVER_MAX_LIFETIME_SECS: u64 = 3600;
 /// lands on. That block is always at least a little behind now, so a TTL equal
 /// to `MAX_LIFETIME` puts `expires` past the ceiling by exactly the amount the
 /// chain trails — and every answer reverts, in production only, with nothing
-/// off chain the wiser. The room is generous on purpose: shortening a TTL costs
-/// a caller nothing, and guessing this too small costs every answer.
+/// off chain the wiser. The room is generous: shortening a TTL costs a caller
+/// nothing, and guessing this too small costs every answer.
 const BLOCK_TIMESTAMP_SLACK_SECS: u64 = 300;
 
 /// The longest TTL a gateway may be configured with.

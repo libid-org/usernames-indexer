@@ -25,8 +25,8 @@ reverse display without guessing.
 ```sh
 docker compose up -d postgres          # listens on 127.0.0.1:55432
 cp .env.example .env                   # fill in RPC_URL and IDENTITY_NAMES_ADDRESS
-cargo run -p usernames-indexer         # the write half
-cargo run -p usernames-api             # the read half, in another shell
+cargo run -p usernames-indexer         # indexes the chain into the database
+cargo run -p usernames-api             # serves the API, in another shell
 ```
 
 Start the indexer first on a fresh database: it owns the schema and runs the
@@ -233,9 +233,9 @@ the map would not be reversible, and an irreversible map on a payment path is
 worse than no name. Such accounts are reachable by address, not by name.
 
 The design's id-derived fallback (`<idNode as 64 hex>._id.handles.link`) is not
-implemented, and deliberately: 64 characters is one past the DNS label ceiling
-of RFC 1035, so no standard client can encode it — ethers' `dnsEncode` refuses
-above 63. It could not have covered these accounts, or any others.
+implemented: 64 characters is one past the DNS label ceiling of RFC 1035, so
+no standard client can encode it — ethers' `dnsEncode` refuses above 63. It
+could not have covered these accounts, or any others.
 
 ## Read model
 
@@ -289,9 +289,9 @@ without pushing so packaging cannot rot:
 | `ghcr.io/libid-org/usernames-indexer` | the polling loop | nothing | RPC + a writer lease |
 | `ghcr.io/libid-org/usernames-api` | the read API | `0.0.0.0:8080` | the database only |
 
-There is deliberately no image carrying both. An entrypoint would have to
-default to one half, and a deployment that pulled it expecting the other would
-run a container that looks healthy while doing half the job.
+No image carries both: an entrypoint would have to default to one of them,
+and a deployment that pulled it expecting the other would run a container
+that looks healthy while doing half the job.
 
 **Upgrading from the single-image build:** the `usernames-indexer` image keeps
 its name and keeps indexing, but it no longer serves the API. Deploy
