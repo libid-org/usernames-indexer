@@ -168,7 +168,7 @@ fn only<T: std::fmt::Debug>(bindings: &[T]) -> &T {
 
 #[tokio::test]
 async fn bind_resolves_all_three_directions() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -204,11 +204,12 @@ async fn bind_resolves_all_three_directions() {
     assert_eq!(identity.handle.as_deref(), Some("alice_1"));
     assert!(identity.published);
     assert!(identity.resolves);
+    drop(guard);
 }
 
 #[tokio::test]
 async fn rename_retires_the_previous_handle() {
-    let Some((store, pool, _guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -246,11 +247,12 @@ async fn rename_retires_the_previous_handle() {
     .await
     .expect("watermark row");
     assert_eq!(watermark, 1000);
+    drop(guard);
 }
 
 #[tokio::test]
 async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -275,11 +277,12 @@ async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
     let binding = only(&resolved.bindings);
     assert_eq!(binding.owner, alice);
     assert_eq!(binding.handle, None);
+    drop(guard);
 }
 
 #[tokio::test]
 async fn publish_flag_is_the_post_state() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -313,6 +316,7 @@ async fn publish_flag_is_the_post_state() {
             .await
             .answer();
     assert!(!only(&resolved.identities).published);
+    drop(guard);
 }
 
 /// The handles a search answered with, in its order.
@@ -322,7 +326,7 @@ fn handles_of(results: &SearchResults) -> Vec<&str> {
 
 #[tokio::test]
 async fn search_ranks_exact_prefix_substring() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -419,11 +423,12 @@ async fn search_ranks_exact_prefix_substring() {
     // LIKE metacharacters match themselves, not everything.
     let results: SearchResults = get(&store, "/v1/search?q=%25").await.answer();
     assert!(results.hits.is_empty());
+    drop(guard);
 }
 
 #[tokio::test]
 async fn replay_converges_instead_of_duplicating() {
-    let Some((store, pool, _guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -461,11 +466,12 @@ async fn replay_converges_instead_of_duplicating() {
         count, 1,
         "replayed PlatformConfigured must not double-count"
     );
+    drop(guard);
 }
 
 #[tokio::test]
 async fn unclaimed_names_on_a_configured_platform_are_coded_404s() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -486,11 +492,12 @@ async fn unclaimed_names_on_a_configured_platform_are_coded_404s() {
         .await
         .refusal();
     assert_eq!(refusal, (StatusCode::NOT_FOUND, "id_not_bound".to_string()));
+    drop(guard);
 }
 
 #[tokio::test]
 async fn api_refuses_to_answer_before_the_first_window() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -514,11 +521,12 @@ async fn api_refuses_to_answer_before_the_first_window() {
         status.chains.iter().all(|c| c.chain_id != CHAIN),
         "{status:?}"
     );
+    drop(guard);
 }
 
 #[tokio::test]
 async fn nul_bytes_neither_stall_the_indexer_nor_crash_the_api() {
-    let Some((store, pool, _guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -554,11 +562,12 @@ async fn nul_bytes_neither_stall_the_indexer_nor_crash_the_api() {
         .await
         .refusal();
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    drop(guard);
 }
 
 #[tokio::test]
 async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
-    let Some((store, pool, _guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -650,11 +659,12 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
             .await
             .expect("ids count");
     assert_eq!(bound, 0, "a ceremony event alone binds nothing");
+    drop(guard);
 }
 
 #[tokio::test]
 async fn unconfigured_platform_and_impossible_text_name_their_codes() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -691,6 +701,7 @@ async fn unconfigured_platform_and_impossible_text_name_their_codes() {
         refusal,
         (StatusCode::NOT_FOUND, "handle_impossible".to_string())
     );
+    drop(guard);
 }
 
 /// A wallet is the same address on every chain; its bindings are not. With
@@ -698,7 +709,7 @@ async fn unconfigured_platform_and_impossible_text_name_their_codes() {
 /// result says which one it is from; `?chain=` narrows to one.
 #[tokio::test]
 async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
-    let Some((store, pool, _guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -778,6 +789,7 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
         refusal,
         (StatusCode::BAD_REQUEST, "invalid_chain".to_string())
     );
+    drop(guard);
 }
 
 // ─── The replay gate ────────────────────────────────────────────────────────

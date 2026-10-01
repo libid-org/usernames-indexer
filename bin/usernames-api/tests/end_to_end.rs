@@ -173,7 +173,7 @@ enum WhoSigns {
 
 /// The four protocol steps, end to end. `None` means the suite skipped.
 async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> {
-    let _guard = DB_LOCK.lock().await;
+    let guard = DB_LOCK.lock().await;
     let url = std::env::var("DATABASE_URL").ok()?;
 
     // ── the read model the gateway answers from ──────────────────────
@@ -257,6 +257,9 @@ async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> 
 
     // ── 3. the client fetches a signed blob ──────────────────────────
     let response = ask_gateway(&router, lookup.sender, &lookup.callData).await;
+    // The gateway's answer is the last read of the chain's rows; the other
+    // test may wipe them from here.
+    drop(guard);
 
     // ── 4. and the chain turns it into an address, or refuses ────────
     Some(
