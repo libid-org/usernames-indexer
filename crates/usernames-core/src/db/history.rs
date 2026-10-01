@@ -2,10 +2,12 @@
 //! written beside it, and the reads that list either newest first.
 //!
 //! An event names some of what it involves and not all of it. A bind does
-//! not name the address it takes a handle or an account from; a ceremony, a
-//! fee and an unpublish name no handle; a fee does not name who paid it. Each
-//! of those is read here from the rows the event is about to change, or from
-//! the events its own transaction emitted just before it.
+//! not name the address it takes a handle or an account from, and a
+//! retirement names the binding wallet rather than the one that held the
+//! handle; a ceremony, a fee and an unpublish name no handle; a fee does not
+//! name who paid it; a claim does not name whose deposits it took. Each of
+//! those is read here from the rows the event is about to change, or from the
+//! events its own transaction emitted just before it.
 
 use alloy::primitives::{
     Address,
@@ -108,11 +110,28 @@ impl Window {
                 involvement.handle = Some((*handle_node, *platform_id));
             }
 
+            // The event names the wallet whose bind retired the handle. When
+            // the account moved wallets in that bind, the handle was held by
+            // the one it left, and that is whose history it belongs in.
             NamesEvent::HandleRetired {
                 platform_id,
                 handle_node,
-                ..
-            } => involvement.handle = Some((*handle_node, *platform_id)),
+                holder,
+            } => {
+                let held_by: Option<Option<Vec<u8>>> =
+                    sqlx::query_scalar(sql::HANDLE_HOLDER)
+                        .bind(chain_id)
+                        .bind(handle_node.as_slice())
+                        .fetch_optional(&mut *self.tx)
+                        .await?;
+                match held_by.flatten().as_deref().and_then(address_of) {
+                    Some(held_by) if held_by != *holder => {
+                        involvement.add(held_by, Role::PreviousHandleHolder)
+                    }
+                    _ => involvement.add(*holder, Role::Holder),
+                }
+                involvement.handle = Some((*handle_node, *platform_id));
+            }
 
             NamesEvent::HandleUnpublished {
                 holder,
@@ -199,9 +218,25 @@ impl Window {
                 ..
             } => involvement.handle = Some((*handle_node, *platform_id)),
 
-            // Neither names a platform; the slot's first deposit did.
+            // Neither names a platform; the slot's first deposit did. A claim
+            // also ends the refunds of everybody whose deposit it took: they
+            // are the round's refundable rows, read before the claim deletes
+            // them.
             NamesEvent::Claimed { handle_node, .. }
             | NamesEvent::Refunded { handle_node, .. } => {
+                if let NamesEvent::Claimed { token, round, .. } = event {
+                    let refund_tos: Vec<Vec<u8>> =
+                        sqlx::query_scalar(sql::CLAIMED_REFUND_TOS)
+                            .bind(chain_id)
+                            .bind(handle_node.as_slice())
+                            .bind(token.as_slice())
+                            .bind(round.to_string())
+                            .fetch_all(&mut *self.tx)
+                            .await?;
+                    for refund_to in refund_tos.iter().filter_map(|a| address_of(a)) {
+                        involvement.add(refund_to, Role::RefundTo);
+                    }
+                }
                 let platform: Option<Vec<u8>> = sqlx::query_scalar(sql::ESCROW_PLATFORM)
                     .bind(chain_id)
                     .bind(handle_node.as_slice())

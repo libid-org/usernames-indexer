@@ -559,11 +559,16 @@ async fn indexes_a_real_chain_end_to_end() {
         "{history:?}"
     );
     assert!(history.entries.iter().all(|e| e.block_time > 0));
+    // The payer's history ends with Bob's claim taking its deposit.
     let history: AddressHistory = get(&store, &format!("/v1/history/address/{payer}"))
         .await
         .answer();
-    assert_eq!(kinds(&history.entries), ["forwarded", "deposited"]);
-    assert_eq!(history.entries[1].roles, [Role::Depositor, Role::RefundTo]);
+    assert_eq!(
+        kinds(&history.entries),
+        ["claimed", "forwarded", "deposited"]
+    );
+    assert_eq!(history.entries[0].roles, [Role::RefundTo]);
+    assert_eq!(history.entries[2].roles, [Role::Depositor, Role::RefundTo]);
     let history: AddressHistory = get(&store, &format!("/v1/history/address/{alice}"))
         .await
         .answer();

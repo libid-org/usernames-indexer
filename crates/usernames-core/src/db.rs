@@ -1400,6 +1400,8 @@ mod sql {
         include_str!("../sql/escrow_take_refundable.sql");
     pub const ESCROW_PLATFORM: &str = include_str!("../sql/escrow_platform.sql");
     pub const PREVIOUS_HOLDERS: &str = include_str!("../sql/previous_holders.sql");
+    pub const HANDLE_HOLDER: &str = include_str!("../sql/handle_holder.sql");
+    pub const CLAIMED_REFUND_TOS: &str = include_str!("../sql/claimed_refund_tos.sql");
     pub const CEREMONY_HANDLE: &str = include_str!("../sql/ceremony_handle.sql");
     pub const FEE_PAYER: &str = include_str!("../sql/fee_payer.sql");
     pub const PUBLISHED_HANDLE_NODE: &str =

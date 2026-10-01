@@ -143,7 +143,8 @@ pub enum Role {
     /// withdrew, ran the ceremony of, or paid the fee of a binding, or was
     /// paid through a handle it holds.
     Holder,
-    /// Held the handle until this bind gave it to another address.
+    /// Held the handle until this event took it: a bind gave it to another
+    /// address, or retired it from a wallet the account has left.
     PreviousHandleHolder,
     /// Held the account until this bind moved it to another address.
     PreviousIdHolder,
@@ -151,7 +152,8 @@ pub enum Role {
     FeeReceiver,
     /// Paid a deposit.
     Depositor,
-    /// May refund an escrowed deposit, or did.
+    /// May refund an escrowed deposit, did, or lost the right when the
+    /// holder claimed it.
     RefundTo,
     /// Claimed what a handle it holds was sent.
     Claimer,
@@ -211,14 +213,17 @@ impl NamesEvent {
     }
 
     /// The addresses the event itself names, each with the part it plays. The
-    /// apply path adds what a bind takes from addresses it does not name, and
-    /// the payer of a bind fee, which only the ceremony beside it names.
+    /// apply path adds what a bind takes from addresses it does not name, the
+    /// payer of a bind fee, which only the ceremony beside it names, and the
+    /// `refundTo` of every deposit a claim takes. A retirement names the
+    /// address whose bind retired the handle, which need not be the one that
+    /// held it, so the apply path names the parties of that one too.
     pub fn parties(&self) -> Vec<(Address, Role)> {
         match self {
             Self::IdentityBound { holder, .. }
-            | Self::HandleRetired { holder, .. }
             | Self::HandleUnpublished { holder, .. }
             | Self::CeremonyBound { holder, .. } => vec![(*holder, Role::Holder)],
+            Self::HandleRetired { .. } => Vec::new(),
             Self::BindFeePaid { receiver, .. } => vec![(*receiver, Role::FeeReceiver)],
             Self::Deposited {
                 refund_to,

@@ -341,15 +341,18 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
     );
     assert_eq!(history.entries[0].roles, [Role::Holder]);
     assert_eq!(history.entries[1].roles, [Role::Claimer, Role::Recipient]);
+    // Carol sees Bob's claim take her native deposit, the one she could no
+    // longer refund after it; Dave had refunded his before it.
     let history: AddressHistory = get(&store, &format!("/v1/history/address/{carol}"))
         .await
         .answer();
     assert_eq!(
         kinds(&history.entries),
-        ["forwarded", "deposited", "deposited"]
+        ["forwarded", "claimed", "deposited", "deposited"]
     );
     assert_eq!(history.entries[0].roles, [Role::Depositor]);
-    assert_eq!(history.entries[1].roles, [Role::Depositor, Role::RefundTo]);
+    assert_eq!(history.entries[1].roles, [Role::RefundTo]);
+    assert_eq!(history.entries[2].roles, [Role::Depositor, Role::RefundTo]);
     let history: AddressHistory = get(&store, &format!("/v1/history/address/{dave}"))
         .await
         .answer();
@@ -524,6 +527,74 @@ async fn a_bind_names_what_it_took_and_from_whom() {
         .await
         .answer();
     assert_eq!(history.entries[0].roles, [Role::Holder]);
+}
+
+#[tokio::test]
+async fn a_retired_handle_is_in_the_history_of_the_wallet_that_held_it() {
+    let Some((store, _pool, _guard)) = test_store().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let (alice, bob) = (addr(0xA1), addr(0xB2));
+    let retire = |handle: &str, holder: Address| NamesEvent::HandleRetired {
+        platform_id: x(),
+        handle_node: node(handle),
+        holder,
+    };
+    // Alice renames @kim1 to @kim2: her own bind retires her own handle.
+    apply(&store, 1, bind(alice, "777", "kim1", 1_000)).await;
+    apply_tx(
+        &store,
+        2,
+        vec![retire("kim1", alice), bind(alice, "777", "kim2", 2_000)],
+    )
+    .await;
+    // The account moves to Bob's wallet and renames to @kim3 in one bind:
+    // the retirement names Bob, but @kim2 was Alice's.
+    apply_tx(
+        &store,
+        3,
+        vec![retire("kim2", bob), bind(bob, "777", "kim3", 3_000)],
+    )
+    .await;
+
+    let history: AddressHistory = get(&store, &format!("/v1/history/address/{alice}"))
+        .await
+        .answer();
+    let entries: Vec<(&str, &[Role], Option<&str>)> = kinds(&history.entries)
+        .into_iter()
+        .zip(&history.entries)
+        .map(|(kind, e)| {
+            (
+                kind,
+                e.roles.as_slice(),
+                e.handle.as_ref().and_then(|h| h.handle.as_deref()),
+            )
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            (
+                "identity_bound",
+                &[Role::PreviousIdHolder][..],
+                Some("kim3")
+            ),
+            (
+                "handle_retired",
+                &[Role::PreviousHandleHolder][..],
+                Some("kim2")
+            ),
+            ("identity_bound", &[Role::Holder][..], Some("kim2")),
+            ("handle_retired", &[Role::Holder][..], Some("kim1")),
+            ("identity_bound", &[Role::Holder][..], Some("kim1")),
+        ]
+    );
+    // Bob never held @kim2: his history is his own bind.
+    let history: AddressHistory = get(&store, &format!("/v1/history/address/{bob}"))
+        .await
+        .answer();
+    assert_eq!(kinds(&history.entries), ["identity_bound"]);
 }
 
 #[tokio::test]
