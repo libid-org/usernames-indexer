@@ -43,6 +43,7 @@ use std::sync::Arc;
 
 use alloy::primitives::{
     Address,
+    Bytes,
     B256,
 };
 use axum::{
@@ -60,7 +61,10 @@ use axum::{
     Router,
 };
 use libid_signer::ManagedSigner;
-use serde::Serialize;
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use usernames_core::{
     db::{
         ChainStore,
@@ -307,7 +311,7 @@ impl Config {
             // line — exactly inverted.
             .map_err(GatewayError::internal)?;
         Ok(GatewayResponse {
-            data: format!("0x{}", hex::encode(reply.encode(&signature))),
+            data: Bytes::from(reply.encode(&signature)),
         })
     }
 
@@ -616,30 +620,33 @@ pub fn router(state: GatewayState) -> Router {
 }
 
 /// One served chain, as supervision should see it.
-#[derive(Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ChainStatus {
-    chain_id: u64,
+pub struct ChainStatus {
+    /// The chain.
+    pub chain_id: u64,
     /// The names the chain goes by in a name, as its indexer declared them.
-    names: Vec<String>,
+    pub names: Vec<String>,
     /// Blocks between the indexer's target and its cursor.
-    lag_blocks: Option<u64>,
+    pub lag_blocks: Option<u64>,
     /// Unix seconds at which the indexer last reported.
-    indexer_reported_at: Option<u64>,
+    pub indexer_reported_at: Option<u64>,
     /// Seconds until the indexer's last report expires, negative once it has.
-    report_valid_for: Option<i64>,
+    pub report_valid_for: Option<i64>,
     /// Whether another chain in the store shares this chain's coin type, in
     /// which case queries for that coin type are refused however fresh either
     /// is: the store cannot say which was meant.
-    ambiguous: bool,
+    pub ambiguous: bool,
     /// Whether a query for this chain would be refused right now, for any of
     /// the reasons above.
-    stale: bool,
+    pub stale: bool,
 }
 
-#[derive(Serialize)]
-struct GatewayStatus {
-    chains: Vec<ChainStatus>,
+/// `GET /ens/status`: every chain the gateway serves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayStatus {
+    /// One row per chain the store holds.
+    pub chains: Vec<ChainStatus>,
 }
 
 /// `GET /status`: one row per chain the store holds. For alerting, never for
@@ -652,10 +659,12 @@ async fn status(
     Ok(Json(state.config.status().await?))
 }
 
-/// What ERC-3668 hands back: one hex blob the resolver's callback decodes.
-#[derive(Serialize)]
-struct GatewayResponse {
-    data: String,
+/// What ERC-3668 hands back: one blob the resolver's callback decodes,
+/// 0x-hex on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayResponse {
+    /// `abi.encode(result, expires, signature)`.
+    pub data: Bytes,
 }
 
 /// Why an answer could not be given at all — as opposed to given as null.

@@ -28,8 +28,11 @@ use tokio::sync::{
 };
 use tower::ServiceExt;
 use usernames_api::ens::{
+    ChainStatus,
     Config,
+    GatewayResponse,
     GatewayState,
+    GatewayStatus,
 };
 use usernames_core::{
     db::{
@@ -180,14 +183,8 @@ async fn ask(router: &Router, sender: Address, call: &[u8]) -> (StatusCode, Stri
 /// to be one the resolver would accept. These are the bytes the callback
 /// returns to the wallet, in whatever shape the record call asked for.
 fn signed_result(body: &str, call: &[u8]) -> Vec<u8> {
-    let value: serde_json::Value = serde_json::from_str(body).expect("json");
-    let data = hex::decode(
-        value["data"]
-            .as_str()
-            .expect("a data field")
-            .trim_start_matches("0x"),
-    )
-    .expect("hex");
+    let answer: GatewayResponse = serde_json::from_str(body).expect("a gateway answer");
+    let data = answer.data;
 
     // (bytes result, uint64 expires, bytes signature), by hand.
     let word = |at: usize| -> u64 {
@@ -605,27 +602,23 @@ async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
         .expect("router");
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    let status: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    let stale_of = |id: i64| {
-        status["chains"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["chainId"] == id)
-            .map(|c| c["stale"].as_bool().unwrap())
-    };
-    assert_eq!(stale_of(OTHER), Some(true), "{status}");
-    assert_eq!(stale_of(CHAIN), Some(false), "{status}");
-    let valid_for_of = |id: i64| {
-        status["chains"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["chainId"] == id)
-            .and_then(|c| c["reportValidFor"].as_i64())
-    };
-    assert!(valid_for_of(OTHER).is_some_and(|s| s < 0), "{status}");
-    assert!(valid_for_of(CHAIN).is_some_and(|s| s > 0), "{status}");
+    let status: GatewayStatus = serde_json::from_slice(&body).expect("a gateway status");
+    let other = row_of(&status, OTHER);
+    let chain = row_of(&status, CHAIN);
+    assert!(other.stale, "{status:?}");
+    assert!(!chain.stale, "{status:?}");
+    assert!(other.report_valid_for.is_some_and(|s| s < 0), "{status:?}");
+    assert!(chain.report_valid_for.is_some_and(|s| s > 0), "{status:?}");
+}
+
+/// The status row of one chain; a chain the status does not list fails the
+/// test.
+fn row_of(status: &GatewayStatus, chain_id: i64) -> &ChainStatus {
+    status
+        .chains
+        .iter()
+        .find(|row| i64::try_from(row.chain_id) == Ok(chain_id))
+        .unwrap_or_else(|| panic!("chain {chain_id} is listed: {status:?}"))
 }
 
 /// A chain has only the names its indexer declared. With none declared, the
@@ -725,16 +718,10 @@ async fn two_indexed_chains_on_one_coin_type_are_refused_unsigned() {
         .await
         .expect("router");
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    let status: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    let status: GatewayStatus = serde_json::from_slice(&body).expect("a gateway status");
     for id in [EDEN, TWIN] {
-        let row = status["chains"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["chainId"] == id)
-            .expect("listed");
-        assert_eq!(row["ambiguous"], true, "{status}");
-        assert_eq!(row["stale"], true, "{status}");
+        let row = row_of(&status, id);
+        assert!(row.ambiguous && row.stale, "{status:?}");
     }
 }
 

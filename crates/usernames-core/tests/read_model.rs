@@ -24,8 +24,10 @@ use tokio::sync::{
 };
 use usernames_core::{
     api::model::{
+        AddressHistory,
         AddressResolution,
         HandleResolution,
+        HistoryEvent,
         IdResolution,
         SearchResults,
         Status,
@@ -635,33 +637,40 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
         .unwrap_or_else(|| panic!("chain {CHAIN} is listed: {status:?}"));
     assert_eq!(chain.proof_verifier, Some(addr(0xEE)));
 
-    // The ceremony's own events are journaled with the payload an operator
-    // asks by, and bind nothing.
-    let journal: Vec<(String, String)> = sqlx::query_as(
-        "SELECT kind, payload::text FROM names.events
-         WHERE chain_id = $1 AND block_number >= 3 ORDER BY block_number",
-    )
-    .bind(CHAIN)
-    .fetch_all(&pool)
-    .await
-    .expect("journal rows");
-    let payloads: Vec<(&str, serde_json::Value)> = journal
-        .iter()
-        .map(|(kind, payload)| {
-            (
-                kind.as_str(),
-                serde_json::from_str(payload).expect("journal payload is JSON"),
-            )
-        })
-        .collect();
-    assert_eq!(payloads[0].0, "ceremony_bound");
-    assert_eq!(payloads[0].1["clientIdentifier"], "0x636c69656e742d61");
+    // The ceremony's own events are journaled with what an operator asks
+    // by — read back here through the histories of the addresses they name —
+    // and bind nothing.
+    let holder: AddressHistory =
+        get(&store, &format!("/v1/history/address/{}", addr(0xA1)))
+            .await
+            .answer();
+    let [entry] = &holder.entries[..] else {
+        panic!("one ceremony: {holder:?}");
+    };
     assert_eq!(
-        payloads[0].1["authorizationDigest"],
-        digest.to_string().as_str()
+        entry.event,
+        HistoryEvent::CeremonyBound {
+            authorization_digest: digest,
+            holder: addr(0xA1),
+            platform_id: x,
+            client_identifier: Bytes::from_static(b"client-a"),
+        }
     );
-    assert_eq!(payloads[1].0, "bind_fee_paid");
-    assert_eq!(payloads[1].1["amount"], "1000");
+    let receiver: AddressHistory =
+        get(&store, &format!("/v1/history/address/{}", addr(0xFE)))
+            .await
+            .answer();
+    let [entry] = &receiver.entries[..] else {
+        panic!("one fee: {receiver:?}");
+    };
+    assert_eq!(
+        entry.event,
+        HistoryEvent::BindFeePaid {
+            authorization_digest: digest,
+            receiver: addr(0xFE),
+            amount: U256::from(1_000u64),
+        }
+    );
     let bound: i64 =
         sqlx::query_scalar("SELECT count(*) FROM names.ids WHERE chain_id = $1")
             .bind(CHAIN)

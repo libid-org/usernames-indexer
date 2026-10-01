@@ -52,6 +52,7 @@ use tokio::sync::Mutex;
 use tower::ServiceExt;
 use usernames_api::ens::{
     Config,
+    GatewayResponse,
     GatewayState,
 };
 use usernames_core::db::{
@@ -119,11 +120,9 @@ async fn ask_gateway(router: &Router, sender: Address, call_data: &Bytes) -> Byt
         response.status()
     );
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    let data = value["data"].as_str().expect("a data field");
-    hex::decode(data.trim_start_matches("0x"))
-        .expect("hex")
-        .into()
+    let answer: GatewayResponse =
+        serde_json::from_slice(&body).expect("a gateway answer");
+    answer.data
 }
 
 #[tokio::test]
