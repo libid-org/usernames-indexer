@@ -314,6 +314,65 @@ async fn publish_flag_is_the_post_state() {
     assert!(!only(&resolved.identities).published);
 }
 
+/// A proxy upgraded to 0.15 in place logs `HandleUnpublished` after the
+/// upgrade and kept `NameUnpublished` from before it. Either withdraws the
+/// published handle, and the journal records each under its own kind.
+#[tokio::test]
+async fn either_unpublish_topic_withdraws_the_published_handle() {
+    let Some((store, pool, _guard)) = test_store().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let x = nodes::Platform::from_key("x").unwrap().id();
+    let alice = addr(0xA1);
+    for (seq, unpublish, kind) in [
+        (
+            1,
+            NamesEvent::NameUnpublished {
+                holder: alice,
+                platform_id: x,
+            },
+            "name_unpublished",
+        ),
+        (
+            3,
+            NamesEvent::HandleUnpublished {
+                holder: alice,
+                platform_id: x,
+            },
+            "handle_unpublished",
+        ),
+    ] {
+        apply(
+            &store,
+            seq,
+            bind(alice, x, "111", "alice_1", seq * 1000, true),
+        )
+        .await;
+        let resolved: AddressResolution =
+            get(&store, &format!("/v1/resolve/address/{alice}"))
+                .await
+                .answer();
+        assert!(only(&resolved.identities).published, "{kind}");
+
+        apply(&store, seq + 1, unpublish).await;
+        let resolved: AddressResolution =
+            get(&store, &format!("/v1/resolve/address/{alice}"))
+                .await
+                .answer();
+        assert!(!only(&resolved.identities).published, "{kind}");
+        let journaled: String = sqlx::query_scalar(
+            "SELECT kind FROM names.events WHERE chain_id = $1 AND block_number = $2",
+        )
+        .bind(CHAIN)
+        .bind((seq + 1) as i64)
+        .fetch_one(&pool)
+        .await
+        .expect("journal row");
+        assert_eq!(journaled, kind);
+    }
+}
+
 /// The handles a search answered with, in its order.
 fn handles_of(results: &SearchResults) -> Vec<&str> {
     results.hits.iter().map(|h| h.handle.as_str()).collect()

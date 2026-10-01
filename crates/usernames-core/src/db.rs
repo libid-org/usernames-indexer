@@ -870,6 +870,10 @@ impl Window {
             NamesEvent::HandleUnpublished {
                 holder,
                 platform_id,
+            }
+            | NamesEvent::NameUnpublished {
+                holder,
+                platform_id,
             } => {
                 sqlx::query(sql::UNPUBLISH)
                     .bind(chain_id)
