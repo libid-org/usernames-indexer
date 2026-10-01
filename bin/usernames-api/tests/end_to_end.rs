@@ -22,6 +22,8 @@
 //!
 //! Skips silently without `DATABASE_URL`, and needs `anvil` on PATH.
 
+use std::time::Duration;
+
 use alloy::{
     node_bindings::Anvil,
     primitives::{
@@ -232,7 +234,7 @@ async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> 
     let router = usernames_api::ens::router(GatewayState::new(Config {
         resolver: resolver_address,
         store: db::Store::new(store.pool().clone()),
-        ttl_secs: 300,
+        ttl: Duration::from_secs(300),
         max_lag_blocks: 32,
         signer: std::sync::Arc::new(ManagedSigner::Local(signer)),
     }));

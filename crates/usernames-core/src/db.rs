@@ -9,6 +9,8 @@
 //! contract keys its own storage by, so replaying a window — after a crash,
 //! or after a version-bump re-index — converges instead of duplicating.
 
+use std::time::Duration;
+
 use alloy::primitives::{
     Address,
     B256,
@@ -102,7 +104,7 @@ pub struct IndexPosition {
 /// The longest validity the store will write: ten years. Anything larger is
 /// a mistake, and a value near `i64::MAX` would overflow the `bigint` addition
 /// in Postgres and fail the whole statement, target included.
-const MAX_VALID_FOR_SECS: u64 = 10 * 366 * 24 * 60 * 60;
+const MAX_VALID_FOR: Duration = Duration::from_secs(10 * 366 * 24 * 60 * 60);
 
 /// The whole store: every chain any indexer has written into one database.
 ///
@@ -453,22 +455,21 @@ impl ChainStore {
     /// confirmation depth.
     ///
     /// Record the target, when it was reported, and how long readers may
-    /// trust that report — `valid_for_secs` from now, by the database's
-    /// clock. One statement, so the three cannot disagree: a report must
+    /// trust that report — `valid_for` from now, by the database's clock. One statement, so the three cannot disagree: a report must
     /// never vouch for a target write that failed, and no host's clock
     /// enters into it.
     ///
     /// Returns whether the write landed, so a caller renewing the report
     /// later in the same cycle can decline to vouch for a target that never
     /// made it.
-    pub async fn set_chain_target(&self, target: u64, valid_for_secs: u64) -> bool {
+    pub async fn set_chain_target(&self, target: u64, valid_for: Duration) -> bool {
         let written = sqlx::query(sql::SET_CHAIN_TARGET)
             .bind(self.chain_id)
             .bind(TARGET_KEY)
             .bind(target.to_string())
             .bind(TARGET_REPORTED_AT_KEY)
             .bind(TARGET_VALID_UNTIL_KEY)
-            .bind(Self::valid_for_bind(valid_for_secs))
+            .bind(Self::valid_for_bind(valid_for))
             .execute(&self.pool)
             .await;
         match written {
@@ -484,12 +485,12 @@ impl ChainStore {
     /// chunk by chunk under one target, and every committed chunk is proof
     /// that the loop is alive and the chain reachable; without this a healthy
     /// backfill would expire.
-    pub async fn touch_chain_target(&self, valid_for_secs: u64) {
+    pub async fn touch_chain_target(&self, valid_for: Duration) {
         let touched = sqlx::query(sql::TOUCH_CHAIN_TARGET)
             .bind(self.chain_id)
             .bind(TARGET_REPORTED_AT_KEY)
             .bind(TARGET_VALID_UNTIL_KEY)
-            .bind(Self::valid_for_bind(valid_for_secs))
+            .bind(Self::valid_for_bind(valid_for))
             .execute(&self.pool)
             .await;
         if let Err(e) = touched {
@@ -504,11 +505,12 @@ impl ChainStore {
         format!("deploy_block:{contract}")
     }
 
-    /// The validity the store will write for a report: at most ten years,
-    /// so the `bigint` addition in Postgres can never overflow and fail the
-    /// whole statement, target included.
-    fn valid_for_bind(valid_for_secs: u64) -> i64 {
-        i64::try_from(valid_for_secs.min(MAX_VALID_FOR_SECS)).unwrap_or(i64::MAX)
+    /// The validity the store will write for a report, in the whole seconds
+    /// the SQL adds to its clock: at most ten years, so the `bigint` addition
+    /// in Postgres can never overflow and fail the whole statement, target
+    /// included.
+    fn valid_for_bind(valid_for: Duration) -> i64 {
+        i64::try_from(valid_for.min(MAX_VALID_FOR).as_secs()).unwrap_or(i64::MAX)
     }
 
     /// Declare the names this chain goes by in an ENS name, replacing whatever

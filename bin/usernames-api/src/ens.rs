@@ -39,7 +39,14 @@
 //! that indexer last committed — which is what [`Config::max_lag_blocks`] and
 //! the indexer's own report guard.
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{
+        Duration,
+        SystemTime,
+        UNIX_EPOCH,
+    },
+};
 
 use alloy::primitives::{
     Address,
@@ -101,7 +108,7 @@ pub struct Config {
     /// another endpoint was there to finish.
     pub store: Store,
     /// How long an answer stays good. The resolver enforces it on chain.
-    pub ttl_secs: u64,
+    pub ttl: Duration,
     /// How far behind the chain an index may be and still assert anything.
     pub max_lag_blocks: u64,
     /// What signs an answer, pinned by the resolver's signer set; rotating it
@@ -298,7 +305,7 @@ impl Config {
     ) -> Result<GatewayResponse, GatewayError> {
         let reply = Reply {
             result,
-            expires: Self::now().saturating_add(self.ttl_secs),
+            expires: Self::now().saturating_add(self.ttl.as_secs()),
         };
         // The digest is already the resolver's `makeSignatureHash`; no
         // EIP-191 prefix goes on top of it.
@@ -319,8 +326,8 @@ impl Config {
     /// stays pure. Saturating, so an absurd TTL cannot wrap it — the startup
     /// ceiling rules one out anyway.
     fn now() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or_default()
     }

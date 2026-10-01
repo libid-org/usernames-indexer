@@ -5,6 +5,8 @@
 //! of resuming inside one, and every write in the window is an idempotent
 //! upsert so the replay converges.
 
+use std::time::Duration;
+
 use alloy::{
     primitives::Address,
     providers::Provider,
@@ -43,20 +45,20 @@ pub struct IndexerConfig {
     /// `latest - confirmations`, so a reorg shallower than this cannot leave
     /// the read model holding events the canonical chain never emitted.
     pub confirmations: u64,
-    /// Seconds between poll cycles; also the retry delay after a failure.
-    pub poll_interval_secs: u64,
+    /// Time between poll cycles; also the retry delay after a failure.
+    pub poll_interval: Duration,
     /// Largest `eth_getLogs` window, sized to the RPC provider's limits.
     pub max_block_range: u64,
     /// Where a FRESH scan starts — used only when no cursor exists (a new
     /// database, or right after a re-index). When unset, the deployment block
     /// is detected by binary search over `eth_getCode` and cached.
     pub start_block: Option<u64>,
-    /// How long readers may trust a report this loop makes, in seconds. Set
-    /// beside every target and renewed per committed chunk; a reader that
-    /// finds it expired treats the index as stale. It has to cover a poll
-    /// interval, a slow chunk and a missed cycle, which is why the CLI derives
-    /// it from `poll_interval_secs` when nothing sets it.
-    pub stale_after_secs: u64,
+    /// How long readers may trust a report this loop makes. Set beside every
+    /// target and renewed per committed chunk; a reader that finds it expired
+    /// treats the index as stale. It has to cover a poll interval, a slow
+    /// chunk and a missed cycle, which is why the CLI derives it from
+    /// `poll_interval` when nothing sets it.
+    pub stale_after: Duration,
 }
 
 /// One chain's indexer: the store, the RPC provider and the knobs fused, so
@@ -236,13 +238,13 @@ impl<P: Provider> Indexer<P> {
                 Ok(None) => match self.resolve_start_block().await {
                     Some(block) => block,
                     None => {
-                        sleep_or_cancel(&cancel, self.config.poll_interval_secs).await;
+                        sleep_or_cancel(&cancel, self.config.poll_interval).await;
                         continue;
                     }
                 },
                 Err(e) => {
                     tracing::warn!(%e, "failed to read the cursor");
-                    sleep_or_cancel(&cancel, self.config.poll_interval_secs).await;
+                    sleep_or_cancel(&cancel, self.config.poll_interval).await;
                     continue;
                 }
             };
@@ -251,7 +253,7 @@ impl<P: Provider> Indexer<P> {
                 Ok(n) => n,
                 Err(e) => {
                     tracing::warn!(%e, "failed to get the latest block");
-                    sleep_or_cancel(&cancel, self.config.poll_interval_secs).await;
+                    sleep_or_cancel(&cancel, self.config.poll_interval).await;
                     continue;
                 }
             };
@@ -263,11 +265,11 @@ impl<P: Provider> Indexer<P> {
             // cursor is never advanced past it.
             let target_written = self
                 .store
-                .set_chain_target(head, self.config.stale_after_secs)
+                .set_chain_target(head, self.config.stale_after)
                 .await;
 
             if from_block > head {
-                sleep_or_cancel(&cancel, self.config.poll_interval_secs).await;
+                sleep_or_cancel(&cancel, self.config.poll_interval).await;
                 continue;
             }
 
@@ -284,9 +286,7 @@ impl<P: Provider> Indexer<P> {
                 // target this cycle actually wrote — a report must never
                 // vouch for a target write that failed.
                 if target_written {
-                    self.store
-                        .touch_chain_target(self.config.stale_after_secs)
-                        .await;
+                    self.store.touch_chain_target(self.config.stale_after).await;
                 }
                 match self.process_chunk(chunk_from, chunk_to).await {
                     Ok(applied) => {
@@ -295,9 +295,7 @@ impl<P: Provider> Indexer<P> {
                         // Each committed chunk is proof the loop is alive and
                         // the chain reachable.
                         if target_written {
-                            self.store
-                                .touch_chain_target(self.config.stale_after_secs)
-                                .await;
+                            self.store.touch_chain_target(self.config.stale_after).await;
                         }
                     }
                     Err(e) => {
@@ -327,14 +325,14 @@ impl<P: Provider> Indexer<P> {
                 );
             }
 
-            sleep_or_cancel(&cancel, self.config.poll_interval_secs).await;
+            sleep_or_cancel(&cancel, self.config.poll_interval).await;
         }
     }
 }
 
-async fn sleep_or_cancel(cancel: &CancellationToken, secs: u64) {
+async fn sleep_or_cancel(cancel: &CancellationToken, interval: Duration) {
     tokio::select! {
         _ = cancel.cancelled() => {}
-        _ = tokio::time::sleep(std::time::Duration::from_secs(secs)) => {}
+        _ = tokio::time::sleep(interval) => {}
     }
 }

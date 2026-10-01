@@ -8,6 +8,8 @@
 
 mod common;
 
+use std::time::Duration;
+
 use alloy::primitives::{
     Address,
     Bytes,
@@ -964,11 +966,10 @@ async fn a_released_lease_frees_the_chain_for_the_next_holder() {
     // Bounded, because the failure mode is a block rather than an error: on
     // the old code this waits for the pool's idle timeout, not forever, and an
     // unbounded await would look like a hung test rather than a broken lock.
-    let second =
-        tokio::time::timeout(std::time::Duration::from_secs(5), store.acquire_writer())
-            .await
-            .expect("the second lease was still blocked on the first")
-            .expect("second lease");
+    let second = tokio::time::timeout(Duration::from_secs(5), store.acquire_writer())
+        .await
+        .expect("the second lease was still blocked on the first")
+        .expect("second lease");
     second.release().await.expect("release");
 }
 
@@ -981,15 +982,15 @@ async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
         return;
     };
     assert!(
-        store.set_chain_target(5, 1).await,
+        store.set_chain_target(5, Duration::from_secs(1)).await,
         "the target write landed"
     );
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
     let position = store.index_position().await.expect("position");
     assert_eq!(position.target, Some(5));
     assert!(position.valid_for.is_some_and(|s| s < 0), "{position:?}");
 
-    store.touch_chain_target(120).await;
+    store.touch_chain_target(Duration::from_secs(120)).await;
     let position = store.index_position().await.expect("position");
     assert_eq!(
         position.target,

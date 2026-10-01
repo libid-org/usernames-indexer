@@ -33,6 +33,8 @@
 #![deny(missing_docs)]
 #![deny(dead_code)]
 
+use std::time::Duration;
+
 use alloy::{
     primitives::{
         Address,
@@ -150,5 +152,5 @@ pub async fn bind(store: &ChainStore, handle: &str, holder: Address) {
     // against the TARGET — the block the cursor chases — so that is the one a
     // fixture must record.
     store.set_chain_head(1).await;
-    store.set_chain_target(1, 120).await;
+    store.set_chain_target(1, Duration::from_secs(120)).await;
 }

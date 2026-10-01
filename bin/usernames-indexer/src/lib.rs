@@ -8,6 +8,8 @@
 #![deny(missing_docs)]
 #![deny(dead_code)]
 
+use std::time::Duration;
+
 use alloy::{
     primitives::Address,
     providers::{
@@ -68,9 +70,10 @@ pub struct Config {
     #[arg(long, env = "CONFIRMATIONS", default_value_t = 5)]
     pub confirmations: u64,
 
-    /// Seconds between poll cycles, and the retry delay after a failure.
-    #[arg(long, env = "POLL_INTERVAL_SECS", default_value_t = 5)]
-    pub poll_interval_secs: u64,
+    /// Time between poll cycles, and the retry delay after a failure:
+    /// `5s`, `1500ms`.
+    #[arg(long, env = "POLL_INTERVAL", default_value = "5s", value_parser = humantime::parse_duration)]
+    pub poll_interval: Duration,
 
     /// Largest eth_getLogs window, sized to the RPC provider's limits.
     #[arg(long, env = "MAX_BLOCK_RANGE", default_value_t = 10_000)]
@@ -80,18 +83,46 @@ pub struct Config {
     #[arg(long, env = "START_BLOCK")]
     pub start_block: Option<u64>,
 
-    /// How long readers may trust this indexer's last report, in seconds. The
-    /// API refuses a chain whose report has expired, so this decides how soon
-    /// a stopped indexer is noticed — and how long a slow chunk or a missed
-    /// cycle may take without a healthy loop reading as stopped. Unset means
-    /// four poll intervals plus a minute.
-    #[arg(long, env = "STALE_AFTER_SECS")]
-    pub stale_after_secs: Option<u64>,
+    /// How long readers may trust this indexer's last report: `80s`, `2m`.
+    /// The API refuses a chain whose report has expired, so this decides how
+    /// soon a stopped indexer is noticed — and how long a slow chunk or a
+    /// missed cycle may take without a healthy loop reading as stopped. Unset
+    /// means four poll intervals plus a minute.
+    #[arg(long, env = "STALE_AFTER", value_parser = humantime::parse_duration)]
+    pub stale_after: Option<Duration>,
 }
 
 /// The longest a report may be trusted: a year. Past that the setting is a
 /// mistake, and the store would clamp it anyway.
-const MAX_STALE_AFTER_SECS: u64 = 366 * 24 * 60 * 60;
+const MAX_STALE_AFTER: Duration = Duration::from_secs(366 * 24 * 60 * 60);
+
+impl Config {
+    /// How long readers may trust a report: `STALE_AFTER`, or four poll
+    /// intervals plus a minute. Refused unless it outlasts a poll interval,
+    /// or every idle cycle would expire the report before the next one
+    /// renews it, and unless it stays within a year.
+    fn report_validity(&self) -> anyhow::Result<Duration> {
+        let validity = self.stale_after.unwrap_or(
+            self.poll_interval
+                .saturating_mul(4)
+                .saturating_add(Duration::from_secs(60)),
+        );
+        anyhow::ensure!(
+            validity > self.poll_interval,
+            "STALE_AFTER ({}) must exceed POLL_INTERVAL ({}), or every idle cycle \
+             expires the report before the next one renews it",
+            humantime::format_duration(validity),
+            humantime::format_duration(self.poll_interval)
+        );
+        anyhow::ensure!(
+            validity <= MAX_STALE_AFTER,
+            "STALE_AFTER ({}) is more than a year; a report nobody expects to \
+             expire is not a report",
+            humantime::format_duration(validity)
+        );
+        Ok(validity)
+    }
+}
 
 /// Parse the environment, connect everything, and index until ctrl-c.
 pub async fn run() -> anyhow::Result<()> {
@@ -108,23 +139,7 @@ pub async fn run() -> anyhow::Result<()> {
     // Pure configuration, checked before anything is touched: `prepare`
     // below may wipe the chain's rows on a version bump, and a refusal has
     // to come before that, not after.
-    let stale_after_secs = config.stale_after_secs.unwrap_or(
-        config
-            .poll_interval_secs
-            .saturating_mul(4)
-            .saturating_add(60),
-    );
-    anyhow::ensure!(
-        stale_after_secs > config.poll_interval_secs,
-        "STALE_AFTER_SECS ({stale_after_secs}) must exceed POLL_INTERVAL_SECS ({}), or \
-         every idle cycle expires the report before the next one renews it",
-        config.poll_interval_secs
-    );
-    anyhow::ensure!(
-        stale_after_secs <= MAX_STALE_AFTER_SECS,
-        "STALE_AFTER_SECS ({stale_after_secs}) is more than a year; a report nobody \
-         expects to expire is not a report"
-    );
+    let stale_after = config.report_validity()?;
 
     let provider: RootProvider = RootProvider::new_http(config.rpc_url.clone());
     let reported = provider.get_chain_id().await?;
@@ -172,10 +187,10 @@ pub async fn run() -> anyhow::Result<()> {
             contract,
             escrow,
             confirmations: config.confirmations,
-            poll_interval_secs: config.poll_interval_secs,
+            poll_interval: config.poll_interval,
             max_block_range: config.max_block_range,
             start_block: config.start_block,
-            stale_after_secs,
+            stale_after,
         },
     );
     tracing::info!(chain_id, %contract, ?escrow, "indexing");

@@ -7,6 +7,8 @@
 //!
 //! Skips silently when `DATABASE_URL` is unset, like the other suites.
 
+use std::time::Duration;
+
 use alloy::{
     primitives::Address,
     signers::local::PrivateKeySigner,
@@ -122,14 +124,14 @@ async fn gateway_parts(
         // The gate measures the cursor against the TARGET — what the indexer
         // intends to reach — not the raw head, so a fixture that records only
         // the head reads as "cannot tell" and refuses every query.
-        store.set_chain_target(1, 120).await;
+        store.set_chain_target(1, Duration::from_secs(120)).await;
     }
 
     let store = ChainStore::new(pool.clone(), chains[0]);
     let config = Config {
         resolver: RESOLVER,
         store: db::Store::new(pool.clone()),
-        ttl_secs: 300,
+        ttl: Duration::from_secs(300),
         max_lag_blocks,
         signer: std::sync::Arc::new(ManagedSigner::Local(
             SIGNER_KEY.parse::<PrivateKeySigner>().expect("key"),
@@ -447,7 +449,9 @@ async fn a_stale_index_refuses_rather_than_signing_a_null() {
     bind(&store, "alice", Address::from([0xbe; 20])).await;
     // Far ahead of the cursor, as the TARGET: that is the quantity the gate
     // compares, and the head alone no longer moves it.
-    store.set_chain_target(10_000, 120).await;
+    store
+        .set_chain_target(10_000, Duration::from_secs(120))
+        .await;
 
     let call = resolve_call(
         &wire_name(&["alice", "x"]),
@@ -508,7 +512,7 @@ async fn one_gateway_answers_for_every_chain_it_serves() {
 /// both absent on a fresh database, and again while `prepare` replays a chain
 /// after a version bump — and an unreadable Postgres looks the same. Folding
 /// that into "no lag" made the gateway sign an authoritative "nobody holds
-/// this" for every name, cached by wallets for the whole `ENS_TTL_SECS`
+/// this" for every name, cached by wallets for the whole `ENS_TTL`
 /// window.
 #[tokio::test]
 async fn an_index_that_cannot_report_its_position_refuses() {
@@ -535,7 +539,7 @@ async fn an_index_that_cannot_report_its_position_refuses() {
 /// The block gate cannot see a stopped indexer: target and cursor are both
 /// its own writes, so they freeze together and lag reads zero for as long as
 /// it stays down — signed nulls for bindings made since, and old addresses
-/// after a rebind, for the whole `ENS_TTL_SECS` each. The report the indexer
+/// after a rebind, for the whole `ENS_TTL` each. The report the indexer
 /// makes beside the target expires on the indexer's own schedule, and that is
 /// what notices.
 #[tokio::test]
@@ -676,7 +680,7 @@ async fn a_chain_that_appears_in_the_store_is_served_without_a_restart() {
         .await
         .expect("commit");
     other.set_chain_head(1).await;
-    other.set_chain_target(1, 120).await;
+    other.set_chain_target(1, Duration::from_secs(120)).await;
     let there = Address::from([0xed; 20]);
     bind(&other, "alice", there).await;
 
