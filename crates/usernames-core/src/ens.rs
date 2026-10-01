@@ -35,7 +35,10 @@
 //! rather than decoding. [`CoinType::shared_by`] names the pair that cannot
 //! be served together.
 
-use std::fmt;
+use std::{
+    fmt,
+    str::FromStr,
+};
 
 use alloy::{
     primitives::{
@@ -76,9 +79,11 @@ pub enum ChainNameError {
     Platform(String),
 }
 
-impl ChainName {
-    /// Accept a name a chain may go by.
-    pub fn parse(name: &str) -> Result<Self, ChainNameError> {
+/// A name a chain may go by.
+impl FromStr for ChainName {
+    type Err = ChainNameError;
+
+    fn from_str(name: &str) -> Result<Self, ChainNameError> {
         if !Name::label_is_wellformed(name) {
             return Err(ChainNameError::Malformed(name.to_string()));
         }
@@ -87,7 +92,9 @@ impl ChainName {
         }
         Ok(Self(name.to_string()))
     }
+}
 
+impl ChainName {
     /// The name, as the label it appears as.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -1008,7 +1015,7 @@ mod chain_names {
     fn a_chain_name_is_a_label_apart_from_the_platforms() {
         for ok in ["eden", "base", "op-mainnet", "l2"] {
             assert_eq!(
-                ChainName::parse(ok).map(|n| n.as_str().to_string()),
+                ok.parse::<ChainName>().map(|n| n.as_str().to_string()),
                 Ok(ok.to_string())
             );
         }
@@ -1017,13 +1024,13 @@ mod chain_names {
                 .key()
                 .expect("a known platform has a key");
             assert_eq!(
-                ChainName::parse(key),
+                key.parse::<ChainName>(),
                 Err(ChainNameError::Platform(key.to_string()))
             );
         }
         for bad in ["", "Base", "eth main", "eth_main", "bäse", "x.y"] {
             assert!(
-                matches!(ChainName::parse(bad), Err(ChainNameError::Malformed(_))),
+                matches!(bad.parse::<ChainName>(), Err(ChainNameError::Malformed(_))),
                 "{bad:?}"
             );
         }

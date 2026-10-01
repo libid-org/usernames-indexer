@@ -8,6 +8,8 @@
 
 mod common;
 
+use std::time::Duration;
+
 use alloy::primitives::{
     Address,
     Bytes,
@@ -24,8 +26,10 @@ use tokio::sync::{
 };
 use usernames_core::{
     api::model::{
+        AddressHistory,
         AddressResolution,
         HandleResolution,
+        HistoryEvent,
         IdResolution,
         SearchResults,
         Status,
@@ -168,7 +172,7 @@ fn only<T: std::fmt::Debug>(bindings: &[T]) -> &T {
 
 #[tokio::test]
 async fn bind_resolves_all_three_directions() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -204,11 +208,12 @@ async fn bind_resolves_all_three_directions() {
     assert_eq!(identity.handle.as_deref(), Some("alice_1"));
     assert!(identity.published);
     assert!(identity.resolves);
+    drop(guard);
 }
 
 #[tokio::test]
 async fn rename_retires_the_previous_handle() {
-    let Some((store, pool, _guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -246,11 +251,12 @@ async fn rename_retires_the_previous_handle() {
     .await
     .expect("watermark row");
     assert_eq!(watermark, 1000);
+    drop(guard);
 }
 
 #[tokio::test]
 async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -275,11 +281,12 @@ async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
     let binding = only(&resolved.bindings);
     assert_eq!(binding.owner, alice);
     assert_eq!(binding.handle, None);
+    drop(guard);
 }
 
 #[tokio::test]
 async fn publish_flag_is_the_post_state() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -313,6 +320,7 @@ async fn publish_flag_is_the_post_state() {
             .await
             .answer();
     assert!(!only(&resolved.identities).published);
+    drop(guard);
 }
 
 /// The handles a search answered with, in its order.
@@ -322,7 +330,7 @@ fn handles_of(results: &SearchResults) -> Vec<&str> {
 
 #[tokio::test]
 async fn search_ranks_exact_prefix_substring() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -419,11 +427,22 @@ async fn search_ranks_exact_prefix_substring() {
     // LIKE metacharacters match themselves, not everything.
     let results: SearchResults = get(&store, "/v1/search?q=%25").await.answer();
     assert!(results.hits.is_empty());
+
+    // A count that is not a number is refused in the API's own envelope.
+    for path in ["/v1/search?q=ali&limit=ten", "/v1/search?q=ali&offset=1.5"] {
+        let refusal = get::<SearchResults>(&store, path).await.refusal();
+        assert_eq!(
+            refusal,
+            (StatusCode::BAD_REQUEST, "invalid_argument".to_string()),
+            "{path}"
+        );
+    }
+    drop(guard);
 }
 
 #[tokio::test]
 async fn replay_converges_instead_of_duplicating() {
-    let Some((store, pool, _guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -461,11 +480,12 @@ async fn replay_converges_instead_of_duplicating() {
         count, 1,
         "replayed PlatformConfigured must not double-count"
     );
+    drop(guard);
 }
 
 #[tokio::test]
 async fn unclaimed_names_on_a_configured_platform_are_coded_404s() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -486,11 +506,12 @@ async fn unclaimed_names_on_a_configured_platform_are_coded_404s() {
         .await
         .refusal();
     assert_eq!(refusal, (StatusCode::NOT_FOUND, "id_not_bound".to_string()));
+    drop(guard);
 }
 
 #[tokio::test]
 async fn api_refuses_to_answer_before_the_first_window() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -514,11 +535,12 @@ async fn api_refuses_to_answer_before_the_first_window() {
         status.chains.iter().all(|c| c.chain_id != CHAIN),
         "{status:?}"
     );
+    drop(guard);
 }
 
 #[tokio::test]
 async fn nul_bytes_neither_stall_the_indexer_nor_crash_the_api() {
-    let Some((store, pool, _guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -554,11 +576,12 @@ async fn nul_bytes_neither_stall_the_indexer_nor_crash_the_api() {
         .await
         .refusal();
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    drop(guard);
 }
 
 #[tokio::test]
 async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
-    let Some((store, pool, _guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -616,33 +639,40 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
         .unwrap_or_else(|| panic!("chain {CHAIN} is listed: {status:?}"));
     assert_eq!(chain.proof_verifier, Some(addr(0xEE)));
 
-    // The ceremony's own events are journaled with the payload an operator
-    // asks by, and bind nothing.
-    let journal: Vec<(String, String)> = sqlx::query_as(
-        "SELECT kind, payload::text FROM names.events
-         WHERE chain_id = $1 AND block_number >= 3 ORDER BY block_number",
-    )
-    .bind(CHAIN)
-    .fetch_all(&pool)
-    .await
-    .expect("journal rows");
-    let payloads: Vec<(&str, serde_json::Value)> = journal
-        .iter()
-        .map(|(kind, payload)| {
-            (
-                kind.as_str(),
-                serde_json::from_str(payload).expect("journal payload is JSON"),
-            )
-        })
-        .collect();
-    assert_eq!(payloads[0].0, "ceremony_bound");
-    assert_eq!(payloads[0].1["clientIdentifier"], "0x636c69656e742d61");
+    // The ceremony's own events are journaled with what an operator asks
+    // by — read back here through the histories of the addresses they name —
+    // and bind nothing.
+    let holder: AddressHistory =
+        get(&store, &format!("/v1/history/address/{}", addr(0xA1)))
+            .await
+            .answer();
+    let [entry] = &holder.entries[..] else {
+        panic!("one ceremony: {holder:?}");
+    };
     assert_eq!(
-        payloads[0].1["authorizationDigest"],
-        digest.to_string().as_str()
+        entry.event,
+        HistoryEvent::CeremonyBound {
+            authorization_digest: digest,
+            holder: addr(0xA1),
+            platform_id: x,
+            client_identifier: Bytes::from_static(b"client-a"),
+        }
     );
-    assert_eq!(payloads[1].0, "bind_fee_paid");
-    assert_eq!(payloads[1].1["amount"], "1000");
+    let receiver: AddressHistory =
+        get(&store, &format!("/v1/history/address/{}", addr(0xFE)))
+            .await
+            .answer();
+    let [entry] = &receiver.entries[..] else {
+        panic!("one fee: {receiver:?}");
+    };
+    assert_eq!(
+        entry.event,
+        HistoryEvent::BindFeePaid {
+            authorization_digest: digest,
+            receiver: addr(0xFE),
+            amount: U256::from(1_000u64),
+        }
+    );
     let bound: i64 =
         sqlx::query_scalar("SELECT count(*) FROM names.ids WHERE chain_id = $1")
             .bind(CHAIN)
@@ -650,11 +680,12 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
             .await
             .expect("ids count");
     assert_eq!(bound, 0, "a ceremony event alone binds nothing");
+    drop(guard);
 }
 
 #[tokio::test]
 async fn unconfigured_platform_and_impossible_text_name_their_codes() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -691,6 +722,7 @@ async fn unconfigured_platform_and_impossible_text_name_their_codes() {
         refusal,
         (StatusCode::NOT_FOUND, "handle_impossible".to_string())
     );
+    drop(guard);
 }
 
 /// A wallet is the same address on every chain; its bindings are not. With
@@ -698,7 +730,7 @@ async fn unconfigured_platform_and_impossible_text_name_their_codes() {
 /// result says which one it is from; `?chain=` narrows to one.
 #[tokio::test]
 async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
-    let Some((store, pool, _guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -778,6 +810,7 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
         refusal,
         (StatusCode::BAD_REQUEST, "invalid_chain".to_string())
     );
+    drop(guard);
 }
 
 // ─── The replay gate ────────────────────────────────────────────────────────
@@ -933,11 +966,10 @@ async fn a_released_lease_frees_the_chain_for_the_next_holder() {
     // Bounded, because the failure mode is a block rather than an error: on
     // the old code this waits for the pool's idle timeout, not forever, and an
     // unbounded await would look like a hung test rather than a broken lock.
-    let second =
-        tokio::time::timeout(std::time::Duration::from_secs(5), store.acquire_writer())
-            .await
-            .expect("the second lease was still blocked on the first")
-            .expect("second lease");
+    let second = tokio::time::timeout(Duration::from_secs(5), store.acquire_writer())
+        .await
+        .expect("the second lease was still blocked on the first")
+        .expect("second lease");
     second.release().await.expect("release");
 }
 
@@ -950,15 +982,15 @@ async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
         return;
     };
     assert!(
-        store.set_chain_target(5, 1).await,
+        store.set_chain_target(5, Duration::from_secs(1)).await,
         "the target write landed"
     );
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
     let position = store.index_position().await.expect("position");
     assert_eq!(position.target, Some(5));
     assert!(position.valid_for.is_some_and(|s| s < 0), "{position:?}");
 
-    store.touch_chain_target(120).await;
+    store.touch_chain_target(Duration::from_secs(120)).await;
     let position = store.index_position().await.expect("position");
     assert_eq!(
         position.target,
@@ -977,7 +1009,7 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
     let Some((store, pool, _g)) = test_store_with(2).await else {
         return;
     };
-    let name = |s: &str| ens::ChainName::parse(s).unwrap();
+    let name = |s: &str| s.parse::<ens::ChainName>().unwrap();
     let writer = store.acquire_writer().await.expect("lease");
     // In the indexer's order: the chain is prepared, then named.
     store

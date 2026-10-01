@@ -4,9 +4,9 @@
 #   docker build --target indexer -t usernames-indexer .
 #   docker build --target api     -t usernames-api     .
 #
-# There is deliberately no image carrying both. A single entrypoint would have
-# to default to one of them, and a deployment that pulled it expecting the
-# other would run a container that looks healthy while doing half the job.
+# No image carries both: a single entrypoint would have to default to one of
+# them, and a deployment that pulled it expecting the other would run a
+# container that looks healthy while doing half the job.
 
 # === Builder ===
 # Pin the builder to bookworm so its glibc matches the bookworm-slim runtime

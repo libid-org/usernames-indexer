@@ -25,8 +25,8 @@ reverse display without guessing.
 ```sh
 docker compose up -d postgres          # listens on 127.0.0.1:55432
 cp .env.example .env                   # fill in RPC_URL and IDENTITY_NAMES_ADDRESS
-cargo run -p usernames-indexer         # the write half
-cargo run -p usernames-api             # the read half, in another shell
+cargo run -p usernames-indexer         # indexes the chain into the database
+cargo run -p usernames-api             # serves the API, in another shell
 ```
 
 Start the indexer first on a fresh database: it owns the schema and runs the
@@ -40,9 +40,10 @@ role allowed to create extensions — true for the compose database; on a
 managed instance with a least-privilege role, have an administrator run it
 once beforehand.
 
-Configuration is flags or environment (a `.env` file is read first). Each
-binary accepts only what it uses — the API takes no `RPC_URL`, and refusing
-the indexer's knobs is the point rather than an omission:
+Configuration is flags or environment (a `.env` file is read first);
+durations are written the way humantime reads them: `5s`, `1500ms`, `2m`. Each
+binary accepts only what it uses: the API takes no `RPC_URL` and none of the
+indexer's settings.
 
 | Variable | Used by | Default | Meaning |
 |---|---|---|---|
@@ -53,8 +54,8 @@ the indexer's knobs is the point rather than an omission:
 | `CHAIN_ID` | indexer | unset | Refuse to start unless the RPC reports this chain id. The API takes none: it serves every chain the store holds, and a request narrows with `?chain=` |
 | `CHAIN_NAMES` | indexer | — | Required. The names this chain goes by in an ENS name, comma-separated: the `base` in `alice.x.base.handles.link`. Labels only, never a platform key. Written to the store at every start for the gateway to read; a name belongs to one chain across the store, and declaring one another chain holds refuses to start |
 | `CONFIRMATIONS` | indexer | `5` | Blocks behind the head to stay (shallow-reorg protection) |
-| `POLL_INTERVAL_SECS` | indexer | `5` | Poll cadence, and the retry delay after a failure |
-| `STALE_AFTER_SECS` | indexer | four poll intervals + 60 | How long readers may trust this indexer's last report; the ENS gateway refuses this chain once it expires. Must exceed `POLL_INTERVAL_SECS`, and at most a year |
+| `POLL_INTERVAL` | indexer | `5s` | Poll cadence, and the retry delay after a failure |
+| `STALE_AFTER` | indexer | four poll intervals + 1m | How long readers may trust this indexer's last report; the ENS gateway refuses this chain once it expires. Must exceed `POLL_INTERVAL`, and at most a year |
 | `MAX_BLOCK_RANGE` | indexer | `10000` | Largest `eth_getLogs` window |
 | `START_BLOCK` | indexer | unset | Where a FRESH scan starts — consulted only when no cursor exists (new database, or right after a re-index). Unset means the deployment block is found by binary search over `eth_getCode`; only a successful detection is cached, and an RPC failure mid-search retries next cycle |
 | `LISTEN_ADDR` | api | `127.0.0.1:8080` | Read-API listen address |
@@ -133,7 +134,7 @@ verifies the signature and returns the record. Both on-chain halves are `view`.
 |---|---|---|
 | `ENS_SIGNER_KEY` | unset | A hex secp256k1 key, or an AWS KMS key id, alias (`alias/…`) or ARN, told apart by shape; with KMS the private material never enters the process, and region and credentials come from the ambient AWS chain (IRSA in the cluster). Setting it mounts the route; startup logs the signer address the resolver must trust |
 | `ENS_RESOLVER_ADDRESS` | — | Required with a key. The one `HandleResolver` on the ENS chain; it answers for every indexed chain, since the request's coin type picks the chain. Every answer is signed for this address, whatever `{sender}` the path carries; a request naming another resolver is refused with a 400, so a value that fell behind a `setResolver` is a visible error rather than a signature the resolver rejects |
-| `ENS_TTL_SECS` | `300` | How long an answer stays good; the resolver enforces it |
+| `ENS_TTL` | `5m` | How long an answer stays good; the resolver enforces it. At most `55m`: the resolver's `MAX_LIFETIME` less five minutes for the chain to trail |
 | `ENS_MAX_LAG_BLOCKS` | `32` | How far behind the chain the index may be and still assert anything. The target is set at the top of a cycle and the cursor catches up chunk by chunk, so this must exceed the blocks any served chain produces in one of its indexer's poll intervals |
 
 **Null is an answer; stale is not.** A name nobody holds gets a *signed* null —
@@ -148,7 +149,7 @@ measures the cursor against the target — and both are the indexer's own
 writes, so an indexer that stopped (crashed, lost its RPC, waiting on the
 writer lease) freezes them together and reads as caught up for as long as it
 stays down. So beside every target it sets, the indexer also declares how long
-that report may be trusted (`STALE_AFTER_SECS`, four poll intervals plus a
+that report may be trusted (`STALE_AFTER`, four poll intervals plus a
 minute unless set), renewing it per cycle and per committed chunk; the gateway
 refuses a chain whose report has expired. The expiry is stamped and read back
 with the database's clock, so no host's clock enters into it, and every
@@ -233,9 +234,9 @@ the map would not be reversible, and an irreversible map on a payment path is
 worse than no name. Such accounts are reachable by address, not by name.
 
 The design's id-derived fallback (`<idNode as 64 hex>._id.handles.link`) is not
-implemented, and deliberately: 64 characters is one past the DNS label ceiling
-of RFC 1035, so no standard client can encode it — ethers' `dnsEncode` refuses
-above 63. It could not have covered these accounts, or any others.
+implemented: 64 characters is one past the DNS label ceiling of RFC 1035, so
+no standard client can encode it — ethers' `dnsEncode` refuses above 63. It
+could not have covered these accounts, or any others.
 
 ## Read model
 
@@ -289,9 +290,9 @@ without pushing so packaging cannot rot:
 | `ghcr.io/libid-org/usernames-indexer` | the polling loop | nothing | RPC + a writer lease |
 | `ghcr.io/libid-org/usernames-api` | the read API | `0.0.0.0:8080` | the database only |
 
-There is deliberately no image carrying both. An entrypoint would have to
-default to one half, and a deployment that pulled it expecting the other would
-run a container that looks healthy while doing half the job.
+No image carries both: an entrypoint would have to default to one of them,
+and a deployment that pulled it expecting the other would run a container
+that looks healthy while doing half the job.
 
 **Upgrading from the single-image build:** the `usernames-indexer` image keeps
 its name and keeps indexing, but it no longer serves the API. Deploy

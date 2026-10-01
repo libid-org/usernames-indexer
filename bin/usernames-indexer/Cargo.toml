@@ -15,6 +15,7 @@ alloy.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 dotenvy.workspace = true
+humantime.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true

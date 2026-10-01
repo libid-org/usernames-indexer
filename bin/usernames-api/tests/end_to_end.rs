@@ -22,6 +22,8 @@
 //!
 //! Skips silently without `DATABASE_URL`, and needs `anvil` on PATH.
 
+use std::time::Duration;
+
 use alloy::{
     node_bindings::Anvil,
     primitives::{
@@ -52,6 +54,7 @@ use tokio::sync::Mutex;
 use tower::ServiceExt;
 use usernames_api::ens::{
     Config,
+    GatewayResponse,
     GatewayState,
 };
 use usernames_core::db::{
@@ -119,11 +122,9 @@ async fn ask_gateway(router: &Router, sender: Address, call_data: &Bytes) -> Byt
         response.status()
     );
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    let data = value["data"].as_str().expect("a data field");
-    hex::decode(data.trim_start_matches("0x"))
-        .expect("hex")
-        .into()
+    let answer: GatewayResponse =
+        serde_json::from_slice(&body).expect("a gateway answer");
+    answer.data
 }
 
 #[tokio::test]
@@ -173,7 +174,7 @@ enum WhoSigns {
 
 /// The four protocol steps, end to end. `None` means the suite skipped.
 async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> {
-    let _guard = DB_LOCK.lock().await;
+    let guard = DB_LOCK.lock().await;
     let url = std::env::var("DATABASE_URL").ok()?;
 
     // ── the read model the gateway answers from ──────────────────────
@@ -233,7 +234,7 @@ async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> 
     let router = usernames_api::ens::router(GatewayState::new(Config {
         resolver: resolver_address,
         store: db::Store::new(store.pool().clone()),
-        ttl_secs: 300,
+        ttl: Duration::from_secs(300),
         max_lag_blocks: 32,
         signer: std::sync::Arc::new(ManagedSigner::Local(signer)),
     }));
@@ -257,6 +258,9 @@ async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> 
 
     // ── 3. the client fetches a signed blob ──────────────────────────
     let response = ask_gateway(&router, lookup.sender, &lookup.callData).await;
+    // The gateway's answer is the last read of the chain's rows; the other
+    // test may wipe them from here.
+    drop(guard);
 
     // ── 4. and the chain turns it into an address, or refuses ────────
     Some(

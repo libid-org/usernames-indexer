@@ -39,10 +39,18 @@
 //! that indexer last committed — which is what [`Config::max_lag_blocks`] and
 //! the indexer's own report guard.
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{
+        Duration,
+        SystemTime,
+        UNIX_EPOCH,
+    },
+};
 
 use alloy::primitives::{
     Address,
+    Bytes,
     B256,
 };
 use axum::{
@@ -60,10 +68,9 @@ use axum::{
     Router,
 };
 use libid_signer::ManagedSigner;
-use serde::Serialize;
-use tracing::{
-    error,
-    warn,
+use serde::{
+    Deserialize,
+    Serialize,
 };
 use usernames_core::{
     db::{
@@ -101,7 +108,7 @@ pub struct Config {
     /// another endpoint was there to finish.
     pub store: Store,
     /// How long an answer stays good. The resolver enforces it on chain.
-    pub ttl_secs: u64,
+    pub ttl: Duration,
     /// How far behind the chain an index may be and still assert anything.
     pub max_lag_blocks: u64,
     /// What signs an answer, pinned by the resolver's signer set; rotating it
@@ -259,7 +266,7 @@ impl Config {
             [chain_id] => ChainMatch::One(self.indexed_chain(*chain_id)),
             [] => ChainMatch::None,
             both => {
-                warn!(
+                tracing::warn!(
                     chains = ?both,
                     %coin_type,
                     "two indexed chains share one coin type"
@@ -298,7 +305,7 @@ impl Config {
     ) -> Result<GatewayResponse, GatewayError> {
         let reply = Reply {
             result,
-            expires: Self::now().saturating_add(self.ttl_secs),
+            expires: Self::now().saturating_add(self.ttl.as_secs()),
         };
         // The digest is already the resolver's `makeSignatureHash`; no
         // EIP-191 prefix goes on top of it.
@@ -311,7 +318,7 @@ impl Config {
             // line — exactly inverted.
             .map_err(GatewayError::internal)?;
         Ok(GatewayResponse {
-            data: format!("0x{}", hex::encode(reply.encode(&signature))),
+            data: Bytes::from(reply.encode(&signature)),
         })
     }
 
@@ -319,8 +326,8 @@ impl Config {
     /// stays pure. Saturating, so an absurd TTL cannot wrap it — the startup
     /// ceiling rules one out anyway.
     fn now() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or_default()
     }
@@ -338,7 +345,7 @@ impl Config {
             .parse()
             .map_err(|_| GatewayError::bad_request("sender is not an address"))?;
         if sender != self.resolver {
-            warn!(
+            tracing::warn!(
                 %sender,
                 resolver = %self.resolver,
                 "refusing a request that names another resolver"
@@ -576,7 +583,7 @@ impl Answer {
                 "two indexed chains share coin type {coin_type}; not answering"
             ))),
             Self::TooStale(why) => {
-                warn!(?why, "refusing to answer from a stale index");
+                tracing::warn!(?why, "refusing to answer from a stale index");
                 Err(GatewayError::unavailable(why.message()))
             }
         }
@@ -620,30 +627,33 @@ pub fn router(state: GatewayState) -> Router {
 }
 
 /// One served chain, as supervision should see it.
-#[derive(Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ChainStatus {
-    chain_id: u64,
+pub struct ChainStatus {
+    /// The chain.
+    pub chain_id: u64,
     /// The names the chain goes by in a name, as its indexer declared them.
-    names: Vec<String>,
+    pub names: Vec<String>,
     /// Blocks between the indexer's target and its cursor.
-    lag_blocks: Option<u64>,
+    pub lag_blocks: Option<u64>,
     /// Unix seconds at which the indexer last reported.
-    indexer_reported_at: Option<u64>,
+    pub indexer_reported_at: Option<u64>,
     /// Seconds until the indexer's last report expires, negative once it has.
-    report_valid_for: Option<i64>,
+    pub report_valid_for: Option<i64>,
     /// Whether another chain in the store shares this chain's coin type, in
     /// which case queries for that coin type are refused however fresh either
     /// is: the store cannot say which was meant.
-    ambiguous: bool,
+    pub ambiguous: bool,
     /// Whether a query for this chain would be refused right now, for any of
     /// the reasons above.
-    stale: bool,
+    pub stale: bool,
 }
 
-#[derive(Serialize)]
-struct GatewayStatus {
-    chains: Vec<ChainStatus>,
+/// `GET /ens/status`: every chain the gateway serves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayStatus {
+    /// One row per chain the store holds.
+    pub chains: Vec<ChainStatus>,
 }
 
 /// `GET /status`: one row per chain the store holds. For alerting, never for
@@ -656,10 +666,12 @@ async fn status(
     Ok(Json(state.config.status().await?))
 }
 
-/// What ERC-3668 hands back: one hex blob the resolver's callback decodes.
-#[derive(Serialize)]
-struct GatewayResponse {
-    data: String,
+/// What ERC-3668 hands back: one blob the resolver's callback decodes,
+/// 0x-hex on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayResponse {
+    /// `abi.encode(result, expires, signature)`.
+    pub data: Bytes,
 }
 
 /// Why an answer could not be given at all — as opposed to given as null.
@@ -696,7 +708,7 @@ impl GatewayError {
     /// INSTEAD of logging it — which is what this used to do — leaves the
     /// operator with nothing while the caller has everything.
     fn internal(e: impl std::fmt::Display) -> Self {
-        error!(cause = %e, "gateway lookup failed");
+        tracing::error!(cause = %e, "gateway lookup failed");
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: "lookup failed".into(),

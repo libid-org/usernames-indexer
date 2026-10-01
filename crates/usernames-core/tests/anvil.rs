@@ -409,11 +409,11 @@ async fn indexes_a_real_chain_end_to_end() {
         contract: *mock.address(),
         escrow: Some(*escrow.address()),
         confirmations: 0,
-        poll_interval_secs: 1,
+        poll_interval: Duration::from_secs(1),
         max_block_range: 2,
         start_block: None,
         // A report good for two minutes; the loop renews it every cycle.
-        stale_after_secs: 120,
+        stale_after: Duration::from_secs(120),
     };
     let task = tokio::spawn(
         indexer::Indexer::new(store.clone(), provider.clone(), config)

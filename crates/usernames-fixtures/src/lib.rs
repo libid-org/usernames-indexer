@@ -18,8 +18,7 @@
 //!
 //! `gateway.rs` drives the router in process with these; `end_to_end.rs`
 //! deploys the real `HandleResolver` on anvil and walks the protocol with
-//! them. Neither needs ENS or a network. It is a dev-dependency of
-//! `usernames-api` and nothing else links it. It is a crate rather than a
+//! them. Neither needs ENS or a network. It is a crate rather than a
 //! `tests/common` module because each test binary compiles such a module on
 //! its own, and a helper one of them does not call reads as dead code there;
 //! a library's public items never do.
@@ -33,6 +32,8 @@
 
 #![deny(missing_docs)]
 #![deny(dead_code)]
+
+use std::time::Duration;
 
 use alloy::{
     primitives::{
@@ -151,5 +152,5 @@ pub async fn bind(store: &ChainStore, handle: &str, holder: Address) {
     // against the TARGET — the block the cursor chases — so that is the one a
     // fixture must record.
     store.set_chain_head(1).await;
-    store.set_chain_target(1, 120).await;
+    store.set_chain_target(1, Duration::from_secs(120)).await;
 }

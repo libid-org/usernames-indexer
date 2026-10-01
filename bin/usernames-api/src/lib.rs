@@ -18,6 +18,7 @@ pub mod ens;
 use std::{
     net::SocketAddr,
     sync::Arc,
+    time::Duration,
 };
 
 use alloy::primitives::Address;
@@ -32,7 +33,6 @@ use tower_http::cors::{
     Any,
     CorsLayer,
 };
-use tracing::info;
 use usernames_core::{
     api,
     db,
@@ -42,7 +42,7 @@ use usernames_core::{
 /// first so local runs need no exports.
 ///
 /// No `RPC_URL`: this process never talks to a chain. No `CONFIRMATIONS`,
-/// `POLL_INTERVAL_SECS`, `MAX_BLOCK_RANGE` or `START_BLOCK` either — those are
+/// `POLL_INTERVAL`, `MAX_BLOCK_RANGE` or `START_BLOCK` either — those are
 /// the indexer's, and accepting them here would suggest they did something.
 #[derive(Debug, Parser)]
 #[command(name = "usernames-api", about)]
@@ -76,10 +76,10 @@ pub struct Config {
     #[arg(long, env = "ENS_RESOLVER_ADDRESS")]
     pub ens_resolver_address: Option<Address>,
 
-    /// How long a signed answer stays good, in seconds. The resolver enforces
-    /// it on chain.
-    #[arg(long, env = "ENS_TTL_SECS", default_value_t = 300)]
-    pub ens_ttl_secs: u64,
+    /// How long a signed answer stays good: `5m`, `300s`. The resolver
+    /// enforces it on chain.
+    #[arg(long, env = "ENS_TTL", default_value = "5m", value_parser = humantime::parse_duration)]
+    pub ens_ttl: Duration,
 
     /// How far behind the chain the index may be and still assert anything.
     /// Past it the gateway refuses UNSIGNED rather than signing a null: a
@@ -111,17 +111,19 @@ pub async fn run() -> anyhow::Result<()> {
     // first would accept connections the process is not yet able to serve.
     let gateway = config.gateway(pool).await?;
     match &gateway {
-        Some(g) => info!(
+        Some(g) => tracing::info!(
             resolver = %g.resolver,
             route = %format!("{}/{{sender}}/{{data}}", ens::ROUTE_PREFIX),
             "ENS gateway configured"
         ),
-        None => info!("ENS gateway not configured; the CCIP-Read route is absent"),
+        None => {
+            tracing::info!("ENS gateway not configured; the CCIP-Read route is absent")
+        }
     }
     let app = build_router(api::AppState::new(store), gateway);
 
     let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
-    info!(addr = %config.listen_addr, "read API listening");
+    tracing::info!(addr = %config.listen_addr, "read API listening");
 
     let shutdown = cancel.clone();
     let mut task = tokio::spawn(async move {
@@ -132,7 +134,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     tokio::select! {
         r = tokio::signal::ctrl_c() => {
-            info!("shutting down");
+            tracing::info!("shutting down");
             cancel.cancel();
             let _ = task.await;
             r?;
@@ -176,11 +178,11 @@ pub fn build_router(state: api::AppState, gateway: Option<ens::Config>) -> Route
     )
 }
 
-/// The resolver's `MAX_LIFETIME`, in seconds. It rejects any `expires` further
-/// out than this, so a longer TTL here would have the gateway sign answers the
-/// contract reverts — every one of them, and only in production, since nothing
-/// off chain looks at the deadline.
-const RESOLVER_MAX_LIFETIME_SECS: u64 = 3600;
+/// The resolver's `MAX_LIFETIME`. It rejects any `expires` further out than
+/// this, so a longer TTL here would have the gateway sign answers the contract
+/// reverts — every one of them, and only in production, since nothing off
+/// chain looks at the deadline.
+const RESOLVER_MAX_LIFETIME: Duration = Duration::from_secs(3600);
 
 /// How far a block timestamp may trail the wall clock this process reads.
 ///
@@ -189,12 +191,14 @@ const RESOLVER_MAX_LIFETIME_SECS: u64 = 3600;
 /// lands on. That block is always at least a little behind now, so a TTL equal
 /// to `MAX_LIFETIME` puts `expires` past the ceiling by exactly the amount the
 /// chain trails — and every answer reverts, in production only, with nothing
-/// off chain the wiser. The room is generous on purpose: shortening a TTL costs
-/// a caller nothing, and guessing this too small costs every answer.
-const BLOCK_TIMESTAMP_SLACK_SECS: u64 = 300;
+/// off chain the wiser. The room is generous: shortening a TTL costs a caller
+/// nothing, and guessing this too small costs every answer.
+const BLOCK_TIMESTAMP_SLACK: Duration = Duration::from_secs(300);
 
 /// The longest TTL a gateway may be configured with.
-const MAX_TTL_SECS: u64 = RESOLVER_MAX_LIFETIME_SECS - BLOCK_TIMESTAMP_SLACK_SECS;
+const MAX_TTL: Duration = Duration::from_secs(
+    RESOLVER_MAX_LIFETIME.as_secs() - BLOCK_TIMESTAMP_SLACK.as_secs(),
+);
 
 impl Config {
     /// Where the gateway's key lives, and the resolver it signs for.
@@ -226,15 +230,15 @@ impl Config {
 
         // The resolver enforces this on chain; refuse at startup rather than
         // let a deployment sign answers that always revert.
-        if self.ens_ttl_secs > MAX_TTL_SECS {
+        if self.ens_ttl > MAX_TTL {
             anyhow::bail!(
-                "ENS_TTL_SECS is {}, but the resolver's MAX_LIFETIME is {}s and it \
-                 measures from the block's timestamp, not from now — leave {}s for \
+                "ENS_TTL is {}, but the resolver's MAX_LIFETIME is {} and it \
+                 measures from the block's timestamp, not from now — leave {} for \
                  the chain to trail, so at most {}",
-                self.ens_ttl_secs,
-                RESOLVER_MAX_LIFETIME_SECS,
-                BLOCK_TIMESTAMP_SLACK_SECS,
-                MAX_TTL_SECS
+                humantime::format_duration(self.ens_ttl),
+                humantime::format_duration(RESOLVER_MAX_LIFETIME),
+                humantime::format_duration(BLOCK_TIMESTAMP_SLACK),
+                humantime::format_duration(MAX_TTL)
             );
         }
 
@@ -244,7 +248,7 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("ENS_SIGNER_KEY: {e}"))?;
         // The address is what the resolver's signer set must hold, and with
         // KMS nothing but this line tells an operator what it is.
-        info!(
+        tracing::info!(
             signer = %signer.address(),
             via = %signer.describe(),
             %resolver,
@@ -253,7 +257,7 @@ impl Config {
         Ok(Some(ens::Config {
             resolver,
             store: db::Store::new(pool),
-            ttl_secs: self.ens_ttl_secs,
+            ttl: self.ens_ttl,
             max_lag_blocks: self.ens_max_lag_blocks,
             signer: Arc::new(signer),
         }))
@@ -338,7 +342,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_ttl_the_resolver_would_reject_is_refused() {
-        let message = refusal(&["--ens-ttl-secs", "7200"]).await;
+        let message = refusal(&["--ens-ttl", "2h"]).await;
         assert!(message.contains("MAX_LIFETIME"), "{message}");
     }
 
@@ -348,11 +352,14 @@ mod tests {
     /// is every block.
     #[tokio::test]
     async fn the_ttl_ceiling_leaves_the_chain_room_to_trail() {
-        let at_ceiling = config(&["--ens-ttl-secs", &MAX_TTL_SECS.to_string()]);
+        let at_ceiling = config(&[
+            "--ens-ttl",
+            &humantime::format_duration(MAX_TTL).to_string(),
+        ]);
         assert!(at_ceiling.gateway(lazy_pool()).await.is_ok());
 
-        let message =
-            refusal(&["--ens-ttl-secs", &RESOLVER_MAX_LIFETIME_SECS.to_string()]).await;
+        let ceiling = humantime::format_duration(RESOLVER_MAX_LIFETIME).to_string();
+        let message = refusal(&["--ens-ttl", &ceiling]).await;
         assert!(message.contains("trail"), "{message}");
     }
 }

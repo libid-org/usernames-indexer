@@ -12,6 +12,7 @@
 
 use std::{
     collections::HashMap,
+    str::FromStr,
     sync::LazyLock,
 };
 
@@ -128,15 +129,12 @@ impl From<KnownPlatform> for Platform {
     }
 }
 
-impl Platform {
-    /// The platform a short key names, when this build knows it.
-    pub fn from_key(key: &str) -> Option<Self> {
-        KnownPlatform::from_key(key).map(Self::from)
-    }
+/// A caller-supplied reference: a known key, or a 0x-hex id — which picks its
+/// key back up when this build knows the platform.
+impl FromStr for Platform {
+    type Err = UnknownPlatform;
 
-    /// A caller-supplied reference: a known key, or a 0x-hex id — which
-    /// picks its key back up when this build knows the platform.
-    pub fn parse(raw: &str) -> Result<Self, UnknownPlatform> {
+    fn from_str(raw: &str) -> Result<Self, UnknownPlatform> {
         if let Some(platform) = Self::from_key(raw) {
             return Ok(platform);
         }
@@ -149,6 +147,13 @@ impl Platform {
         Err(UnknownPlatform {
             raw: raw.to_string(),
         })
+    }
+}
+
+impl Platform {
+    /// The platform a short key names, when this build knows it.
+    pub fn from_key(key: &str) -> Option<Self> {
+        KnownPlatform::from_key(key).map(Self::from)
     }
 
     /// The 32-byte id the chain keys this platform by.
@@ -325,21 +330,24 @@ mod tests {
 
     #[test]
     fn parse_accepts_keys_and_hex_and_names_the_keys_it_knows() {
-        let by_key = Platform::parse("x").unwrap();
+        let by_key = "x".parse::<Platform>().unwrap();
         assert_eq!(by_key.key(), Some("x"));
 
         // The hex form of a registered platform picks its key back up.
-        let by_id = Platform::parse(&by_key.id().to_string()).unwrap();
+        let by_id = by_key.id().to_string().parse::<Platform>().unwrap();
         assert_eq!(by_id.id(), by_key.id());
         assert_eq!(by_id.key(), Some("x"));
 
         // An unregistered id still parses — events are self-describing —
         // it just has no key, and so no rules, on this side.
-        let foreign = Platform::parse(&B256::repeat_byte(7).to_string()).unwrap();
+        let foreign = B256::repeat_byte(7)
+            .to_string()
+            .parse::<Platform>()
+            .unwrap();
         assert_eq!(foreign.key(), None);
 
         // The refusal names every registered key, derived from the registry.
-        let err = Platform::parse("myspace").unwrap_err().to_string();
+        let err = "myspace".parse::<Platform>().unwrap_err().to_string();
         for platform in KnownPlatform::ALL {
             assert!(err.contains(platform.key()), "{err}");
         }

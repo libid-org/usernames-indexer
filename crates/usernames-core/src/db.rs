@@ -9,6 +9,8 @@
 //! contract keys its own storage by, so replaying a window — after a crash,
 //! or after a version-bump re-index — converges instead of duplicating.
 
+use std::time::Duration;
+
 use alloy::primitives::{
     Address,
     B256,
@@ -19,11 +21,6 @@ use sqlx::{
     Postgres,
     QueryBuilder,
     Transaction,
-};
-use tracing::{
-    error,
-    info,
-    warn,
 };
 
 use crate::{
@@ -107,7 +104,7 @@ pub struct IndexPosition {
 /// The longest validity the store will write: ten years. Anything larger is
 /// a mistake, and a value near `i64::MAX` would overflow the `bigint` addition
 /// in Postgres and fail the whole statement, target included.
-const MAX_VALID_FOR_SECS: u64 = 10 * 366 * 24 * 60 * 60;
+const MAX_VALID_FOR: Duration = Duration::from_secs(10 * 366 * 24 * 60 * 60);
 
 /// The whole store: every chain any indexer has written into one database.
 ///
@@ -329,7 +326,7 @@ impl ChainStore {
                 .fetch_one(&mut conn)
                 .await?;
         if !taken {
-            warn!(
+            tracing::warn!(
                 chain_id = self.chain_id,
                 "another indexer holds this chain's writer lock; waiting"
             );
@@ -384,7 +381,7 @@ impl ChainStore {
         if version_ok && contract_ok && escrow_ok {
             return Ok(());
         }
-        warn!(
+        tracing::warn!(
             chain_id = self.chain_id,
             version_from = version.as_deref().unwrap_or("<none>"),
             version_to = INDEXER_VERSION,
@@ -422,7 +419,7 @@ impl ChainStore {
                 .await?;
         }
         tx.commit().await?;
-        info!(
+        tracing::info!(
             chain_id = self.chain_id,
             version = INDEXER_VERSION,
             "replay armed; starts next cycle"
@@ -435,7 +432,7 @@ impl ChainStore {
     /// window.
     pub async fn set_chain_head(&self, head: u64) {
         if let Err(e) = self.set_metadata(HEAD_KEY, &head.to_string()).await {
-            warn!(%e, "failed to record the chain head");
+            tracing::warn!(%e, "failed to record the chain head");
         }
     }
 
@@ -458,28 +455,27 @@ impl ChainStore {
     /// confirmation depth.
     ///
     /// Record the target, when it was reported, and how long readers may
-    /// trust that report — `valid_for_secs` from now, by the database's
-    /// clock. One statement, so the three cannot disagree: a report must
+    /// trust that report — `valid_for` from now, by the database's clock. One statement, so the three cannot disagree: a report must
     /// never vouch for a target write that failed, and no host's clock
     /// enters into it.
     ///
     /// Returns whether the write landed, so a caller renewing the report
     /// later in the same cycle can decline to vouch for a target that never
     /// made it.
-    pub async fn set_chain_target(&self, target: u64, valid_for_secs: u64) -> bool {
+    pub async fn set_chain_target(&self, target: u64, valid_for: Duration) -> bool {
         let written = sqlx::query(sql::SET_CHAIN_TARGET)
             .bind(self.chain_id)
             .bind(TARGET_KEY)
             .bind(target.to_string())
             .bind(TARGET_REPORTED_AT_KEY)
             .bind(TARGET_VALID_UNTIL_KEY)
-            .bind(Self::valid_for_bind(valid_for_secs))
+            .bind(Self::valid_for_bind(valid_for))
             .execute(&self.pool)
             .await;
         match written {
             Ok(_) => true,
             Err(e) => {
-                warn!(%e, "failed to record the chain target");
+                tracing::warn!(%e, "failed to record the chain target");
                 false
             }
         }
@@ -489,16 +485,16 @@ impl ChainStore {
     /// chunk by chunk under one target, and every committed chunk is proof
     /// that the loop is alive and the chain reachable; without this a healthy
     /// backfill would expire.
-    pub async fn touch_chain_target(&self, valid_for_secs: u64) {
+    pub async fn touch_chain_target(&self, valid_for: Duration) {
         let touched = sqlx::query(sql::TOUCH_CHAIN_TARGET)
             .bind(self.chain_id)
             .bind(TARGET_REPORTED_AT_KEY)
             .bind(TARGET_VALID_UNTIL_KEY)
-            .bind(Self::valid_for_bind(valid_for_secs))
+            .bind(Self::valid_for_bind(valid_for))
             .execute(&self.pool)
             .await;
         if let Err(e) = touched {
-            warn!(%e, "failed to renew the chain target's report");
+            tracing::warn!(%e, "failed to renew the chain target's report");
         }
     }
 
@@ -509,11 +505,12 @@ impl ChainStore {
         format!("deploy_block:{contract}")
     }
 
-    /// The validity the store will write for a report: at most ten years,
-    /// so the `bigint` addition in Postgres can never overflow and fail the
-    /// whole statement, target included.
-    fn valid_for_bind(valid_for_secs: u64) -> i64 {
-        i64::try_from(valid_for_secs.min(MAX_VALID_FOR_SECS)).unwrap_or(i64::MAX)
+    /// The validity the store will write for a report, in the whole seconds
+    /// the SQL adds to its clock: at most ten years, so the `bigint` addition
+    /// in Postgres can never overflow and fail the whole statement, target
+    /// included.
+    fn valid_for_bind(valid_for: Duration) -> i64 {
+        i64::try_from(valid_for.min(MAX_VALID_FOR).as_secs()).unwrap_or(i64::MAX)
     }
 
     /// Declare the names this chain goes by in an ENS name, replacing whatever
@@ -579,7 +576,7 @@ impl ChainStore {
             .set_metadata(TARGET_VALID_UNTIL_KEY, &secs.to_string())
             .await
         {
-            warn!(%e, "failed to record when the chain target's report expires");
+            tracing::warn!(%e, "failed to record when the chain target's report expires");
         }
     }
 
@@ -639,7 +636,7 @@ impl ChainStore {
                 .map(|_| ()),
         };
         if let Err(e) = result {
-            warn!(%e, "failed to record the window error state");
+            tracing::warn!(%e, "failed to record the window error state");
         }
     }
 
@@ -714,7 +711,7 @@ impl ChainStore {
 /// chain actually keys — stay exact.
 fn sanitize(value: &str, what: &str) -> String {
     if value.contains('\0') {
-        error!(
+        tracing::error!(
             what,
             "string contains a NUL byte; storing with U+FFFD in its place"
         );
@@ -798,7 +795,7 @@ impl Window {
 
         let mut payload = event.payload();
         if sanitize_json(&mut payload) {
-            error!(
+            tracing::error!(
                 kind = event.kind(),
                 "journal payload contained a NUL byte; stored with U+FFFD in its place"
             );
@@ -843,14 +840,14 @@ impl Window {
                 // platform ids or hashing drifted and resolution-by-string is
                 // broken until fixed.
                 if nodes::id_node(*platform_id, id) != *id_node {
-                    error!(%id_node, id, "recomputed idNode disagrees with the emitted topic");
+                    tracing::error!(%id_node, id, "recomputed idNode disagrees with the emitted topic");
                 }
                 if nodes::handle_node(
                     *platform_id,
                     &nodes::NormalizedHandle::from_chain(handle),
                 ) != *handle_node
                 {
-                    error!(%handle_node, handle, "recomputed handleNode disagrees with the emitted topic");
+                    tracing::error!(%handle_node, handle, "recomputed handleNode disagrees with the emitted topic");
                 }
 
                 let observed = as_i64(*observed_at, "observedAt")?;
@@ -951,7 +948,7 @@ impl Window {
                     // rules payload, so the honest move is to say so loudly
                     // and keep indexing by node — node lookups stay exact
                     // either way.
-                    warn!(
+                    tracing::warn!(
                         %platform_id,
                         block,
                         "platform reconfigured on chain; if its rules changed, \

@@ -7,6 +7,8 @@
 //!
 //! Skips silently when `DATABASE_URL` is unset, like the other suites.
 
+use std::time::Duration;
+
 use alloy::{
     primitives::Address,
     signers::local::PrivateKeySigner,
@@ -28,8 +30,11 @@ use tokio::sync::{
 };
 use tower::ServiceExt;
 use usernames_api::ens::{
+    ChainStatus,
     Config,
+    GatewayResponse,
     GatewayState,
+    GatewayStatus,
 };
 use usernames_core::{
     db::{
@@ -119,14 +124,14 @@ async fn gateway_parts(
         // The gate measures the cursor against the TARGET — what the indexer
         // intends to reach — not the raw head, so a fixture that records only
         // the head reads as "cannot tell" and refuses every query.
-        store.set_chain_target(1, 120).await;
+        store.set_chain_target(1, Duration::from_secs(120)).await;
     }
 
     let store = ChainStore::new(pool.clone(), chains[0]);
     let config = Config {
         resolver: RESOLVER,
         store: db::Store::new(pool.clone()),
-        ttl_secs: 300,
+        ttl: Duration::from_secs(300),
         max_lag_blocks,
         signer: std::sync::Arc::new(ManagedSigner::Local(
             SIGNER_KEY.parse::<PrivateKeySigner>().expect("key"),
@@ -140,7 +145,7 @@ async fn gateway_parts(
 async fn declare_names(store: &ChainStore, names: &[&str]) {
     let names: Vec<_> = names
         .iter()
-        .map(|name| ens::ChainName::parse(name).expect("a chain name"))
+        .map(|name| name.parse::<ens::ChainName>().expect("a chain name"))
         .collect();
     let writer = store.acquire_writer().await.expect("lease");
     store
@@ -180,14 +185,8 @@ async fn ask(router: &Router, sender: Address, call: &[u8]) -> (StatusCode, Stri
 /// to be one the resolver would accept. These are the bytes the callback
 /// returns to the wallet, in whatever shape the record call asked for.
 fn signed_result(body: &str, call: &[u8]) -> Vec<u8> {
-    let value: serde_json::Value = serde_json::from_str(body).expect("json");
-    let data = hex::decode(
-        value["data"]
-            .as_str()
-            .expect("a data field")
-            .trim_start_matches("0x"),
-    )
-    .expect("hex");
+    let answer: GatewayResponse = serde_json::from_str(body).expect("a gateway answer");
+    let data = answer.data;
 
     // (bytes result, uint64 expires, bytes signature), by hand.
     let word = |at: usize| -> u64 {
@@ -450,7 +449,9 @@ async fn a_stale_index_refuses_rather_than_signing_a_null() {
     bind(&store, "alice", Address::from([0xbe; 20])).await;
     // Far ahead of the cursor, as the TARGET: that is the quantity the gate
     // compares, and the head alone no longer moves it.
-    store.set_chain_target(10_000, 120).await;
+    store
+        .set_chain_target(10_000, Duration::from_secs(120))
+        .await;
 
     let call = resolve_call(
         &wire_name(&["alice", "x"]),
@@ -511,7 +512,7 @@ async fn one_gateway_answers_for_every_chain_it_serves() {
 /// both absent on a fresh database, and again while `prepare` replays a chain
 /// after a version bump — and an unreadable Postgres looks the same. Folding
 /// that into "no lag" made the gateway sign an authoritative "nobody holds
-/// this" for every name, cached by wallets for the whole `ENS_TTL_SECS`
+/// this" for every name, cached by wallets for the whole `ENS_TTL`
 /// window.
 #[tokio::test]
 async fn an_index_that_cannot_report_its_position_refuses() {
@@ -538,7 +539,7 @@ async fn an_index_that_cannot_report_its_position_refuses() {
 /// The block gate cannot see a stopped indexer: target and cursor are both
 /// its own writes, so they freeze together and lag reads zero for as long as
 /// it stays down — signed nulls for bindings made since, and old addresses
-/// after a rebind, for the whole `ENS_TTL_SECS` each. The report the indexer
+/// after a rebind, for the whole `ENS_TTL` each. The report the indexer
 /// makes beside the target expires on the indexer's own schedule, and that is
 /// what notices.
 #[tokio::test]
@@ -605,27 +606,23 @@ async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
         .expect("router");
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    let status: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    let stale_of = |id: i64| {
-        status["chains"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["chainId"] == id)
-            .map(|c| c["stale"].as_bool().unwrap())
-    };
-    assert_eq!(stale_of(OTHER), Some(true), "{status}");
-    assert_eq!(stale_of(CHAIN), Some(false), "{status}");
-    let valid_for_of = |id: i64| {
-        status["chains"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["chainId"] == id)
-            .and_then(|c| c["reportValidFor"].as_i64())
-    };
-    assert!(valid_for_of(OTHER).is_some_and(|s| s < 0), "{status}");
-    assert!(valid_for_of(CHAIN).is_some_and(|s| s > 0), "{status}");
+    let status: GatewayStatus = serde_json::from_slice(&body).expect("a gateway status");
+    let other = row_of(&status, OTHER);
+    let chain = row_of(&status, CHAIN);
+    assert!(other.stale, "{status:?}");
+    assert!(!chain.stale, "{status:?}");
+    assert!(other.report_valid_for.is_some_and(|s| s < 0), "{status:?}");
+    assert!(chain.report_valid_for.is_some_and(|s| s > 0), "{status:?}");
+}
+
+/// The status row of one chain; a chain the status does not list fails the
+/// test.
+fn row_of(status: &GatewayStatus, chain_id: i64) -> &ChainStatus {
+    status
+        .chains
+        .iter()
+        .find(|row| i64::try_from(row.chain_id) == Ok(chain_id))
+        .unwrap_or_else(|| panic!("chain {chain_id} is listed: {status:?}"))
 }
 
 /// A chain has only the names its indexer declared. With none declared, the
@@ -683,7 +680,7 @@ async fn a_chain_that_appears_in_the_store_is_served_without_a_restart() {
         .await
         .expect("commit");
     other.set_chain_head(1).await;
-    other.set_chain_target(1, 120).await;
+    other.set_chain_target(1, Duration::from_secs(120)).await;
     let there = Address::from([0xed; 20]);
     bind(&other, "alice", there).await;
 
@@ -725,16 +722,10 @@ async fn two_indexed_chains_on_one_coin_type_are_refused_unsigned() {
         .await
         .expect("router");
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    let status: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    let status: GatewayStatus = serde_json::from_slice(&body).expect("a gateway status");
     for id in [EDEN, TWIN] {
-        let row = status["chains"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["chainId"] == id)
-            .expect("listed");
-        assert_eq!(row["ambiguous"], true, "{status}");
-        assert_eq!(row["stale"], true, "{status}");
+        let row = row_of(&status, id);
+        assert!(row.ambiguous && row.stale, "{status:?}");
     }
 }
 
