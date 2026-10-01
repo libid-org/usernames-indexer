@@ -1,7 +1,7 @@
-//! End to end against a real chain: anvil runs, a mock contract with the
-//! exact IdentityRegistry event surface emits a scenario, and the indexer's
-//! own loop — deployment-block detection included — indexes it into Postgres,
-//! where the API answers.
+//! End to end against a real chain: anvil runs, mock contracts with the exact
+//! IdentityRegistry and HandleEscrow event surfaces emit a scenario, and the
+//! indexer's own loop — deployment-block detection included — indexes both
+//! into Postgres, where the API answers.
 //!
 //! Skips silently in exactly two cases: `DATABASE_URL` unset, or no `anvil`
 //! binary on PATH. Everything past those checks panics on failure.
@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use alloy::{
     primitives::{
+        address,
         Address,
         Bytes,
         B256,
@@ -27,12 +28,19 @@ use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
 use usernames_core::{
     api::model::{
+        AddressBalances,
+        AddressHistory,
         AddressResolution,
+        HandleHistory,
         HandleResolution,
+        HistoryEntry,
+        HistoryEvent,
         IdResolution,
+        Role,
         SearchResults,
         Status,
     },
+    chain,
     db::{
         self,
         ChainStore,
@@ -82,6 +90,56 @@ sol! {
         function emitPlatformConfigured(bytes32 platformId) external;
         function emitProofVerifierConfigured(address verifier) external;
         function emitHandleUnpublished(address holder, bytes32 platformId) external;
+    }
+}
+
+sol! {
+    /// The event surface of HandleEscrow behind bare emit functions, and its
+    /// `registry` view; source and regeneration notes in
+    /// contracts/MockHandleEscrow.sol. (Each emitter takes its event's seven
+    /// fields, as the registry's does its nine.)
+    #[allow(clippy::too_many_arguments)]
+    #[sol(rpc)]
+    #[sol(bytecode = "0x60a060405234801561000f575f5ffd5b506040516106eb3803806106eb833981810160405281019061003191906100c9565b8073ffffffffffffffffffffffffffffffffffffffff1660808173ffffffffffffffffffffffffffffffffffffffff1681525050506100f4565b5f5ffd5b5f73ffffffffffffffffffffffffffffffffffffffff82169050919050565b5f6100988261006f565b9050919050565b6100a88161008e565b81146100b2575f5ffd5b50565b5f815190506100c38161009f565b92915050565b5f602082840312156100de576100dd61006b565b5b5f6100eb848285016100b5565b91505092915050565b6080516105df61010c5f395f6101d301526105df5ff3fe608060405234801561000f575f5ffd5b5060043610610055575f3560e01c80632d3cc3e1146100595780634367153b146100755780637b10399914610091578063da3dcba7146100af578063f02f15d2146100cb575b5f5ffd5b610073600480360381019061006e91906103a3565b6100e7565b005b61008f600480360381019061008a91906103a3565b61015c565b005b6100996101d1565b6040516100a6919061044f565b60405180910390f35b6100c960048036038101906100c49190610468565b6101f5565b005b6100e560048036038101906100e09190610468565b61026a565b005b8473ffffffffffffffffffffffffffffffffffffffff168673ffffffffffffffffffffffffffffffffffffffff16887fb7d023fdcfc8cdb1aeb0fcf141fb12597f076f2d9cfa676aba35f34489d52e4e8787878760405161014b9493929190610514565b60405180910390a450505050505050565b8473ffffffffffffffffffffffffffffffffffffffff168673ffffffffffffffffffffffffffffffffffffffff16887f1250cc5278315bb2cb7738cc5a09976c58b02915c0276c970e7f29516954cce6878787876040516101c09493929190610514565b60405180910390a450505050505050565b7f000000000000000000000000000000000000000000000000000000000000000081565b8473ffffffffffffffffffffffffffffffffffffffff168673ffffffffffffffffffffffffffffffffffffffff16887f71c8ac17b0d61cd3caffe11aa02503df41a1ce9009949c95908b0acce726a03d878787876040516102599493929190610566565b60405180910390a450505050505050565b8473ffffffffffffffffffffffffffffffffffffffff168673ffffffffffffffffffffffffffffffffffffffff16887f03859cb562640b930fb7d5def4727f9aeb85fbed245fad32eb049ee0422dc84d878787876040516102ce9493929190610566565b60405180910390a450505050505050565b5f5ffd5b5f819050919050565b6102f5816102e3565b81146102ff575f5ffd5b50565b5f81359050610310816102ec565b92915050565b5f73ffffffffffffffffffffffffffffffffffffffff82169050919050565b5f61033f82610316565b9050919050565b61034f81610335565b8114610359575f5ffd5b50565b5f8135905061036a81610346565b92915050565b5f819050919050565b61038281610370565b811461038c575f5ffd5b50565b5f8135905061039d81610379565b92915050565b5f5f5f5f5f5f5f60e0888a0312156103be576103bd6102df565b5b5f6103cb8a828b01610302565b97505060206103dc8a828b0161035c565b96505060406103ed8a828b0161035c565b95505060606103fe8a828b0161035c565b945050608061040f8a828b0161038f565b93505060a06104208a828b0161038f565b92505060c06104318a828b0161038f565b91505092959891949750929550565b61044981610335565b82525050565b5f6020820190506104625f830184610440565b92915050565b5f5f5f5f5f5f5f60e0888a031215610483576104826102df565b5b5f6104908a828b01610302565b97505060206104a18a828b0161035c565b96505060406104b28a828b0161035c565b95505060606104c38a828b0161035c565b94505060806104d48a828b01610302565b93505060a06104e58a828b0161038f565b92505060c06104f68a828b0161038f565b91505092959891949750929550565b61050e81610370565b82525050565b5f6080820190506105275f830187610440565b6105346020830186610505565b6105416040830185610505565b61054e6060830184610505565b95945050505050565b610560816102e3565b82525050565b5f6080820190506105795f830187610440565b6105866020830186610557565b6105936040830185610505565b6105a06060830184610505565b9594505050505056fea26469706673582212206f7be131657ae258b0579d15a55bcf6535d7823c5433e39026d5c89649bc487064736f6c63430008210033")]
+    contract MockHandleEscrow {
+        constructor(address registry_);
+        function registry() external view returns (address);
+        function emitDeposited(
+            bytes32 handleNode,
+            address token,
+            address refundTo,
+            address depositor,
+            bytes32 platformId,
+            uint256 round,
+            uint256 amount
+        ) external;
+        function emitForwarded(
+            bytes32 handleNode,
+            address token,
+            address depositor,
+            address holder,
+            bytes32 platformId,
+            uint256 amount,
+            uint256 received
+        ) external;
+        function emitClaimed(
+            bytes32 handleNode,
+            address token,
+            address claimer,
+            address recipient,
+            uint256 round,
+            uint256 released,
+            uint256 received
+        ) external;
+        function emitRefunded(
+            bytes32 handleNode,
+            address token,
+            address refundTo,
+            address recipient,
+            uint256 round,
+            uint256 released,
+            uint256 received
+        ) external;
     }
 }
 
@@ -251,13 +309,95 @@ async fn indexes_a_real_chain_end_to_end() {
         .await
         .unwrap();
 
+    // The escrow, deployed after the registry it resolves through: a payer
+    // escrows for @bob_x, whom nobody holds yet, and pays Alice's held handle
+    // straight through; Bob then binds @bob_x and claims what waited.
+    let escrow = MockHandleEscrow::deploy(provider.clone(), *mock.address())
+        .await
+        .expect("deploy the escrow");
+    // The startup check the indexer binary makes before it prepares a chain.
+    assert_eq!(
+        chain::escrow_registry(&provider, *escrow.address())
+            .await
+            .expect("registry()"),
+        *mock.address()
+    );
+    let native = address!("EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
+    let (payer, bob) = (Address::repeat_byte(0xC0), Address::repeat_byte(0xB0));
+    let bob_node = nodes::handle_node(x, &nodes::NormalizedHandle::from_chain("bob_x"));
+    escrow
+        .emitDeposited(
+            bob_node,
+            native,
+            payer,
+            payer,
+            x,
+            U256::ZERO,
+            U256::from(100u64),
+        )
+        .send()
+        .await
+        .unwrap()
+        .watch()
+        .await
+        .unwrap();
+    escrow
+        .emitForwarded(
+            nodes::handle_node(x, &nodes::NormalizedHandle::from_chain("alice_2")),
+            native,
+            payer,
+            alice,
+            x,
+            U256::from(7u64),
+            U256::from(7u64),
+        )
+        .send()
+        .await
+        .unwrap()
+        .watch()
+        .await
+        .unwrap();
+    mock.emitIdentityBound(
+        bob,
+        nodes::id_node(x, "222"),
+        bob_node,
+        x,
+        "222".into(),
+        "bob_x".into(),
+        4000,
+        false,
+        1,
+    )
+    .send()
+    .await
+    .unwrap()
+    .watch()
+    .await
+    .unwrap();
+    escrow
+        .emitClaimed(
+            bob_node,
+            native,
+            bob,
+            bob,
+            U256::ZERO,
+            U256::from(100u64),
+            U256::from(100u64),
+        )
+        .send()
+        .await
+        .unwrap()
+        .watch()
+        .await
+        .unwrap();
+
     let latest = provider.get_block_number().await.expect("latest");
 
     // What the binary does before its loop: take the chain's writer lease and
     // prepare the chain, which records the contract the rows come from.
     let writer = store.acquire_writer().await.expect("writer lease");
     store
-        .prepare(&writer, *mock.address())
+        .prepare(&writer, *mock.address(), Some(*escrow.address()))
         .await
         .expect("prepare");
 
@@ -267,6 +407,7 @@ async fn indexes_a_real_chain_end_to_end() {
     let cancel = CancellationToken::new();
     let config = indexer::IndexerConfig {
         contract: *mock.address(),
+        escrow: Some(*escrow.address()),
         confirmations: 0,
         poll_interval_secs: 1,
         max_block_range: 2,
@@ -380,6 +521,7 @@ async fn indexes_a_real_chain_end_to_end() {
         "{chain:?}"
     );
     assert_eq!(chain.proof_verifier, Some(verifier));
+    assert_eq!(chain.escrow, Some(*escrow.address()));
     let platform_key: Option<String> = sqlx::query_scalar(
         "SELECT platform_key FROM names.platforms WHERE chain_id = $1 AND platform_id = $2",
     )
@@ -398,7 +540,7 @@ async fn indexes_a_real_chain_end_to_end() {
             .fetch_one(&pool)
             .await
             .expect("journal count");
-    assert_eq!(journal, 9);
+    assert_eq!(journal, 13);
     let fee_kinds: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM names.events WHERE chain_id = $1 AND kind = 'bind_fee_paid'",
     )
@@ -407,4 +549,61 @@ async fn indexes_a_real_chain_end_to_end() {
     .await
     .expect("fee count");
     assert_eq!(fee_kinds, 1);
+
+    // Both emitters' logs, in one history: the handle's from the deposit made
+    // while nobody held it through the bind to the claim, each dated by its
+    // block.
+    let history: HandleHistory = get(&store, "/v1/history/handle/x/bob_x").await.answer();
+    assert!(
+        matches!(
+            events(&history.entries)[..],
+            [
+                HistoryEvent::Claimed { .. },
+                HistoryEvent::IdentityBound { .. },
+                HistoryEvent::Deposited { .. },
+            ]
+        ),
+        "{history:?}"
+    );
+    assert!(history.entries.iter().all(|e| e.block_time > 0));
+    // The payer's history ends with Bob's claim taking its deposit.
+    let history: AddressHistory = get(&store, &format!("/v1/history/address/{payer}"))
+        .await
+        .answer();
+    assert!(
+        matches!(
+            events(&history.entries)[..],
+            [
+                HistoryEvent::Claimed { .. },
+                HistoryEvent::Forwarded { .. },
+                HistoryEvent::Deposited { .. },
+            ]
+        ),
+        "{history:?}"
+    );
+    assert_eq!(history.entries[0].roles, [Role::RefundTo]);
+    assert_eq!(history.entries[2].roles, [Role::Depositor, Role::RefundTo]);
+    let history: AddressHistory = get(&store, &format!("/v1/history/address/{alice}"))
+        .await
+        .answer();
+    assert_eq!(history.entries[0].roles, [Role::Holder]);
+    assert!(matches!(
+        history.entries[0].event,
+        HistoryEvent::Forwarded { received, .. } if received == U256::from(7u64)
+    ));
+
+    // Claimed: nothing waits for Bob, and the payer's refund ended with it.
+    let bobs: AddressBalances = get(&store, &format!("/v1/escrow/address/{bob}"))
+        .await
+        .answer();
+    assert!(bobs.claimable.is_empty(), "{bobs:?}");
+    let payers: AddressBalances = get(&store, &format!("/v1/escrow/address/{payer}"))
+        .await
+        .answer();
+    assert!(payers.refundable.is_empty(), "{payers:?}");
+}
+
+/// A history's events, in the order served.
+fn events(entries: &[HistoryEntry]) -> Vec<&HistoryEvent> {
+    entries.iter().map(|entry| &entry.event).collect()
 }

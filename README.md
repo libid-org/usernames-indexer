@@ -1,9 +1,11 @@
 # usernames-indexer
 
 Indexes [`IdentityRegistry`](https://github.com/libid-org/libid-contracts/blob/main/solidity/contracts/identity/IdentityRegistry.sol)
+and [`HandleEscrow`](https://github.com/libid-org/libid-contracts/blob/main/solidity/contracts/escrow/HandleEscrow.sol)
 events into Postgres and serves resolution and search over the claimed
-handles. **Two binaries over one read model**: `usernames-indexer`, a polling
-loop that indexes the contract's storage from its events alone, and
+handles, the history of every address and handle, and what the escrow holds.
+**Two binaries over one read model**: `usernames-indexer`, a polling loop
+that indexes the contracts' storage from their events alone, and
 `usernames-api`, which serves what the loop wrote. They are separate because
 they scale and fail differently — one writer per chain holds a Postgres
 advisory lease, while readers are stateless and horizontal — and because a
@@ -45,8 +47,9 @@ the indexer's knobs is the point rather than an omission:
 | Variable | Used by | Default | Meaning |
 |---|---|---|---|
 | `DATABASE_URL` | both | — | Postgres connection string |
-| `RPC_URL` | indexer | — | JSON-RPC endpoint of the chain to follow. Prefer a single node or a sticky endpoint: a load balancer that mixes lagged replicas can answer `eth_getLogs` for blocks a backend has not seen, and events dropped that way past the confirmation margin are gone until a re-index. The loop re-checks the backend's height before committing a window, which narrows but cannot close that hole. |
+| `RPC_URL` | indexer | — | JSON-RPC endpoint of the chain to follow. Its `eth_getLogs` must return `blockTimestamp` (reth, geth and anvil do); a log without one fails the window. Prefer a single node or a sticky endpoint: a load balancer that mixes lagged replicas can answer `eth_getLogs` for blocks a backend has not seen, and events dropped that way past the confirmation margin are gone until a re-index. The loop re-checks the backend's height before committing a window, which narrows but cannot close that hole. |
 | `IDENTITY_NAMES_ADDRESS` | indexer | — | The IdentityRegistry **ERC1967 proxy** (the implementation changes on upgrade; the proxy is the one that emits). The indexer records it per chain, and `/v1/status` reports it from there |
+| `HANDLE_ESCROW_ADDRESS` | indexer | unset | The HandleEscrow **ERC1967 proxy**, when the chain has one. The indexer refuses to start unless its `registry()` is `IDENTITY_NAMES_ADDRESS`. Its events share the registry's windows and cursor; setting, changing or unsetting it replays the chain. `/v1/status` reports it as `escrow` |
 | `CHAIN_ID` | indexer | unset | Refuse to start unless the RPC reports this chain id. The API takes none: it serves every chain the store holds, and a request narrows with `?chain=` |
 | `CHAIN_NAMES` | indexer | — | Required. The names this chain goes by in an ENS name, comma-separated: the `base` in `alice.x.base.handles.link`. Labels only, never a platform key. Written to the store at every start for the gateway to read; a name belongs to one chain across the store, and declaring one another chain holds refuses to start |
 | `CONFIRMATIONS` | indexer | `5` | Blocks behind the head to stay (shallow-reorg protection) |
@@ -64,12 +67,32 @@ the indexer's knobs is the point rather than an omission:
 | `GET /v1/resolve/id/{platform}/{userId}` | The wallet an account id resolves to (`resolveId`) on each chain it is bound on, each with the handle that account currently holds |
 | `GET /v1/resolve/address/{address}` | Every identity a wallet proved on every chain, with `resolves` and `published` flags (`publishedHandleOf`'s reverse display) |
 | `GET /v1/search?q=gre&platform=x&owner=0x…&limit=10&offset=0` | Live handles matching a partial query (exact, then prefix, then substring, then trigram-fuzzy), linked to a wallet, or both; one of `q` and `owner` is required. `limit` (1..50, default 10) and `offset` (up to 10000) page the ranked list; a page shorter than `limit` is the last |
-| `GET /v1/status` | Every chain the store holds: chain id, contract, last indexed block, chain head, lag, when the indexer last reported and how long that report is still good, last window error, the Proof Verifier the contract is wired to; and the read-model version |
+| `GET /v1/history/address/{address}?before=&limit=` | Every event the address took part in, newest first, each with its `roles`: `holder`, `previousHandleHolder` and `previousIdHolder` (an event took that handle or account from it), `feeReceiver`, `depositor`, `refundTo` (a claim took its deposit, too), `claimer`, `recipient` |
+| `GET /v1/history/handle/{platform}/{handle}?before=&limit=` | Every event on the handle: deposits while nobody held it, the binds that gave it a holder, and every claim, refund and payment after |
+| `GET /v1/history/node/{node}` | The same, by handle node: for a handle nobody has bound, whose text no event carried |
+| `GET /v1/escrow/address/{address}` | What waits for an address: `claimable`, held for the handles it holds now, and `refundable`, what deposits naming it as `refundTo` booked that nobody has claimed yet |
+| `GET /v1/escrow/handle/{platform}/{handle}` | What a handle holds, token by token, and its holder; `/v1/escrow/node/{node}` by node |
+| `GET /v1/escrow/unclaimed?token=0x…&platform=x&before=&limit=` | Every slot still holding something, bound or not: token by token, descending, the largest amount first within each |
+| `GET /v1/status` | Every chain the store holds: chain id, contract, escrow, last indexed block, chain head, lag, when the indexer last reported and how long that report is still good, last window error, the Proof Verifier the contract is wired to; and the read-model version |
 | `GET /health` | Liveness |
 
 Every read spans every chain the store holds, and every result carries its
 `chainId`; `?chain=8453` narrows a read to one chain. Nothing about chains
 or contracts is configured on the API: the indexers wrote it.
+
+A history is ordered by block time, then chain, block and log index, so one
+spanning chains interleaves them in time. Histories and the unclaimed list page
+by cursor: a page holds `limit` entries (1..100, default 20) and, while more
+remain, a `next` to pass back as `before`. Each entry carries the event in `event`, tagged by `kind`
+(the journal's kinds, fields named as the contract names them), and the
+handle it concerns. Amounts and rounds are `uint256` decimal strings; the
+chain's own coin is the EIP-7528 token `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`.
+Anybody can deposit a token they wrote, so show the tokens you recognize.
+
+A deposit names a handle by its node, never its text. Until somebody binds
+the handle, the store knows it by node and platform alone: `handle` is absent
+on those amounts and entries. Asking by text works from the first deposit,
+because the API hashes the text the way the chain does.
 
 `{platform}` is a short key (`x`, `github`, `google`) or a 0x-hex 32-byte
 platform id. With a known key, the handle in the path is normalized exactly
@@ -83,7 +106,8 @@ is stable and machine-readable; the prose is for humans and may be reworded.
 Resolution 404s distinguish `handle_not_bound`, `handle_retired`,
 `id_not_bound`, `platform_not_configured`, and `handle_impossible` (text the
 platform could never hold); `not_synced` is the 503 before the first window;
-bad input is `invalid_platform`, `invalid_address`, or `invalid_argument`;
+bad input is `invalid_platform`, `invalid_address`, `invalid_node`,
+`invalid_cursor`, or `invalid_argument`;
 `internal` is a 500.
 
 ## ENS gateway
@@ -230,6 +254,15 @@ chain; a second deployment can share the database):
   stored string is nonempty
 - `platforms` — one row per platform the contract configured; the Proof
   Verifier it is wired to is chain metadata, reported by `/v1/status`
+- `escrow_held` — mirrors HandleEscrow's `held` and `round` per handle node
+  and token, with the platform its first deposit named
+- `escrow_refundable` — mirrors `refundable`: each `refundTo`'s contribution
+  in a slot's current round; a refund deletes its row, a claim the round's
+- `address_events`, `handle_events` — which addresses (with their roles) and
+  which handle each journal row involves, dated by its block. A bind's
+  previous holders, a ceremony's and a fee's handle, and a fee's payer are
+  read from the rows the event changes, or from the events its transaction
+  emitted just before it
 
 Each poll window commits in one transaction — journal, projections and cursor
 together — and the journal's `(chain, block, log)` conflict gates the
@@ -241,8 +274,9 @@ interleaving.
 Bump `INDEXER_VERSION` (in `db.rs`) when the written shape changes: the next
 start clears that chain's rows — co-tenant chains untouched — and replays it
 from the deployment block. The re-index is the migration. Changing
-`IDENTITY_NAMES_ADDRESS` triggers the same per-chain replay, because the old
-contract's bindings are not the new contract's bindings.
+`IDENTITY_NAMES_ADDRESS` or `HANDLE_ESCROW_ADDRESS` triggers the same
+per-chain replay, because the old contract's bindings are not the new
+contract's bindings.
 
 ## Deploying
 
@@ -277,6 +311,16 @@ replays from its contract's deployment block.
 refuses a database 0.3 migrated, as above. Start it on a fresh database with
 `IDENTITY_NAMES_ADDRESS` set to the 0.15 registry; it indexes from that
 registry's deployment block.
+
+**Upgrading from 0.4:** roll the indexer first. It migrates the database in
+place (`002_escrow_and_history.sql`) and, because `INDEXER_VERSION` is 2,
+replays every chain from its registry's deployment block, filling the escrow
+books and the histories. Set `HANDLE_ESCROW_ADDRESS` before that start, or the
+chain replays again when it is set. A 0.4 API keeps serving its routes over the
+migrated database; a 0.5 API started before the migration answers `internal`
+on the new routes until it lands. A 0.4 indexer refuses a database 002 has
+migrated: to go back, start it on a fresh database, or run
+`DROP SCHEMA names CASCADE; DROP TABLE _sqlx_migrations;` first, as above.
 
 Probes belong to the API: `GET /health` for liveness; for readiness gate on
 the status code of `GET /v1/status`, which is 200 whenever the database

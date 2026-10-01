@@ -1,8 +1,11 @@
 //! The read API. Resolution answers exactly what the contract's resolvers
-//! answer, from the projections; search is the one thing the chain cannot do.
-//! The answers' shapes live in [`model`]; the handlers here only translate
-//! HTTP to store calls and rows to those shapes.
+//! answer, from the projections; search, the histories and the escrow's
+//! waiting amounts are what the chain cannot list. The answers' shapes live
+//! in [`model`]; the handlers here and in [`history`] and [`escrow`] only
+//! translate HTTP to store calls and rows to those shapes.
 
+mod escrow;
+mod history;
 pub mod model;
 
 use std::str::FromStr;
@@ -82,6 +85,16 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/resolve/id/{platform}/{user_id}", get(resolve_id))
         .route("/v1/resolve/address/{address}", get(resolve_address))
         .route("/v1/search", get(search))
+        .route("/v1/history/address/{address}", get(history::address))
+        .route(
+            "/v1/history/handle/{platform}/{handle}",
+            get(history::handle),
+        )
+        .route("/v1/history/node/{node}", get(history::node))
+        .route("/v1/escrow/address/{address}", get(escrow::address))
+        .route("/v1/escrow/handle/{platform}/{handle}", get(escrow::handle))
+        .route("/v1/escrow/node/{node}", get(escrow::node))
+        .route("/v1/escrow/unclaimed", get(escrow::unclaimed))
         .with_state(state)
 }
 
@@ -117,6 +130,18 @@ impl ApiError {
         }
     }
 
+    /// A stored value this build cannot read back. Logged with `what` where
+    /// it is found; the client gets the same opaque 500 as a database error.
+    fn internal(what: impl std::fmt::Display) -> Self {
+        tracing::error!(%what, "unreadable stored value");
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal",
+            message: "internal error".into(),
+            source: None,
+        }
+    }
+
     fn not_synced(chain: Option<i64>) -> Self {
         let message = match chain {
             Some(chain) => {
@@ -130,6 +155,18 @@ impl ApiError {
             message,
             source: None,
         }
+    }
+}
+
+/// Text the platform could never hold, refused the way the contract's
+/// `resolveHandle` answers it — the zero address, so a 404 and not a 400:
+/// "nobody holds this", not "you asked wrong".
+impl From<libid_identity::HandleError> for ApiError {
+    fn from(e: libid_identity::HandleError) -> Self {
+        Self::not_found(
+            "handle_impossible",
+            format!("no handle can exist on this platform for this text: {e}"),
+        )
     }
 }
 
@@ -207,6 +244,29 @@ fn parse_address(raw: &str) -> Result<Address, ApiError> {
     })
 }
 
+/// A count from the query string, refused in the API's envelope: typed as a
+/// number in the extractor, `limit=ten` would get axum's plain-text 400.
+fn parse_count(raw: Option<&str>, name: &str) -> Result<Option<i64>, ApiError> {
+    raw.map(|raw| {
+        raw.parse::<i64>().map_err(|_| {
+            ApiError::bad_request(
+                "invalid_argument",
+                format!("{name} must be an integer, not {raw:?}"),
+            )
+        })
+    })
+    .transpose()
+}
+
+fn parse_node(raw: &str) -> Result<B256, ApiError> {
+    B256::from_str(raw).map_err(|_| {
+        ApiError::bad_request(
+            "invalid_node",
+            format!("{raw:?} is not a 0x-hex 32-byte handle node"),
+        )
+    })
+}
+
 async fn health() -> &'static str {
     "ok"
 }
@@ -220,6 +280,7 @@ impl ChainStatus {
             chain_id: store.chain_id(),
             names: store.chain_names().await?,
             contract: store.contract().await?,
+            escrow: store.escrow().await?,
             last_indexed_block: last,
             chain_head_block: head,
             lag_blocks: head.map(|h| h.saturating_sub(last.unwrap_or(0))),
@@ -256,19 +317,8 @@ async fn resolve_handle(
     let chain = filter.parse()?;
     state.synced(chain).await?;
 
-    // Normalize the way the chain did before it keyed the handle. Text the
-    // platform could never hold mirrors the contract's `resolveHandle`,
-    // which deliberately answers the zero address for it — a 404, not a 400:
-    // "nobody holds this", not "you asked wrong".
-    let normalized = match platform.normalize_query(&handle) {
-        Ok(normalized) => normalized,
-        Err(e) => {
-            return Err(ApiError::not_found(
-                "handle_impossible",
-                format!("no handle can exist on this platform for this text: {e}"),
-            ));
-        }
-    };
+    // Normalize the way the chain did before it keyed the handle.
+    let normalized = platform.normalize_query(&handle)?;
 
     let rows = state
         .store
@@ -427,6 +477,11 @@ const SEARCH_MAX_LIMIT: i64 = 50;
 /// database repeats per request; a client that far in wants a narrower
 /// query.
 const SEARCH_MAX_OFFSET: i64 = 10_000;
+/// A history or unclaimed page holds this many entries unless the request
+/// asks for fewer.
+const PAGE_DEFAULT_LIMIT: i64 = 20;
+/// The most entries one history or unclaimed page holds.
+const PAGE_MAX_LIMIT: i64 = 100;
 
 /// `GET /v1/search?q=gre&platform=x&owner=0x…&chain=8453&limit=10&offset=0`
 /// — live handles matching a partial query (exact first, then prefix,

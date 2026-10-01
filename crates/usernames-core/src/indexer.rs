@@ -8,7 +8,10 @@
 use alloy::{
     primitives::Address,
     providers::Provider,
-    rpc::types::Filter,
+    rpc::types::{
+        Filter,
+        Log,
+    },
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{
@@ -19,7 +22,12 @@ use tracing::{
 use crate::{
     chain,
     db::ChainStore,
-    events,
+    events::{
+        self,
+        DecodeError,
+        LogPosition,
+        NamesEvent,
+    },
 };
 
 /// The loop's knobs, resolved by the CLI. The chain itself is carried by the
@@ -30,6 +38,11 @@ pub struct IndexerConfig {
     /// implementation behind it changes on upgrade; the proxy is the one that
     /// emits.
     pub contract: Address,
+    /// The HandleEscrow ERC1967 proxy that resolves through `contract`, when
+    /// the chain has one. Its events share the registry's windows and cursor:
+    /// it is deployed after the registry it names, so the registry's
+    /// deployment block covers it.
+    pub escrow: Option<Address>,
     /// Blocks behind the head this indexer stays. The loop never scans past
     /// `latest - confirmations`, so a reorg shallower than this cannot leave
     /// the read model holding events the canonical chain never emitted.
@@ -60,15 +73,39 @@ pub struct Indexer<P> {
 }
 
 impl<P: Provider> Indexer<P> {
-    /// Build the indexer; the log filter is derived from the watched contract
+    /// Build the indexer; the log filter is derived from the watched contracts
     /// once, here, instead of at every fetch.
     pub fn new(store: ChainStore, provider: P, config: IndexerConfig) -> Self {
-        let filter = Filter::new().address(config.contract);
+        let watched: Vec<Address> = std::iter::once(config.contract)
+            .chain(config.escrow)
+            .collect();
+        let filter = Filter::new().address(watched);
         Self {
             store,
             provider,
             config,
             filter,
+        }
+    }
+
+    /// Decode a log by the contract that emitted it: each contract's topics
+    /// mean something only from that contract. The filter admits no other
+    /// emitter, so one would be an RPC answering a different question.
+    fn decode(
+        &self,
+        log: &Log,
+    ) -> Result<Option<(NamesEvent, LogPosition)>, DecodeError> {
+        let emitter = log.address();
+        if emitter == self.config.contract {
+            events::decode_registry(log)
+        } else if Some(emitter) == self.config.escrow {
+            events::decode_escrow(log)
+        } else {
+            tracing::warn!(
+                %emitter,
+                "a log from a contract the filter does not name; skipped"
+            );
+            Ok(None)
         }
     }
 
@@ -154,21 +191,22 @@ impl<P: Provider> Indexer<P> {
         let mut window = self.store.begin_window().await?;
         let mut applied = 0usize;
         for log in &logs {
-            match events::decode(log) {
+            match self.decode(log) {
                 Ok(Some((event, position))) => {
                     if window.apply(&event, &position).await? {
                         applied += 1;
                     }
                 }
                 Ok(None) => {
-                    // A topic this build does not know. The contract is
+                    // A topic this build does not know. The contracts are
                     // upgradeable, so this is survivable — but it is not
                     // silent, because a new event type usually means the read
                     // model is due for a version bump.
                     warn!(
+                        emitter = %log.address(),
                         topic0 = ?log.topic0(),
                         block = log.block_number,
-                        "unknown event topic from the contract; skipped"
+                        "unknown event topic from a watched contract; skipped"
                     );
                 }
                 Err(e) => {
@@ -185,6 +223,7 @@ impl<P: Provider> Indexer<P> {
     pub async fn run(self, cancel: CancellationToken) {
         info!(
             contract = %self.config.contract,
+            escrow = ?self.config.escrow,
             chain_id = self.store.chain_id(),
             confirmations = self.config.confirmations,
             "usernames indexer starting"
