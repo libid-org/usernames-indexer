@@ -553,9 +553,15 @@ async fn indexes_a_real_chain_end_to_end() {
     // while nobody held it through the bind to the claim, each dated by its
     // block.
     let history: HandleHistory = get(&store, "/v1/history/handle/x/bob_x").await.answer();
-    assert_eq!(
-        kinds(&history.entries),
-        ["claimed", "identity_bound", "deposited"],
+    assert!(
+        matches!(
+            events(&history.entries)[..],
+            [
+                HistoryEvent::Claimed { .. },
+                HistoryEvent::IdentityBound { .. },
+                HistoryEvent::Deposited { .. },
+            ]
+        ),
         "{history:?}"
     );
     assert!(history.entries.iter().all(|e| e.block_time > 0));
@@ -563,9 +569,16 @@ async fn indexes_a_real_chain_end_to_end() {
     let history: AddressHistory = get(&store, &format!("/v1/history/address/{payer}"))
         .await
         .answer();
-    assert_eq!(
-        kinds(&history.entries),
-        ["claimed", "forwarded", "deposited"]
+    assert!(
+        matches!(
+            events(&history.entries)[..],
+            [
+                HistoryEvent::Claimed { .. },
+                HistoryEvent::Forwarded { .. },
+                HistoryEvent::Deposited { .. },
+            ]
+        ),
+        "{history:?}"
     );
     assert_eq!(history.entries[0].roles, [Role::RefundTo]);
     assert_eq!(history.entries[2].roles, [Role::Depositor, Role::RefundTo]);
@@ -589,15 +602,7 @@ async fn indexes_a_real_chain_end_to_end() {
     assert!(payers.refundable.is_empty(), "{payers:?}");
 }
 
-/// The journal kinds of a history's entries, in the order served.
-fn kinds(entries: &[usernames_core::api::model::HistoryEntry]) -> Vec<String> {
-    entries
-        .iter()
-        .map(|entry| {
-            serde_json::to_value(&entry.event).expect("an event serializes")["kind"]
-                .as_str()
-                .expect("a kind")
-                .to_string()
-        })
-        .collect()
+/// A history's events, in the order served.
+fn events(entries: &[usernames_core::api::model::HistoryEntry]) -> Vec<&HistoryEvent> {
+    entries.iter().map(|entry| &entry.event).collect()
 }

@@ -119,6 +119,15 @@ async fn get<T: DeserializeOwned>(store: &ChainStore, path: &str) -> Reply<T> {
     common::get(store, &format!("{path}{separator}chain={CHAIN}")).await
 }
 
+/// The status and code a route refuses `path` with, read as the refusal of
+/// the answer type that route serves.
+async fn refused<T: DeserializeOwned + std::fmt::Debug>(
+    store: &ChainStore,
+    path: &str,
+) -> (StatusCode, String) {
+    get::<T>(store, path).await.refusal()
+}
+
 fn bind(holder: Address, id: &str, handle: &str, observed_at: u64) -> NamesEvent {
     NamesEvent::IdentityBound {
         holder,
@@ -180,7 +189,7 @@ fn amounts(list: &[EscrowAmount]) -> Vec<(Address, u64)> {
 
 #[tokio::test]
 async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -376,11 +385,12 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
     // Only USDC is still waiting anywhere on this chain.
     let unclaimed: Unclaimed = get(&store, "/v1/escrow/unclaimed").await.answer();
     assert_eq!(amounts(&unclaimed.slots), [(USDC, 7)]);
+    drop(guard);
 }
 
 #[tokio::test]
 async fn the_unclaimed_list_groups_by_token_and_ranks_by_amount() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -435,11 +445,12 @@ async fn the_unclaimed_list_groups_by_token_and_ranks_by_amount() {
         .await
         .answer();
     assert!(github.slots.is_empty());
+    drop(guard);
 }
 
 #[tokio::test]
 async fn a_history_pages_by_cursor_without_gaps_or_repeats() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -489,11 +500,12 @@ async fn a_history_pages_by_cursor_without_gaps_or_repeats() {
         refusal,
         (StatusCode::BAD_REQUEST, "invalid_cursor".to_string())
     );
+    drop(guard);
 }
 
 #[tokio::test]
 async fn a_bind_names_what_it_took_and_from_whom() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -527,11 +539,12 @@ async fn a_bind_names_what_it_took_and_from_whom() {
         .await
         .answer();
     assert_eq!(history.entries[0].roles, [Role::Holder]);
+    drop(guard);
 }
 
 #[tokio::test]
 async fn a_retired_handle_is_in_the_history_of_the_wallet_that_held_it() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -595,11 +608,12 @@ async fn a_retired_handle_is_in_the_history_of_the_wallet_that_held_it() {
         .await
         .answer();
     assert_eq!(kinds(&history.entries), ["identity_bound"]);
+    drop(guard);
 }
 
 #[tokio::test]
 async fn a_bind_fee_is_in_the_payers_history_under_the_handle_it_bought() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -648,11 +662,12 @@ async fn a_bind_fee_is_in_the_payers_history_under_the_handle_it_bought() {
 
     let history: HandleHistory = get(&store, "/v1/history/handle/x/ann_1").await.answer();
     assert_eq!(history.entries.len(), 3);
+    drop(guard);
 }
 
 #[tokio::test]
 async fn an_unpublish_concerns_the_handle_it_withdrew() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -685,11 +700,12 @@ async fn an_unpublish_concerns_the_handle_it_withdrew() {
     );
     assert!(history.entries[0].handle.is_none());
     assert!(history.entries[1].handle.is_some());
+    drop(guard);
 }
 
 #[tokio::test]
 async fn the_escrow_routes_name_what_they_refuse() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -708,57 +724,43 @@ async fn the_escrow_routes_name_what_they_refuse() {
         NamesEvent::PlatformConfigured { platform_id: x() },
     )
     .await;
-    let cases = [
-        (
-            "/v1/escrow/node/0x1234",
-            StatusCode::BAD_REQUEST,
-            "invalid_node",
-        ),
-        (
-            "/v1/history/node/alice",
-            StatusCode::BAD_REQUEST,
-            "invalid_node",
-        ),
-        (
-            "/v1/escrow/unclaimed?token=usdc",
-            StatusCode::BAD_REQUEST,
-            "invalid_address",
-        ),
-        (
-            "/v1/escrow/address/0xnope",
-            StatusCode::BAD_REQUEST,
-            "invalid_address",
-        ),
-        (
-            "/v1/history/handle/x/no%20spaces",
-            StatusCode::NOT_FOUND,
-            "handle_impossible",
-        ),
-        (
-            "/v1/escrow/handle/myspace/tom",
-            StatusCode::BAD_REQUEST,
-            "invalid_platform",
-        ),
-        (
-            "/v1/escrow/unclaimed?limit=ten",
-            StatusCode::BAD_REQUEST,
-            "invalid_argument",
-        ),
-        (
-            "/v1/escrow/unclaimed?offset=-",
-            StatusCode::BAD_REQUEST,
-            "invalid_argument",
-        ),
-        (
-            "/v1/history/handle/x/nobody?limit=1.5",
-            StatusCode::BAD_REQUEST,
-            "invalid_argument",
-        ),
-    ];
-    for (path, status, code) in cases {
-        let refusal = get::<serde_json::Value>(&store, path).await.refusal();
-        assert_eq!(refusal, (status, code.to_string()), "{path}");
-    }
+    let bad = |code: &str| (StatusCode::BAD_REQUEST, code.to_string());
+    assert_eq!(
+        refused::<HandleBalances>(&store, "/v1/escrow/node/0x1234").await,
+        bad("invalid_node")
+    );
+    assert_eq!(
+        refused::<HandleHistory>(&store, "/v1/history/node/alice").await,
+        bad("invalid_node")
+    );
+    assert_eq!(
+        refused::<Unclaimed>(&store, "/v1/escrow/unclaimed?token=usdc").await,
+        bad("invalid_address")
+    );
+    assert_eq!(
+        refused::<AddressBalances>(&store, "/v1/escrow/address/0xnope").await,
+        bad("invalid_address")
+    );
+    assert_eq!(
+        refused::<HandleHistory>(&store, "/v1/history/handle/x/no%20spaces").await,
+        (StatusCode::NOT_FOUND, "handle_impossible".to_string())
+    );
+    assert_eq!(
+        refused::<HandleBalances>(&store, "/v1/escrow/handle/myspace/tom").await,
+        bad("invalid_platform")
+    );
+    assert_eq!(
+        refused::<Unclaimed>(&store, "/v1/escrow/unclaimed?limit=ten").await,
+        bad("invalid_argument")
+    );
+    assert_eq!(
+        refused::<Unclaimed>(&store, "/v1/escrow/unclaimed?offset=-").await,
+        bad("invalid_argument")
+    );
+    assert_eq!(
+        refused::<HandleHistory>(&store, "/v1/history/handle/x/nobody?limit=1.5").await,
+        bad("invalid_argument")
+    );
 
     // Nothing held is an answer, not an error.
     let held: HandleBalances = get(&store, "/v1/escrow/handle/x/nobody").await.answer();
@@ -766,11 +768,12 @@ async fn the_escrow_routes_name_what_they_refuse() {
     let history: HandleHistory =
         get(&store, "/v1/history/handle/x/nobody").await.answer();
     assert!(history.entries.is_empty() && history.next.is_none());
+    drop(guard);
 }
 
 #[tokio::test]
 async fn the_status_names_the_escrow_and_a_new_one_replays_the_chain() {
-    let Some((store, pool, _guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -820,4 +823,5 @@ async fn the_status_names_the_escrow_and_a_new_one_replays_the_chain() {
         .expect("prepare none");
     assert_eq!(store.escrow().await.expect("escrow"), None);
     writer.release().await.expect("release");
+    drop(guard);
 }
