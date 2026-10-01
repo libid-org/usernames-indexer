@@ -5757,6 +5757,7 @@ dependencies = [
  "libid-profiles",
  "serde",
  "serde_json",
+ "serde_with",
  "sqlx",
  "thiserror",
  "tokio",

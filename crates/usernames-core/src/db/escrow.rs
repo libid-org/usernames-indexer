@@ -8,7 +8,6 @@ use alloy::primitives::{
     U256,
 };
 use sqlx::QueryBuilder;
-use tracing::error;
 
 use super::{
     scoped,
@@ -80,7 +79,7 @@ impl Window {
                     .fetch_optional(&mut *self.tx)
                     .await?;
                 if moved.is_none() {
-                    error!(
+                    tracing::error!(
                         %handle_node,
                         %token,
                         block,
@@ -114,7 +113,7 @@ impl Window {
                     .fetch_optional(&mut *self.tx)
                     .await?;
                 if moved.is_none() {
-                    error!(
+                    tracing::error!(
                         %handle_node,
                         %token,
                         block,
@@ -187,8 +186,7 @@ impl EscrowSlotRow {
     pub fn holder_address(&self) -> Option<Address> {
         self.holder
             .as_deref()
-            .and_then(|bytes| <[u8; 20]>::try_from(bytes).ok())
-            .map(Address::from)
+            .and_then(|bytes| Address::try_from(bytes).ok())
     }
 }
 
@@ -234,27 +232,53 @@ impl Store {
     /// Every slot still holding something: token by token, largest first.
     pub async fn unclaimed(
         &self,
-        filter: UnclaimedFilter,
-        limit: i64,
-        offset: i64,
+        page: UnclaimedPage,
     ) -> Result<Vec<EscrowSlotRow>, sqlx::Error> {
-        unclaimed_lookup("", filter, limit, offset)
-            .build_query_as()
-            .fetch_all(&self.pool)
-            .await
+        page.lookup("").build_query_as().fetch_all(&self.pool).await
     }
 }
 
-/// What narrows the unclaimed list. Every field is optional; none lists every
-/// slot the store holds.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct UnclaimedFilter {
+/// One page of the unclaimed list: narrowed by whatever it names, and none of
+/// them lists every slot the store holds.
+#[derive(Debug, Clone, Copy)]
+pub struct UnclaimedPage {
     /// One chain.
     pub chain: Option<i64>,
     /// One token.
     pub token: Option<Address>,
     /// One platform.
     pub platform_id: Option<B256>,
+    /// The most slots the page holds.
+    pub limit: i64,
+    /// How many slots of the order precede the page.
+    pub offset: i64,
+}
+
+impl UnclaimedPage {
+    /// Token first, so one asset's slots page together, and the largest
+    /// amount first within it; chain and node break ties so a page boundary
+    /// is stable.
+    pub(super) fn lookup(&self, prefix: &str) -> Statement {
+        let mut statement =
+            QueryBuilder::new(format!("{prefix}{}", sql::ESCROW_SLOT_PROJECTION));
+        if let Some(token) = self.token {
+            statement
+                .push(" AND e.token = ")
+                .push_bind(token.as_slice().to_vec());
+        }
+        scoped(&mut statement, "e.chain_id", self.chain);
+        if let Some(platform_id) = self.platform_id {
+            statement
+                .push(" AND e.platform_id = ")
+                .push_bind(platform_id.as_slice().to_vec());
+        }
+        statement
+            .push(" ORDER BY e.token, e.held DESC, e.chain_id, e.handle_node LIMIT ")
+            .push_bind(self.limit)
+            .push(" OFFSET ")
+            .push_bind(self.offset);
+        statement
+    }
 }
 
 pub(super) fn claimable_lookup(
@@ -299,34 +323,5 @@ pub(super) fn node_slots_lookup(
     statement.push_bind(handle_node.as_slice().to_vec());
     scoped(&mut statement, "e.chain_id", chain);
     statement.push(" ORDER BY e.chain_id, e.token");
-    statement
-}
-
-/// Token first, so one asset's slots page together, and the largest amount
-/// first within it; chain and node break ties so a page boundary is stable.
-pub(super) fn unclaimed_lookup(
-    prefix: &str,
-    filter: UnclaimedFilter,
-    limit: i64,
-    offset: i64,
-) -> Statement {
-    let mut statement =
-        QueryBuilder::new(format!("{prefix}{}", sql::ESCROW_SLOT_PROJECTION));
-    if let Some(token) = filter.token {
-        statement
-            .push(" AND e.token = ")
-            .push_bind(token.as_slice().to_vec());
-    }
-    scoped(&mut statement, "e.chain_id", filter.chain);
-    if let Some(platform_id) = filter.platform_id {
-        statement
-            .push(" AND e.platform_id = ")
-            .push_bind(platform_id.as_slice().to_vec());
-    }
-    statement
-        .push(" ORDER BY e.token, e.held DESC, e.chain_id, e.handle_node LIMIT ")
-        .push_bind(limit)
-        .push(" OFFSET ")
-        .push_bind(offset);
     statement
 }

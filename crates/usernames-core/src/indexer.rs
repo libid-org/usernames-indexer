@@ -94,7 +94,10 @@ impl<P: Provider> Indexer<P> {
         } else if Some(emitter) == self.config.escrow {
             events::decode_escrow(log)
         } else {
-            warn!(%emitter, "a log from a contract the filter does not name; skipped");
+            tracing::warn!(
+                %emitter,
+                "a log from a contract the filter does not name; skipped"
+            );
             Ok(None)
         }
     }

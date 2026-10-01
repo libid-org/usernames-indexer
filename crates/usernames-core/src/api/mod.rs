@@ -158,6 +158,18 @@ impl ApiError {
     }
 }
 
+/// Text the platform could never hold, refused the way the contract's
+/// `resolveHandle` answers it — the zero address, so a 404 and not a 400:
+/// "nobody holds this", not "you asked wrong".
+impl From<libid_identity::HandleError> for ApiError {
+    fn from(e: libid_identity::HandleError) -> Self {
+        Self::not_found(
+            "handle_impossible",
+            format!("no handle can exist on this platform for this text: {e}"),
+        )
+    }
+}
+
 impl From<sqlx::Error> for ApiError {
     // A pure conversion: the logging happens where the error is handled
     // (IntoResponse), not as a side effect of the type change.
@@ -255,24 +267,6 @@ fn parse_node(raw: &str) -> Result<B256, ApiError> {
     })
 }
 
-/// The handle a path names by platform and text, normalized the way the chain
-/// did before keying it. Text the platform could never hold is a 404, as in
-/// `resolveHandle`: nothing can ever have happened to it.
-fn handle_of(
-    platform: &str,
-    handle: &str,
-) -> Result<(nodes::Platform, nodes::NormalizedHandle), ApiError> {
-    let platform = parse_platform(platform)?;
-    reject_nul(handle, "handle")?;
-    let normalized = platform.normalize_query(handle).map_err(|e| {
-        ApiError::not_found(
-            "handle_impossible",
-            format!("no handle can exist on this platform for this text: {e}"),
-        )
-    })?;
-    Ok((platform, normalized))
-}
-
 async fn health() -> &'static str {
     "ok"
 }
@@ -323,19 +317,8 @@ async fn resolve_handle(
     let chain = filter.parse()?;
     state.synced(chain).await?;
 
-    // Normalize the way the chain did before it keyed the handle. Text the
-    // platform could never hold mirrors the contract's `resolveHandle`,
-    // which deliberately answers the zero address for it — a 404, not a 400:
-    // "nobody holds this", not "you asked wrong".
-    let normalized = match platform.normalize_query(&handle) {
-        Ok(normalized) => normalized,
-        Err(e) => {
-            return Err(ApiError::not_found(
-                "handle_impossible",
-                format!("no handle can exist on this platform for this text: {e}"),
-            ));
-        }
-    };
+    // Normalize the way the chain did before it keyed the handle.
+    let normalized = platform.normalize_query(&handle)?;
 
     let rows = state
         .store
@@ -490,10 +473,15 @@ struct SearchParams {
 
 /// The page size a search may ask for: at most this many hits per request.
 const SEARCH_MAX_LIMIT: i64 = 50;
-/// How far into a ranked list a search may page. Deeper pages are a scan the
-/// database repeats per request; a client that far in wants a narrower
-/// query.
-const SEARCH_MAX_OFFSET: i64 = 10_000;
+/// How far into a list an offset page may start: the search's ranking or the
+/// unclaimed slots. Deeper pages are a scan the database repeats per request;
+/// a client that far in wants a narrower query.
+const MAX_OFFSET: i64 = 10_000;
+/// A history or unclaimed page holds this many entries unless the request
+/// asks for fewer.
+const PAGE_DEFAULT_LIMIT: i64 = 20;
+/// The most entries one history or unclaimed page holds.
+const PAGE_MAX_LIMIT: i64 = 100;
 
 /// `GET /v1/search?q=gre&platform=x&owner=0x…&chain=8453&limit=10&offset=0`
 /// — live handles matching a partial query (exact first, then prefix,
@@ -531,7 +519,7 @@ async fn search(
         ));
     }
     let limit = params.limit.unwrap_or(10).clamp(1, SEARCH_MAX_LIMIT);
-    let offset = params.offset.unwrap_or(0).clamp(0, SEARCH_MAX_OFFSET);
+    let offset = params.offset.unwrap_or(0).clamp(0, MAX_OFFSET);
     let platform_id = params
         .platform
         .as_deref()

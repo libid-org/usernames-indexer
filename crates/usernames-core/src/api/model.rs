@@ -15,6 +15,10 @@ use serde::{
     Deserialize,
     Serialize,
 };
+use serde_with::{
+    serde_as,
+    DisplayFromStr,
+};
 
 pub use crate::events::Role;
 use crate::nodes::KnownPlatform;
@@ -234,32 +238,6 @@ pub struct SearchResults {
     pub hits: Vec<SearchHit>,
 }
 
-/// A `uint256` on the wire: a decimal string, because token amounts do not
-/// fit a JSON number. The journal writes them the same way.
-mod decimal {
-    use alloy::primitives::U256;
-    use serde::{
-        de::Error,
-        Deserialize,
-        Deserializer,
-        Serializer,
-    };
-
-    pub fn serialize<S: Serializer>(
-        value: &U256,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(value)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<U256, D::Error> {
-        let text = String::deserialize(deserializer)?;
-        U256::from_str_radix(&text, 10).map_err(D::Error::custom)
-    }
-}
-
 /// The handle an event or an amount concerns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -276,7 +254,9 @@ pub struct HandleRef {
 }
 
 /// One event, typed by its `kind`: the journal kinds, with each event's
-/// fields named the way the contract names them.
+/// fields named the way the contract names them. A `uint256` is a decimal
+/// string, as in the journal: token amounts do not fit a JSON number.
+#[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
@@ -320,7 +300,7 @@ pub enum HistoryEvent {
     BindFeePaid {
         authorization_digest: B256,
         receiver: Address,
-        #[serde(with = "decimal")]
+        #[serde_as(as = "DisplayFromStr")]
         amount: U256,
     },
     Deposited {
@@ -329,9 +309,9 @@ pub enum HistoryEvent {
         refund_to: Address,
         depositor: Address,
         platform_id: B256,
-        #[serde(with = "decimal")]
+        #[serde_as(as = "DisplayFromStr")]
         round: U256,
-        #[serde(with = "decimal")]
+        #[serde_as(as = "DisplayFromStr")]
         amount: U256,
     },
     Forwarded {
@@ -340,9 +320,9 @@ pub enum HistoryEvent {
         depositor: Address,
         holder: Address,
         platform_id: B256,
-        #[serde(with = "decimal")]
+        #[serde_as(as = "DisplayFromStr")]
         amount: U256,
-        #[serde(with = "decimal")]
+        #[serde_as(as = "DisplayFromStr")]
         received: U256,
     },
     Claimed {
@@ -350,11 +330,11 @@ pub enum HistoryEvent {
         token: Address,
         claimer: Address,
         recipient: Address,
-        #[serde(with = "decimal")]
+        #[serde_as(as = "DisplayFromStr")]
         round: U256,
-        #[serde(with = "decimal")]
+        #[serde_as(as = "DisplayFromStr")]
         released: U256,
-        #[serde(with = "decimal")]
+        #[serde_as(as = "DisplayFromStr")]
         received: U256,
     },
     Refunded {
@@ -362,11 +342,11 @@ pub enum HistoryEvent {
         token: Address,
         refund_to: Address,
         recipient: Address,
-        #[serde(with = "decimal")]
+        #[serde_as(as = "DisplayFromStr")]
         round: U256,
-        #[serde(with = "decimal")]
+        #[serde_as(as = "DisplayFromStr")]
         released: U256,
-        #[serde(with = "decimal")]
+        #[serde_as(as = "DisplayFromStr")]
         received: U256,
     },
 }
@@ -454,6 +434,7 @@ pub struct HandleQuery {
 }
 
 /// One amount waiting in the escrow, and what it waits for.
+#[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EscrowAmount {
@@ -468,10 +449,10 @@ pub struct EscrowAmount {
     /// the ones you recognize.
     pub token: Address,
     /// Token units, as a decimal string.
-    #[serde(with = "decimal")]
+    #[serde_as(as = "DisplayFromStr")]
     pub amount: U256,
     /// The slot's current round: how many claims it has seen.
-    #[serde(with = "decimal")]
+    #[serde_as(as = "DisplayFromStr")]
     pub round: U256,
 }
 

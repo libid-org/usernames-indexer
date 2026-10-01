@@ -1,10 +1,7 @@
 //! `GET /v1/history/...`: what an address took part in, and what happened to
 //! a handle, newest first and paged by a cursor.
 
-use alloy::primitives::{
-    Address,
-    B256,
-};
+use alloy::primitives::B256;
 use axum::{
     extract::{
         Path,
@@ -16,7 +13,6 @@ use axum::{
 use serde::Deserialize;
 
 use super::{
-    handle_of,
     model::{
         AddressHistory,
         HandleHistory,
@@ -24,27 +20,27 @@ use super::{
         HandleRef,
         HistoryEntry,
         HistoryEvent,
-        Role,
     },
     parse_address,
     parse_count,
     parse_node,
+    parse_platform,
+    reject_nul,
     ApiError,
     AppState,
     ChainFilter,
+    PAGE_DEFAULT_LIMIT,
+    PAGE_MAX_LIMIT,
 };
 use crate::{
     db::{
         HistoryCursor,
+        HistoryPage,
         HistoryRow,
+        HistoryRows,
     },
     nodes,
 };
-
-/// A page holds this many entries unless the request asks for fewer.
-const DEFAULT_LIMIT: i64 = 20;
-/// The most entries one page holds.
-const MAX_LIMIT: i64 = 100;
 
 /// `?chain=8453&before=<next>&limit=20`.
 #[derive(Deserialize)]
@@ -54,21 +50,14 @@ pub(super) struct HistoryParams {
     limit: Option<String>,
 }
 
-/// One page, parsed: the chain, where the page starts, and its size.
-struct Page {
-    chain: Option<i64>,
-    before: Option<HistoryCursor>,
-    limit: i64,
-}
-
 impl HistoryParams {
-    fn parse(self) -> Result<Page, ApiError> {
+    fn page(self) -> Result<HistoryPage, ApiError> {
         let chain = ChainFilter { chain: self.chain }.parse()?;
         let before = self
             .before
             .as_deref()
             .map(|raw| {
-                HistoryCursor::parse(raw).ok_or_else(|| {
+                raw.parse::<HistoryCursor>().map_err(|_| {
                     ApiError::bad_request(
                         "invalid_cursor",
                         format!("{raw:?} is not a cursor a history page handed out"),
@@ -77,9 +66,9 @@ impl HistoryParams {
             })
             .transpose()?;
         let limit = parse_count(self.limit.as_deref(), "limit")?
-            .unwrap_or(DEFAULT_LIMIT)
-            .clamp(1, MAX_LIMIT);
-        Ok(Page {
+            .unwrap_or(PAGE_DEFAULT_LIMIT)
+            .clamp(1, PAGE_MAX_LIMIT);
+        Ok(HistoryPage {
             chain,
             before,
             limit,
@@ -87,61 +76,55 @@ impl HistoryParams {
     }
 }
 
-impl Page {
-    /// The entries a page serves out of the `limit + 1` rows it read, and the
-    /// cursor for the next page — only when that extra row proved one exists.
-    fn serve(
-        &self,
-        mut rows: Vec<HistoryRow>,
-    ) -> Result<(Vec<HistoryEntry>, Option<String>), ApiError> {
-        let more = rows.len() as i64 > self.limit;
-        rows.truncate(self.limit as usize);
-        let next = more
-            .then(|| rows.last().map(|row| HistoryCursor::after(row).to_string()))
-            .flatten();
-        let entries = rows.into_iter().map(entry_of).collect::<Result<_, _>>()?;
-        Ok((entries, next))
+impl HistoryEntry {
+    /// The entry a stored row stands for. The journal is this build's own
+    /// writing, so a row it cannot read back is an internal error.
+    fn of(row: HistoryRow) -> Result<Self, ApiError> {
+        let event = HistoryEvent::from_journal(&row.kind, row.payload).map_err(|e| {
+            ApiError::internal(format_args!(
+                "journal row {}/{}/{} ({}): {e}",
+                row.chain_id, row.block_number, row.log_index, row.kind
+            ))
+        })?;
+        let roles = row
+            .roles
+            .unwrap_or_default()
+            .iter()
+            .map(|name| name.parse().map_err(ApiError::internal))
+            .collect::<Result<_, _>>()?;
+        let handle = match (row.handle_node, row.platform_id) {
+            (Some(node), Some(platform)) => {
+                let platform_id = B256::from_slice(&platform);
+                Some(HandleRef {
+                    platform: nodes::Platform::known_of(platform_id),
+                    platform_id,
+                    handle_node: B256::from_slice(&node),
+                    handle: row.handle,
+                })
+            }
+            _ => None,
+        };
+        Ok(Self {
+            chain_id: row.chain_id,
+            block_number: row.block_number,
+            log_index: row.log_index,
+            tx_hash: B256::from_slice(&row.tx_hash),
+            block_time: row.block_time,
+            roles,
+            handle,
+            event,
+        })
     }
 }
 
-fn entry_of(row: HistoryRow) -> Result<HistoryEntry, ApiError> {
-    let event = HistoryEvent::from_journal(&row.kind, row.payload).map_err(|e| {
-        ApiError::internal(format_args!(
-            "journal row {}/{}/{} ({}): {e}",
-            row.chain_id, row.block_number, row.log_index, row.kind
-        ))
-    })?;
-    let roles = row
-        .roles
-        .unwrap_or_default()
-        .iter()
-        .map(|name| {
-            Role::parse(name)
-                .ok_or_else(|| ApiError::internal(format_args!("role {name:?}")))
-        })
+/// A page's entries and the cursor for the next one.
+fn served(page: HistoryRows) -> Result<(Vec<HistoryEntry>, Option<String>), ApiError> {
+    let entries = page
+        .rows
+        .into_iter()
+        .map(HistoryEntry::of)
         .collect::<Result<_, _>>()?;
-    let handle = match (row.handle_node, row.platform_id) {
-        (Some(node), Some(platform)) => {
-            let platform_id = B256::from_slice(&platform);
-            Some(HandleRef {
-                platform: nodes::Platform::known_of(platform_id),
-                platform_id,
-                handle_node: B256::from_slice(&node),
-                handle: row.handle,
-            })
-        }
-        _ => None,
-    };
-    Ok(HistoryEntry {
-        chain_id: row.chain_id,
-        block_number: row.block_number,
-        log_index: row.log_index,
-        tx_hash: B256::from_slice(&row.tx_hash),
-        block_time: row.block_time,
-        roles,
-        handle,
-        event,
-    })
+    Ok((entries, page.next.map(|next| next.to_string())))
 }
 
 /// `GET /v1/history/address/{address}?chain=&before=&limit=` — every event the
@@ -153,15 +136,11 @@ pub(super) async fn address(
     Path(address): Path<String>,
     Query(params): Query<HistoryParams>,
 ) -> Result<Json<AddressHistory>, ApiError> {
-    let address: Address = parse_address(&address)?;
-    let page = params.parse()?;
+    let address = parse_address(&address)?;
+    let page = params.page()?;
     state.synced(page.chain).await?;
 
-    let rows = state
-        .store
-        .address_history(page.chain, address, page.before, page.limit + 1)
-        .await?;
-    let (entries, next) = page.serve(rows)?;
+    let (entries, next) = served(state.store.address_history(address, page).await?)?;
     Ok(Json(AddressHistory {
         address,
         entries,
@@ -177,16 +156,14 @@ pub(super) async fn handle(
     Path((platform, handle)): Path<(String, String)>,
     Query(params): Query<HistoryParams>,
 ) -> Result<Json<HandleHistory>, ApiError> {
-    let (platform, normalized) = handle_of(&platform, &handle)?;
-    let page = params.parse()?;
+    let platform = parse_platform(&platform)?;
+    reject_nul(&handle, "handle")?;
+    let page = params.page()?;
     state.synced(page.chain).await?;
+    let normalized = platform.normalize_query(&handle)?;
 
     let handle_node = nodes::handle_node(platform.id(), &normalized);
-    let rows = state
-        .store
-        .handle_history(page.chain, handle_node, page.before, page.limit + 1)
-        .await?;
-    let (entries, next) = page.serve(rows)?;
+    let (entries, next) = served(state.store.handle_history(handle_node, page).await?)?;
     Ok(Json(HandleHistory {
         handle: HandleQuery {
             platform: platform.known(),
@@ -208,14 +185,10 @@ pub(super) async fn node(
     Query(params): Query<HistoryParams>,
 ) -> Result<Json<HandleHistory>, ApiError> {
     let handle_node = parse_node(&node)?;
-    let page = params.parse()?;
+    let page = params.page()?;
     state.synced(page.chain).await?;
 
-    let rows = state
-        .store
-        .handle_history(page.chain, handle_node, page.before, page.limit + 1)
-        .await?;
-    let (entries, next) = page.serve(rows)?;
+    let (entries, next) = served(state.store.handle_history(handle_node, page).await?)?;
     // Every entry concerns this node, so any one names its platform, and its
     // text once a bind has carried it.
     let known = entries.iter().find_map(|entry| entry.handle.as_ref());

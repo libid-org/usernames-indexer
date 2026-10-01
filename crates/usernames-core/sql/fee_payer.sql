@@ -1,8 +1,12 @@
 -- Who paid a bind fee, and for which handle: the CeremonyBound of the same
--- bind carries the same digest in the same transaction, names the holder
--- whose value paid the fee, and already has its handle recorded.
-SELECT c.payload->>'holder' AS holder, he.handle_node, he.platform_id
+-- bind carries the same digest in the same transaction, and its holder and
+-- handle are already recorded. The journal spells the digest the way
+-- NamesEvent::payload writes it.
+SELECT ae.address, he.handle_node, he.platform_id
 FROM names.events c
+JOIN names.address_events ae
+  ON ae.chain_id = c.chain_id AND ae.block_number = c.block_number
+     AND ae.log_index = c.log_index
 LEFT JOIN names.handle_events he
   ON he.chain_id = c.chain_id AND he.block_number = c.block_number
      AND he.log_index = c.log_index

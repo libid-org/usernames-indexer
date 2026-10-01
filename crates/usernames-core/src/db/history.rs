@@ -7,14 +7,15 @@
 //! handle; a ceremony, a fee and an unpublish name no handle; a fee does not
 //! name who paid it; a claim does not name whose deposits it took. Each of
 //! those is read here from the rows the event is about to change, or from the
-//! events its own transaction emitted just before it.
+//! rows its own transaction recorded just before it.
+
+use std::str::FromStr;
 
 use alloy::primitives::{
     Address,
     B256,
 };
 use sqlx::QueryBuilder;
-use tracing::warn;
 
 use super::{
     as_i64,
@@ -50,17 +51,13 @@ impl Involvement {
     }
 }
 
-/// The ceremony a bind fee was paid beside: the holder it names, and the
-/// handle already recorded for it.
+/// The ceremony a bind fee was paid beside: the holder it recorded, and the
+/// handle recorded for it.
 #[derive(sqlx::FromRow)]
 struct FeeCeremony {
-    holder: Option<String>,
+    address: Vec<u8>,
     handle_node: Option<Vec<u8>>,
     platform_id: Option<Vec<u8>>,
-}
-
-fn address_of(bytes: &[u8]) -> Option<Address> {
-    <[u8; 20]>::try_from(bytes).ok().map(Address::from)
 }
 
 impl Window {
@@ -101,10 +98,10 @@ impl Window {
                     (id_holder, Role::PreviousIdHolder),
                 ];
                 for (bytes, role) in previous {
-                    if let Some(previous) = bytes.as_deref().and_then(address_of) {
-                        if previous != *holder {
-                            involvement.add(previous, role);
-                        }
+                    let previous =
+                        bytes.and_then(|b| Address::try_from(b.as_slice()).ok());
+                    if let Some(previous) = previous.filter(|p| p != holder) {
+                        involvement.add(previous, role);
                     }
                 }
                 involvement.handle = Some((*handle_node, *platform_id));
@@ -124,7 +121,10 @@ impl Window {
                         .bind(handle_node.as_slice())
                         .fetch_optional(&mut *self.tx)
                         .await?;
-                match held_by.flatten().as_deref().and_then(address_of) {
+                let held_by = held_by
+                    .flatten()
+                    .and_then(|b| Address::try_from(b.as_slice()).ok());
+                match held_by {
                     Some(held_by) if held_by != *holder => {
                         involvement.add(held_by, Role::PreviousHandleHolder)
                     }
@@ -155,21 +155,25 @@ impl Window {
                 platform_id,
                 ..
             } => {
-                let node: Option<Option<String>> =
-                    sqlx::query_scalar(sql::CEREMONY_HANDLE)
-                        .bind(chain_id)
-                        .bind(block)
-                        .bind(pos.tx_hash.as_slice())
-                        .bind(log_index)
-                        .bind(holder.to_string())
-                        .bind(platform_id.to_string())
-                        .fetch_optional(&mut *self.tx)
-                        .await?;
-                match node.flatten().and_then(|node| node.parse::<B256>().ok()) {
-                    Some(node) => involvement.handle = Some((node, *platform_id)),
-                    None => {
-                        warn!(block, log_index, "a ceremony without the bind beside it")
+                let node: Option<Vec<u8>> = sqlx::query_scalar(sql::CEREMONY_HANDLE)
+                    .bind(chain_id)
+                    .bind(block)
+                    .bind(pos.tx_hash.as_slice())
+                    .bind(log_index)
+                    .bind(holder.as_slice())
+                    .bind(Role::Holder.as_str())
+                    .bind(platform_id.as_slice())
+                    .fetch_optional(&mut *self.tx)
+                    .await?;
+                match node {
+                    Some(node) => {
+                        involvement.handle = Some((B256::from_slice(&node), *platform_id))
                     }
+                    None => tracing::warn!(
+                        block,
+                        log_index,
+                        "a ceremony without the bind beside it"
+                    ),
                 }
             }
 
@@ -186,9 +190,8 @@ impl Window {
                     .await?;
                 match ceremony {
                     Some(ceremony) => {
-                        let holder =
-                            ceremony.holder.and_then(|h| h.parse::<Address>().ok());
-                        if let Some(holder) = holder {
+                        if let Ok(holder) = Address::try_from(ceremony.address.as_slice())
+                        {
                             involvement.add(holder, Role::Holder);
                         }
                         if let (Some(node), Some(platform)) =
@@ -200,9 +203,10 @@ impl Window {
                             ));
                         }
                     }
-                    None => warn!(
+                    None => tracing::warn!(
                         block,
-                        log_index, "a bind fee without the ceremony beside it"
+                        log_index,
+                        "a bind fee without the ceremony beside it"
                     ),
                 }
             }
@@ -218,43 +222,32 @@ impl Window {
                 ..
             } => involvement.handle = Some((*handle_node, *platform_id)),
 
-            // Neither names a platform; the slot's first deposit did. A claim
-            // also ends the refunds of everybody whose deposit it took: they
-            // are the round's refundable rows, read before the claim deletes
-            // them.
-            NamesEvent::Claimed { handle_node, .. }
-            | NamesEvent::Refunded { handle_node, .. } => {
-                if let NamesEvent::Claimed { token, round, .. } = event {
-                    let refund_tos: Vec<Vec<u8>> =
-                        sqlx::query_scalar(sql::CLAIMED_REFUND_TOS)
-                            .bind(chain_id)
-                            .bind(handle_node.as_slice())
-                            .bind(token.as_slice())
-                            .bind(round.to_string())
-                            .fetch_all(&mut *self.tx)
-                            .await?;
-                    for refund_to in refund_tos.iter().filter_map(|a| address_of(a)) {
+            // A claim ends the refunds of everybody whose deposit it took:
+            // the round's refundable rows, read before the claim deletes them.
+            NamesEvent::Claimed {
+                handle_node,
+                token,
+                round,
+                ..
+            } => {
+                let refund_tos: Vec<Vec<u8>> =
+                    sqlx::query_scalar(sql::CLAIMED_REFUND_TOS)
+                        .bind(chain_id)
+                        .bind(handle_node.as_slice())
+                        .bind(token.as_slice())
+                        .bind(round.to_string())
+                        .fetch_all(&mut *self.tx)
+                        .await?;
+                for refund_to in refund_tos {
+                    if let Ok(refund_to) = Address::try_from(refund_to.as_slice()) {
                         involvement.add(refund_to, Role::RefundTo);
                     }
                 }
-                let platform: Option<Vec<u8>> = sqlx::query_scalar(sql::ESCROW_PLATFORM)
-                    .bind(chain_id)
-                    .bind(handle_node.as_slice())
-                    .fetch_optional(&mut *self.tx)
-                    .await?;
-                match platform {
-                    Some(platform) => {
-                        involvement.handle =
-                            Some((*handle_node, B256::from_slice(&platform)))
-                    }
-                    None => {
-                        warn!(
-                            %handle_node,
-                            block,
-                            "an escrow payout from a slot this index never saw deposited"
-                        )
-                    }
-                }
+                involvement.handle = self.escrow_handle(*handle_node, block).await?;
+            }
+
+            NamesEvent::Refunded { handle_node, .. } => {
+                involvement.handle = self.escrow_handle(*handle_node, block).await?;
             }
 
             NamesEvent::PlatformConfigured { .. }
@@ -262,6 +255,28 @@ impl Window {
         }
 
         Ok(involvement)
+    }
+
+    /// An escrowed node with its platform, which only the slot's first deposit
+    /// named: claims and refunds name none.
+    async fn escrow_handle(
+        &mut self,
+        handle_node: B256,
+        block: i64,
+    ) -> Result<Option<(B256, B256)>, ApplyError> {
+        let platform: Option<Vec<u8>> = sqlx::query_scalar(sql::ESCROW_PLATFORM)
+            .bind(self.chain_id)
+            .bind(handle_node.as_slice())
+            .fetch_optional(&mut *self.tx)
+            .await?;
+        if platform.is_none() {
+            tracing::warn!(
+                %handle_node,
+                block,
+                "an escrow payout from a slot this index never saw deposited"
+            );
+        }
+        Ok(platform.map(|platform| (handle_node, B256::from_slice(&platform))))
     }
 
     /// Put the event at `pos` in the histories of everything it involves.
@@ -303,9 +318,9 @@ impl Window {
 
 /// Where a history page ends: the last entry it served. A history is newest
 /// first, ordered by block time, then chain, block and log index, so this is
-/// the next page's exclusive upper bound. On the wire it is
-/// `blockTime-chainId-blockNumber-logIndex`, and a client passes it back
-/// without reading it.
+/// the next page's exclusive upper bound. Its text is
+/// `blockTime-chainId-blockNumber-logIndex`, which a client passes back
+/// without reading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HistoryCursor {
     /// The entry's block time, in unix seconds.
@@ -318,28 +333,27 @@ pub struct HistoryCursor {
     pub log_index: i64,
 }
 
-impl HistoryCursor {
-    /// The cursor a page that ended with `row` hands out.
-    pub fn after(row: &HistoryRow) -> Self {
-        Self {
-            block_time: row.block_time,
-            chain_id: row.chain_id,
-            block_number: row.block_number,
-            log_index: row.log_index,
-        }
-    }
+/// Text that is not a cursor a history page handed out.
+#[derive(Debug, thiserror::Error)]
+#[error("not a history cursor")]
+pub struct InvalidCursor;
 
-    /// The cursor a client passed back; `None` for anything else.
-    pub fn parse(raw: &str) -> Option<Self> {
+impl FromStr for HistoryCursor {
+    type Err = InvalidCursor;
+
+    fn from_str(raw: &str) -> Result<Self, InvalidCursor> {
         let mut parts = raw.split('-').map(str::parse::<i64>);
-        let mut next = || parts.next()?.ok();
+        let mut next = || parts.next().and_then(Result::ok).ok_or(InvalidCursor);
         let cursor = Self {
             block_time: next()?,
             chain_id: next()?,
             block_number: next()?,
             log_index: next()?,
         };
-        parts.next().is_none().then_some(cursor)
+        match parts.next() {
+            None => Ok(cursor),
+            Some(_) => Err(InvalidCursor),
+        }
     }
 }
 
@@ -381,20 +395,112 @@ pub struct HistoryRow {
     pub handle: Option<String>,
 }
 
+/// One page of a history, as a request asks for it: on every chain or one,
+/// older than a cursor or from the newest entry, at most `limit` entries.
+#[derive(Debug, Clone, Copy)]
+pub struct HistoryPage {
+    /// One chain, or every chain the store holds.
+    pub chain: Option<i64>,
+    /// The cursor the previous page handed out, if this is not the first.
+    pub before: Option<HistoryCursor>,
+    /// The most entries the page holds.
+    pub limit: i64,
+}
+
+/// A page as the store read it: its entries, and where the next page starts
+/// while there is one.
+pub struct HistoryRows {
+    /// Newest first.
+    pub rows: Vec<HistoryRow>,
+    /// The cursor to pass back as the next page's `before`.
+    pub next: Option<HistoryCursor>,
+}
+
+impl HistoryPage {
+    /// An address's history page, composed per request like every lookup.
+    pub(super) fn address_lookup(&self, prefix: &str, address: Address) -> Statement {
+        let mut statement = QueryBuilder::new(format!(
+            "{prefix}{} WHERE a.address = ",
+            sql::ADDRESS_HISTORY_PROJECTION
+        ));
+        statement.push_bind(address.as_slice().to_vec());
+        scoped(&mut statement, "a.chain_id", self.chain);
+        self.bound(&mut statement, "a");
+        statement
+    }
+
+    /// A handle's history page.
+    pub(super) fn node_lookup(&self, prefix: &str, handle_node: B256) -> Statement {
+        let mut statement = QueryBuilder::new(format!(
+            "{prefix}{} WHERE he.handle_node = ",
+            sql::HANDLE_HISTORY_PROJECTION
+        ));
+        statement.push_bind(handle_node.as_slice().to_vec());
+        scoped(&mut statement, "he.chain_id", self.chain);
+        self.bound(&mut statement, "he");
+        statement
+    }
+
+    /// The cursor, the order and one row past the limit, which tells whether
+    /// a next page exists. The cursor's row comparison and the order are the
+    /// history index's column order, so a page is one backward range scan
+    /// from the cursor.
+    fn bound(&self, statement: &mut Statement, table: &str) {
+        if let Some(before) = self.before {
+            statement
+                .push(format!(
+                    " AND ({table}.block_time, {table}.chain_id, \
+                     {table}.block_number, {table}.log_index) < ("
+                ))
+                .push_bind(before.block_time)
+                .push(", ")
+                .push_bind(before.chain_id)
+                .push(", ")
+                .push_bind(before.block_number)
+                .push(", ")
+                .push_bind(before.log_index)
+                .push(")");
+        }
+        statement
+            .push(format!(
+                " ORDER BY {table}.block_time DESC, {table}.chain_id DESC, \
+                 {table}.block_number DESC, {table}.log_index DESC LIMIT "
+            ))
+            .push_bind(self.limit + 1);
+    }
+
+    /// The page out of the rows its lookup read: at most `limit`, and the
+    /// cursor after the last when the extra row proved more exist.
+    fn split(&self, mut rows: Vec<HistoryRow>) -> HistoryRows {
+        let limit = usize::try_from(self.limit).unwrap_or_default();
+        let more = rows.len() > limit;
+        rows.truncate(limit);
+        let next = more
+            .then(|| rows.last())
+            .flatten()
+            .map(|last| HistoryCursor {
+                block_time: last.block_time,
+                chain_id: last.chain_id,
+                block_number: last.block_number,
+                log_index: last.log_index,
+            });
+        HistoryRows { rows, next }
+    }
+}
+
 impl Store {
-    /// The events an address took part in, newest first, on every chain or
-    /// the one named: a page of `limit` entries older than `before`.
+    /// The events an address took part in, newest first.
     pub async fn address_history(
         &self,
-        chain: Option<i64>,
         address: Address,
-        before: Option<HistoryCursor>,
-        limit: i64,
-    ) -> Result<Vec<HistoryRow>, sqlx::Error> {
-        address_history_lookup("", chain, address, before, limit)
+        page: HistoryPage,
+    ) -> Result<HistoryRows, sqlx::Error> {
+        let rows = page
+            .address_lookup("", address)
             .build_query_as()
             .fetch_all(&self.pool)
-            .await
+            .await?;
+        Ok(page.split(rows))
     }
 
     /// The events on one handle node, newest first: deposits made while
@@ -402,82 +508,16 @@ impl Store {
     /// payment after.
     pub async fn handle_history(
         &self,
-        chain: Option<i64>,
         handle_node: B256,
-        before: Option<HistoryCursor>,
-        limit: i64,
-    ) -> Result<Vec<HistoryRow>, sqlx::Error> {
-        handle_history_lookup("", chain, handle_node, before, limit)
+        page: HistoryPage,
+    ) -> Result<HistoryRows, sqlx::Error> {
+        let rows = page
+            .node_lookup("", handle_node)
             .build_query_as()
             .fetch_all(&self.pool)
-            .await
+            .await?;
+        Ok(page.split(rows))
     }
-}
-
-/// `AND (time, chain, block, log) < cursor ORDER BY ... DESC LIMIT n`: the row
-/// comparison and the order are both the history index's column order, so a
-/// page is one backward range scan from the cursor.
-fn paged(
-    statement: &mut Statement,
-    table: &str,
-    before: Option<HistoryCursor>,
-    limit: i64,
-) {
-    if let Some(before) = before {
-        statement
-            .push(format!(
-                " AND ({table}.block_time, {table}.chain_id, \
-                 {table}.block_number, {table}.log_index) < ("
-            ))
-            .push_bind(before.block_time)
-            .push(", ")
-            .push_bind(before.chain_id)
-            .push(", ")
-            .push_bind(before.block_number)
-            .push(", ")
-            .push_bind(before.log_index)
-            .push(")");
-    }
-    statement
-        .push(format!(
-            " ORDER BY {table}.block_time DESC, {table}.chain_id DESC, \
-             {table}.block_number DESC, {table}.log_index DESC LIMIT "
-        ))
-        .push_bind(limit);
-}
-
-pub(super) fn address_history_lookup(
-    prefix: &str,
-    chain: Option<i64>,
-    address: Address,
-    before: Option<HistoryCursor>,
-    limit: i64,
-) -> Statement {
-    let mut statement = QueryBuilder::new(format!(
-        "{prefix}{} WHERE a.address = ",
-        sql::ADDRESS_HISTORY_PROJECTION
-    ));
-    statement.push_bind(address.as_slice().to_vec());
-    scoped(&mut statement, "a.chain_id", chain);
-    paged(&mut statement, "a", before, limit);
-    statement
-}
-
-pub(super) fn handle_history_lookup(
-    prefix: &str,
-    chain: Option<i64>,
-    handle_node: B256,
-    before: Option<HistoryCursor>,
-    limit: i64,
-) -> Statement {
-    let mut statement = QueryBuilder::new(format!(
-        "{prefix}{} WHERE he.handle_node = ",
-        sql::HANDLE_HISTORY_PROJECTION
-    ));
-    statement.push_bind(handle_node.as_slice().to_vec());
-    scoped(&mut statement, "he.chain_id", chain);
-    paged(&mut statement, "he", before, limit);
-    statement
 }
 
 #[cfg(test)]
@@ -492,9 +532,12 @@ mod tests {
             block_number: 274_217_956,
             log_index: 2,
         };
-        assert_eq!(HistoryCursor::parse(&cursor.to_string()), Some(cursor));
+        assert_eq!(
+            cursor.to_string().parse::<HistoryCursor>().ok(),
+            Some(cursor)
+        );
         for garbage in ["", "1-2-3", "1-2-3-4-5", "a-2-3-4", "1--2-3", "1-2-3-"] {
-            assert_eq!(HistoryCursor::parse(garbage), None, "{garbage:?}");
+            assert!(garbage.parse::<HistoryCursor>().is_err(), "{garbage:?}");
         }
     }
 }

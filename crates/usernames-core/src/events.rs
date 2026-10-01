@@ -161,6 +161,11 @@ pub enum Role {
     Recipient,
 }
 
+/// A stored role name this build does not know.
+#[derive(Debug, thiserror::Error)]
+#[error("unknown role {0:?}")]
+pub struct UnknownRole(String);
+
 impl Role {
     /// Every role, so a stored name parses back by the same table.
     const ALL: [Self; 8] = [
@@ -187,10 +192,16 @@ impl Role {
             Self::Recipient => "recipient",
         }
     }
+}
 
-    /// The role a stored name stands for.
-    pub fn parse(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|role| role.as_str() == name)
+impl std::str::FromStr for Role {
+    type Err = UnknownRole;
+
+    fn from_str(name: &str) -> Result<Self, UnknownRole> {
+        Self::ALL
+            .into_iter()
+            .find(|role| role.as_str() == name)
+            .ok_or_else(|| UnknownRole(name.to_string()))
     }
 }
 
@@ -780,12 +791,12 @@ mod tests {
     #[test]
     fn every_role_parses_back_from_its_name() {
         for role in Role::ALL {
-            assert_eq!(Role::parse(role.as_str()), Some(role));
+            assert_eq!(role.as_str().parse::<Role>().ok(), Some(role));
             assert_eq!(
                 serde_json::to_value(role).unwrap(),
                 serde_json::Value::String(role.as_str().to_string())
             );
         }
-        assert_eq!(Role::parse("owner"), None);
+        assert!("owner".parse::<Role>().is_err());
     }
 }
