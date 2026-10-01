@@ -467,8 +467,8 @@ struct SearchParams {
     platform: Option<String>,
     owner: Option<String>,
     chain: Option<String>,
-    limit: Option<i64>,
-    offset: Option<i64>,
+    limit: Option<String>,
+    offset: Option<String>,
 }
 
 /// The page size a search may ask for: at most this many hits per request.
@@ -518,8 +518,12 @@ async fn search(
             "q or owner is required",
         ));
     }
-    let limit = params.limit.unwrap_or(10).clamp(1, SEARCH_MAX_LIMIT);
-    let offset = params.offset.unwrap_or(0).clamp(0, MAX_OFFSET);
+    let limit = parse_count(params.limit.as_deref(), "limit")?
+        .unwrap_or(10)
+        .clamp(1, SEARCH_MAX_LIMIT);
+    let offset = parse_count(params.offset.as_deref(), "offset")?
+        .unwrap_or(0)
+        .clamp(0, MAX_OFFSET);
     let platform_id = params
         .platform
         .as_deref()

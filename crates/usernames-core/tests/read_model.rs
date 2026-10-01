@@ -423,6 +423,16 @@ async fn search_ranks_exact_prefix_substring() {
     // LIKE metacharacters match themselves, not everything.
     let results: SearchResults = get(&store, "/v1/search?q=%25").await.answer();
     assert!(results.hits.is_empty());
+
+    // A count that is not a number is refused in the API's own envelope.
+    for path in ["/v1/search?q=ali&limit=ten", "/v1/search?q=ali&offset=1.5"] {
+        let refusal = get::<SearchResults>(&store, path).await.refusal();
+        assert_eq!(
+            refusal,
+            (StatusCode::BAD_REQUEST, "invalid_argument".to_string()),
+            "{path}"
+        );
+    }
     drop(guard);
 }
 
