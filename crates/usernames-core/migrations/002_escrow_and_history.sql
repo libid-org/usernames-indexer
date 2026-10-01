@@ -26,9 +26,10 @@ CREATE TABLE IF NOT EXISTS names.escrow_held (
     updated_at   TIMESTAMPTZ   NOT NULL DEFAULT now(),
     PRIMARY KEY (chain_id, handle_node, token)
 );
--- The unclaimed list, token by token, largest first.
+-- The unclaimed list, token by token, largest first: read backwards, with
+-- the page cursor as one row comparison.
 CREATE INDEX IF NOT EXISTS escrow_held_unclaimed_idx
-    ON names.escrow_held (token, held DESC, chain_id, handle_node) WHERE held > 0;
+    ON names.escrow_held (token, held, chain_id, handle_node) WHERE held > 0;
 -- One handle's slots still holding something, across every chain or one.
 CREATE INDEX IF NOT EXISTS escrow_held_node_chain_idx
     ON names.escrow_held (handle_node, chain_id) WHERE held > 0;

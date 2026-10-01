@@ -4,6 +4,8 @@
 //! `alloy` logs: a test builds a `NamesEvent` directly and never touches RPC
 //! types.
 
+use std::str::FromStr;
+
 use alloy::{
     primitives::{
         Address,
@@ -194,7 +196,7 @@ impl Role {
     }
 }
 
-impl std::str::FromStr for Role {
+impl FromStr for Role {
     type Err = UnknownRole;
 
     fn from_str(name: &str) -> Result<Self, UnknownRole> {
@@ -460,25 +462,27 @@ fn payload_of<E: SolEvent>(log: &Log, event: &'static str) -> Result<E, DecodeEr
         .map_err(|source| DecodeError::Payload { event, source })
 }
 
-/// Where a mined log sat. Every field is one a mined log carries; the block's
-/// timestamp is one `eth_getLogs` has returned since execution-apis added it
-/// (reth, geth, anvil), and an RPC without it fails the window rather than
-/// writing a history with no time in it.
-fn position_of(log: &Log) -> Result<LogPosition, DecodeError> {
-    Ok(LogPosition {
-        block_number: log
-            .block_number
-            .ok_or(DecodeError::MissingField("block number"))?,
-        log_index: log
-            .log_index
-            .ok_or(DecodeError::MissingField("log index"))?,
-        tx_hash: log
-            .transaction_hash
-            .ok_or(DecodeError::MissingField("transaction hash"))?,
-        block_time: log
-            .block_timestamp
-            .ok_or(DecodeError::MissingField("block timestamp"))?,
-    })
+impl LogPosition {
+    /// Where a mined log sat. Every field is one a mined log carries; the
+    /// block's timestamp is one `eth_getLogs` has returned since execution-apis
+    /// added it (reth, geth, anvil), and an RPC without it fails the window
+    /// rather than writing a history with no time in it.
+    fn of(log: &Log) -> Result<Self, DecodeError> {
+        Ok(Self {
+            block_number: log
+                .block_number
+                .ok_or(DecodeError::MissingField("block number"))?,
+            log_index: log
+                .log_index
+                .ok_or(DecodeError::MissingField("log index"))?,
+            tx_hash: log
+                .transaction_hash
+                .ok_or(DecodeError::MissingField("transaction hash"))?,
+            block_time: log
+                .block_timestamp
+                .ok_or(DecodeError::MissingField("block timestamp"))?,
+        })
+    }
 }
 
 /// Decode one log from `IdentityRegistry`. `Ok(None)` is a topic this indexer
@@ -489,7 +493,7 @@ fn position_of(log: &Log) -> Result<LogPosition, DecodeError> {
 pub fn decode_registry(
     log: &Log,
 ) -> Result<Option<(NamesEvent, LogPosition)>, DecodeError> {
-    let position = position_of(log)?;
+    let position = LogPosition::of(log)?;
     let Some(&topic0) = log.topic0() else {
         return Ok(None);
     };
@@ -562,7 +566,7 @@ pub fn decode_registry(
 pub fn decode_escrow(
     log: &Log,
 ) -> Result<Option<(NamesEvent, LogPosition)>, DecodeError> {
-    let position = position_of(log)?;
+    let position = LogPosition::of(log)?;
     let Some(&topic0) = log.topic0() else {
         return Ok(None);
     };

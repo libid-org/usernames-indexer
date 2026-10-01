@@ -2,6 +2,11 @@
 //! deposit's `refundTo` may still take back, moved the way the contract moves
 //! its own storage — and the reads that answer "what is waiting" over them.
 
+use std::{
+    fmt,
+    str::FromStr,
+};
+
 use alloy::primitives::{
     Address,
     B256,
@@ -13,6 +18,7 @@ use super::{
     scoped,
     sql,
     ApplyError,
+    InvalidCursor,
     Statement,
     Store,
     Window,
@@ -24,7 +30,7 @@ impl Window {
     /// slot this index never saw deposited is reported, not refused: it means
     /// the scan started after the escrow's first deposit (`START_BLOCK`), and
     /// stalling the chain would not bring the deposit back.
-    pub(super) async fn book_escrow(
+    pub(crate) async fn book_escrow(
         &mut self,
         event: &NamesEvent,
         block: i64,
@@ -233,32 +239,91 @@ impl Store {
     pub async fn unclaimed(
         &self,
         page: UnclaimedPage,
-    ) -> Result<Vec<EscrowSlotRow>, sqlx::Error> {
-        page.lookup("").build_query_as().fetch_all(&self.pool).await
+    ) -> Result<UnclaimedRows, sqlx::Error> {
+        let rows = page
+            .lookup("")
+            .build_query_as()
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(page.split(rows))
     }
 }
 
-/// One page of the unclaimed list: narrowed by whatever it names, and none of
-/// them lists every slot the store holds.
+/// Where an unclaimed page ends: the last slot it served. The list runs by
+/// token, then amount, chain and node, all descending, so this is the next
+/// page's exclusive upper bound. Its text is `token-amount-chainId-node`,
+/// which a client passes back without reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnclaimedCursor {
+    /// The slot's token.
+    pub token: Address,
+    /// What the slot held.
+    pub held: U256,
+    /// The slot's chain.
+    pub chain_id: i64,
+    /// The slot's handle node.
+    pub handle_node: B256,
+}
+
+impl FromStr for UnclaimedCursor {
+    type Err = InvalidCursor;
+
+    fn from_str(raw: &str) -> Result<Self, InvalidCursor> {
+        let mut parts = raw.split('-');
+        let mut next = || parts.next().ok_or(InvalidCursor);
+        let cursor = Self {
+            token: next()?.parse().map_err(|_| InvalidCursor)?,
+            held: next()?.parse().map_err(|_| InvalidCursor)?,
+            chain_id: next()?.parse().map_err(|_| InvalidCursor)?,
+            handle_node: next()?.parse().map_err(|_| InvalidCursor)?,
+        };
+        match parts.next() {
+            None => Ok(cursor),
+            Some(_) => Err(InvalidCursor),
+        }
+    }
+}
+
+impl fmt::Display for UnclaimedCursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}-{}-{}-{}",
+            self.token, self.held, self.chain_id, self.handle_node
+        )
+    }
+}
+
+/// One page of the unclaimed list: narrowed by whatever it names, after the
+/// slot a previous page ended with, at most `limit` slots.
 #[derive(Debug, Clone, Copy)]
 pub struct UnclaimedPage {
-    /// One chain.
+    /// One chain, or every chain the store holds.
     pub chain: Option<i64>,
-    /// One token.
+    /// One token, or every token.
     pub token: Option<Address>,
-    /// One platform.
+    /// One platform, or every platform.
     pub platform_id: Option<B256>,
+    /// The cursor the previous page handed out, if this is not the first.
+    pub before: Option<UnclaimedCursor>,
     /// The most slots the page holds.
     pub limit: i64,
-    /// How many slots of the order precede the page.
-    pub offset: i64,
+}
+
+/// A page as the store read it: its slots, and where the next page starts
+/// while there is one.
+pub struct UnclaimedRows {
+    /// Token by token, the largest amount first within each.
+    pub rows: Vec<EscrowSlotRow>,
+    /// The cursor to pass back as the next page's `before`.
+    pub next: Option<UnclaimedCursor>,
 }
 
 impl UnclaimedPage {
-    /// Token first, so one asset's slots page together, and the largest
-    /// amount first within it; chain and node break ties so a page boundary
-    /// is stable.
-    pub(super) fn lookup(&self, prefix: &str) -> Statement {
+    /// Every column of the order descends, so the cursor is one row
+    /// comparison and a page is one backward scan of the unclaimed index; one
+    /// row past the limit tells whether a next page exists.
+    pub(crate) fn lookup(&self, prefix: &str) -> Statement {
         let mut statement =
             QueryBuilder::new(format!("{prefix}{}", sql::ESCROW_SLOT_PROJECTION));
         if let Some(token) = self.token {
@@ -272,16 +337,55 @@ impl UnclaimedPage {
                 .push(" AND e.platform_id = ")
                 .push_bind(platform_id.as_slice().to_vec());
         }
+        if let Some(before) = self.before {
+            statement
+                .push(" AND (e.token, e.held, e.chain_id, e.handle_node) < (")
+                .push_bind(before.token.as_slice().to_vec())
+                .push(", ")
+                .push_bind(before.held.to_string())
+                .push("::numeric, ")
+                .push_bind(before.chain_id)
+                .push(", ")
+                .push_bind(before.handle_node.as_slice().to_vec())
+                .push(")");
+        }
         statement
-            .push(" ORDER BY e.token, e.held DESC, e.chain_id, e.handle_node LIMIT ")
-            .push_bind(self.limit)
-            .push(" OFFSET ")
-            .push_bind(self.offset);
+            .push(
+                " ORDER BY e.token DESC, e.held DESC, e.chain_id DESC, \
+                 e.handle_node DESC LIMIT ",
+            )
+            .push_bind(self.limit + 1);
         statement
+    }
+
+    /// The page out of the rows its lookup read: at most `limit`, and the
+    /// cursor after the last when the extra row proved more exist.
+    fn split(&self, mut rows: Vec<EscrowSlotRow>) -> UnclaimedRows {
+        let limit = usize::try_from(self.limit).unwrap_or_default();
+        let more = rows.len() > limit;
+        rows.truncate(limit);
+        let next = more
+            .then(|| rows.last())
+            .flatten()
+            .and_then(UnclaimedCursor::after);
+        UnclaimedRows { rows, next }
     }
 }
 
-pub(super) fn claimable_lookup(
+impl UnclaimedCursor {
+    /// The cursor a page that ended with `row` hands out; `None` only for a
+    /// stored value the books never write.
+    fn after(row: &EscrowSlotRow) -> Option<Self> {
+        Some(Self {
+            token: Address::try_from(row.token.as_slice()).ok()?,
+            held: row.amount()?,
+            chain_id: row.chain_id,
+            handle_node: B256::try_from(row.handle_node.as_slice()).ok()?,
+        })
+    }
+}
+
+pub(crate) fn claimable_lookup(
     prefix: &str,
     chain: Option<i64>,
     holder: Address,
@@ -296,7 +400,7 @@ pub(super) fn claimable_lookup(
     statement
 }
 
-pub(super) fn refundable_lookup(
+pub(crate) fn refundable_lookup(
     prefix: &str,
     chain: Option<i64>,
     refund_to: Address,
@@ -311,7 +415,7 @@ pub(super) fn refundable_lookup(
     statement
 }
 
-pub(super) fn node_slots_lookup(
+pub(crate) fn node_slots_lookup(
     prefix: &str,
     chain: Option<i64>,
     handle_node: B256,

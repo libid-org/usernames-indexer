@@ -473,10 +473,10 @@ struct SearchParams {
 
 /// The page size a search may ask for: at most this many hits per request.
 const SEARCH_MAX_LIMIT: i64 = 50;
-/// How far into a list an offset page may start: the search's ranking or the
-/// unclaimed slots. Deeper pages are a scan the database repeats per request;
-/// a client that far in wants a narrower query.
-const MAX_OFFSET: i64 = 10_000;
+/// How far into a ranked list a search may page. Deeper pages are a scan the
+/// database repeats per request; a client that far in wants a narrower
+/// query.
+const SEARCH_MAX_OFFSET: i64 = 10_000;
 /// A history or unclaimed page holds this many entries unless the request
 /// asks for fewer.
 const PAGE_DEFAULT_LIMIT: i64 = 20;
@@ -523,7 +523,7 @@ async fn search(
         .clamp(1, SEARCH_MAX_LIMIT);
     let offset = parse_count(params.offset.as_deref(), "offset")?
         .unwrap_or(0)
-        .clamp(0, MAX_OFFSET);
+        .clamp(0, SEARCH_MAX_OFFSET);
     let platform_id = params
         .platform
         .as_deref()

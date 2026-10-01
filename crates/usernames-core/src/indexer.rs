@@ -8,14 +8,22 @@
 use alloy::{
     primitives::Address,
     providers::Provider,
-    rpc::types::Filter,
+    rpc::types::{
+        Filter,
+        Log,
+    },
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     chain,
     db::ChainStore,
-    events,
+    events::{
+        self,
+        DecodeError,
+        LogPosition,
+        NamesEvent,
+    },
 };
 
 /// The loop's knobs, resolved by the CLI. The chain itself is carried by the
@@ -81,9 +89,8 @@ impl<P: Provider> Indexer<P> {
     /// emitter, so one would be an RPC answering a different question.
     fn decode(
         &self,
-        log: &alloy::rpc::types::Log,
-    ) -> Result<Option<(events::NamesEvent, events::LogPosition)>, events::DecodeError>
-    {
+        log: &Log,
+    ) -> Result<Option<(NamesEvent, LogPosition)>, DecodeError> {
         let emitter = log.address();
         if emitter == self.config.contract {
             events::decode_registry(log)

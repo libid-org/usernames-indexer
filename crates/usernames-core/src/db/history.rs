@@ -9,7 +9,10 @@
 //! those is read here from the rows the event is about to change, or from the
 //! rows its own transaction recorded just before it.
 
-use std::str::FromStr;
+use std::{
+    fmt,
+    str::FromStr,
+};
 
 use alloy::primitives::{
     Address,
@@ -34,7 +37,7 @@ use crate::events::{
 
 /// What one event involves: the addresses, each with every part it plays in
 /// it, and the handle node it concerns with that node's platform.
-pub(super) struct Involvement {
+pub(crate) struct Involvement {
     parties: Vec<(Address, Vec<Role>)>,
     handle: Option<(B256, B256)>,
 }
@@ -62,7 +65,7 @@ struct FeeCeremony {
 
 impl Window {
     /// What `event` involves, read before its projections move.
-    pub(super) async fn involvement(
+    pub(crate) async fn involvement(
         &mut self,
         event: &NamesEvent,
         pos: &LogPosition,
@@ -280,7 +283,7 @@ impl Window {
     }
 
     /// Put the event at `pos` in the histories of everything it involves.
-    pub(super) async fn record(
+    pub(crate) async fn record(
         &mut self,
         involvement: Involvement,
         pos: &LogPosition,
@@ -357,8 +360,8 @@ impl FromStr for HistoryCursor {
     }
 }
 
-impl std::fmt::Display for HistoryCursor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for HistoryCursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "{}-{}-{}-{}",
@@ -418,7 +421,7 @@ pub struct HistoryRows {
 
 impl HistoryPage {
     /// An address's history page, composed per request like every lookup.
-    pub(super) fn address_lookup(&self, prefix: &str, address: Address) -> Statement {
+    pub(crate) fn address_lookup(&self, prefix: &str, address: Address) -> Statement {
         let mut statement = QueryBuilder::new(format!(
             "{prefix}{} WHERE a.address = ",
             sql::ADDRESS_HISTORY_PROJECTION
@@ -430,7 +433,7 @@ impl HistoryPage {
     }
 
     /// A handle's history page.
-    pub(super) fn node_lookup(&self, prefix: &str, handle_node: B256) -> Statement {
+    pub(crate) fn node_lookup(&self, prefix: &str, handle_node: B256) -> Statement {
         let mut statement = QueryBuilder::new(format!(
             "{prefix}{} WHERE he.handle_node = ",
             sql::HANDLE_HISTORY_PROJECTION

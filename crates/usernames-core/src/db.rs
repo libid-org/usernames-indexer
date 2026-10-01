@@ -38,7 +38,9 @@ mod history;
 pub use self::{
     escrow::{
         EscrowSlotRow,
+        UnclaimedCursor,
         UnclaimedPage,
+        UnclaimedRows,
     },
     history::{
         HistoryCursor,
@@ -1429,6 +1431,8 @@ mod sql {
 
 #[cfg(test)]
 mod plan_tests {
+    use alloy::primitives::U256;
+
     use super::*;
 
     /// Rows in the shape production holds them, on the chain every probe
@@ -1553,8 +1557,13 @@ mod plan_tests {
                 chain,
                 token,
                 platform_id: None,
+                before: Some(UnclaimedCursor {
+                    token: Address::repeat_byte(3),
+                    held: U256::from(10u64),
+                    chain_id: 1,
+                    handle_node: platform,
+                }),
                 limit: 20,
-                offset: 0,
             }
             .lookup("EXPLAIN ")
         };

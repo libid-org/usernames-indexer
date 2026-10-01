@@ -72,7 +72,7 @@ the indexer's knobs is the point rather than an omission:
 | `GET /v1/history/node/{node}` | The same, by handle node: for a handle nobody has bound, whose text no event carried |
 | `GET /v1/escrow/address/{address}` | What waits for an address: `claimable`, held for the handles it holds now, and `refundable`, what deposits naming it as `refundTo` booked that nobody has claimed yet |
 | `GET /v1/escrow/handle/{platform}/{handle}` | What a handle holds, token by token, and its holder; `/v1/escrow/node/{node}` by node |
-| `GET /v1/escrow/unclaimed?token=0x…&platform=x&limit=20&offset=0` | Every slot still holding something, bound or not: by token, the largest amount first within each. `limit` 1..100 (default 20), `offset` up to 10000 |
+| `GET /v1/escrow/unclaimed?token=0x…&platform=x&before=&limit=` | Every slot still holding something, bound or not: token by token, descending, the largest amount first within each |
 | `GET /v1/status` | Every chain the store holds: chain id, contract, escrow, last indexed block, chain head, lag, when the indexer last reported and how long that report is still good, last window error, the Proof Verifier the contract is wired to; and the read-model version |
 | `GET /health` | Liveness |
 
@@ -81,9 +81,9 @@ Every read spans every chain the store holds, and every result carries its
 or contracts is configured on the API: the indexers wrote it.
 
 A history is ordered by block time, then chain, block and log index, so one
-spanning chains interleaves them in time. It pages by cursor: a page holds
-`limit` entries (1..100, default 20) and, while more remain, a `next` to pass
-back as `before`. Each entry carries the event in `event`, tagged by `kind`
+spanning chains interleaves them in time. Histories and the unclaimed list page
+by cursor: a page holds `limit` entries (1..100, default 20) and, while more
+remain, a `next` to pass back as `before`. Each entry carries the event in `event`, tagged by `kind`
 (the journal's kinds, fields named as the contract names them), and the
 handle it concerns. Amounts and rounds are `uint256` decimal strings; the
 chain's own coin is the EIP-7528 token `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`.

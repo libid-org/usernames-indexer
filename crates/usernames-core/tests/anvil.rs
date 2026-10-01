@@ -33,6 +33,7 @@ use usernames_core::{
         AddressResolution,
         HandleHistory,
         HandleResolution,
+        HistoryEntry,
         HistoryEvent,
         IdResolution,
         Role,
@@ -603,6 +604,6 @@ async fn indexes_a_real_chain_end_to_end() {
 }
 
 /// A history's events, in the order served.
-fn events(entries: &[usernames_core::api::model::HistoryEntry]) -> Vec<&HistoryEvent> {
+fn events(entries: &[HistoryEntry]) -> Vec<&HistoryEvent> {
     entries.iter().map(|entry| &entry.event).collect()
 }
