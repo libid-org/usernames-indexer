@@ -272,13 +272,11 @@ fresh database, or stop it and run
 `pg_trgm`, which a least-privilege role cannot create. Every chain then
 replays from its contract's deployment block.
 
-**Upgrading from 0.3:** journal payloads take the field names of
-`IdentityRegistry` 0.15 (`holder`, `id`), and migration `002` admits the
-`handle_unpublished` kind. `INDEXER_VERSION` 2 replays each chain from its
-deployment block on its indexer's first start. A 0.3 indexer refuses a
-database `002` migrated (`migration 2 was previously applied but is missing
-in the resolved migrations`), so upgrade every indexer sharing the database
-together.
+**Upgrading from 0.3:** `IdentityRegistry` 0.15 is a fresh deployment, and
+`001_schema.sql` admits its `handle_unpublished` journal kind, so the indexer
+refuses a database 0.3 migrated, as above. Start it on a fresh database with
+`IDENTITY_NAMES_ADDRESS` set to the 0.15 registry; it indexes from that
+registry's deployment block.
 
 Probes belong to the API: `GET /health` for liveness; for readiness gate on
 the status code of `GET /v1/status`, which is 200 whenever the database

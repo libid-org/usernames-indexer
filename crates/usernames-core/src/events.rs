@@ -17,16 +17,6 @@ use alloy::{
 use libid_contracts::bindings::identity::IdentityRegistry;
 use serde_json::json;
 
-/// Events that `IdentityNames`, the registry before 0.15, emits under names
-/// 0.15 retired. The indexer still follows such deployments.
-mod legacy {
-    alloy::sol! {
-        /// `HandleUnpublished` under its earlier name: the same fields, and
-        /// so the same data under another topic.
-        event NameUnpublished(address indexed holder, bytes32 indexed platformId);
-    }
-}
-
 /// Where in the chain a log sat. The pair (block, log index) is the natural
 /// id every table keys provenance by.
 #[derive(Debug, Clone, Copy)]
@@ -69,9 +59,6 @@ pub enum NamesEvent {
     },
     /// A holder withdrew its published handle.
     HandleUnpublished { holder: Address, platform_id: B256 },
-    /// `HandleUnpublished` as releases before 0.15 logged it, under its
-    /// earlier name and topic.
-    NameUnpublished { holder: Address, platform_id: B256 },
     /// A platform's handle rules were configured or reconfigured.
     PlatformConfigured { platform_id: B256 },
     /// The contract was pointed at the Proof Verifier that checks every claim
@@ -101,7 +88,6 @@ impl NamesEvent {
             Self::IdentityBound { .. } => "identity_bound",
             Self::HandleRetired { .. } => "handle_retired",
             Self::HandleUnpublished { .. } => "handle_unpublished",
-            Self::NameUnpublished { .. } => "name_unpublished",
             Self::PlatformConfigured { .. } => "platform_configured",
             Self::ProofVerifierConfigured { .. } => "proof_verifier_configured",
             Self::CeremonyBound { .. } => "ceremony_bound",
@@ -145,10 +131,6 @@ impl NamesEvent {
                 "holder": holder.to_string(),
             }),
             Self::HandleUnpublished {
-                holder,
-                platform_id,
-            }
-            | Self::NameUnpublished {
                 holder,
                 platform_id,
             } => json!({
@@ -276,12 +258,6 @@ pub fn decode(log: &Log) -> Result<Option<(NamesEvent, LogPosition)>, DecodeErro
             holder: d.holder,
             platform_id: d.platformId,
         }
-    } else if topic0 == legacy::NameUnpublished::SIGNATURE_HASH {
-        let d: legacy::NameUnpublished = payload_of(log, "NameUnpublished")?;
-        NamesEvent::NameUnpublished {
-            holder: d.holder,
-            platform_id: d.platformId,
-        }
     } else if topic0 == IdentityRegistry::PlatformConfigured::SIGNATURE_HASH {
         let d: IdentityRegistry::PlatformConfigured =
             payload_of(log, "PlatformConfigured")?;
@@ -363,14 +339,9 @@ mod tests {
             IdentityRegistry::ProofVerifierConfigured::SIGNATURE_HASH,
             b256!("01970f3cbef68f8ac95615ab5c75299e421a83a787173408d693928ed40b6574")
         );
-        // The unpublish topic since 0.15, and the one before it.
         assert_eq!(
             IdentityRegistry::HandleUnpublished::SIGNATURE_HASH,
             b256!("327d843d48b64b6d010abe26e340d8c8eb34e327aa886c7fafbb4a024eccc3f8")
-        );
-        assert_eq!(
-            legacy::NameUnpublished::SIGNATURE_HASH,
-            b256!("8e43ba98be6948052c3368d53fef5505611df0ae5994d278a646eb9ad3479edd")
         );
     }
 
@@ -393,30 +364,6 @@ mod tests {
             "{event:?}"
         );
         assert_eq!(event.kind(), "handle_unpublished");
-        assert_eq!((position.block_number, position.log_index), (7, 3));
-    }
-
-    /// A deployment from before 0.15 logs the earlier topic, and the read
-    /// model has to apply those logs too.
-    #[test]
-    fn name_unpublished_from_before_0_15_decodes() {
-        let log = mined(
-            legacy::NameUnpublished {
-                holder: HOLDER,
-                platformId: PLATFORM,
-            }
-            .encode_log_data(),
-        );
-        let (event, position) = decode(&log).unwrap().expect("a known topic");
-        assert!(
-            matches!(
-                event,
-                NamesEvent::NameUnpublished { holder, platform_id }
-                    if holder == HOLDER && platform_id == PLATFORM
-            ),
-            "{event:?}"
-        );
-        assert_eq!(event.kind(), "name_unpublished");
         assert_eq!((position.block_number, position.log_index), (7, 3));
     }
 }
