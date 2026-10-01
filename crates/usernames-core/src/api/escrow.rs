@@ -23,6 +23,7 @@ use super::{
         Unclaimed,
     },
     parse_address,
+    parse_count,
     parse_node,
     parse_platform,
     ApiError,
@@ -150,8 +151,8 @@ pub(super) struct UnclaimedParams {
     token: Option<String>,
     platform: Option<String>,
     chain: Option<String>,
-    limit: Option<i64>,
-    offset: Option<i64>,
+    limit: Option<String>,
+    offset: Option<String>,
 }
 
 /// `GET /v1/escrow/unclaimed?token=&platform=&chain=&limit=&offset=` — every
@@ -173,8 +174,12 @@ pub(super) async fn unclaimed(
         .map(parse_platform)
         .transpose()?
         .map(|platform| platform.id());
-    let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    let offset = params.offset.unwrap_or(0).clamp(0, MAX_OFFSET);
+    let limit = parse_count(params.limit.as_deref(), "limit")?
+        .unwrap_or(DEFAULT_LIMIT)
+        .clamp(1, MAX_LIMIT);
+    let offset = parse_count(params.offset.as_deref(), "offset")?
+        .unwrap_or(0)
+        .clamp(0, MAX_OFFSET);
 
     let filter = UnclaimedFilter {
         chain,

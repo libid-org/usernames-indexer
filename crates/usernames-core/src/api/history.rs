@@ -27,6 +27,7 @@ use super::{
         Role,
     },
     parse_address,
+    parse_count,
     parse_node,
     ApiError,
     AppState,
@@ -50,7 +51,7 @@ const MAX_LIMIT: i64 = 100;
 pub(super) struct HistoryParams {
     chain: Option<String>,
     before: Option<String>,
-    limit: Option<i64>,
+    limit: Option<String>,
 }
 
 /// One page, parsed: the chain, where the page starts, and its size.
@@ -75,7 +76,9 @@ impl HistoryParams {
                 })
             })
             .transpose()?;
-        let limit = self.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+        let limit = parse_count(self.limit.as_deref(), "limit")?
+            .unwrap_or(DEFAULT_LIMIT)
+            .clamp(1, MAX_LIMIT);
         Ok(Page {
             chain,
             before,

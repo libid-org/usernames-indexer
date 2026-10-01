@@ -312,12 +312,15 @@ refuses a database 0.3 migrated, as above. Start it on a fresh database with
 `IDENTITY_NAMES_ADDRESS` set to the 0.15 registry; it indexes from that
 registry's deployment block.
 
-**Upgrading from 0.4:** the indexer migrates the database in place
-(`002_escrow_and_history.sql`) and, because `INDEXER_VERSION` is 2, replays
-every chain from its registry's deployment block on first start, filling the
-escrow books and the histories. Set `HANDLE_ESCROW_ADDRESS` before that start,
-or the chain replays again when it is set. The API answers the new routes once
-the indexer's first window lands.
+**Upgrading from 0.4:** roll the indexer first. It migrates the database in
+place (`002_escrow_and_history.sql`) and, because `INDEXER_VERSION` is 2,
+replays every chain from its registry's deployment block, filling the escrow
+books and the histories. Set `HANDLE_ESCROW_ADDRESS` before that start, or the
+chain replays again when it is set. A 0.4 API keeps serving its routes over the
+migrated database; a 0.5 API started before the migration answers `internal`
+on the new routes until it lands. A 0.4 indexer refuses a database 002 has
+migrated: to go back, start it on a fresh database, or run
+`DROP SCHEMA names CASCADE; DROP TABLE _sqlx_migrations;` first, as above.
 
 Probes belong to the API: `GET /health` for liveness; for readiness gate on
 the status code of `GET /v1/status`, which is 200 whenever the database

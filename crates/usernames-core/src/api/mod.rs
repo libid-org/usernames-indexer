@@ -232,6 +232,20 @@ fn parse_address(raw: &str) -> Result<Address, ApiError> {
     })
 }
 
+/// A count from the query string, refused in the API's envelope: typed as a
+/// number in the extractor, `limit=ten` would get axum's plain-text 400.
+fn parse_count(raw: Option<&str>, name: &str) -> Result<Option<i64>, ApiError> {
+    raw.map(|raw| {
+        raw.parse::<i64>().map_err(|_| {
+            ApiError::bad_request(
+                "invalid_argument",
+                format!("{name} must be an integer, not {raw:?}"),
+            )
+        })
+    })
+    .transpose()
+}
+
 fn parse_node(raw: &str) -> Result<B256, ApiError> {
     B256::from_str(raw).map_err(|_| {
         ApiError::bad_request(

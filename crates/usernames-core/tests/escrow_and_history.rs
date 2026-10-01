@@ -739,6 +739,21 @@ async fn the_escrow_routes_name_what_they_refuse() {
             StatusCode::BAD_REQUEST,
             "invalid_platform",
         ),
+        (
+            "/v1/escrow/unclaimed?limit=ten",
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+        ),
+        (
+            "/v1/escrow/unclaimed?offset=-",
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+        ),
+        (
+            "/v1/history/handle/x/nobody?limit=1.5",
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+        ),
     ];
     for (path, status, code) in cases {
         let refusal = get::<serde_json::Value>(&store, path).await.refusal();
