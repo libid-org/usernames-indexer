@@ -999,7 +999,7 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
     let Some((store, pool, _g)) = test_store_with(2).await else {
         return;
     };
-    let name = |s: &str| ens::ChainName::parse(s).unwrap();
+    let name = |s: &str| s.parse::<ens::ChainName>().unwrap();
     let writer = store.acquire_writer().await.expect("lease");
     // In the indexer's order: the chain is prepared, then named.
     store

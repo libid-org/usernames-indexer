@@ -140,7 +140,7 @@ async fn gateway_parts(
 async fn declare_names(store: &ChainStore, names: &[&str]) {
     let names: Vec<_> = names
         .iter()
-        .map(|name| ens::ChainName::parse(name).expect("a chain name"))
+        .map(|name| name.parse::<ens::ChainName>().expect("a chain name"))
         .collect();
     let writer = store.acquire_writer().await.expect("lease");
     store

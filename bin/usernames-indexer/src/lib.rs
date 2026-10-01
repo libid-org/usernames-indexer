@@ -62,7 +62,7 @@ pub struct Config {
     /// store at every start for the gateway to read, replacing what this
     /// chain declared before; a name belongs to one chain across the store.
     #[arg(long, env = "CHAIN_NAMES", value_delimiter = ',', required = true)]
-    pub chain_names: Vec<String>,
+    pub chain_names: Vec<ChainName>,
 
     /// Blocks behind the head to stay; shallow-reorg protection.
     #[arg(long, env = "CONFIRMATIONS", default_value_t = 5)]
@@ -125,12 +125,6 @@ pub async fn run() -> anyhow::Result<()> {
         "STALE_AFTER_SECS ({stale_after_secs}) is more than a year; a report nobody \
          expects to expire is not a report"
     );
-    let chain_names = config
-        .chain_names
-        .iter()
-        .map(|name| ChainName::parse(name.trim()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| anyhow::anyhow!("CHAIN_NAMES: {e}"))?;
 
     let provider: RootProvider = RootProvider::new_http(config.rpc_url.clone());
     let reported = provider.get_chain_id().await?;
@@ -168,7 +162,7 @@ pub async fn run() -> anyhow::Result<()> {
     // still-running older pod.
     let writer = store.acquire_writer().await?;
     store.prepare(&writer, contract, escrow).await?;
-    store.set_chain_names(&writer, &chain_names).await?;
+    store.set_chain_names(&writer, &config.chain_names).await?;
 
     let cancel = CancellationToken::new();
     let indexer = indexer::Indexer::new(
@@ -204,7 +198,10 @@ pub async fn run() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod help_tests {
-    use clap::CommandFactory;
+    use clap::{
+        CommandFactory,
+        Parser,
+    };
 
     use super::Config;
 
@@ -223,6 +220,35 @@ mod help_tests {
                 arg.is_hide_env_values_set(),
                 "{secret} shows its value in --help"
             );
+        }
+    }
+
+    /// The chain names are parsed by clap into their type, so a platform key
+    /// or a malformed label stops the process before anything connects.
+    #[test]
+    fn chain_names_are_refused_at_parse() {
+        let args = |names: &str| {
+            Config::try_parse_from([
+                "usernames-indexer",
+                "--database-url",
+                "postgres://localhost/usernames",
+                "--rpc-url",
+                "http://127.0.0.1:8545",
+                "--identity-names-address",
+                "0x0000000000000000000000000000000000000001",
+                "--chain-names",
+                names,
+            ])
+        };
+        let names: Vec<String> = args("eden,base")
+            .expect("two labels")
+            .chain_names
+            .iter()
+            .map(|name| name.as_str().to_string())
+            .collect();
+        assert_eq!(names, ["eden", "base"]);
+        for bad in ["eden,x", "Eden", "eden,"] {
+            assert!(args(bad).is_err(), "{bad:?}");
         }
     }
 }

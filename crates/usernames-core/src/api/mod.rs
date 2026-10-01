@@ -199,7 +199,7 @@ impl IntoResponse for ApiError {
 }
 
 fn parse_platform(raw: &str) -> Result<nodes::Platform, ApiError> {
-    nodes::Platform::parse(raw)
+    raw.parse::<nodes::Platform>()
         .map_err(|e| ApiError::bad_request("invalid_platform", e.to_string()))
 }
 
