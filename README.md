@@ -13,9 +13,9 @@ Neither binary contains logic: both stand on the `usernames-core` library,
 where the read model, the event decoding and the loop itself live.
 
 The contract was designed for exactly this: `IdentityBound` carries the
-plaintext `userId` and the normalized `handle` next to their storage nodes,
+plaintext `id` and the normalized `handle` next to their storage nodes,
 so the read model needs no on-chain strings, and the `published` flag plus
-`NameUnpublished` are emitted precisely so an off-chain index can reproduce
+`HandleUnpublished` are emitted precisely so an off-chain index can reproduce
 reverse display without guessing.
 
 ## Running
@@ -62,7 +62,7 @@ the indexer's knobs is the point rather than an omission:
 |---|---|
 | `GET /v1/resolve/handle/{platform}/{handle}` | The wallet a handle resolves to (`resolveHandle`) on each chain it is bound on, each with the account id it pairs with |
 | `GET /v1/resolve/id/{platform}/{userId}` | The wallet an account id resolves to (`resolveId`) on each chain it is bound on, each with the handle that account currently holds |
-| `GET /v1/resolve/address/{address}` | Every identity a wallet proved on every chain, with `resolves` and `published` flags (`primaryOf`'s reverse display) |
+| `GET /v1/resolve/address/{address}` | Every identity a wallet proved on every chain, with `resolves` and `published` flags (`publishedHandleOf`'s reverse display) |
 | `GET /v1/search?q=gre&platform=x&owner=0x…&limit=10&offset=0` | Live handles matching a partial query (exact, then prefix, then substring, then trigram-fuzzy), linked to a wallet, or both; one of `q` and `owner` is required. `limit` (1..50, default 10) and `offset` (up to 10000) page the ranked list; a page shorter than `limit` is the last |
 | `GET /v1/status` | Every chain the store holds: chain id, contract, last indexed block, chain head, lag, when the indexer last reported and how long that report is still good, last window error, the Proof Verifier the contract is wired to; and the read-model version |
 | `GET /health` | Liveness |
@@ -222,8 +222,8 @@ chain; a second deployment can share the database):
   `CeremonyBound` and `BindFeePaid` live only here: which client
   authenticated a binding and what fee it paid are an operator's questions,
   and nothing resolves by them
-- `ids` — mirrors `byId` + `handleOfId`: account id → wallet, current handle
-- `handles` — mirrors `byHandle` + `idOfHandle`: handle node → wallet;
+- `ids` — mirrors `idBindings` + `handleNodeById`: id → holder, current handle
+- `handles` — mirrors `handleBindings` + `idNodeByHandle`: handle node → holder;
   `owner NULL` mirrors the contract's retirement, and the `observed_at`
   watermark survives it the way the contract keeps it
 - `published` — the display names; a row exists exactly while the contract's
@@ -271,6 +271,14 @@ fresh database, or stop it and run
 `DROP SCHEMA names CASCADE; DROP TABLE _sqlx_migrations;` first; that keeps
 `pg_trgm`, which a least-privilege role cannot create. Every chain then
 replays from its contract's deployment block.
+
+**Upgrading from 0.3:** journal payloads take the field names of
+`IdentityNames` 0.15 (`holder`, `id`), and migration `002` admits the
+`handle_unpublished` kind. `INDEXER_VERSION` 2 replays each chain from its
+deployment block on its indexer's first start. A 0.3 indexer refuses a
+database `002` migrated (`migration 2 was previously applied but is missing
+in the resolved migrations`), so upgrade every indexer sharing the database
+together.
 
 Probes belong to the API: `GET /health` for liveness; for readiness gate on
 the status code of `GET /v1/status`, which is 200 whenever the database

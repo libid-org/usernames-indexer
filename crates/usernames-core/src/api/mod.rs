@@ -375,7 +375,7 @@ async fn resolve_id(
 
 /// `GET /v1/resolve/address/{address}?chain=` — every identity a wallet
 /// proved, on every chain the store holds or the one named, with the
-/// published flag that mirrors `primaryOf`'s reverse display.
+/// published flag that mirrors `publishedHandleOf`'s reverse display.
 async fn resolve_address(
     State(state): State<AppState>,
     Path(address): Path<String>,

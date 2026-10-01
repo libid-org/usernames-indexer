@@ -97,7 +97,7 @@ pub struct HandleBinding {
     pub ceremony_version: i64,
     /// The plaintext account id the handle points back at, when ever bound.
     pub user_id: Option<String>,
-    /// The account id node the handle points back at (`idOfHandle`).
+    /// The account id node the handle points back at (`idNodeByHandle`).
     pub id_node: B256,
 }
 
@@ -131,9 +131,10 @@ pub struct IdBinding {
     /// The ceremony version that proved the binding.
     pub ceremony_version: i64,
     /// The handle this account last proved, when the node it points at is
-    /// still the account's — the `handleOfId`/`idOfHandle` round trip.
+    /// still the account's — the `handleNodeById`/`idNodeByHandle` round
+    /// trip.
     pub handle: Option<String>,
-    /// The handle node this account last proved (`handleOfId`).
+    /// The handle node this account last proved (`handleNodeById`).
     pub handle_node: B256,
     /// Whether the handle is the wallet's displayed name on the platform.
     pub published: bool,

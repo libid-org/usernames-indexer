@@ -116,17 +116,17 @@ pub fn legacy_addr_call(labels: &[&str]) -> Vec<u8> {
 }
 
 /// Seed one binding into the read model the gateway answers from.
-pub async fn bind(store: &ChainStore, handle: &str, owner: Address) {
+pub async fn bind(store: &ChainStore, handle: &str, holder: Address) {
     let platform = nodes::Platform::from_key("x").unwrap().id();
     let event = NamesEvent::IdentityBound {
-        owner,
+        holder,
         id_node: nodes::id_node(platform, "42"),
         handle_node: nodes::handle_node(
             platform,
             &nodes::NormalizedHandle::from_chain(handle),
         ),
         platform_id: platform,
-        user_id: "42".into(),
+        id: "42".into(),
         handle: handle.into(),
         observed_at: 1_700_000_000,
         ceremony_version: 1,

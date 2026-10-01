@@ -40,7 +40,7 @@ use crate::{
 /// Bump on any change to what the indexer writes. A mismatch at startup
 /// clears the chain's rows and cursor, so the next loop replays the chain
 /// from the deployment block — the re-index IS the migration.
-pub const INDEXER_VERSION: &str = "1";
+pub const INDEXER_VERSION: &str = "2";
 
 /// Every projection table, in one place. [`ChainStore::prepare`] clears them
 /// for a replay and the tests clean them between scenarios; a single list
@@ -772,11 +772,11 @@ impl Window {
 
         match event {
             NamesEvent::IdentityBound {
-                owner,
+                holder,
                 id_node,
                 handle_node,
                 platform_id,
-                user_id,
+                id,
                 handle,
                 observed_at,
                 published,
@@ -787,8 +787,8 @@ impl Window {
                 // already keyed its storage by them — but a mismatch means
                 // platform ids or hashing drifted and resolution-by-string is
                 // broken until fixed.
-                if nodes::id_node(*platform_id, user_id) != *id_node {
-                    error!(%id_node, user_id, "recomputed idNode disagrees with the emitted topic");
+                if nodes::id_node(*platform_id, id) != *id_node {
+                    error!(%id_node, id, "recomputed idNode disagrees with the emitted topic");
                 }
                 if nodes::handle_node(
                     *platform_id,
@@ -799,14 +799,14 @@ impl Window {
                 }
 
                 let observed = as_i64(*observed_at, "observedAt")?;
-                let user_id = sanitize(user_id, "userId");
+                let id = sanitize(id, "id");
                 let handle = sanitize(handle, "handle");
                 sqlx::query(sql::UPSERT_ID)
                     .bind(chain_id)
                     .bind(id_node.as_slice())
                     .bind(platform_id.as_slice())
-                    .bind(&user_id)
-                    .bind(owner.as_slice())
+                    .bind(&id)
+                    .bind(holder.as_slice())
                     .bind(observed)
                     .bind(i64::from(*ceremony_version))
                     .bind(handle_node.as_slice())
@@ -820,7 +820,7 @@ impl Window {
                     .bind(handle_node.as_slice())
                     .bind(platform_id.as_slice())
                     .bind(&handle)
-                    .bind(owner.as_slice())
+                    .bind(holder.as_slice())
                     .bind(observed)
                     .bind(i64::from(*ceremony_version))
                     .bind(id_node.as_slice())
@@ -838,7 +838,7 @@ impl Window {
                 if *published {
                     sqlx::query(sql::PUBLISH)
                         .bind(chain_id)
-                        .bind(owner.as_slice())
+                        .bind(holder.as_slice())
                         .bind(platform_id.as_slice())
                         .bind(&handle)
                         .execute(&mut **tx)
@@ -846,7 +846,7 @@ impl Window {
                 } else {
                     sqlx::query(sql::UNPUBLISH)
                         .bind(chain_id)
-                        .bind(owner.as_slice())
+                        .bind(holder.as_slice())
                         .bind(platform_id.as_slice())
                         .execute(&mut **tx)
                         .await?;
@@ -856,7 +856,7 @@ impl Window {
             NamesEvent::HandleRetired {
                 platform_id: _,
                 handle_node,
-                owner: _,
+                holder: _,
             } => {
                 sqlx::query(sql::RETIRE_HANDLE)
                     .bind(chain_id)
@@ -867,10 +867,13 @@ impl Window {
                     .await?;
             }
 
-            NamesEvent::NameUnpublished { owner, platform_id } => {
+            NamesEvent::HandleUnpublished {
+                holder,
+                platform_id,
+            } => {
                 sqlx::query(sql::UNPUBLISH)
                     .bind(chain_id)
-                    .bind(owner.as_slice())
+                    .bind(holder.as_slice())
                     .bind(platform_id.as_slice())
                     .execute(&mut **tx)
                     .await?;
@@ -950,7 +953,7 @@ pub struct HandleRow {
     /// through retirement: the contract never stored it, and this row is its
     /// only record.
     pub ceremony_version: i64,
-    /// The account id node this handle points back at (`idOfHandle`).
+    /// The account id node this handle points back at (`idNodeByHandle`).
     pub id_node: Vec<u8>,
     /// The plaintext account id behind that node, when it was ever bound.
     pub user_id: Option<String>,
@@ -986,7 +989,7 @@ pub struct IdentityRow {
     pub observed_at: i64,
     /// The ceremony version that proved the binding.
     pub ceremony_version: i64,
-    /// The handle node this account last proved (`handleOfId`).
+    /// The handle node this account last proved (`handleNodeById`).
     pub handle_node: Vec<u8>,
     /// The handle string at that node, when the node was ever bound.
     pub handle: Option<String>,
@@ -999,10 +1002,10 @@ pub struct IdentityRow {
 }
 
 impl IdentityRow {
-    /// The `handleOfId`/`idOfHandle` round trip, written once: the stored
-    /// handle string is presentable only while the node still points back at
-    /// this id and still resolves to this wallet. Otherwise the account
-    /// renamed or was overtaken, and showing the stale string would
+    /// The `handleNodeById`/`idNodeByHandle` round trip, written once: the
+    /// stored handle string is presentable only while the node still points
+    /// back at this id and still resolves to this wallet. Otherwise the
+    /// account renamed or was overtaken, and showing the stale string would
     /// mis-route a payment.
     pub fn handle_still_owned(&self) -> bool {
         self.handle_owner.as_deref() == Some(self.owner.as_slice())
@@ -1114,8 +1117,8 @@ impl Store {
             .await
     }
 
-    /// Every identity a wallet proved — `primaryOf`'s reverse display, chain
-    /// by chain and platform by platform.
+    /// Every identity a wallet proved — `publishedHandleOf`'s reverse
+    /// display, chain by chain and platform by platform.
     pub async fn identities_of(
         &self,
         chain: Option<i64>,
