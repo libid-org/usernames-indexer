@@ -1,6 +1,6 @@
 # usernames-indexer
 
-Indexes [`IdentityNames`](https://github.com/libid-org/libid-contracts/blob/main/solidity/contracts/identity/IdentityNames.sol)
+Indexes [`IdentityRegistry`](https://github.com/libid-org/libid-contracts/blob/main/solidity/contracts/identity/IdentityRegistry.sol)
 events into Postgres and serves resolution and search over the claimed
 handles. **Two binaries over one read model**: `usernames-indexer`, a polling
 loop that indexes the contract's storage from its events alone, and
@@ -46,7 +46,7 @@ the indexer's knobs is the point rather than an omission:
 |---|---|---|---|
 | `DATABASE_URL` | both | — | Postgres connection string |
 | `RPC_URL` | indexer | — | JSON-RPC endpoint of the chain to follow. Prefer a single node or a sticky endpoint: a load balancer that mixes lagged replicas can answer `eth_getLogs` for blocks a backend has not seen, and events dropped that way past the confirmation margin are gone until a re-index. The loop re-checks the backend's height before committing a window, which narrows but cannot close that hole. |
-| `IDENTITY_NAMES_ADDRESS` | indexer | — | The IdentityNames **ERC1967 proxy** (the implementation changes on upgrade; the proxy is the one that emits). The indexer records it per chain, and `/v1/status` reports it from there |
+| `IDENTITY_NAMES_ADDRESS` | indexer | — | The IdentityRegistry **ERC1967 proxy** (the implementation changes on upgrade; the proxy is the one that emits). The indexer records it per chain, and `/v1/status` reports it from there |
 | `CHAIN_ID` | indexer | unset | Refuse to start unless the RPC reports this chain id. The API takes none: it serves every chain the store holds, and a request narrows with `?chain=` |
 | `CHAIN_NAMES` | indexer | — | Required. The names this chain goes by in an ENS name, comma-separated: the `base` in `alice.x.base.handles.link`. Labels only, never a platform key. Written to the store at every start for the gateway to read; a name belongs to one chain across the store, and declaring one another chain holds refuses to start |
 | `CONFIRMATIONS` | indexer | `5` | Blocks behind the head to stay (shallow-reorg protection) |
@@ -273,7 +273,7 @@ fresh database, or stop it and run
 replays from its contract's deployment block.
 
 **Upgrading from 0.3:** journal payloads take the field names of
-`IdentityNames` 0.15 (`holder`, `id`), and migration `002` admits the
+`IdentityRegistry` 0.15 (`holder`, `id`), and migration `002` admits the
 `handle_unpublished` kind. `INDEXER_VERSION` 2 replays each chain from its
 deployment block on its indexer's first start. A 0.3 indexer refuses a
 database `002` migrated (`migration 2 was previously applied but is missing

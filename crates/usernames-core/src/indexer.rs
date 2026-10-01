@@ -26,7 +26,7 @@ use crate::{
 /// [`ChainStore`] the [`Indexer`] is built over.
 #[derive(Debug, Clone)]
 pub struct IndexerConfig {
-    /// The IdentityNames ERC1967 proxy — the address to watch. The
+    /// The IdentityRegistry ERC1967 proxy — the address to watch. The
     /// implementation behind it changes on upgrade; the proxy is the one that
     /// emits.
     pub contract: Address,

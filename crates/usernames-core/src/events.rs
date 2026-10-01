@@ -1,4 +1,4 @@
-//! Decoding `IdentityNames` logs into one typed stream.
+//! Decoding `IdentityRegistry` logs into one typed stream.
 //!
 //! The enum exists so the apply path and its tests speak decoded values, not
 //! `alloy` logs: a test builds a `NamesEvent` directly and never touches RPC
@@ -14,11 +14,11 @@ use alloy::{
     rpc::types::Log,
     sol_types::SolEvent,
 };
-use libid_contracts::bindings::identity::IdentityNames;
+use libid_contracts::bindings::identity::IdentityRegistry;
 use serde_json::json;
 
-/// Events `IdentityNames` logged before 0.15 under names 0.15 retired. A
-/// proxy upgraded to 0.15 in place keeps them in its history.
+/// Events that `IdentityNames`, the registry before 0.15, emits under names
+/// 0.15 retired. The indexer still follows such deployments.
 mod legacy {
     alloy::sol! {
         /// `HandleUnpublished` under its earlier name: the same fields, and
@@ -39,7 +39,7 @@ pub struct LogPosition {
     pub tx_hash: B256,
 }
 
-/// One decoded `IdentityNames` event. Field names track the Solidity event
+/// One decoded `IdentityRegistry` event. Field names track the Solidity event
 /// parameters one to one, so they carry no docs of their own — the contract's
 /// natspec is the reference.
 #[derive(Debug, Clone)]
@@ -72,7 +72,7 @@ pub enum NamesEvent {
     /// `HandleUnpublished` as releases before 0.15 logged it, under its
     /// earlier name and topic.
     NameUnpublished { holder: Address, platform_id: B256 },
-    /// A platform's keyspace was configured or reconfigured.
+    /// A platform's handle rules were configured or reconfigured.
     PlatformConfigured { platform_id: B256 },
     /// The contract was pointed at the Proof Verifier that checks every claim
     /// and holds the version set the contract itself does not.
@@ -249,8 +249,8 @@ pub fn decode(log: &Log) -> Result<Option<(NamesEvent, LogPosition)>, DecodeErro
         return Ok(None);
     };
 
-    let event = if topic0 == IdentityNames::IdentityBound::SIGNATURE_HASH {
-        let d: IdentityNames::IdentityBound = payload_of(log, "IdentityBound")?;
+    let event = if topic0 == IdentityRegistry::IdentityBound::SIGNATURE_HASH {
+        let d: IdentityRegistry::IdentityBound = payload_of(log, "IdentityBound")?;
         NamesEvent::IdentityBound {
             holder: d.holder,
             id_node: d.idNode,
@@ -262,15 +262,16 @@ pub fn decode(log: &Log) -> Result<Option<(NamesEvent, LogPosition)>, DecodeErro
             published: d.published,
             ceremony_version: d.ceremonyVersion,
         }
-    } else if topic0 == IdentityNames::HandleRetired::SIGNATURE_HASH {
-        let d: IdentityNames::HandleRetired = payload_of(log, "HandleRetired")?;
+    } else if topic0 == IdentityRegistry::HandleRetired::SIGNATURE_HASH {
+        let d: IdentityRegistry::HandleRetired = payload_of(log, "HandleRetired")?;
         NamesEvent::HandleRetired {
             platform_id: d.platformId,
             handle_node: d.handleNode,
             holder: d.holder,
         }
-    } else if topic0 == IdentityNames::HandleUnpublished::SIGNATURE_HASH {
-        let d: IdentityNames::HandleUnpublished = payload_of(log, "HandleUnpublished")?;
+    } else if topic0 == IdentityRegistry::HandleUnpublished::SIGNATURE_HASH {
+        let d: IdentityRegistry::HandleUnpublished =
+            payload_of(log, "HandleUnpublished")?;
         NamesEvent::HandleUnpublished {
             holder: d.holder,
             platform_id: d.platformId,
@@ -281,27 +282,28 @@ pub fn decode(log: &Log) -> Result<Option<(NamesEvent, LogPosition)>, DecodeErro
             holder: d.holder,
             platform_id: d.platformId,
         }
-    } else if topic0 == IdentityNames::PlatformConfigured::SIGNATURE_HASH {
-        let d: IdentityNames::PlatformConfigured = payload_of(log, "PlatformConfigured")?;
+    } else if topic0 == IdentityRegistry::PlatformConfigured::SIGNATURE_HASH {
+        let d: IdentityRegistry::PlatformConfigured =
+            payload_of(log, "PlatformConfigured")?;
         NamesEvent::PlatformConfigured {
             platform_id: d.platformId,
         }
-    } else if topic0 == IdentityNames::ProofVerifierConfigured::SIGNATURE_HASH {
-        let d: IdentityNames::ProofVerifierConfigured =
+    } else if topic0 == IdentityRegistry::ProofVerifierConfigured::SIGNATURE_HASH {
+        let d: IdentityRegistry::ProofVerifierConfigured =
             payload_of(log, "ProofVerifierConfigured")?;
         NamesEvent::ProofVerifierConfigured {
             verifier: d.verifier,
         }
-    } else if topic0 == IdentityNames::CeremonyBound::SIGNATURE_HASH {
-        let d: IdentityNames::CeremonyBound = payload_of(log, "CeremonyBound")?;
+    } else if topic0 == IdentityRegistry::CeremonyBound::SIGNATURE_HASH {
+        let d: IdentityRegistry::CeremonyBound = payload_of(log, "CeremonyBound")?;
         NamesEvent::CeremonyBound {
             authorization_digest: d.authorizationDigest,
             holder: d.holder,
             platform_id: d.platformId,
             client_identifier: d.clientIdentifier,
         }
-    } else if topic0 == IdentityNames::BindFeePaid::SIGNATURE_HASH {
-        let d: IdentityNames::BindFeePaid = payload_of(log, "BindFeePaid")?;
+    } else if topic0 == IdentityRegistry::BindFeePaid::SIGNATURE_HASH {
+        let d: IdentityRegistry::BindFeePaid = payload_of(log, "BindFeePaid")?;
         NamesEvent::BindFeePaid {
             authorization_digest: d.authorizationDigest,
             receiver: d.receiver,
@@ -341,29 +343,29 @@ mod tests {
     }
 
     /// Fixed points from `cast keccak` over the event signatures in
-    /// `IdentityNames.sol`, so a crate binding that drifts from the contract
+    /// `IdentityRegistry.sol`, so a crate binding that drifts from the contract
     /// fails against numbers this code never produced.
     #[test]
     fn topics_match_the_contract() {
         assert_eq!(
-            IdentityNames::IdentityBound::SIGNATURE_HASH,
+            IdentityRegistry::IdentityBound::SIGNATURE_HASH,
             b256!("8ae08d06a548b84d8340ef35ae06cd4c34983cd87b5554e6c818b8180530950c")
         );
         assert_eq!(
-            IdentityNames::CeremonyBound::SIGNATURE_HASH,
+            IdentityRegistry::CeremonyBound::SIGNATURE_HASH,
             b256!("f0f0b831e902ded46acfd6caf87649edb445c2e2733992b2e79cd1420719c19c")
         );
         assert_eq!(
-            IdentityNames::BindFeePaid::SIGNATURE_HASH,
+            IdentityRegistry::BindFeePaid::SIGNATURE_HASH,
             b256!("471f5d0665e5719861746aa9077ef4997ae3d84cad4f349f5e7cc2cfe74be599")
         );
         assert_eq!(
-            IdentityNames::ProofVerifierConfigured::SIGNATURE_HASH,
+            IdentityRegistry::ProofVerifierConfigured::SIGNATURE_HASH,
             b256!("01970f3cbef68f8ac95615ab5c75299e421a83a787173408d693928ed40b6574")
         );
         // The unpublish topic since 0.15, and the one before it.
         assert_eq!(
-            IdentityNames::HandleUnpublished::SIGNATURE_HASH,
+            IdentityRegistry::HandleUnpublished::SIGNATURE_HASH,
             b256!("327d843d48b64b6d010abe26e340d8c8eb34e327aa886c7fafbb4a024eccc3f8")
         );
         assert_eq!(
@@ -375,7 +377,7 @@ mod tests {
     #[test]
     fn handle_unpublished_decodes() {
         let log = mined(
-            IdentityNames::HandleUnpublished {
+            IdentityRegistry::HandleUnpublished {
                 holder: HOLDER,
                 platformId: PLATFORM,
             }
@@ -394,8 +396,8 @@ mod tests {
         assert_eq!((position.block_number, position.log_index), (7, 3));
     }
 
-    /// A proxy upgraded to 0.15 in place keeps the earlier topic in its
-    /// history, and the read model has to apply those logs too.
+    /// A deployment from before 0.15 logs the earlier topic, and the read
+    /// model has to apply those logs too.
     #[test]
     fn name_unpublished_from_before_0_15_decodes() {
         let log = mined(

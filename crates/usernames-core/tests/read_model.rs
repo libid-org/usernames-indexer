@@ -314,9 +314,9 @@ async fn publish_flag_is_the_post_state() {
     assert!(!only(&resolved.identities).published);
 }
 
-/// A proxy upgraded to 0.15 in place logs `HandleUnpublished` after the
-/// upgrade and kept `NameUnpublished` from before it. Either withdraws the
-/// published handle, and the journal records each under its own kind.
+/// `HandleUnpublished` from a 0.15 registry and `NameUnpublished` from one
+/// deployed before it both withdraw the published handle, and the journal
+/// records each under its own kind.
 #[tokio::test]
 async fn either_unpublish_topic_withdraws_the_published_handle() {
     let Some((store, pool, _guard)) = test_store().await else {
