@@ -1,5 +1,5 @@
-//! The indexer: one process per chain, mirroring `IdentityRegistry` events into
-//! Postgres under that chain's writer lease.
+//! The indexer: one process per chain, mirroring `IdentityRegistry` and
+//! `HandleEscrow` events into Postgres under that chain's writer lease.
 //!
 //! It exposes no port. An indexer that stops advancing exits, and the
 //! supervisor notices; the read API is a separate binary over the same
@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 use url::Url;
 use usernames_core::{
+    chain,
     db,
     ens::ChainName,
     indexer,
@@ -43,6 +44,13 @@ pub struct Config {
     /// failure.
     #[arg(long, env = "IDENTITY_NAMES_ADDRESS")]
     pub identity_names_address: Address,
+
+    /// The HandleEscrow ERC1967 proxy, when the chain has one. Its `registry`
+    /// must be `IDENTITY_NAMES_ADDRESS`: the escrow pays whoever that registry
+    /// says holds a handle, and the index joins the two on that. Setting it,
+    /// changing it or unsetting it replays the chain.
+    #[arg(long, env = "HANDLE_ESCROW_ADDRESS")]
+    pub handle_escrow_address: Option<Address>,
 
     /// Refuse to start unless the RPC reports this chain id. Optional, but a
     /// deployment that sets it cannot silently index the wrong chain.
@@ -135,6 +143,21 @@ pub async fn run() -> anyhow::Result<()> {
     }
     let chain_id = i64::try_from(reported)
         .map_err(|_| anyhow::anyhow!("chain id {reported} does not fit in a BIGINT"))?;
+    let escrow = config.handle_escrow_address;
+    if let Some(escrow) = escrow {
+        // Before `prepare`, which clears the chain when the escrow changes: a
+        // misconfiguration refuses without touching the rows.
+        let registry = chain::escrow_registry(&provider, escrow)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("HANDLE_ESCROW_ADDRESS {escrow}: registry(): {e}")
+            })?;
+        anyhow::ensure!(
+            registry == contract,
+            "HANDLE_ESCROW_ADDRESS {escrow} resolves through registry {registry}, \
+             not IDENTITY_NAMES_ADDRESS {contract}"
+        );
+    }
 
     // The indexer migrates because the indexer writes. The read API connects
     // to whatever schema it finds.
@@ -145,7 +168,7 @@ pub async fn run() -> anyhow::Result<()> {
     // the lease is a parameter there, so a version-bump replay cannot race a
     // still-running older pod.
     let writer = store.acquire_writer().await?;
-    store.prepare(&writer, contract).await?;
+    store.prepare(&writer, contract, escrow).await?;
     store.set_chain_names(&writer, &chain_names).await?;
 
     let cancel = CancellationToken::new();
@@ -154,6 +177,7 @@ pub async fn run() -> anyhow::Result<()> {
         provider,
         indexer::IndexerConfig {
             contract,
+            escrow,
             confirmations: config.confirmations,
             poll_interval_secs: config.poll_interval_secs,
             max_block_range: config.max_block_range,
@@ -161,7 +185,7 @@ pub async fn run() -> anyhow::Result<()> {
             stale_after_secs,
         },
     );
-    info!(chain_id, %contract, "indexing");
+    info!(chain_id, %contract, ?escrow, "indexing");
     let mut task = tokio::spawn(indexer.run(cancel.clone()));
 
     tokio::select! {

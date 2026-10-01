@@ -37,22 +37,46 @@ use crate::{
     },
 };
 
+mod escrow;
+mod history;
+
+pub use self::{
+    escrow::{
+        EscrowSlotRow,
+        UnclaimedFilter,
+    },
+    history::{
+        HistoryCursor,
+        HistoryRow,
+    },
+};
+
 /// Bump on any change to what the indexer writes. A mismatch at startup
 /// clears the chain's rows and cursor, so the next loop replays the chain
 /// from the deployment block — the re-index IS the migration.
-pub const INDEXER_VERSION: &str = "1";
+pub const INDEXER_VERSION: &str = "2";
 
 /// Every projection table, in one place. [`ChainStore::prepare`] clears them
 /// for a replay and the tests clean them between scenarios; a single list
 /// means a new table cannot be wiped in one place and silently survive in
 /// another.
-pub const PROJECTION_TABLES: &[&str] =
-    &["events", "ids", "handles", "published", "platforms"];
+pub const PROJECTION_TABLES: &[&str] = &[
+    "events",
+    "ids",
+    "handles",
+    "published",
+    "platforms",
+    "escrow_held",
+    "escrow_refundable",
+    "address_events",
+    "handle_events",
+];
 
 // The chain_metadata keys. Chain scoping is the table's chain_id column;
 // only the deployment-block cache still carries anything in its key.
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 const CONTRACT_KEY: &str = "contract";
+const ESCROW_KEY: &str = "escrow";
 const CURSOR_KEY: &str = "cursor";
 const HEAD_KEY: &str = "head";
 const TARGET_KEY: &str = "target";
@@ -316,8 +340,9 @@ impl ChainStore {
     }
 
     /// Clear and rescan this chain when this build writes a different shape
-    /// than the database holds — or when the watched contract changed, because
-    /// the old contract's bindings are not the new contract's bindings.
+    /// than the database holds — or when a watched contract changed, because
+    /// the old contract's bindings are not the new contract's bindings, and an
+    /// escrow watched from now on has events behind the cursor.
     /// Strictly scoped to this chain: a co-tenant chain's rows, cursor and
     /// metadata are untouched. The deployment-block cache survives a version
     /// bump (it is keyed by contract, and `eth_getCode` history does not
@@ -336,6 +361,7 @@ impl ChainStore {
         &self,
         writer: &WriterLease,
         contract: Address,
+        escrow: Option<Address>,
     ) -> Result<(), sqlx::Error> {
         assert_eq!(
             writer.chain_id, self.chain_id,
@@ -344,10 +370,13 @@ impl ChainStore {
         );
         let version = self.get_metadata(SCHEMA_VERSION_KEY).await?;
         let known_contract = self.get_metadata(CONTRACT_KEY).await?;
+        let known_escrow = self.get_metadata(ESCROW_KEY).await?;
         let contract_now = contract.to_string().to_lowercase();
+        let escrow_now = escrow.map(|escrow| escrow.to_string().to_lowercase());
         let version_ok = version.as_deref() == Some(INDEXER_VERSION);
         let contract_ok = known_contract.as_deref() == Some(contract_now.as_str());
-        if version_ok && contract_ok {
+        let escrow_ok = known_escrow == escrow_now;
+        if version_ok && contract_ok && escrow_ok {
             return Ok(());
         }
         warn!(
@@ -356,7 +385,9 @@ impl ChainStore {
             version_to = INDEXER_VERSION,
             contract_from = known_contract.as_deref().unwrap_or("<none>"),
             contract_to = %contract_now,
-            "read-model shape or watched contract changed; clearing this chain for a full replay"
+            escrow_from = known_escrow.as_deref().unwrap_or("<none>"),
+            escrow_to = escrow_now.as_deref().unwrap_or("<none>"),
+            "read-model shape or a watched contract changed; clearing this chain for a full replay"
         );
         let mut tx = self.pool.begin().await?;
         for table in PROJECTION_TABLES {
@@ -369,10 +400,15 @@ impl ChainStore {
             .bind(self.chain_id)
             .execute(&mut *tx)
             .await?;
-        for (key, value) in [
-            (SCHEMA_VERSION_KEY, INDEXER_VERSION.to_string()),
-            (CONTRACT_KEY, contract_now),
-        ] {
+        let stamps = [
+            (SCHEMA_VERSION_KEY, Some(INDEXER_VERSION.to_string())),
+            (CONTRACT_KEY, Some(contract_now)),
+            (ESCROW_KEY, escrow_now),
+        ];
+        for (key, value) in stamps
+            .into_iter()
+            .filter_map(|(key, value)| Some((key, value?)))
+        {
             sqlx::query(sql::UPSERT_METADATA)
                 .bind(self.chain_id)
                 .bind(key)
@@ -621,6 +657,14 @@ impl ChainStore {
         Ok(value.and_then(|v| v.parse().ok()))
     }
 
+    /// The HandleEscrow this chain's escrow rows were indexed from, as the
+    /// indexer recorded it when it prepared the chain. `None` when it watches
+    /// none.
+    pub async fn escrow(&self) -> Result<Option<Address>, sqlx::Error> {
+        let value = self.get_metadata(ESCROW_KEY).await?;
+        Ok(value.and_then(|v| v.parse().ok()))
+    }
+
     /// The last fully-processed block, if any window ever committed.
     pub async fn cursor(&self) -> Result<Option<u64>, sqlx::Error> {
         let value = self.get_metadata(CURSOR_KEY).await?;
@@ -732,11 +776,12 @@ impl Window {
         self.tx.commit().await
     }
 
-    /// Apply one decoded event: journal row plus projection writes, in the
-    /// order the contract wrote its own storage. `Ok(false)` means the
-    /// journal already held this (chain, block, log) — an earlier window
-    /// applied it and committed — so the projections were left alone and the
-    /// caller should not count it as new.
+    /// Apply one decoded event: journal row, projection writes in the order
+    /// the contract wrote its own storage, and the rows that put the event in
+    /// the histories of the addresses and the handle it involves. `Ok(false)`
+    /// means the journal already held this (chain, block, log) — an earlier
+    /// window applied it and committed — so the projections were left alone
+    /// and the caller should not count it as new.
     pub async fn apply(
         &mut self,
         event: &NamesEvent,
@@ -745,7 +790,6 @@ impl Window {
         let chain_id = self.chain_id;
         let block = as_i64(pos.block_number, "block number")?;
         let log_index = as_i64(pos.log_index, "log index")?;
-        let tx = &mut self.tx;
 
         let mut payload = event.payload();
         if sanitize_json(&mut payload) {
@@ -761,14 +805,20 @@ impl Window {
             .bind(pos.tx_hash.as_slice())
             .bind(event.kind())
             .bind(payload)
-            .execute(&mut **tx)
+            .execute(&mut *self.tx)
             .await?;
         if journaled.rows_affected() == 0 {
             // Running the projection writes again would be harmless for the
-            // upserts but would double-count `configured_count`, so the
-            // journal's conflict is the one idempotency gate for everything.
+            // upserts but would double-count `configured_count` and every
+            // escrowed amount, so the journal's conflict is the one
+            // idempotency gate for everything.
             return Ok(false);
         }
+
+        // Read before the projections move: a bind's previous holders are the
+        // rows it is about to overwrite, and an unpublish's handle is the row
+        // it deletes.
+        let involvement = self.involvement(event, pos).await?;
 
         match event {
             NamesEvent::IdentityBound {
@@ -812,7 +862,7 @@ impl Window {
                     .bind(handle_node.as_slice())
                     .bind(block)
                     .bind(log_index)
-                    .execute(&mut **tx)
+                    .execute(&mut *self.tx)
                     .await?;
 
                 sqlx::query(sql::UPSERT_HANDLE)
@@ -826,7 +876,7 @@ impl Window {
                     .bind(id_node.as_slice())
                     .bind(block)
                     .bind(log_index)
-                    .execute(&mut **tx)
+                    .execute(&mut *self.tx)
                     .await?;
 
                 // The event's flag is the post-state of the contract's
@@ -841,14 +891,14 @@ impl Window {
                         .bind(holder.as_slice())
                         .bind(platform_id.as_slice())
                         .bind(&handle)
-                        .execute(&mut **tx)
+                        .execute(&mut *self.tx)
                         .await?;
                 } else {
                     sqlx::query(sql::UNPUBLISH)
                         .bind(chain_id)
                         .bind(holder.as_slice())
                         .bind(platform_id.as_slice())
-                        .execute(&mut **tx)
+                        .execute(&mut *self.tx)
                         .await?;
                 }
             }
@@ -863,7 +913,7 @@ impl Window {
                     .bind(handle_node.as_slice())
                     .bind(block)
                     .bind(log_index)
-                    .execute(&mut **tx)
+                    .execute(&mut *self.tx)
                     .await?;
             }
 
@@ -875,7 +925,7 @@ impl Window {
                     .bind(chain_id)
                     .bind(holder.as_slice())
                     .bind(platform_id.as_slice())
-                    .execute(&mut **tx)
+                    .execute(&mut *self.tx)
                     .await?;
             }
 
@@ -886,7 +936,7 @@ impl Window {
                     .bind(platform_id.as_slice())
                     .bind(key)
                     .bind(block)
-                    .fetch_one(&mut **tx)
+                    .fetch_one(&mut *self.tx)
                     .await?;
                 if reconfigured {
                     // setPlatform ran again. If the rules changed, every
@@ -910,18 +960,26 @@ impl Window {
                     .bind(chain_id)
                     .bind(PROOF_VERIFIER_KEY)
                     .bind(verifier.to_string().to_lowercase())
-                    .execute(&mut **tx)
+                    .execute(&mut *self.tx)
                     .await?;
             }
 
-            // Journal only. What a ceremony carried beyond the binding it
-            // proved — which client authenticated it, what fee it paid —
-            // answers an operator's question after the fact, and the journal
-            // row beside the binding's `IdentityBound` is where it is asked.
-            // Nothing resolves by it.
+            // No projection of their own. What a ceremony carried beyond the
+            // binding it proved — which client authenticated it, what fee it
+            // paid — answers an operator's question after the fact, from the
+            // journal row beside the binding's `IdentityBound`, and the
+            // histories list it. Nothing resolves by it.
             NamesEvent::CeremonyBound { .. } | NamesEvent::BindFeePaid { .. } => {}
+
+            NamesEvent::Deposited { .. }
+            | NamesEvent::Forwarded { .. }
+            | NamesEvent::Claimed { .. }
+            | NamesEvent::Refunded { .. } => {
+                self.book_escrow(event, block, log_index).await?;
+            }
         }
 
+        self.record(involvement, pos).await?;
         Ok(true)
     }
 }
@@ -1332,6 +1390,41 @@ mod sql {
     /// Live handles with their id and display flag; the caller narrows,
     /// orders and pages.
     pub const SEARCH_PROJECTION: &str = include_str!("../sql/search_projection.sql");
+    pub const ESCROW_DEPOSIT: &str = include_str!("../sql/escrow_deposit.sql");
+    pub const ESCROW_BOOK_REFUNDABLE: &str =
+        include_str!("../sql/escrow_book_refundable.sql");
+    pub const ESCROW_CLAIM: &str = include_str!("../sql/escrow_claim.sql");
+    pub const ESCROW_CLOSE_ROUND: &str = include_str!("../sql/escrow_close_round.sql");
+    pub const ESCROW_REFUND: &str = include_str!("../sql/escrow_refund.sql");
+    pub const ESCROW_TAKE_REFUNDABLE: &str =
+        include_str!("../sql/escrow_take_refundable.sql");
+    pub const ESCROW_PLATFORM: &str = include_str!("../sql/escrow_platform.sql");
+    pub const PREVIOUS_HOLDERS: &str = include_str!("../sql/previous_holders.sql");
+    pub const CEREMONY_HANDLE: &str = include_str!("../sql/ceremony_handle.sql");
+    pub const FEE_PAYER: &str = include_str!("../sql/fee_payer.sql");
+    pub const PUBLISHED_HANDLE_NODE: &str =
+        include_str!("../sql/published_handle_node.sql");
+    pub const RECORD_ADDRESS_EVENT: &str =
+        include_str!("../sql/record_address_event.sql");
+    pub const RECORD_HANDLE_EVENT: &str = include_str!("../sql/record_handle_event.sql");
+    /// An address's history: the events it took part in, each with its
+    /// roles, the journal row and the handle the event concerns. The caller
+    /// names the address, narrows and pages.
+    pub const ADDRESS_HISTORY_PROJECTION: &str =
+        include_str!("../sql/address_history_projection.sql");
+    /// A handle's history, in the same shape without roles.
+    pub const HANDLE_HISTORY_PROJECTION: &str =
+        include_str!("../sql/handle_history_projection.sql");
+    /// Slots still holding something, with the handle and its holder; the
+    /// caller narrows, orders and pages.
+    pub const ESCROW_SLOT_PROJECTION: &str =
+        include_str!("../sql/escrow_slot_projection.sql");
+    /// The same shape, driven from the handles an address holds.
+    pub const CLAIMABLE_PROJECTION: &str =
+        include_str!("../sql/claimable_projection.sql");
+    /// One `refundTo`'s contributions in the same shape.
+    pub const REFUNDABLE_PROJECTION: &str =
+        include_str!("../sql/refundable_projection.sql");
 }
 
 #[cfg(test)]
@@ -1433,6 +1526,91 @@ mod plan_tests {
                 ),
             ),
         ];
+        let cursor = Some(HistoryCursor {
+            block_time: 1_700_000_000,
+            chain_id: 1,
+            block_number: 10,
+            log_index: 0,
+        });
+        let unclaimed = |token: Option<Address>, chain: Option<i64>| {
+            escrow::unclaimed_lookup(
+                "EXPLAIN ",
+                UnclaimedFilter {
+                    chain,
+                    token,
+                    platform_id: None,
+                },
+                20,
+                0,
+            )
+        };
+        let shapes: Vec<(&str, Option<&str>, Statement)> = shapes
+            .into_iter()
+            .chain([
+                (
+                    "address history, any chain",
+                    Some("address_events_history_idx"),
+                    history::address_history_lookup("EXPLAIN ", None, owner, None, 21),
+                ),
+                (
+                    "address history, one chain, past a cursor",
+                    Some("address_events_history_idx"),
+                    history::address_history_lookup(
+                        "EXPLAIN ",
+                        Some(1),
+                        owner,
+                        cursor,
+                        21,
+                    ),
+                ),
+                (
+                    "handle history, any chain",
+                    Some("handle_events_history_idx"),
+                    history::handle_history_lookup("EXPLAIN ", None, platform, None, 21),
+                ),
+                (
+                    "handle history, one chain, past a cursor",
+                    Some("handle_events_history_idx"),
+                    history::handle_history_lookup(
+                        "EXPLAIN ",
+                        Some(1),
+                        platform,
+                        cursor,
+                        21,
+                    ),
+                ),
+                (
+                    "claimable, any chain",
+                    Some("handles_owner_chain_idx"),
+                    escrow::claimable_lookup("EXPLAIN ", None, owner),
+                ),
+                (
+                    "refundable, any chain",
+                    Some("escrow_refundable_pkey"),
+                    escrow::refundable_lookup("EXPLAIN ", None, owner),
+                ),
+                (
+                    "refundable, one chain",
+                    Some("escrow_refundable_pkey"),
+                    escrow::refundable_lookup("EXPLAIN ", Some(1), owner),
+                ),
+                (
+                    "a node's slots, any chain",
+                    Some("escrow_held_node_chain_idx"),
+                    escrow::node_slots_lookup("EXPLAIN ", None, platform),
+                ),
+                (
+                    "unclaimed, every token",
+                    Some("escrow_held_unclaimed_idx"),
+                    unclaimed(None, None),
+                ),
+                (
+                    "unclaimed, one token on one chain",
+                    Some("escrow_held_unclaimed_idx"),
+                    unclaimed(Some(owner), Some(1)),
+                ),
+            ])
+            .collect();
         for (name, index, mut statement) in shapes {
             let plan: Vec<String> = statement
                 .build_query_scalar()
@@ -1446,7 +1624,15 @@ mod plan_tests {
                     "{name} does not seek {index}:\n{plan}"
                 );
             }
-            for table in ["handles", "ids"] {
+            for table in [
+                "handles",
+                "ids",
+                "events",
+                "escrow_held",
+                "escrow_refundable",
+                "address_events",
+                "handle_events",
+            ] {
                 assert!(
                     !plan.contains(&format!("Seq Scan on {table}")),
                     "{name} scans {table}:\n{plan}"

@@ -1,4 +1,5 @@
-//! Chain access: deployment-block discovery and windowed log fetching.
+//! Chain access: deployment-block discovery, windowed log fetching, and the
+//! one contract read the indexer makes.
 
 use alloy::{
     eips::BlockNumberOrTag,
@@ -10,6 +11,7 @@ use alloy::{
     },
     transports::TransportError,
 };
+use libid_contracts::bindings::escrow::HandleEscrow;
 
 /// Binary search for the block at which a contract was deployed: the first
 /// block where `eth_getCode` returns non-empty bytecode. `Ok(None)` means the
@@ -70,4 +72,14 @@ pub async fn fetch_logs(
         .from_block(BlockNumberOrTag::Number(from))
         .to_block(BlockNumberOrTag::Number(to));
     provider.get_logs(&f).await
+}
+
+/// The registry a HandleEscrow resolves holders through. An escrow keeps one
+/// for life, so an indexer reads it once, at startup, to refuse an escrow that
+/// pays the holders of a registry it is not indexing.
+pub async fn escrow_registry(
+    provider: &impl Provider,
+    escrow: Address,
+) -> Result<Address, alloy::contract::Error> {
+    HandleEscrow::new(escrow, provider).registry().call().await
 }
