@@ -32,13 +32,13 @@ use super::{
     ApiError,
     AppState,
     ChainFilter,
-    MAX_OFFSET,
     PAGE_DEFAULT_LIMIT,
     PAGE_MAX_LIMIT,
 };
 use crate::{
     db::{
         EscrowSlotRow,
+        UnclaimedCursor,
         UnclaimedPage,
     },
     nodes,
@@ -79,7 +79,7 @@ impl EscrowAmount {
 /// everything held for the handles it holds now, which `claim` pays it, and
 /// what deposits naming it as `refundTo` booked that nobody has claimed yet,
 /// which `refund` pays back.
-pub(super) async fn address(
+pub(crate) async fn address(
     State(state): State<AppState>,
     Path(address): Path<String>,
     Query(filter): Query<ChainFilter>,
@@ -88,16 +88,20 @@ pub(super) async fn address(
     let chain = filter.parse()?;
     state.synced(chain).await?;
 
+    let (claimable, refundable) = tokio::try_join!(
+        state.store.claimable(chain, address),
+        state.store.refundable(chain, address),
+    )?;
     Ok(Json(AddressBalances {
         address,
-        claimable: EscrowAmount::all_of(state.store.claimable(chain, address).await?)?,
-        refundable: EscrowAmount::all_of(state.store.refundable(chain, address).await?)?,
+        claimable: EscrowAmount::all_of(claimable)?,
+        refundable: EscrowAmount::all_of(refundable)?,
     }))
 }
 
 /// `GET /v1/escrow/handle/{platform}/{handle}?chain=` — what a handle holds,
 /// token by token, and who may claim it.
-pub(super) async fn handle(
+pub(crate) async fn handle(
     State(state): State<AppState>,
     Path((platform, handle)): Path<(String, String)>,
     Query(filter): Query<ChainFilter>,
@@ -122,7 +126,7 @@ pub(super) async fn handle(
 
 /// `GET /v1/escrow/node/{node}?chain=` — the same, for a handle known only by
 /// its node.
-pub(super) async fn node(
+pub(crate) async fn node(
     State(state): State<AppState>,
     Path(node): Path<String>,
     Query(filter): Query<ChainFilter>,
@@ -144,14 +148,14 @@ pub(super) async fn node(
     }))
 }
 
-/// `?token=0x…&platform=x&chain=8453&limit=20&offset=0`.
+/// `?token=0x…&platform=x&chain=8453&before=<next>&limit=20`.
 #[derive(Deserialize)]
-pub(super) struct UnclaimedParams {
+pub(crate) struct UnclaimedParams {
     token: Option<String>,
     platform: Option<String>,
     chain: Option<String>,
+    before: Option<String>,
     limit: Option<String>,
-    offset: Option<String>,
 }
 
 impl UnclaimedParams {
@@ -165,31 +169,43 @@ impl UnclaimedParams {
                 .map(parse_platform)
                 .transpose()?
                 .map(|platform| platform.id()),
+            before: self
+                .before
+                .as_deref()
+                .map(|raw| {
+                    raw.parse::<UnclaimedCursor>().map_err(|_| {
+                        ApiError::bad_request(
+                            "invalid_cursor",
+                            format!(
+                                "{raw:?} is not a cursor an unclaimed page handed out"
+                            ),
+                        )
+                    })
+                })
+                .transpose()?,
             limit: parse_count(self.limit.as_deref(), "limit")?
                 .unwrap_or(PAGE_DEFAULT_LIMIT)
                 .clamp(1, PAGE_MAX_LIMIT),
-            offset: parse_count(self.offset.as_deref(), "offset")?
-                .unwrap_or(0)
-                .clamp(0, MAX_OFFSET),
         })
     }
 }
 
-/// `GET /v1/escrow/unclaimed?token=&platform=&chain=&limit=&offset=` — every
+/// `GET /v1/escrow/unclaimed?token=&platform=&chain=&before=&limit=` — every
 /// slot still holding something, bound handles and unbound alike: grouped by
-/// token, the largest amount first within each.
-pub(super) async fn unclaimed(
+/// token, the largest amount first within each, paged by cursor.
+pub(crate) async fn unclaimed(
     State(state): State<AppState>,
     Query(params): Query<UnclaimedParams>,
 ) -> Result<Json<Unclaimed>, ApiError> {
     let page = params.page()?;
     state.synced(page.chain).await?;
 
+    let unclaimed = state.store.unclaimed(page).await?;
     Ok(Json(Unclaimed {
         token: page.token,
         platform_id: page.platform_id,
         limit: page.limit,
-        offset: page.offset,
-        slots: EscrowAmount::all_of(state.store.unclaimed(page).await?)?,
+        slots: EscrowAmount::all_of(unclaimed.rows)?,
+        next: unclaimed.next.map(|next| next.to_string()),
     }))
 }

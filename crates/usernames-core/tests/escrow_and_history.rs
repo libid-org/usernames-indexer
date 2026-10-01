@@ -31,6 +31,7 @@ use usernames_core::{
         EscrowAmount,
         HandleBalances,
         HandleHistory,
+        HistoryEntry,
         HistoryEvent,
         Role,
         Status,
@@ -161,7 +162,7 @@ fn deposited(
     }
 }
 
-fn kinds(entries: &[usernames_core::api::model::HistoryEntry]) -> Vec<&'static str> {
+fn kinds(entries: &[HistoryEntry]) -> Vec<&'static str> {
     entries
         .iter()
         .map(|entry| match entry.event {
@@ -412,18 +413,21 @@ async fn the_unclaimed_list_groups_by_token_and_ranks_by_amount() {
         .await;
     }
 
-    // Token by token, the token's largest amount first.
+    // Token by token, descending, each token's largest amount first: the
+    // native coin's address sorts above DAI's, DAI's above USDC's.
     let all: Unclaimed = get(&store, "/v1/escrow/unclaimed").await.answer();
-    let mut expected = vec![
-        (USDC, 900),
-        (USDC, 60),
-        (USDC, 5),
-        (DAI, 40),
-        (DAI, 1),
-        (NATIVE, 3),
-    ];
-    expected.sort_by_key(|(token, amount)| (*token, std::cmp::Reverse(*amount)));
-    assert_eq!(amounts(&all.slots), expected);
+    assert_eq!(
+        amounts(&all.slots),
+        [
+            (NATIVE, 3),
+            (DAI, 40),
+            (DAI, 1),
+            (USDC, 900),
+            (USDC, 60),
+            (USDC, 5),
+        ]
+    );
+    assert!(all.next.is_none());
 
     let usdc: Unclaimed = get(&store, &format!("/v1/escrow/unclaimed?token={USDC}"))
         .await
@@ -431,15 +435,22 @@ async fn the_unclaimed_list_groups_by_token_and_ranks_by_amount() {
     assert_eq!(usdc.token, Some(USDC));
     assert_eq!(amounts(&usdc.slots), [(USDC, 900), (USDC, 60), (USDC, 5)]);
 
-    // Pages are stable slices of the same order.
-    let page: Unclaimed = get(
+    // A cursor resumes after the last slot served, and the last page hands
+    // out none.
+    let first: Unclaimed = get(&store, "/v1/escrow/unclaimed?limit=4").await.answer();
+    assert_eq!(
+        amounts(&first.slots),
+        [(NATIVE, 3), (DAI, 40), (DAI, 1), (USDC, 900)]
+    );
+    let next = first.next.expect("two slots remain");
+    let rest: Unclaimed = get(
         &store,
-        &format!("/v1/escrow/unclaimed?token={USDC}&limit=2&offset=1"),
+        &format!("/v1/escrow/unclaimed?limit=4&before={next}"),
     )
     .await
     .answer();
-    assert_eq!(amounts(&page.slots), [(USDC, 60), (USDC, 5)]);
-    assert_eq!((page.limit, page.offset), (2, 1));
+    assert_eq!(amounts(&rest.slots), [(USDC, 60), (USDC, 5)]);
+    assert!(rest.next.is_none());
 
     let github: Unclaimed = get(&store, "/v1/escrow/unclaimed?platform=github")
         .await
@@ -754,8 +765,8 @@ async fn the_escrow_routes_name_what_they_refuse() {
         bad("invalid_argument")
     );
     assert_eq!(
-        refused::<Unclaimed>(&store, "/v1/escrow/unclaimed?offset=-").await,
-        bad("invalid_argument")
+        refused::<Unclaimed>(&store, "/v1/escrow/unclaimed?before=nope").await,
+        bad("invalid_cursor")
     );
     assert_eq!(
         refused::<HandleHistory>(&store, "/v1/history/handle/x/nobody?limit=1.5").await,

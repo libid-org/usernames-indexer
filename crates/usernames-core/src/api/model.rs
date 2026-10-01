@@ -491,10 +491,10 @@ pub struct Unclaimed {
     pub platform_id: Option<B256>,
     /// The page size served.
     pub limit: i64,
-    /// The page start served; a page shorter than `limit` is the last one.
-    pub offset: i64,
-    /// Token by token, the largest amount first within each.
+    /// Token by token, descending, the largest amount first within each.
     pub slots: Vec<EscrowAmount>,
+    /// Pass as `before` for the next page; absent on the last one.
+    pub next: Option<String>,
 }
 
 #[cfg(test)]

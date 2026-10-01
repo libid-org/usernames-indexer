@@ -44,7 +44,7 @@ use crate::{
 
 /// `?chain=8453&before=<next>&limit=20`.
 #[derive(Deserialize)]
-pub(super) struct HistoryParams {
+pub(crate) struct HistoryParams {
     chain: Option<String>,
     before: Option<String>,
     limit: Option<String>,
@@ -117,21 +117,23 @@ impl HistoryEntry {
     }
 }
 
-/// A page's entries and the cursor for the next one.
-fn served(page: HistoryRows) -> Result<(Vec<HistoryEntry>, Option<String>), ApiError> {
-    let entries = page
-        .rows
-        .into_iter()
-        .map(HistoryEntry::of)
-        .collect::<Result<_, _>>()?;
-    Ok((entries, page.next.map(|next| next.to_string())))
+impl HistoryEntry {
+    /// A page's entries, and the cursor that fetches the next one.
+    fn page(rows: HistoryRows) -> Result<(Vec<Self>, Option<String>), ApiError> {
+        let entries = rows
+            .rows
+            .into_iter()
+            .map(Self::of)
+            .collect::<Result<_, _>>()?;
+        Ok((entries, rows.next.map(|next| next.to_string())))
+    }
 }
 
 /// `GET /v1/history/address/{address}?chain=&before=&limit=` — every event the
 /// address took part in, newest first, each with the parts it played: binds
 /// and what they took from it, its deposits and refunds, what it claimed, was
 /// paid, or was paid through a handle it holds.
-pub(super) async fn address(
+pub(crate) async fn address(
     State(state): State<AppState>,
     Path(address): Path<String>,
     Query(params): Query<HistoryParams>,
@@ -140,7 +142,8 @@ pub(super) async fn address(
     let page = params.page()?;
     state.synced(page.chain).await?;
 
-    let (entries, next) = served(state.store.address_history(address, page).await?)?;
+    let (entries, next) =
+        HistoryEntry::page(state.store.address_history(address, page).await?)?;
     Ok(Json(AddressHistory {
         address,
         entries,
@@ -151,7 +154,7 @@ pub(super) async fn address(
 /// `GET /v1/history/handle/{platform}/{handle}?chain=&before=&limit=` — every
 /// event on the handle's node, newest first: deposits while nobody held it,
 /// the binds that gave it a holder, and the claims and payments after.
-pub(super) async fn handle(
+pub(crate) async fn handle(
     State(state): State<AppState>,
     Path((platform, handle)): Path<(String, String)>,
     Query(params): Query<HistoryParams>,
@@ -163,7 +166,8 @@ pub(super) async fn handle(
     let normalized = platform.normalize_query(&handle)?;
 
     let handle_node = nodes::handle_node(platform.id(), &normalized);
-    let (entries, next) = served(state.store.handle_history(handle_node, page).await?)?;
+    let (entries, next) =
+        HistoryEntry::page(state.store.handle_history(handle_node, page).await?)?;
     Ok(Json(HandleHistory {
         handle: HandleQuery {
             platform: platform.known(),
@@ -179,7 +183,7 @@ pub(super) async fn handle(
 /// `GET /v1/history/node/{node}?chain=&before=&limit=` — the same, for a
 /// handle known only by its node: one somebody deposited for and nobody has
 /// bound, whose text no event has carried.
-pub(super) async fn node(
+pub(crate) async fn node(
     State(state): State<AppState>,
     Path(node): Path<String>,
     Query(params): Query<HistoryParams>,
@@ -188,7 +192,8 @@ pub(super) async fn node(
     let page = params.page()?;
     state.synced(page.chain).await?;
 
-    let (entries, next) = served(state.store.handle_history(handle_node, page).await?)?;
+    let (entries, next) =
+        HistoryEntry::page(state.store.handle_history(handle_node, page).await?)?;
     // Every entry concerns this node, so any one names its platform, and its
     // text once a bind has carried it.
     let known = entries.iter().find_map(|entry| entry.handle.as_ref());
