@@ -124,7 +124,8 @@ async fn gateway_parts(
 
     let store = ChainStore::new(pool.clone(), chains[0]);
     let config = Config {
-        resolver: RESOLVER,
+        domain: "handles.link".parse().expect("domain"),
+        resolvers: vec![RESOLVER],
         store: db::Store::new(pool.clone()),
         ttl_secs: 300,
         max_lag_blocks,
@@ -180,6 +181,11 @@ async fn ask(router: &Router, sender: Address, call: &[u8]) -> (StatusCode, Stri
 /// to be one the resolver would accept. These are the bytes the callback
 /// returns to the wallet, in whatever shape the record call asked for.
 fn signed_result(body: &str, call: &[u8]) -> Vec<u8> {
+    signed_result_for(RESOLVER, body, call)
+}
+
+/// The same, for an answer the gateway signed for `resolver`.
+fn signed_result_for(resolver: Address, body: &str, call: &[u8]) -> Vec<u8> {
     let value: serde_json::Value = serde_json::from_str(body).expect("json");
     let data = hex::decode(
         value["data"]
@@ -207,7 +213,7 @@ fn signed_result(body: &str, call: &[u8]) -> Vec<u8> {
         result: result.to_vec(),
         expires,
     }
-    .digest(RESOLVER, call);
+    .digest(resolver, call);
     let recovered = alloy::primitives::Signature::try_from(signature)
         .expect("65-byte signature")
         .recover_address_from_prehash(&digest)
@@ -222,7 +228,12 @@ fn signed_result(body: &str, call: &[u8]) -> Vec<u8> {
 
 /// The address in a gateway answer, or `None` for a null in either shape.
 fn verify(body: &str, call: &[u8]) -> Option<Address> {
-    let result = signed_result(body, call);
+    verify_for(RESOLVER, body, call)
+}
+
+/// The same, for an answer the gateway signed for `resolver`.
+fn verify_for(resolver: Address, body: &str, call: &[u8]) -> Option<Address> {
+    let result = signed_result_for(resolver, body, call);
     // Both shapes, because the caller chooses which to ask in and a helper that
     // knows only one reports a correct legacy answer as a null.
     match result.len() {
@@ -440,6 +451,60 @@ async fn a_request_for_another_resolver_is_refused_not_signed() {
     );
     let (status, _) = ask(&router, Address::from([0xcc; 20]), &call).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// One domain may be registered on two ENS chains, each with its own
+/// resolver contract. The answer is bound to the one that asked.
+#[tokio::test]
+async fn each_resolver_of_the_domain_gets_an_answer_signed_for_itself() {
+    let Some((mut config, store, _g)) = gateway_parts(&[CHAIN], 32).await else {
+        return;
+    };
+    let second = Address::from([0xbb; 20]);
+    config.resolvers.push(second);
+    let router = usernames_api::ens::router(GatewayState::new(config));
+    let owner = Address::from([0xbe; 20]);
+    bind(&store, "alice", owner).await;
+
+    let call = resolve_call(
+        &wire_name(&["alice", "x"]),
+        &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
+    );
+    for resolver in [RESOLVER, second] {
+        let (status, body) = ask(&router, resolver, &call).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(verify_for(resolver, &body, &call), Some(owner));
+    }
+}
+
+/// A deployment may answer under a subname of the domain. Its names carry
+/// the subname, and the parent's own names are not its to speak about.
+#[tokio::test]
+async fn a_gateway_under_a_subname_answers_its_names_and_refuses_the_parents() {
+    let Some((mut config, store, _g)) = gateway_parts(&[CHAIN], 32).await else {
+        return;
+    };
+    config.domain = "testnet.handles.link".parse().expect("domain");
+    let router = usernames_api::ens::router(GatewayState::new(config));
+    let owner = Address::from([0xbe; 20]);
+    bind(&store, "alice", owner).await;
+    let coin = 0x8000_0000 | CHAIN as u64;
+
+    // `wire_name` appends `handles.link`, so the subname rides as a label.
+    let ours = resolve_call(
+        &wire_name(&["alice", "x", "testnet"]),
+        &addr_call(&["alice", "x", "testnet"], coin),
+    );
+    let (status, body) = ask(&router, RESOLVER, &ours).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(verify(&body, &ours), Some(owner));
+
+    let parents = resolve_call(
+        &wire_name(&["alice", "x"]),
+        &addr_call(&["alice", "x"], coin),
+    );
+    let (status, body) = ask(&router, RESOLVER, &parents).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
 #[tokio::test]

@@ -74,6 +74,7 @@ use usernames_core::{
     ens::{
         AddrShape,
         CoinType,
+        Domain,
         EnsError,
         Name,
         Record,
@@ -87,13 +88,19 @@ use usernames_core::{
 /// What the gateway needs: the store it reads, and the identity it signs with.
 #[derive(Clone)]
 pub struct Config {
-    /// The resolver this gateway answers for. Every answer is signed for this
-    /// address, whatever `{sender}` the path carries: the target is
-    /// configuration, never the request. A request naming another resolver is
-    /// refused rather than answered, so a value that fell behind a
+    /// The domain this gateway's names sit under. A name outside it is
+    /// refused: a signed null is an assertion, and this gateway has standing
+    /// only over its own names.
+    pub domain: Domain,
+    /// The resolvers this gateway answers for: the `HandleResolver` of its
+    /// domain on each ENS chain the domain is registered on. An answer is
+    /// signed for the one that asked, and only when it is in this set: the
+    /// targets are configuration, never the request, so the key signs for no
+    /// contract it was not told about. A request naming any other resolver
+    /// is refused rather than answered, so a set that fell behind a
     /// `setResolver` is a visible 400 instead of a signature the resolver
     /// rejects.
-    pub resolver: Address,
+    pub resolvers: Vec<Address>,
     /// The store every answer comes from. Which chains it holds is read per
     /// request, never configured: a coin type naming a chain no indexer has
     /// written gets an unsigned refusal, not a signed null — the resolver has
@@ -119,14 +126,15 @@ impl Config {
         // — so the name has to be one this resolver has standing to speak
         // about, whatever record was asked of it.
         let name = Name::parse(&call.name).map_err(GatewayError::bad_request)?;
-        let query = name.query();
+        let query = name.query(&self.domain);
         // Not a name under this resolver's domain. Refused rather than
         // answered: a signed null is an authoritative "nobody holds this", and
         // this gateway has no standing to say that about someone else's name.
         if matches!(query, Err(EnsError::ForeignDomain)) {
-            return Err(GatewayError::bad_request(
-                "this resolver answers only for names under handles.link",
-            ));
+            return Err(GatewayError::bad_request(format!(
+                "this resolver answers only for names under {}",
+                self.domain
+            )));
         }
 
         // Only `addr` has a shape this gateway can fill. Anything else —
@@ -289,10 +297,11 @@ impl Config {
         )
     }
 
-    /// Sign a result for one request, and encode what the resolver's callback
-    /// decodes.
+    /// Sign a result for one request of `resolver`, and encode what its
+    /// callback decodes.
     async fn sign(
         &self,
+        resolver: Address,
         request: &[u8],
         result: Vec<u8>,
     ) -> Result<GatewayResponse, GatewayError> {
@@ -304,7 +313,7 @@ impl Config {
         // EIP-191 prefix goes on top of it.
         let signature = self
             .signer
-            .sign_prehash(&reply.digest(self.resolver, request).0)
+            .sign_prehash(&reply.digest(resolver, request).0)
             .await
             // Through `internal`, like every other failure here: the raw
             // error went to an anonymous caller while the operator got no log
@@ -325,29 +334,29 @@ impl Config {
             .unwrap_or_default()
     }
 
-    /// Refuse a request that names another resolver.
+    /// The resolver a request came from, when it is one of this gateway's.
     ///
-    /// Bound to one resolver on purpose. The digest names the configured
-    /// target, never `sender`, so this check adds no authority — what it adds
-    /// is a visible error. Logged, because a 4xx is terminal for an ERC-3668
-    /// client (it ends the walk of the resolver's `urls`) and a line here is
-    /// the only way an operator learns that `ENS_RESOLVER_ADDRESS` fell behind
-    /// a `setResolver`.
-    fn accept(&self, sender: &str) -> Result<(), GatewayError> {
+    /// The answer is signed for the resolver returned here, so the set is the
+    /// whole authority: a sender outside it gets no signature. The refusal is
+    /// logged, because a 4xx is terminal for an ERC-3668 client (it ends the
+    /// walk of the resolver's `urls`) and a line here is the only way an
+    /// operator learns that `ENS_RESOLVER_ADDRESS` fell behind a
+    /// `setResolver`.
+    fn accept(&self, sender: &str) -> Result<Address, GatewayError> {
         let sender: Address = sender
             .parse()
             .map_err(|_| GatewayError::bad_request("sender is not an address"))?;
-        if sender != self.resolver {
+        if !self.resolvers.contains(&sender) {
             warn!(
                 %sender,
-                resolver = %self.resolver,
+                resolvers = ?self.resolvers,
                 "refusing a request that names another resolver"
             );
             return Err(GatewayError::bad_request(
                 "this gateway answers for a different resolver",
             ));
         }
-        Ok(())
+        Ok(sender)
     }
 
     /// One row per chain the store holds, as supervision should see it.
@@ -744,8 +753,10 @@ async fn resolve(
     Path((sender, data)): Path<(String, String)>,
 ) -> Result<Json<GatewayResponse>, GatewayError> {
     let config = &state.config;
-    config.accept(&sender)?;
+    let resolver = config.accept(&sender)?;
     let request = Request::from_path(&data)?;
     let result = config.answer(&request.call).await?.into_result()?;
-    Ok(Json(config.sign(&request.call_data, result).await?))
+    Ok(Json(
+        config.sign(resolver, &request.call_data, result).await?,
+    ))
 }
