@@ -30,6 +30,7 @@ use tower::ServiceExt;
 use usernames_api::ens::{
     Config,
     GatewayState,
+    Resolver,
 };
 use usernames_core::{
     db::{
@@ -53,6 +54,7 @@ const TWIN: i64 = 1_588_445_166;
 /// Every chain any test here may write, so a fixture can clear them all: the
 /// gateway serves whatever the store holds, so a leftover would be served.
 const SUITE_CHAINS: [i64; 5] = [CHAIN, OTHER, EDEN, TWIN, 1];
+/// The suite's resolver, which sits in the mainnet registry.
 const RESOLVER: Address = Address::new([0xaa; 20]);
 const SIGNER_KEY: &str =
     "0x00000000000000000000000000000000000000000000000000000000000a11ce";
@@ -125,7 +127,10 @@ async fn gateway_parts(
     let store = ChainStore::new(pool.clone(), chains[0]);
     let config = Config {
         domain: "handles.link".parse().expect("domain"),
-        resolvers: vec![RESOLVER],
+        resolvers: vec![Resolver {
+            ens_chain: 1,
+            address: RESOLVER,
+        }],
         store: db::Store::new(pool.clone()),
         ttl_secs: 300,
         max_lag_blocks,
@@ -461,7 +466,10 @@ async fn each_resolver_of_the_domain_gets_an_answer_signed_for_itself() {
         return;
     };
     let second = Address::from([0xbb; 20]);
-    config.resolvers.push(second);
+    config.resolvers.push(Resolver {
+        ens_chain: 11_155_111,
+        address: second,
+    });
     let router = usernames_api::ens::router(GatewayState::new(config));
     let owner = Address::from([0xbe; 20]);
     bind(&store, "alice", owner).await;
@@ -836,8 +844,9 @@ async fn the_eden_testnet_resolves_despite_its_chain_id() {
 /// it UNSIGNED.
 ///
 /// Both halves matter. The decode had no coverage at all, and the refusal is
-/// the multi-chain invariant: coin type 60 names Ethereum mainnet, so a
-/// gateway serving only some other chain has nothing to say about it. Saying
+/// the multi-chain invariant: through the mainnet registry coin type 60 names
+/// Ethereum mainnet, so a gateway serving only some other chain has nothing
+/// to say about it. Saying
 /// so with a 5xx keeps the client walking the resolver's `urls`; a signed null
 /// would be an authoritative "nobody holds this" and would end that walk at
 /// the first gateway asked.
@@ -856,6 +865,42 @@ async fn the_legacy_addr_shape_is_refused_unsigned_off_mainnet() {
         StatusCode::SERVICE_UNAVAILABLE,
         "a signed null here would end the client's url walk: {body}"
     );
+}
+
+/// Bare `addr(node)` asks for the chain of the registry it went through, and
+/// the resolver that asked is what says which registry that is.
+///
+/// It is the only query MetaMask sends on a network that carries ENS: on
+/// Sepolia it asks Sepolia's registry with coin type 60 and sends on Sepolia.
+/// Read as Ethereum mainnet, that query is refused by a deployment that
+/// indexes Sepolia, and the wallet shows no resolution for a bound name.
+#[tokio::test]
+async fn bare_addr_asks_for_the_chain_of_the_resolvers_registry() {
+    let Some((mut config, store, _g)) = gateway_parts(&[CHAIN], 32).await else {
+        return;
+    };
+    let in_our_registry = Address::from([0xbb; 20]);
+    config.resolvers.push(Resolver {
+        ens_chain: CHAIN as u64,
+        address: in_our_registry,
+    });
+    let router = usernames_api::ens::router(GatewayState::new(config));
+    let owner = Address::from([0xbe; 20]);
+    bind(&store, "alice", owner).await;
+
+    let call = resolve_call(
+        &wire_name(&["alice", "x"]),
+        &legacy_addr_call(&["alice", "x"]),
+    );
+    let (status, body) = ask(&router, in_our_registry, &call).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(verify_for(in_our_registry, &body, &call), Some(owner));
+
+    // The same question through the mainnet registry is a mainnet one, and
+    // this store holds no mainnet.
+    let (status, body) = ask(&router, RESOLVER, &call).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(!body.contains("\"data\""), "a refusal must carry no answer");
 }
 
 /// What the binary actually serves: both halves on one router, with the

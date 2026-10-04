@@ -16,18 +16,20 @@
 //! signature turns an answer into an assertion, and neither of these has
 //! earned one.
 //!
-//! * **A chain the store does not hold** — mainnet included, and that is
-//!   the case worth stating plainly, because `addr(node)` with no coin type
-//!   IS a mainnet query and it is what `getAddress()` sends by default. The
-//!   resolver carries ONE `urls` list for every query it ever answers — it
-//!   cannot route by coin type — so ERC-3668 has the client walk that list
-//!   until something succeeds. A signed null is a success, and it ends the
-//!   walk. A gateway that signed null for every chain but its own would
-//!   therefore answer, authoritatively and wrongly, for chains its neighbours
-//!   in the list were there to serve. Refusing steps aside and lets the walk
-//!   continue — which also means a deployment must index every chain it
-//!   wants resolvable, mainnet among them, or the default query shape gets an
-//!   error rather than an address.
+//! * **A chain the store does not hold** — the registry's own included, and
+//!   that is the case worth stating plainly, because `addr(node)` with no
+//!   coin type asks for the chain of the registry it went through — Ethereum
+//!   mainnet from the mainnet registry, Sepolia from Sepolia's — and it is
+//!   what `getAddress()` sends by default. The resolver carries ONE `urls`
+//!   list for every query it ever answers — it cannot route by coin type —
+//!   so ERC-3668 has the client walk that list until something succeeds. A
+//!   signed null is a success, and it ends the walk. A gateway that signed
+//!   null for every chain but its own would therefore answer, authoritatively
+//!   and wrongly, for chains its neighbours in the list were there to serve.
+//!   Refusing steps aside and lets the walk continue — which also means a
+//!   deployment must index every chain it wants resolvable, the chains its
+//!   resolvers sit on among them, or the default query shape gets an error
+//!   rather than an address.
 //! * **An index too far behind.** Same shape: a signed null from a stale
 //!   index denies a binding that may already exist.
 //!
@@ -39,11 +41,19 @@
 //! that indexer last committed — which is what [`Config::max_lag_blocks`] and
 //! the indexer's own report guard.
 
-use std::sync::Arc;
+use std::{
+    fmt,
+    num::ParseIntError,
+    str::FromStr,
+    sync::Arc,
+};
 
-use alloy::primitives::{
-    Address,
-    B256,
+use alloy::{
+    hex::FromHexError,
+    primitives::{
+        Address,
+        B256,
+    },
 };
 use axum::{
     extract::{
@@ -85,6 +95,57 @@ use usernames_core::{
     nodes::NormalizedHandle,
 };
 
+/// A `HandleResolver` this gateway answers for: the contract, and the chain
+/// whose ENS registry it is set in.
+///
+/// The chain is what gives bare `addr(node)` its meaning. Coin type 60 asks
+/// for the registry's own chain, so one query is a Sepolia question through
+/// a resolver in Sepolia's registry and an Ethereum one through a resolver in
+/// the mainnet registry. Nothing in a request names the registry; the sender
+/// does, because a resolver sits in exactly one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Resolver {
+    /// The chain whose ENS registry the resolver is set in.
+    pub ens_chain: u64,
+    /// The contract: the `{sender}` of its requests, and the target every
+    /// answer to them is signed for.
+    pub address: Address,
+}
+
+/// Why a string does not name a resolver.
+#[derive(Debug, thiserror::Error)]
+pub enum ResolverError {
+    /// Not the two fields the form has.
+    #[error("expected <chain id>:<address>, as in 1:0x…")]
+    Shape,
+    /// The chain id is not a number.
+    #[error("chain id: {0}")]
+    Chain(#[from] ParseIntError),
+    /// The address is not one.
+    #[error("address: {0}")]
+    Address(#[from] FromHexError),
+}
+
+impl FromStr for Resolver {
+    type Err = ResolverError;
+
+    /// `<chain id>:<address>`: `11155111:0x20E9…` is a resolver in Sepolia's
+    /// registry, `1:0x07E5…` one in the mainnet registry.
+    fn from_str(pair: &str) -> Result<Self, Self::Err> {
+        let (chain, address) = pair.split_once(':').ok_or(ResolverError::Shape)?;
+        Ok(Self {
+            ens_chain: chain.parse()?,
+            address: address.parse()?,
+        })
+    }
+}
+
+impl fmt::Display for Resolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.ens_chain, self.address)
+    }
+}
+
 /// What the gateway needs: the store it reads, and the identity it signs with.
 #[derive(Clone)]
 pub struct Config {
@@ -99,8 +160,9 @@ pub struct Config {
     /// contract it was not told about. A request naming any other resolver
     /// is refused rather than answered, so a set that fell behind a
     /// `setResolver` is a visible 400 instead of a signature the resolver
-    /// rejects.
-    pub resolvers: Vec<Address>,
+    /// rejects. No two share an address: a request names its resolver by
+    /// address alone, and the resolver is what says which registry asked.
+    pub resolvers: Vec<Resolver>,
     /// The store every answer comes from. Which chains it holds is read per
     /// request, never configured: a coin type naming a chain no indexer has
     /// written gets an unsigned refusal, not a signed null — the resolver has
@@ -119,8 +181,13 @@ pub struct Config {
 }
 
 impl Config {
-    /// Answer one forwarded call, or say why it cannot be answered.
-    async fn answer(&self, call: &ResolveCall) -> Result<Answer, GatewayError> {
+    /// Answer one call `resolver` forwarded, or say why it cannot be
+    /// answered.
+    async fn answer(
+        &self,
+        resolver: Resolver,
+        call: &ResolveCall,
+    ) -> Result<Answer, GatewayError> {
         // The NAME is settled before the record is looked at. Every answer
         // below is signed, and a signature makes it an assertion about a name
         // — so the name has to be one this resolver has standing to speak
@@ -179,7 +246,10 @@ impl Config {
             ));
         }
 
-        let indexed = match self.indexed_chain_for(coin_type).await? {
+        let indexed = match self
+            .indexed_chain_for(coin_type, resolver.ens_chain)
+            .await?
+        {
             ChainMatch::One(indexed) => indexed,
             // A coin type that names no EVM chain at all — Bitcoin, say — is a
             // SIGNED null: no libID binding is ever an address of that kind,
@@ -242,7 +312,8 @@ impl Config {
         })
     }
 
-    /// The one chain in the store a coin type names, if there is exactly one.
+    /// The one chain in the store a coin type names when asked through the
+    /// ENS registry on `ens_chain`, if there is exactly one.
     ///
     /// Matched against the chains the STORE holds — whatever indexers have
     /// written — never decoded back into a chain id. `0x80000000 | chainId`
@@ -256,12 +327,13 @@ impl Config {
     async fn indexed_chain_for(
         &self,
         coin_type: CoinType,
+        ens_chain: u64,
     ) -> Result<ChainMatch, GatewayError> {
         let candidates: Vec<u64> = self
             .indexed_chains()
             .await?
             .into_iter()
-            .filter(|id| coin_type.names_chain(*id))
+            .filter(|id| coin_type.names_chain(*id, ens_chain))
             .collect();
         Ok(match candidates.as_slice() {
             [chain_id] => ChainMatch::One(self.indexed_chain(*chain_id)),
@@ -342,11 +414,11 @@ impl Config {
     /// walk of the resolver's `urls`) and a line here is the only way an
     /// operator learns that `ENS_RESOLVER_ADDRESS` fell behind a
     /// `setResolver`.
-    fn accept(&self, sender: &str) -> Result<Address, GatewayError> {
+    fn accept(&self, sender: &str) -> Result<Resolver, GatewayError> {
         let sender: Address = sender
             .parse()
             .map_err(|_| GatewayError::bad_request("sender is not an address"))?;
-        if !self.resolvers.contains(&sender) {
+        let Some(resolver) = self.resolvers.iter().find(|r| r.address == sender) else {
             warn!(
                 %sender,
                 resolvers = ?self.resolvers,
@@ -355,8 +427,8 @@ impl Config {
             return Err(GatewayError::bad_request(
                 "this gateway answers for a different resolver",
             ));
-        }
-        Ok(sender)
+        };
+        Ok(*resolver)
     }
 
     /// One row per chain the store holds, as supervision should see it.
@@ -755,8 +827,13 @@ async fn resolve(
     let config = &state.config;
     let resolver = config.accept(&sender)?;
     let request = Request::from_path(&data)?;
-    let result = config.answer(&request.call).await?.into_result()?;
+    let result = config
+        .answer(resolver, &request.call)
+        .await?
+        .into_result()?;
     Ok(Json(
-        config.sign(resolver, &request.call_data, result).await?,
+        config
+            .sign(resolver.address, &request.call_data, result)
+            .await?,
     ))
 }

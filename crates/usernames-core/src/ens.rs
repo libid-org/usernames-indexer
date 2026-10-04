@@ -20,11 +20,12 @@
 //!
 //! # Which chain
 //!
-//! A coin type names one chain, and mainnet is one of them rather than a
-//! default: bare `addr(node)` is coin type 60, which is Ethereum mainnet
-//! specifically. Whether an answer is owed for it is the gateway's decision
-//! rather than this module's — see `usernames-api`'s `ens` module, where a
-//! chain the store does not hold is refused rather than denied.
+//! A coin type names one chain, and none of them is a default. Bare
+//! `addr(node)` is coin type 60: the coin of the chain whose ENS registry was
+//! asked, so Ethereum mainnet through the mainnet registry and Sepolia
+//! through Sepolia's. Whether an answer is owed for it is the gateway's
+//! decision rather than this module's — see `usernames-api`'s `ens` module,
+//! where a chain the store does not hold is refused rather than denied.
 //!
 //! Note what the range limit does and does not cost. `0x80000000 | chainId`
 //! stops being injective at 2^31, so a coin type cannot be decoded back to one
@@ -133,7 +134,8 @@ impl ChainName {
 /// ENSIP-11: an EVM chain's coin type is `0x80000000 | chainId`.
 const EVM_COIN_TYPE_BIT: u64 = 0x8000_0000;
 
-/// Coin type 60 is Ethereum mainnet — a specific chain, not an unknown one.
+/// Coin type 60 is ether: the coin of the chain whose ENS registry was asked —
+/// a specific chain, not an unknown one.
 const COIN_TYPE_ETH: u64 = 60;
 
 /// A coin type, exactly as a wallet asked with it: undecoded, and matched
@@ -173,15 +175,16 @@ impl CoinType {
         raw == COIN_TYPE_ETH || raw & EVM_COIN_TYPE_BIT != 0
     }
 
-    /// Whether this coin type names Ethereum mainnet, which answers to two:
-    /// the legacy 60, and ENSIP-11's `0x80000001`.
-    pub fn is_mainnet(self) -> bool {
-        self.0 == U256::from(COIN_TYPE_ETH) || self == Self::of_chain(1)
-    }
-
-    /// Whether this coin type names the given chain — forward, never decoded.
-    pub fn names_chain(self, chain_id: u64) -> bool {
-        Self::of_chain(chain_id) == self || (chain_id == 1 && self.is_mainnet())
+    /// Whether this coin type, asked through the ENS registry on `ens_chain`,
+    /// names the given chain — forward, never decoded.
+    ///
+    /// The registry's own chain answers to two: its ENSIP-11 coin type, and
+    /// the legacy 60. A wallet on Sepolia asks Sepolia's registry with bare
+    /// `addr(node)` and sends what it is given on Sepolia, so 60 there is
+    /// Sepolia and never Ethereum mainnet.
+    pub fn names_chain(self, chain_id: u64, ens_chain: u64) -> bool {
+        Self::of_chain(chain_id) == self
+            || (chain_id == ens_chain && self.0 == U256::from(COIN_TYPE_ETH))
     }
 
     /// Whether two chains cannot be told apart by their coin type.
@@ -316,7 +319,7 @@ impl Record {
         };
         match selector {
             // addr(bytes32) — the node and nothing else, which is coin type 60
-            // by definition: Ethereum mainnet.
+            // by definition: the coin of the chain whose registry was asked.
             s if s == ADDR_SELECTOR => match <(B256,)>::abi_decode_params(args) {
                 Ok((node,)) => Self::Addr {
                     node,
@@ -915,10 +918,28 @@ mod tests {
     fn a_chain_gets_the_coin_type_ensip11_gives_it() {
         assert_eq!(CoinType::of_chain(1).raw(), U256::from(0x8000_0001u64));
         assert_eq!(CoinType::of_chain(8453).raw(), U256::from(0x8000_2105u64)); // Base
-                                                                                // Mainnet answers to the legacy 60 as well.
-        assert!(CoinType::from(U256::from(60u64)).is_mainnet());
-        assert!(CoinType::of_chain(1).is_mainnet());
-        assert!(!CoinType::of_chain(8453).is_mainnet());
+    }
+
+    /// Bare `addr(node)` asks for the chain of the registry it went through.
+    ///
+    /// MetaMask on Sepolia asks Sepolia's registry with coin type 60 and sends
+    /// on Sepolia. Read as Ethereum mainnet, that query has no answer in a
+    /// deployment that indexes Sepolia, and a bound name shows no resolution.
+    #[test]
+    fn the_legacy_coin_type_names_the_chain_of_the_registry_asked() {
+        const MAINNET: u64 = 1;
+        const SEPOLIA: u64 = 11_155_111;
+        let legacy = CoinType::from(U256::from(60u64));
+
+        assert!(legacy.names_chain(MAINNET, MAINNET));
+        assert!(legacy.names_chain(SEPOLIA, SEPOLIA));
+        assert!(!legacy.names_chain(MAINNET, SEPOLIA));
+        assert!(!legacy.names_chain(SEPOLIA, MAINNET));
+
+        // An ENSIP-11 coin type names its chain through either registry.
+        assert!(CoinType::of_chain(MAINNET).names_chain(MAINNET, SEPOLIA));
+        assert!(CoinType::of_chain(SEPOLIA).names_chain(SEPOLIA, MAINNET));
+        assert!(!CoinType::of_chain(8453).names_chain(MAINNET, MAINNET));
     }
 
     /// The eden testnet, and why matching forwards is what makes it work.
