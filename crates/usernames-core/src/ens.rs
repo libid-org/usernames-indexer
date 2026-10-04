@@ -35,7 +35,10 @@
 //! rather than decoding. [`CoinType::shared_by`] names the pair that cannot
 //! be served together.
 
-use std::fmt;
+use std::{
+    fmt,
+    str::FromStr,
+};
 
 use alloy::{
     primitives::{
@@ -53,8 +56,41 @@ use crate::nodes::{
     Platform,
 };
 
-/// The domain every name sits under, as labels.
-pub const DOMAIN: [&str; 2] = ["handles", "link"];
+/// The domain a gateway's names sit under: `handles.link`, or
+/// `testnet.handles.link` for a deployment that answers under a subname.
+///
+/// A deployment declares it; a name outside it is foreign, whatever its
+/// labels look like.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Domain {
+    labels: Vec<String>,
+}
+
+impl Domain {
+    /// The labels, leftmost first: `["testnet", "handles", "link"]`.
+    pub fn labels(&self) -> &[String] {
+        &self.labels
+    }
+}
+
+impl FromStr for Domain {
+    type Err = EnsError;
+
+    /// Dotted labels, each one a wallet could send after ENS normalization.
+    fn from_str(dotted: &str) -> Result<Self, Self::Err> {
+        let labels: Vec<String> = dotted.split('.').map(String::from).collect();
+        match labels.iter().find(|l| !Name::label_is_wellformed(l)) {
+            Some(label) => Err(EnsError::UnnormalizedLabel(label.clone())),
+            None => Ok(Self { labels }),
+        }
+    }
+}
+
+impl fmt::Display for Domain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.labels.join("."))
+    }
+}
 
 /// A name a chain goes by in a name: the `base` in `alice.x.base.handles.link`.
 ///
@@ -191,7 +227,7 @@ pub enum EnsError {
     #[error("label {0:?} is not valid ENS-normalized text")]
     UnnormalizedLabel(String),
     /// The name does not sit under this gateway's domain.
-    #[error("name is not under handles.link")]
+    #[error("name is not under this gateway's domain")]
     ForeignDomain,
     /// Nothing left after the domain, or a platform label with no handle.
     #[error("name has no subject beneath the domain")]
@@ -406,8 +442,8 @@ impl Name {
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     }
 
-    /// The question this name asks.
-    pub fn query(&self) -> Result<Query, EnsError> {
+    /// The question this name asks of a gateway that answers under `domain`.
+    pub fn query(&self, domain: &Domain) -> Result<Query, EnsError> {
         // The domain before anything else, so a name that is not ours is
         // refused as foreign whatever its labels look like. Label hygiene is
         // a statement about OUR names; a name under someone else's domain is
@@ -415,7 +451,7 @@ impl Name {
         // "unreadable" — which is answered — by miscasing a label.
         let rest = self
             .labels
-            .strip_suffix(&DOMAIN.map(String::from))
+            .strip_suffix(domain.labels())
             .ok_or(EnsError::ForeignDomain)?;
         for label in rest {
             // ENS normalization never produces uppercase or whitespace.
@@ -597,6 +633,16 @@ mod tests {
         Name::parse(name).unwrap().labels().to_vec()
     }
 
+    /// The domain the mainnet deployment answers under.
+    fn handles_link() -> Domain {
+        "handles.link".parse().unwrap()
+    }
+
+    /// The domain the testnet deployment answers under.
+    fn testnet_handles_link() -> Domain {
+        "testnet.handles.link".parse().unwrap()
+    }
+
     fn handle_of(q: &Query) -> String {
         match &q.subject {
             Subject::Handle { handle, .. } => handle.clone(),
@@ -627,7 +673,9 @@ mod tests {
 
     #[test]
     fn the_short_form_names_a_platform_and_no_chain() {
-        let q = Name::from_labels(labels(ALICE_X)).query().unwrap();
+        let q = Name::from_labels(labels(ALICE_X))
+            .query(&handles_link())
+            .unwrap();
         assert_eq!(handle_of(&q), "alice");
         assert_eq!(q.chain_label, None);
     }
@@ -636,7 +684,7 @@ mod tests {
     fn a_chain_label_is_carried_and_never_guessed() {
         let q =
             Name::from_labels(labels(b"\x05alice\x01x\x04base\x07handles\x04link\x00"))
-                .query()
+                .query(&handles_link())
                 .unwrap();
         assert_eq!(handle_of(&q), "alice");
         assert_eq!(q.chain_label.as_deref(), Some("base"));
@@ -645,15 +693,55 @@ mod tests {
     #[test]
     fn a_name_outside_the_domain_is_refused() {
         assert!(matches!(
-            Name::from_labels(labels(b"\x05alice\x01x\x03eth\x00")).query(),
+            Name::from_labels(labels(b"\x05alice\x01x\x03eth\x00"))
+                .query(&handles_link()),
             Err(EnsError::ForeignDomain)
         ));
     }
 
     #[test]
+    fn a_subname_domain_takes_its_names_and_leaves_the_parents() {
+        let alice = b"\x05alice\x01x\x07testnet\x07handles\x04link\x00";
+        let q = Name::from_labels(labels(alice))
+            .query(&testnet_handles_link())
+            .unwrap();
+        assert_eq!(handle_of(&q), "alice");
+        assert_eq!(q.chain_label, None);
+
+        // The parent's own names are not this gateway's to speak about.
+        assert!(matches!(
+            Name::from_labels(labels(ALICE_X)).query(&testnet_handles_link()),
+            Err(EnsError::ForeignDomain)
+        ));
+    }
+
+    #[test]
+    fn a_chain_label_sits_before_a_subname_domain_too() {
+        let alice = b"\x05alice\x01x\x07sepolia\x07testnet\x07handles\x04link\x00";
+        let q = Name::from_labels(labels(alice))
+            .query(&testnet_handles_link())
+            .unwrap();
+        assert_eq!(handle_of(&q), "alice");
+        assert_eq!(q.chain_label.as_deref(), Some("sepolia"));
+    }
+
+    #[test]
+    fn a_domain_reads_and_writes_as_dotted_labels() {
+        let domain = testnet_handles_link();
+        assert_eq!(domain.labels(), ["testnet", "handles", "link"]);
+        assert_eq!(domain.to_string(), "testnet.handles.link");
+        for bad in ["Handles.link", "handles..link", ""] {
+            assert!(
+                matches!(bad.parse::<Domain>(), Err(EnsError::UnnormalizedLabel(_))),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
     fn the_domain_alone_names_nobody() {
         assert!(matches!(
-            Name::from_labels(labels(b"\x07handles\x04link\x00")).query(),
+            Name::from_labels(labels(b"\x07handles\x04link\x00")).query(&handles_link()),
             Err(EnsError::EmptyName)
         ));
     }
@@ -669,7 +757,7 @@ mod tests {
                 "handles".into(),
                 "link".into()
             ])
-            .query(),
+            .query(&handles_link()),
             Err(EnsError::UnnormalizedLabel(_))
         ));
     }
@@ -681,7 +769,7 @@ mod tests {
         // `_` -> `-` is a bijection onto its image because X's alphabet holds
         // no hyphen, so this reverses exactly.
         let q = Name::from_labels(labels(b"\x04a--b\x01x\x07handles\x04link\x00"))
-            .query()
+            .query(&handles_link())
             .unwrap();
         assert_eq!(handle_of(&q), "a__b");
     }
@@ -689,7 +777,7 @@ mod tests {
     #[test]
     fn github_labels_are_the_handle_unchanged() {
         let q = Name::from_labels(labels(b"\x05alice\x06github\x07handles\x04link\x00"))
-            .query()
+            .query(&handles_link())
             .unwrap();
         assert_eq!(handle_of(&q), "alice");
     }
@@ -698,7 +786,7 @@ mod tests {
     fn gmail_joins_its_labels_and_appends_the_domain_the_platform_implies() {
         let q =
             Name::from_labels(labels(b"\x05alice\x01b\x06google\x07handles\x04link\x00"))
-                .query()
+                .query(&handles_link())
                 .unwrap();
         assert_eq!(handle_of(&q), "alice.b@gmail.com");
     }
@@ -710,7 +798,7 @@ mod tests {
         // untested code on a payment path.
         assert!(matches!(
             Name::from_labels(labels(b"\x06al-ice\x06google\x07handles\x04link\x00"))
-                .query(),
+                .query(&handles_link()),
             Err(EnsError::UnnormalizedLabel(_))
         ));
     }
