@@ -66,18 +66,23 @@ pub struct Config {
     #[arg(long, env = "ENS_SIGNER_KEY", hide_env_values = true)]
     pub ens_signer_key: Option<String>,
 
-    /// The resolvers this gateway answers for, comma-separated: the
-    /// `HandleResolver` of its domain on each ENS chain the domain is
-    /// registered on (Sepolia and Ethereum, say). Each serves every chain the
-    /// store holds, because the request's coin type picks the chain, not the
-    /// resolver. Nothing the indexer watches names them, so they cannot come
-    /// from the store.
+    /// The resolver this gateway answers for: the `HandleResolver` of its
+    /// domain. It serves every chain the store holds, because the request's
+    /// coin type picks the chain, not the resolver. Nothing the indexer
+    /// watches names it, so it cannot come from the store.
     ///
-    /// Required with a signing key: the signature binds an answer to the
-    /// resolver that asked, and signing for one outside this list would lend
-    /// the key to any contract that asked.
-    #[arg(long, env = "ENS_RESOLVER_ADDRESS", value_delimiter = ',')]
-    pub ens_resolver_address: Vec<Address>,
+    /// Required with a signing key: the signature binds an answer to one
+    /// resolver, and signing for a caller-supplied one would lend this key
+    /// to any contract that asked.
+    #[arg(long, env = "ENS_RESOLVER_ADDRESS")]
+    pub ens_resolver_address: Option<Address>,
+
+    /// The chain whose ENS registry the resolver is set in: 1 for Ethereum,
+    /// 11155111 for Sepolia. A bare `addr(node)` asks for that chain: coin
+    /// type 60 is the registry's own coin, and a wallet sends what it is
+    /// given on the network whose registry it asked.
+    #[arg(long, env = "ENS_CHAIN_ID", default_value_t = 1)]
+    pub ens_chain_id: u64,
 
     /// The domain this gateway's names sit under: `handles.link`, or
     /// `testnet.handles.link` for a deployment that answers under a subname.
@@ -122,7 +127,8 @@ pub async fn run() -> anyhow::Result<()> {
     match &gateway {
         Some(g) => info!(
             domain = %g.domain,
-            resolvers = ?g.resolvers,
+            resolver = %g.resolver,
+            ens_chain = g.ens_chain,
             route = %format!("{}/{{sender}}/{{data}}", ens::ROUTE_PREFIX),
             "ENS gateway configured"
         ),
@@ -207,30 +213,30 @@ const BLOCK_TIMESTAMP_SLACK_SECS: u64 = 300;
 const MAX_TTL_SECS: u64 = RESOLVER_MAX_LIFETIME_SECS - BLOCK_TIMESTAMP_SLACK_SECS;
 
 impl Config {
-    /// Where the gateway's key lives, and the resolvers it signs for.
+    /// Where the gateway's key lives, and the resolver it signs for.
     ///
     /// `None` when no gateway runs: the key is what turns the route on. A key
     /// without a resolver is a usage error rather than a default, because
     /// there is no safe resolver to guess — signing for whatever address asked
     /// would make this a signing oracle. Pure: nothing here reaches KMS, so a
     /// misconfiguration is refused before any network is touched.
-    fn signing_identity(&self) -> anyhow::Result<Option<(SignerSource, Vec<Address>)>> {
+    fn signing_identity(&self) -> anyhow::Result<Option<(SignerSource, Address)>> {
         let Some(spec) = self.ens_signer_key.as_deref() else {
             return Ok(None);
         };
-        if self.ens_resolver_address.is_empty() {
-            anyhow::bail!("ENS_SIGNER_KEY is set but ENS_RESOLVER_ADDRESS is not");
-        }
+        let resolver = self.ens_resolver_address.ok_or_else(|| {
+            anyhow::anyhow!("ENS_SIGNER_KEY is set but ENS_RESOLVER_ADDRESS is not")
+        })?;
         let source = SignerSource::from_spec(spec)
             .map_err(|e| anyhow::anyhow!("ENS_SIGNER_KEY: {e}"))?;
-        Ok(Some((source, self.ens_resolver_address.clone())))
+        Ok(Some((source, resolver)))
     }
 
     /// The gateway this configuration describes, or `None` when this
     /// deployment runs none. Every pure check runs before the signer is
     /// built, because building the KMS one is a network call.
     async fn gateway(&self, pool: sqlx::PgPool) -> anyhow::Result<Option<ens::Config>> {
-        let Some((source, resolvers)) = self.signing_identity()? else {
+        let Some((source, resolver)) = self.signing_identity()? else {
             return Ok(None);
         };
 
@@ -257,12 +263,13 @@ impl Config {
         info!(
             signer = %signer.address(),
             via = %signer.describe(),
-            ?resolvers,
+            %resolver,
             "ens gateway signer ready"
         );
         Ok(Some(ens::Config {
             domain: self.ens_domain.clone(),
-            resolvers,
+            resolver,
+            ens_chain: self.ens_chain_id,
             store: db::Store::new(pool),
             ttl_secs: self.ens_ttl_secs,
             max_lag_blocks: self.ens_max_lag_blocks,

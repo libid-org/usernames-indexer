@@ -232,7 +232,8 @@ async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> 
     // The gateway is bound to THIS resolver, because the signature names it.
     let router = usernames_api::ens::router(GatewayState::new(Config {
         domain: "handles.link".parse().expect("domain"),
-        resolvers: vec![resolver_address],
+        resolver: resolver_address,
+        ens_chain: anvil.chain_id(),
         store: db::Store::new(store.pool().clone()),
         ttl_secs: 300,
         max_lag_blocks: 32,
