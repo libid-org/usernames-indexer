@@ -1,7 +1,8 @@
 //! End to end against a real chain: anvil runs, mock contracts with the exact
 //! IdentityRegistry and HandleEscrow event surfaces emit a scenario, and the
 //! indexer's own loop — deployment-block detection included — indexes both
-//! into Postgres, where the API answers.
+//! into Postgres, where the API answers. The scenario runs once per log
+//! source, each on a chain of its own.
 //!
 //! Skips silently in exactly two cases: `DATABASE_URL` unset, or no `anvil`
 //! binary on PATH. Everything past those checks panics on failure.
@@ -9,6 +10,7 @@
 use std::time::Duration;
 
 use alloy::{
+    node_bindings::Anvil,
     primitives::{
         address,
         Address,
@@ -44,7 +46,10 @@ use usernames_core::{
         self,
         ChainStore,
     },
-    indexer,
+    indexer::{
+        self,
+        LogSource,
+    },
     nodes,
 };
 
@@ -56,16 +61,21 @@ use mocks::{
     MockIdentityRegistry,
 };
 
-/// A request scoped to this suite's chain: the store is shared with the
+/// A request scoped to the store's chain: the database is shared with the
 /// read-model suite's chain.
 async fn get<T: DeserializeOwned>(store: &ChainStore, path: &str) -> Reply<T> {
     let separator = if path.contains('?') { '&' } else { '?' };
-    common::get(store, &format!("{path}{separator}chain={CHAIN}")).await
+    let chain = store.chain_id();
+    common::get(store, &format!("{path}{separator}chain={chain}")).await
 }
 
-/// Not 31337: the read-model tests use anvil's default id against the same
-/// database, and chain_id keying is exactly the isolation this exercises.
-const CHAIN: u64 = 43117;
+/// The polled chain. Not 31337: the read-model tests use anvil's default id
+/// against the same database, and chain_id keying is exactly the isolation
+/// this exercises.
+const POLLED: u64 = 43117;
+
+/// The subscribed chain, apart from the polled one so both run at once.
+const SUBSCRIBED: u64 = 43118;
 
 /// A Google account id as the chain binds it: `0x` and the hex SHA-256 of
 /// `"libid.google-user-id" || sub`. This is libid-contracts'
@@ -74,7 +84,18 @@ const GOOGLE_USER_ID: &str =
     "0x20078023c9d4bf6bffc2580ec36446075d10c8453cecbe4f1cb3d326b2b35560";
 
 #[tokio::test]
-async fn indexes_a_real_chain_end_to_end() {
+async fn indexes_a_real_chain_end_to_end_by_polling() {
+    indexes_a_real_chain_end_to_end(LogSource::Poll, POLLED).await;
+}
+
+#[tokio::test]
+async fn indexes_a_real_chain_end_to_end_from_a_subscription() {
+    indexes_a_real_chain_end_to_end(LogSource::Subscribe, SUBSCRIBED).await;
+}
+
+/// The scenario, emitted before the indexer starts and indexed through
+/// `source`: deployment detection, catch-up and the API's answers.
+async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
     let Ok(url) = std::env::var("DATABASE_URL") else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
@@ -89,25 +110,26 @@ async fn indexes_a_real_chain_end_to_end() {
     }
 
     let pool = db::connect_and_migrate(&url).await.expect("database");
-    let store = ChainStore::new(pool.clone(), CHAIN as i64);
+    let store = ChainStore::new(pool.clone(), chain_id as i64);
     // A previous run of this test left rows under this chain id; the loop
     // must start from a clean slate to make block-number assertions exact.
     for table in db::PROJECTION_TABLES {
         sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
-            .bind(CHAIN as i64)
+            .bind(chain_id as i64)
             .execute(&pool)
             .await
             .expect("cleanup");
     }
     sqlx::query("DELETE FROM names.chain_metadata WHERE chain_id = $1")
-        .bind(CHAIN as i64)
+        .bind(chain_id as i64)
         .execute(&pool)
         .await
         .expect("metadata cleanup");
 
+    let anvil = Anvil::new().chain_id(chain_id).spawn();
     let provider = ProviderBuilder::new()
-        .connect_anvil_with_wallet_and_config(|anvil| anvil.chain_id(CHAIN))
-        .expect("anvil spawns");
+        .wallet(anvil.wallet().expect("anvil's dev accounts"))
+        .connect_http(anvil.endpoint_url());
 
     // Blocks before the deploy give the binary search something to find.
     provider.anvil_mine(Some(5), None).await.expect("mine");
@@ -312,6 +334,8 @@ async fn indexes_a_real_chain_end_to_end() {
         .unwrap();
 
     let latest = provider.get_block_number().await.expect("latest");
+    // One block on top, so the scenario's last event is a confirmation deep.
+    provider.anvil_mine(Some(1), None).await.expect("mine");
 
     // What the binary does before its loop: take the chain's writer lease and
     // prepare the chain, which records the contract the rows come from.
@@ -322,21 +346,23 @@ async fn indexes_a_real_chain_end_to_end() {
         .expect("prepare");
 
     // Run the real loop: no start override (detection must find the deploy
-    // block), a tiny window so catch-up spans several chunks, no
-    // confirmation lag on a chain that cannot reorg.
+    // block), a tiny window so catch-up spans several chunks, and the one
+    // confirmation a subscription needs.
     let cancel = CancellationToken::new();
     let config = indexer::IndexerConfig {
         contract: *mock.address(),
         escrow: Some(*escrow.address()),
-        confirmations: 0,
+        confirmations: 1,
+        source,
         poll_interval: Duration::from_secs(1),
+        head_interval: Duration::from_secs(1),
         max_block_range: 2,
         start_block: None,
         // A report good for two minutes; the loop renews it every cycle.
         stale_after: Duration::from_secs(120),
     };
     let task = tokio::spawn(
-        indexer::Indexer::new(store.clone(), provider.clone(), config)
+        indexer::Indexer::new(store.clone(), anvil.endpoint_url(), config)
             .run(cancel.clone()),
     );
 
@@ -368,7 +394,7 @@ async fn indexes_a_real_chain_end_to_end() {
     let resolved: HandleResolution =
         get(&store, "/v1/resolve/handle/x/alice_2").await.answer();
     let binding = &resolved.bindings[0];
-    assert_eq!(binding.chain_id, CHAIN as i64);
+    assert_eq!(binding.chain_id, chain_id as i64);
     assert_eq!(binding.owner, alice);
     assert_eq!(binding.ceremony_version, 1);
     let resolved: IdResolution = get(&store, "/v1/resolve/id/x/111").await.answer();
@@ -422,8 +448,8 @@ async fn indexes_a_real_chain_end_to_end() {
     let chain = status
         .chains
         .iter()
-        .find(|c| c.chain_id == CHAIN as i64)
-        .unwrap_or_else(|| panic!("chain {CHAIN} is listed: {status:?}"));
+        .find(|c| c.chain_id == chain_id as i64)
+        .unwrap_or_else(|| panic!("chain {chain_id} is listed: {status:?}"));
     assert_eq!(chain.contract, Some(*mock.address()));
     // The loop reports beside every target it sets, with an expiry in the
     // future, and the API surfaces both: this is what tells a caught-up
@@ -445,7 +471,7 @@ async fn indexes_a_real_chain_end_to_end() {
     let platform_key: Option<String> = sqlx::query_scalar(
         "SELECT platform_key FROM names.platforms WHERE chain_id = $1 AND platform_id = $2",
     )
-    .bind(CHAIN as i64)
+    .bind(chain_id as i64)
     .bind(x.as_slice())
     .fetch_one(&pool)
     .await
@@ -456,7 +482,7 @@ async fn indexes_a_real_chain_end_to_end() {
     // two included.
     let journal: i64 =
         sqlx::query_scalar("SELECT count(*) FROM names.events WHERE chain_id = $1")
-            .bind(CHAIN as i64)
+            .bind(chain_id as i64)
             .fetch_one(&pool)
             .await
             .expect("journal count");
@@ -464,7 +490,7 @@ async fn indexes_a_real_chain_end_to_end() {
     let fee_kinds: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM names.events WHERE chain_id = $1 AND kind = 'bind_fee_paid'",
     )
-    .bind(CHAIN as i64)
+    .bind(chain_id as i64)
     .fetch_one(&pool)
     .await
     .expect("fee count");

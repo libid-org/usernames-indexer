@@ -9,9 +9,10 @@ description = "The read model, event decoding and indexing loop behind the usern
 publish = false
 
 [dependencies]
-alloy.workspace = true
+alloy = { workspace = true, features = ["provider-ws"] }
 anyhow.workspace = true
 axum.workspace = true
+futures = "0.3"
 libid-contracts.workspace = true
 libid-identity.workspace = true
 serde.workspace = true
@@ -22,9 +23,11 @@ tokio.workspace = true
 tokio-util.workspace = true
 thiserror = "2"
 tracing.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 libid-profiles.workspace = true
-alloy = { workspace = true, features = ["node-bindings", "signer-local"] }
+alloy = { workspace = true, features = ["node-bindings", "rpc-types-anvil", "signer-local"] }
 http-body-util = "0.1"
+tokio-tungstenite = "0.28"
 tower = { version = "0.5", features = ["util"] }

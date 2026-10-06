@@ -4,9 +4,10 @@ Indexes [`IdentityRegistry`](https://github.com/libid-org/libid-contracts/blob/m
 and [`HandleEscrow`](https://github.com/libid-org/libid-contracts/blob/main/solidity/contracts/escrow/HandleEscrow.sol)
 events into Postgres and serves resolution and search over the claimed
 handles, the history of every address and handle, and what the escrow holds.
-**Two binaries over one read model**: `usernames-indexer`, a polling loop
-that indexes the contracts' storage from their events alone, and
-`usernames-api`, which serves what the loop wrote. They are separate because
+**Two binaries over one read model**: `usernames-indexer`, a loop that
+follows the contracts' events — pushed by a log subscription, or polled —
+and indexes their storage from those events alone, and `usernames-api`,
+which serves what the loop wrote. They are separate because
 they scale and fail differently — one writer per chain holds a Postgres
 advisory lease, while readers are stateless and horizontal — and because a
 stalled indexer must not hide behind a healthy-looking endpoint.
@@ -48,17 +49,37 @@ indexer's settings.
 | Variable | Used by | Default | Meaning |
 |---|---|---|---|
 | `DATABASE_URL` | both | — | Postgres connection string |
-| `RPC_URL` | indexer | — | JSON-RPC endpoint of the chain to follow. Its `eth_getLogs` must return `blockTimestamp` (reth, geth and anvil do); a log without one fails the window. Prefer a single node or a sticky endpoint: a load balancer that mixes lagged replicas can answer `eth_getLogs` for blocks a backend has not seen, and events dropped that way past the confirmation margin are gone until a re-index. The loop re-checks the backend's height before committing a window, which narrows but cannot close that hole. |
+| `RPC_URL` | indexer | — | JSON-RPC endpoint of the chain to follow. With `LOG_SOURCE=subscribe` an `http(s)` URL is dialled as `ws(s)` on the same host and path, where Alchemy and a bare node serve their WebSocket. Its `eth_getLogs` must return `blockTimestamp` (reth, geth and anvil do); a log without one fails the window. Prefer a single node or a sticky endpoint: a load balancer that mixes lagged replicas can answer `eth_getLogs` for blocks a backend has not seen, and events dropped that way past the confirmation margin are gone until a re-index. The loop re-checks the backend's height before committing a window, which narrows but cannot close that hole. |
 | `IDENTITY_NAMES_ADDRESS` | indexer | — | The IdentityRegistry **ERC1967 proxy** (the implementation changes on upgrade; the proxy is the one that emits). The indexer records it per chain, and `/v1/status` reports it from there |
 | `HANDLE_ESCROW_ADDRESS` | indexer | unset | The HandleEscrow **ERC1967 proxy**, when the chain has one. The indexer refuses to start unless its `registry()` is `IDENTITY_NAMES_ADDRESS`. Its events share the registry's windows and cursor; setting, changing or unsetting it replays the chain. `/v1/status` reports it as `escrow` |
 | `CHAIN_ID` | indexer | unset | Refuse to start unless the RPC reports this chain id. The API takes none: it serves every chain the store holds, and a request narrows with `?chain=` |
 | `CHAIN_NAMES` | indexer | — | Required. The names this chain goes by in an ENS name, comma-separated: the `base` in `alice.x.base.handles.link`. Labels only, never a platform key. Written to the store at every start for the gateway to read; a name belongs to one chain across the store, and declaring one another chain holds refuses to start |
-| `CONFIRMATIONS` | indexer | `5` | Blocks behind the head to stay (shallow-reorg protection) |
-| `POLL_INTERVAL` | indexer | `5s` | Poll cadence, and the retry delay after a failure |
+| `CONFIRMATIONS` | indexer | `5` | Blocks behind the head to stay (shallow-reorg protection). At least 1 with `LOG_SOURCE=subscribe` |
+| `LOG_SOURCE` | indexer | `subscribe` | How the indexer learns of new logs: `subscribe` holds an `eth_subscribe("logs")` stream on a WebSocket; `poll` asks with `eth_getLogs` every `POLL_INTERVAL`, for an endpoint without WebSocket. See [Log sources](#log-sources) |
+| `POLL_INTERVAL` | indexer | `5s` | The loop's cadence, and the retry delay after a failure: a poll cycle, or with a subscription a renewal of the report and, while pushed logs wait for their confirmations, a head read |
+| `HEAD_INTERVAL` | indexer | `1m` | With a subscription, how often an idle indexer reads the head; each read carries the cursor past blocks without events |
 | `STALE_AFTER` | indexer | four poll intervals + 1m | How long readers may trust this indexer's last report; the ENS gateway refuses this chain once it expires. Must exceed `POLL_INTERVAL`, and at most a year |
 | `MAX_BLOCK_RANGE` | indexer | `10000` | Largest `eth_getLogs` window |
 | `START_BLOCK` | indexer | unset | Where a FRESH scan starts — consulted only when no cursor exists (new database, or right after a re-index). Unset means the deployment block is found by binary search over `eth_getCode`; only a successful detection is cached, and an RPC failure mid-search retries next cycle |
 | `LISTEN_ADDR` | api | `127.0.0.1:8080` | Read-API listen address |
+
+### Log sources
+
+**Subscribe** (the default) costs RPC calls per event rather than per
+block. A session subscribes to both contracts' logs, reads the head, and
+backfills from the cursor in `eth_getLogs` windows: the confirmed blocks
+commit, and the blocks above `CONFIRMATIONS` wait beside the pushed logs.
+Any socket drop, stream overflow or RPC error ends the session, and the
+next one backfills from the cursor, so nothing the socket missed is lost.
+A pushed log commits once its block is `CONFIRMATIONS` deep, after its
+block hash is compared with the canonical block at that height; a block a
+reorg replaced has its logs refetched by the new hash. Between events, a
+head read every `HEAD_INTERVAL` carries the cursor forward, and the report
+is renewed every `POLL_INTERVAL` from the database alone.
+
+**Poll** asks for every window with `eth_getLogs` and re-reads the head
+each `POLL_INTERVAL`, which costs RPC calls per block whether or not
+anything happened.
 
 ## API
 
@@ -265,7 +286,7 @@ chain; a second deployment can share the database):
   read from the rows the event changes, or from the events its transaction
   emitted just before it
 
-Each poll window commits in one transaction — journal, projections and cursor
+Each window commits in one transaction — journal, projections and cursor
 together — and the journal's `(chain, block, log)` conflict gates the
 projection writes, so a crash or an overlap replays a window and converges.
 One process holds a per-chain Postgres advisory lock while it may write; a
@@ -287,7 +308,7 @@ without pushing so packaging cannot rot:
 
 | Image | Runs | Listens | Needs |
 |---|---|---|---|
-| `ghcr.io/libid-org/usernames-indexer` | the polling loop | nothing | RPC + a writer lease |
+| `ghcr.io/libid-org/usernames-indexer` | the indexing loop | nothing | RPC + a writer lease |
 | `ghcr.io/libid-org/usernames-api` | the read API | `0.0.0.0:8080` | the database only |
 
 No image carries both: an entrypoint would have to default to one of them,
@@ -346,8 +367,14 @@ compose Postgres — set `RPC_URL` and `IDENTITY_NAMES_ADDRESS` in
   `libid-identity`). A reconfiguration is recorded and warned about; if the
   rules actually changed, string lookups need this build's rules updated and
   a re-index. Node-keyed lookups stay exact throughout.
-- **Reorgs**: the loop stays `CONFIRMATIONS` blocks behind the head; there is
-  no rollback. On a chain with deeper reorgs, raise the setting.
+- **Reorgs**: the loop commits nothing above `CONFIRMATIONS` blocks behind
+  the head, and a subscription checks each block it pushed logs from against
+  the canonical chain before committing it; there is no rollback. On a chain
+  with deeper reorgs, raise the setting.
+- **A subscription trusts its stream**: a head read proves the chain grew,
+  not that the endpoint pushed every log of the blocks it covers. A log an
+  endpoint drops on a live socket is missed until a re-index; a dropped
+  socket loses nothing, because the next session backfills.
 - **Unknown platforms** index fine (events are self-describing) but cannot be
   normalized or named by key on this side until `handles.json` learns them.
 - **Sync state is a caller's concern**: until the first window commits, the

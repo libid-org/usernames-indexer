@@ -12,10 +12,7 @@ use std::time::Duration;
 
 use alloy::{
     primitives::Address,
-    providers::{
-        Provider,
-        RootProvider,
-    },
+    providers::Provider,
 };
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
@@ -24,7 +21,10 @@ use usernames_core::{
     chain,
     db,
     ens::ChainName,
-    indexer,
+    indexer::{
+        self,
+        LogSource,
+    },
 };
 
 /// Everything comes from flags or the environment; a `.env` file is read
@@ -36,9 +36,18 @@ pub struct Config {
     #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
     pub database_url: String,
 
-    /// JSON-RPC endpoint of the chain to follow.
+    /// JSON-RPC endpoint of the chain to follow. With the `subscribe` log
+    /// source an `http(s)` URL is dialled as `ws(s)` on the same host and
+    /// path.
     #[arg(long, env = "RPC_URL", hide_env_values = true)]
     pub rpc_url: Url,
+
+    /// How the indexer learns of new logs: `subscribe` holds an
+    /// `eth_subscribe("logs")` stream on a WebSocket and reads the head once
+    /// per `HEAD_INTERVAL`; `poll` asks with `eth_getLogs` every
+    /// `POLL_INTERVAL`, for an endpoint that serves no WebSocket.
+    #[arg(long, env = "LOG_SOURCE", default_value = "subscribe")]
+    pub log_source: LogSource,
 
     /// The IdentityRegistry ERC1967 proxy address. Typed as an address so
     /// garbage is a usage error before anything connects, not a mid-startup
@@ -66,14 +75,22 @@ pub struct Config {
     #[arg(long, env = "CHAIN_NAMES", value_delimiter = ',', required = true)]
     pub chain_names: Vec<ChainName>,
 
-    /// Blocks behind the head to stay; shallow-reorg protection.
+    /// Blocks behind the head to stay; shallow-reorg protection. At least one
+    /// with the `subscribe` log source.
     #[arg(long, env = "CONFIRMATIONS", default_value_t = 5)]
     pub confirmations: u64,
 
-    /// Time between poll cycles, and the retry delay after a failure:
-    /// `5s`, `1500ms`.
+    /// The loop's cadence, and the retry delay after a failure: `5s`,
+    /// `1500ms`. A poll cycle; with a subscription, a renewal of the report,
+    /// and a head read while pushed logs wait for their confirmations.
     #[arg(long, env = "POLL_INTERVAL", default_value = "5s", value_parser = humantime::parse_duration)]
     pub poll_interval: Duration,
+
+    /// With the `subscribe` log source, how often an idle indexer reads the
+    /// chain head, which carries the cursor past blocks without events:
+    /// `1m`, `30s`.
+    #[arg(long, env = "HEAD_INTERVAL", default_value = "1m", value_parser = humantime::parse_duration)]
+    pub head_interval: Duration,
 
     /// Largest eth_getLogs window, sized to the RPC provider's limits.
     #[arg(long, env = "MAX_BLOCK_RANGE", default_value_t = 10_000)]
@@ -97,6 +114,19 @@ pub struct Config {
 const MAX_STALE_AFTER: Duration = Duration::from_secs(366 * 24 * 60 * 60);
 
 impl Config {
+    /// How many blocks behind the head to stay: `CONFIRMATIONS`, refused at
+    /// zero with a subscription. The stream's logs for the head block can
+    /// still be on their way when the head is read, and committing that
+    /// block would skip them.
+    fn confirmations(&self) -> anyhow::Result<u64> {
+        anyhow::ensure!(
+            self.confirmations > 0 || self.log_source == LogSource::Poll,
+            "LOG_SOURCE=subscribe needs CONFIRMATIONS of at least 1: the logs of \
+             the head block can still be on their way when the head is read"
+        );
+        Ok(self.confirmations)
+    }
+
     /// How long readers may trust a report: `STALE_AFTER`, or four poll
     /// intervals plus a minute. Refused unless it outlasts a poll interval,
     /// or every idle cycle would expire the report before the next one
@@ -140,8 +170,17 @@ pub async fn run() -> anyhow::Result<()> {
     // below may wipe the chain's rows on a version bump, and a refusal has
     // to come before that, not after.
     let stale_after = config.report_validity()?;
+    let confirmations = config.confirmations()?;
 
-    let provider: RootProvider = RootProvider::new_http(config.rpc_url.clone());
+    // The same transport the loop will use, so an endpoint that serves no
+    // WebSocket refuses here, at startup, instead of in every session.
+    let provider = config
+        .log_source
+        .connect(&config.rpc_url)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("RPC_URL over LOG_SOURCE={}: {e}", config.log_source)
+        })?;
     let reported = provider.get_chain_id().await?;
     if let Some(expected) = config.chain_id {
         anyhow::ensure!(
@@ -180,14 +219,18 @@ pub async fn run() -> anyhow::Result<()> {
     store.set_chain_names(&writer, &config.chain_names).await?;
 
     let cancel = CancellationToken::new();
+    // Startup's own connection: every session of the loop opens its own.
+    drop(provider);
     let indexer = indexer::Indexer::new(
         store,
-        provider,
+        config.rpc_url,
         indexer::IndexerConfig {
             contract,
             escrow,
-            confirmations: config.confirmations,
+            confirmations,
+            source: config.log_source,
             poll_interval: config.poll_interval,
+            head_interval: config.head_interval,
             max_block_range: config.max_block_range,
             start_block: config.start_block,
             stale_after,
@@ -218,7 +261,10 @@ mod help_tests {
         Parser,
     };
 
-    use super::Config;
+    use super::{
+        Config,
+        LogSource,
+    };
 
     /// clap renders `[env: NAME=value]` in `--help` for every argument bound
     /// to a variable, and `.env` is read before parsing, so without
@@ -265,5 +311,60 @@ mod help_tests {
         for bad in ["eden,x", "Eden", "eden,"] {
             assert!(args(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// Without a setting the indexer subscribes; `poll` is the opt-out, and
+    /// any other name stops the process before anything connects.
+    #[test]
+    fn the_log_source_defaults_to_a_subscription() {
+        let args = |extra: &[&str]| {
+            let required = [
+                "usernames-indexer",
+                "--database-url",
+                "postgres://localhost/usernames",
+                "--rpc-url",
+                "http://127.0.0.1:8545",
+                "--identity-names-address",
+                "0x0000000000000000000000000000000000000001",
+                "--chain-names",
+                "eden",
+            ];
+            Config::try_parse_from(required.iter().chain(extra))
+        };
+        assert_eq!(
+            args(&[]).expect("defaults").log_source,
+            LogSource::Subscribe
+        );
+        assert_eq!(
+            args(&["--log-source", "poll"]).expect("poll").log_source,
+            LogSource::Poll
+        );
+        assert!(args(&["--log-source", "websocket"]).is_err());
+    }
+
+    /// A subscription needs a confirmation; a poll may run at the head.
+    #[test]
+    fn a_subscription_refuses_zero_confirmations() {
+        let args = |extra: &[&str]| {
+            let required = [
+                "usernames-indexer",
+                "--database-url",
+                "postgres://localhost/usernames",
+                "--rpc-url",
+                "http://127.0.0.1:8545",
+                "--identity-names-address",
+                "0x0000000000000000000000000000000000000001",
+                "--chain-names",
+                "eden",
+                "--confirmations",
+                "0",
+            ];
+            Config::try_parse_from(required.iter().chain(extra)).expect("parses")
+        };
+        assert!(args(&[]).confirmations().is_err());
+        assert_eq!(
+            args(&["--log-source", "poll"]).confirmations().ok(),
+            Some(0)
+        );
     }
 }
