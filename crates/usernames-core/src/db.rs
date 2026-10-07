@@ -15,6 +15,7 @@ use alloy::primitives::{
     Address,
     B256,
 };
+use chrono::TimeDelta;
 use sqlx::{
     Connection,
     PgPool,
@@ -91,8 +92,9 @@ pub struct IndexPosition {
     pub cursor: Option<u64>,
     /// Unix seconds at which the indexer last reported.
     pub reported_at: Option<u64>,
-    /// Seconds until the indexer's last report expires; negative once it has.
-    pub valid_for: Option<i64>,
+    /// How long until the indexer's last report expires; negative once it
+    /// has.
+    pub valid_for: Option<TimeDelta>,
 }
 
 /// The longest a report may be trusted: a year. A longer setting is a
@@ -569,7 +571,7 @@ impl ChainStore {
                 position.valid_for = value
                     .parse::<i64>()
                     .ok()
-                    .map(|until| until.saturating_sub(now));
+                    .map(|until| TimeDelta::seconds(until.saturating_sub(now)));
             }
         }
         Ok(position)

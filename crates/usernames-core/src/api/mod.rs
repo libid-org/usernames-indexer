@@ -464,7 +464,7 @@ impl ChainStatus {
             chain_head_block: head,
             lag_blocks: head.map(|h| h.saturating_sub(last.unwrap_or(0))),
             indexer_reported_at: position.reported_at,
-            report_valid_for: position.valid_for,
+            report_valid_for: position.valid_for.map(|valid_for| valid_for.num_seconds()),
             last_window_error,
             proof_verifier,
         })

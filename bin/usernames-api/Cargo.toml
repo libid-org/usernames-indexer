@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 usernames-core.workspace = true
 
+chrono = "0.4"
 alloy = { workspace = true, features = ["signer-local"] }
 anyhow.workspace = true
 axum.workspace = true

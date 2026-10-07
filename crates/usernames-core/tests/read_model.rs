@@ -10,6 +10,7 @@ mod common;
 
 use std::time::Duration;
 
+use chrono::TimeDelta;
 use tokio::time::Instant;
 
 use alloy::primitives::{
@@ -963,7 +964,7 @@ async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let position = loop {
         let position = store.index_position().await.expect("position");
-        if position.valid_for.is_some_and(|s| s < 0) {
+        if position.valid_for.is_some_and(|d| d < TimeDelta::zero()) {
             break position;
         }
         assert!(Instant::now() < deadline, "never expired: {position:?}");
@@ -978,7 +979,10 @@ async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
         Some(5),
         "a renewal must not move the target"
     );
-    assert!(position.valid_for.is_some_and(|s| s > 0), "{position:?}");
+    assert!(
+        position.valid_for.is_some_and(|d| d > TimeDelta::zero()),
+        "{position:?}"
+    );
     assert!(position.reported_at.is_some(), "{position:?}");
     drop(guard);
 }

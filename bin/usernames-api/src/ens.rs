@@ -71,6 +71,7 @@ use axum::{
     Json,
     Router,
 };
+use chrono::TimeDelta;
 use libid_signer::ManagedSigner;
 use serde::{
     Deserialize,
@@ -385,7 +386,9 @@ impl Config {
                 names,
                 lag_blocks: lag.blocks(),
                 indexer_reported_at: position.and_then(|p| p.reported_at),
-                report_valid_for: position.and_then(|p| p.valid_for),
+                report_valid_for: position
+                    .and_then(|p| p.valid_for)
+                    .map(|valid_for| valid_for.num_seconds()),
                 ambiguous,
                 stale: ambiguous || lag.staleness(self.max_lag_blocks).is_some(),
             });
@@ -457,9 +460,9 @@ impl IndexedChain {
 /// How far behind the chain an answer would be.
 enum Lag {
     /// Read from an index: this many blocks behind the target its indexer
-    /// last set, and this many seconds before that indexer's report expires
-    /// — negative once it has.
-    Indexed { blocks: u64, valid_for: i64 },
+    /// last set, and this long before that indexer's report expires —
+    /// negative once it has.
+    Indexed { blocks: u64, valid_for: TimeDelta },
     /// An index that cannot say. Treated as too stale, because a source that
     /// does not know its own position has not earned the right to deny a
     /// binding.
@@ -501,9 +504,9 @@ impl Lag {
     /// sees.
     fn staleness(&self, max_lag_blocks: u64) -> Option<Staleness> {
         match *self {
-            Self::Indexed { valid_for, .. } if valid_for < 0 => {
-                Some(Staleness::Expired(valid_for.unsigned_abs()))
-            }
+            Self::Indexed { valid_for, .. } if valid_for < TimeDelta::zero() => Some(
+                Staleness::Expired(valid_for.abs().to_std().unwrap_or_default()),
+            ),
             Self::Indexed { blocks, .. } if blocks > max_lag_blocks => {
                 Some(Staleness::Behind(blocks))
             }
@@ -518,8 +521,8 @@ impl Lag {
 enum Staleness {
     /// The cursor trails the target by this many blocks.
     Behind(u64),
-    /// The indexer's last report expired this many seconds ago.
-    Expired(u64),
+    /// The indexer's last report expired this long ago.
+    Expired(Duration),
     /// The index cannot report its position at all.
     Unknown,
 }
@@ -531,8 +534,11 @@ impl Staleness {
             Self::Behind(lag) => {
                 format!("read model is {lag} blocks behind; not answering")
             }
-            Self::Expired(secs) => {
-                format!("the indexer's last report expired {secs}s ago; not answering")
+            Self::Expired(ago) => {
+                format!(
+                    "the indexer's last report expired {}s ago; not answering",
+                    ago.as_secs()
+                )
             }
             Self::Unknown => {
                 "read model cannot report its position; not answering".into()
