@@ -67,18 +67,7 @@ async fn test_store() -> Option<(ChainStore, PgPool, MutexGuard<'static, ()>)> {
         .await
         .expect("DATABASE_URL is set but connecting failed");
     db::MIGRATOR.run(&pool).await.expect("migrations failed");
-    for table in db::PROJECTION_TABLES {
-        sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
-            .bind(CHAIN)
-            .execute(&pool)
-            .await
-            .expect("cleanup failed");
-    }
-    sqlx::query("DELETE FROM names.chain_metadata WHERE chain_id = $1")
-        .bind(CHAIN)
-        .execute(&pool)
-        .await
-        .expect("metadata cleanup failed");
+    common::clear_chain(&pool, CHAIN).await;
     Some((ChainStore::new(pool.clone(), CHAIN), pool, guard))
 }
 

@@ -1,6 +1,6 @@
-//! Plumbing both integration suites share: drive one request through the
-//! real router and hand back what a caller gets, in the type the API
-//! declares for it.
+//! Plumbing the integration suites share: a clean slate for a suite's
+//! chain, and one request driven through the real router, answered in the
+//! type the API declares for it.
 
 use axum::{
     body::Body,
@@ -11,6 +11,7 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use serde::de::DeserializeOwned;
+use sqlx::PgPool;
 use tower::ServiceExt;
 use usernames_core::{
     api::{
@@ -18,10 +19,34 @@ use usernames_core::{
         model::ErrorBody,
     },
     db::{
+        self,
         ChainStore,
         Store,
     },
 };
+
+/// Delete every row the store holds for `chain`: projections, metadata and
+/// names. Suites share one database, so each clears its own chains before it
+/// writes and never reads what another left behind.
+pub async fn clear_chain(pool: &PgPool, chain: i64) {
+    for table in db::PROJECTION_TABLES {
+        sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
+            .bind(chain)
+            .execute(pool)
+            .await
+            .expect("projection cleanup");
+    }
+    for statement in [
+        "DELETE FROM names.chain_metadata WHERE chain_id = $1",
+        "DELETE FROM names.chain_names WHERE chain_id = $1",
+    ] {
+        sqlx::query(statement)
+            .bind(chain)
+            .execute(pool)
+            .await
+            .expect("metadata cleanup");
+    }
+}
 
 /// What one GET came back with: the answer in its type, or the refusal.
 pub struct Reply<T> {

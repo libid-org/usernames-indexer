@@ -79,23 +79,7 @@ async fn test_store_with(
     // Scoped to this suite's chain, like the anvil suite scopes to its own:
     // neither depends on cargo happening to run test binaries sequentially.
     for chain in [CHAIN, OTHER_CHAIN] {
-        for table in db::PROJECTION_TABLES {
-            sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
-                .bind(chain)
-                .execute(&pool)
-                .await
-                .expect("cleanup failed");
-        }
-        sqlx::query("DELETE FROM names.chain_metadata WHERE chain_id = $1")
-            .bind(chain)
-            .execute(&pool)
-            .await
-            .expect("metadata cleanup failed");
-        sqlx::query("DELETE FROM names.chain_names WHERE chain_id = $1")
-            .bind(chain)
-            .execute(&pool)
-            .await
-            .expect("names cleanup failed");
+        common::clear_chain(&pool, chain).await;
     }
     Some((ChainStore::new(pool.clone(), CHAIN), pool, guard))
 }

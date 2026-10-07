@@ -113,18 +113,7 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
     let store = ChainStore::new(pool.clone(), chain_id as i64);
     // A previous run of this test left rows under this chain id; the loop
     // must start from a clean slate to make block-number assertions exact.
-    for table in db::PROJECTION_TABLES {
-        sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
-            .bind(chain_id as i64)
-            .execute(&pool)
-            .await
-            .expect("cleanup");
-    }
-    sqlx::query("DELETE FROM names.chain_metadata WHERE chain_id = $1")
-        .bind(chain_id as i64)
-        .execute(&pool)
-        .await
-        .expect("metadata cleanup");
+    common::clear_chain(&pool, chain_id as i64).await;
 
     let anvil = Anvil::new().chain_id(chain_id).spawn();
     let provider = ProviderBuilder::new()
