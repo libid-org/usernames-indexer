@@ -4,7 +4,7 @@ pragma solidity ^0.8.20;
 /// @notice Test double for the indexer: the exact event surface of
 ///         IdentityRegistry, each behind a function that just emits it. The
 ///         integration test deploys this on anvil and replays scenarios, so
-///         the indexer decodes REAL ABI-encoded logs rather than values a
+///         the indexer decodes real ABI-encoded logs rather than values a
 ///         Rust test constructed for itself.
 ///
 ///         Event signatures are copied verbatim from
