@@ -2,7 +2,7 @@
 //!
 //! [`ChainStore`] fuses the pool with the chain it scopes every query to, so
 //! no call site can pass the wrong chain id or forget it. [`Window`] is an
-//! open poll window: applying events and committing-with-cursor are its only
+//! open window: applying events and committing-with-cursor are its only
 //! operations, which makes "the cursor and the writes it stands for commit
 //! together or not at all" a fact of the type rather than caller discipline.
 //! Every write in [`Window::apply`] is an idempotent upsert keyed by what the
@@ -694,7 +694,7 @@ impl ChainStore {
             .await
     }
 
-    /// Open a poll window. Everything applied through it commits atomically
+    /// Open a window. Everything applied through it commits atomically
     /// with the cursor when [`Window::commit`] runs, or not at all.
     pub async fn begin_window(&self) -> Result<Window, sqlx::Error> {
         Ok(Window {
@@ -755,7 +755,7 @@ fn as_i64(value: u64, what: &'static str) -> Result<i64, ApplyError> {
     i64::try_from(value).map_err(|_| ApplyError::OutOfRange { what, value })
 }
 
-/// One open poll window: a transaction that only knows how to apply events
+/// One open window: a transaction that only knows how to apply events
 /// and how to commit together with the cursor. That the cursor cannot be
 /// left behind — or advanced without its writes — is not a convention here,
 /// it is the shape of the API.
