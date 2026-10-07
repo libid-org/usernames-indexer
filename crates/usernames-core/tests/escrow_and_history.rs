@@ -3,11 +3,14 @@
 //! the axum handlers a caller hits.
 //!
 //! Skips silently when `DATABASE_URL` is unset; everything past that check
-//! panics on failure. It shares the database with the other suites, so its
-//! chain and its handles are its own: the read-model suite reads `alice_1`
-//! across every chain the store holds.
+//! panics on failure. The suite's chain and handles are its own.
 
 mod common;
+
+use std::{
+    collections::BTreeMap,
+    fmt::Debug,
+};
 
 use alloy::primitives::{
     address,
@@ -17,19 +20,18 @@ use alloy::primitives::{
     U256,
 };
 use axum::http::StatusCode;
-use common::Reply;
-use serde::de::DeserializeOwned;
-use sqlx::PgPool;
-use tokio::sync::{
-    Mutex,
-    MutexGuard,
+use common::{
+    events,
+    Suite,
 };
+use serde::de::DeserializeOwned;
+use tokio::sync::Mutex;
 use usernames_core::{
     api::model::{
-        AddressBalances,
+        AddressAmounts,
         AddressHistory,
         EscrowAmount,
-        HandleBalances,
+        HandleAmounts,
         HandleHistory,
         HistoryEntry,
         HistoryEvent,
@@ -37,12 +39,8 @@ use usernames_core::{
         Status,
         Unclaimed,
     },
-    db::{
-        self,
-        ChainStore,
-    },
     events::{
-        LogPosition,
+        EscrowEvent,
         NamesEvent,
     },
     nodes::{
@@ -58,83 +56,25 @@ const NATIVE: Address = address!("EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
 const USDC: Address = Address::repeat_byte(0x05);
 const DAI: Address = Address::repeat_byte(0x0D);
 
-static DB_LOCK: Mutex<()> = Mutex::const_new(());
-
-async fn test_store() -> Option<(ChainStore, PgPool, MutexGuard<'static, ()>)> {
-    let guard = DB_LOCK.lock().await;
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = PgPool::connect(&url)
-        .await
-        .expect("DATABASE_URL is set but connecting failed");
-    db::MIGRATOR.run(&pool).await.expect("migrations failed");
-    for table in db::PROJECTION_TABLES {
-        sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
-            .bind(CHAIN)
-            .execute(&pool)
-            .await
-            .expect("cleanup failed");
-    }
-    sqlx::query("DELETE FROM names.chain_metadata WHERE chain_id = $1")
-        .bind(CHAIN)
-        .execute(&pool)
-        .await
-        .expect("metadata cleanup failed");
-    Some((ChainStore::new(pool.clone(), CHAIN), pool, guard))
-}
+static SUITE: Mutex<()> = Mutex::const_new(());
 
 fn addr(byte: u8) -> Address {
     Address::repeat_byte(byte)
 }
 
-fn x() -> B256 {
-    nodes::Platform::from_key("x").unwrap().id()
-}
-
 fn node(handle: &str) -> B256 {
-    nodes::handle_node(x(), &nodes::NormalizedHandle::from_chain(handle))
-}
-
-/// Apply one transaction's events at block `block`, in log order, committing
-/// like a window. The block's time is the block number plus a constant, so
-/// later blocks are later in time too.
-async fn apply_tx(store: &ChainStore, block: u64, events: Vec<NamesEvent>) {
-    let mut window = store.begin_window().await.expect("begin");
-    for (log_index, event) in events.into_iter().enumerate() {
-        let pos = LogPosition {
-            block_number: block,
-            log_index: log_index as u64,
-            tx_hash: B256::from_slice(&[block as u8; 32]),
-            block_time: 1_700_000_000 + block,
-        };
-        window.apply(&event, &pos).await.expect("apply");
-    }
-    window.commit(block).await.expect("commit");
-}
-
-async fn apply(store: &ChainStore, block: u64, event: NamesEvent) {
-    apply_tx(store, block, vec![event]).await;
-}
-
-async fn get<T: DeserializeOwned>(store: &ChainStore, path: &str) -> Reply<T> {
-    let separator = if path.contains('?') { '&' } else { '?' };
-    common::get(store, &format!("{path}{separator}chain={CHAIN}")).await
-}
-
-/// The status and code a route refuses `path` with, read as the refusal of
-/// the answer type that route serves.
-async fn refused<T: DeserializeOwned + std::fmt::Debug>(
-    store: &ChainStore,
-    path: &str,
-) -> (StatusCode, String) {
-    get::<T>(store, path).await.refusal()
+    nodes::handle_node(
+        KnownPlatform::X.id(),
+        &nodes::NormalizedHandle::from_chain(handle),
+    )
 }
 
 fn bind(holder: Address, id: &str, handle: &str, observed_at: u64) -> NamesEvent {
     NamesEvent::IdentityBound {
         holder,
-        id_node: nodes::id_node(x(), id),
+        id_node: nodes::id_node(KnownPlatform::X.id(), id),
         handle_node: node(handle),
-        platform_id: x(),
+        platform_id: KnownPlatform::X.id(),
         id: id.into(),
         handle: handle.into(),
         observed_at,
@@ -148,37 +88,17 @@ fn deposited(
     token: Address,
     depositor: Address,
     refund_to: Address,
-    round: u64,
     amount: u64,
 ) -> NamesEvent {
-    NamesEvent::Deposited {
+    NamesEvent::Escrow(EscrowEvent::Deposited {
         handle_node: node(handle),
         token,
         refund_to,
         depositor,
-        platform_id: x(),
-        round: U256::from(round),
+        platform_id: KnownPlatform::X.id(),
+        round: U256::ZERO,
         amount: U256::from(amount),
-    }
-}
-
-fn kinds(entries: &[HistoryEntry]) -> Vec<&'static str> {
-    entries
-        .iter()
-        .map(|entry| match entry.event {
-            HistoryEvent::IdentityBound { .. } => "identity_bound",
-            HistoryEvent::HandleRetired { .. } => "handle_retired",
-            HistoryEvent::HandleUnpublished { .. } => "handle_unpublished",
-            HistoryEvent::PlatformConfigured { .. } => "platform_configured",
-            HistoryEvent::ProofVerifierConfigured { .. } => "proof_verifier_configured",
-            HistoryEvent::CeremonyBound { .. } => "ceremony_bound",
-            HistoryEvent::BindFeePaid { .. } => "bind_fee_paid",
-            HistoryEvent::Deposited { .. } => "deposited",
-            HistoryEvent::Forwarded { .. } => "forwarded",
-            HistoryEvent::Claimed { .. } => "claimed",
-            HistoryEvent::Refunded { .. } => "refunded",
-        })
-        .collect()
+    })
 }
 
 /// (token, amount) pairs, in the order served.
@@ -188,9 +108,42 @@ fn amounts(list: &[EscrowAmount]) -> Vec<(Address, u64)> {
         .collect()
 }
 
+/// Per token, the amounts a list serves.
+fn by_token(list: &[EscrowAmount]) -> BTreeMap<Address, U256> {
+    list.iter().map(|a| (a.token, a.amount)).collect()
+}
+
+/// Per token, what a handle's history deposited less what claims and refunds
+/// released from it: what the escrow must still hold for the handle. The
+/// history is served newest first, so it is replayed from its end.
+fn owed(entries: &[HistoryEntry]) -> BTreeMap<Address, U256> {
+    let mut owed = BTreeMap::<Address, U256>::new();
+    for entry in entries.iter().rev() {
+        match &entry.event {
+            HistoryEvent::Deposited { token, amount, .. } => {
+                *owed.entry(*token).or_default() += *amount;
+            }
+            HistoryEvent::Claimed {
+                token, released, ..
+            }
+            | HistoryEvent::Refunded {
+                token, released, ..
+            } => {
+                let held = owed.entry(*token).or_default();
+                *held = held
+                    .checked_sub(*released)
+                    .expect("paid out more than was deposited");
+            }
+            _ => {}
+        }
+    }
+    owed.retain(|_, amount| !amount.is_zero());
+    owed
+}
+
 #[tokio::test]
 async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
-    let Some((store, _pool, guard)) = test_store().await else {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -200,201 +153,238 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
 
     // Nobody holds @bob_1: three deposits escrow. Erin pays for Dave, whose
     // address is the one that may refund.
-    apply(&store, 1, deposited("bob_1", NATIVE, carol, carol, 0, 100)).await;
-    apply(&store, 2, deposited("bob_1", NATIVE, erin, dave, 0, 50)).await;
-    apply(&store, 3, deposited("bob_1", USDC, carol, carol, 0, 7)).await;
+    suite
+        .apply(1, deposited("bob_1", NATIVE, carol, carol, 100))
+        .await;
+    suite
+        .apply(2, deposited("bob_1", NATIVE, erin, dave, 50))
+        .await;
+    suite
+        .apply(3, deposited("bob_1", USDC, carol, carol, 7))
+        .await;
 
-    // Known by its node alone: no bind has carried the text.
-    let held: HandleBalances = get(&store, &format!("/v1/escrow/node/{bob_node}"))
+    // Known by its node alone: no bind has carried the text. Token by token,
+    // descending: the native coin's address sorts above USDC's.
+    let held: HandleAmounts = suite
+        .get(&format!("/v1/escrow/node/{bob_node}"))
         .await
         .answer();
-    // Token by token: USDC's address sorts before the native coin's.
-    assert_eq!(amounts(&held.held), [(USDC, 7), (NATIVE, 150)]);
+    assert_eq!(amounts(&held.amounts), [(NATIVE, 150), (USDC, 7)]);
     assert_eq!(held.handle.platform, Some(KnownPlatform::X));
     assert_eq!(held.handle.handle, None);
-    assert!(held.held.iter().all(|a| a.holder.is_none()));
+    assert!(held.amounts.iter().all(|a| a.holder.is_none()));
     // By text, the request names the handle; the node is the same.
-    let held: HandleBalances = get(&store, "/v1/escrow/handle/x/@Bob_1").await.answer();
+    let held: HandleAmounts = suite.get("/v1/escrow/handle/x/@Bob_1").await.answer();
     assert_eq!(held.handle.handle_node, bob_node);
     assert_eq!(held.handle.handle.as_deref(), Some("bob_1"));
-    assert_eq!(amounts(&held.held), [(USDC, 7), (NATIVE, 150)]);
 
     // The payers see what they may take back; a payer that named somebody
     // else's refund address sees nothing.
-    let carols: AddressBalances = get(&store, &format!("/v1/escrow/address/{carol}"))
+    let carols: AddressAmounts = suite
+        .get(&format!("/v1/escrow/refundable/{carol}"))
         .await
         .answer();
-    assert_eq!(amounts(&carols.refundable), [(USDC, 7), (NATIVE, 100)]);
-    assert!(carols.claimable.is_empty());
-    let daves: AddressBalances = get(&store, &format!("/v1/escrow/address/{dave}"))
+    assert_eq!(amounts(&carols.amounts), [(NATIVE, 100), (USDC, 7)]);
+    let daves: AddressAmounts = suite
+        .get(&format!("/v1/escrow/refundable/{dave}"))
         .await
         .answer();
-    assert_eq!(amounts(&daves.refundable), [(NATIVE, 50)]);
-    let erins: AddressBalances = get(&store, &format!("/v1/escrow/address/{erin}"))
+    assert_eq!(amounts(&daves.amounts), [(NATIVE, 50)]);
+    let erins: AddressAmounts = suite
+        .get(&format!("/v1/escrow/refundable/{erin}"))
         .await
         .answer();
-    assert!(erins.refundable.is_empty() && erins.claimable.is_empty());
+    assert!(erins.amounts.is_empty());
 
-    // Dave takes his back, paid to another wallet of his.
-    apply(
-        &store,
-        4,
-        NamesEvent::Refunded {
-            handle_node: bob_node,
-            token: NATIVE,
-            refund_to: dave,
-            recipient: dave_wallet,
-            round: U256::ZERO,
-            released: U256::from(50u64),
-            received: U256::from(50u64),
-        },
-    )
-    .await;
-    let daves: AddressBalances = get(&store, &format!("/v1/escrow/address/{dave}"))
+    // Dave takes his back, paid to another address of his, through a token
+    // that keeps a fee on transfer: the books release what the escrow sent.
+    suite
+        .apply(
+            4,
+            NamesEvent::Escrow(EscrowEvent::Refunded {
+                handle_node: bob_node,
+                token: NATIVE,
+                refund_to: dave,
+                recipient: dave_wallet,
+                round: U256::ZERO,
+                released: U256::from(50u64),
+                received: U256::from(49u64),
+            }),
+        )
+        .await;
+    let daves: AddressAmounts = suite
+        .get(&format!("/v1/escrow/refundable/{dave}"))
         .await
         .answer();
-    assert!(daves.refundable.is_empty());
+    assert!(daves.amounts.is_empty());
 
     // Bob binds @bob_1: what is held is his to claim, under the handle's text.
-    apply(&store, 5, bind(bob, "222", "bob_1", 5_000)).await;
-    let bobs: AddressBalances = get(&store, &format!("/v1/escrow/address/{bob}"))
+    suite.apply(5, bind(bob, "222", "bob_1", 5_000)).await;
+    let bobs: AddressAmounts = suite
+        .get(&format!("/v1/escrow/claimable/{bob}"))
         .await
         .answer();
-    assert_eq!(amounts(&bobs.claimable), [(USDC, 7), (NATIVE, 100)]);
+    assert_eq!(amounts(&bobs.amounts), [(NATIVE, 100), (USDC, 7)]);
     assert!(bobs
-        .claimable
+        .amounts
         .iter()
         .all(|a| a.holder == Some(bob) && a.handle.handle.as_deref() == Some("bob_1")));
+    // The refund released Dave's 50 from the books, not the 49 he received.
+    let history: HandleHistory = suite.get("/v1/history/handle/x/bob_1").await.answer();
+    assert_eq!(owed(&history.entries), by_token(&bobs.amounts));
     // Carol may still refund until he claims: the race is the contract's.
-    let carols: AddressBalances = get(&store, &format!("/v1/escrow/address/{carol}"))
+    let carols: AddressAmounts = suite
+        .get(&format!("/v1/escrow/refundable/{carol}"))
         .await
         .answer();
-    assert_eq!(amounts(&carols.refundable), [(USDC, 7), (NATIVE, 100)]);
-    assert!(carols.refundable.iter().all(|a| a.holder == Some(bob)));
+    assert_eq!(amounts(&carols.amounts), [(NATIVE, 100), (USDC, 7)]);
+    assert!(carols.amounts.iter().all(|a| a.holder == Some(bob)));
 
     // Bob claims the native coin: that round closes, and with it Carol's
     // refund of it. The USDC slot is untouched.
-    apply(
-        &store,
-        6,
-        NamesEvent::Claimed {
-            handle_node: bob_node,
-            token: NATIVE,
-            claimer: bob,
-            recipient: bob,
-            round: U256::ZERO,
-            released: U256::from(100u64),
-            received: U256::from(100u64),
-        },
-    )
-    .await;
-    let bobs: AddressBalances = get(&store, &format!("/v1/escrow/address/{bob}"))
+    suite
+        .apply(
+            6,
+            NamesEvent::Escrow(EscrowEvent::Claimed {
+                handle_node: bob_node,
+                token: NATIVE,
+                claimer: bob,
+                recipient: bob,
+                round: U256::ZERO,
+                released: U256::from(100u64),
+                received: U256::from(97u64),
+            }),
+        )
+        .await;
+    let bobs: AddressAmounts = suite
+        .get(&format!("/v1/escrow/claimable/{bob}"))
         .await
         .answer();
-    assert_eq!(amounts(&bobs.claimable), [(USDC, 7)]);
-    let carols: AddressBalances = get(&store, &format!("/v1/escrow/address/{carol}"))
+    assert_eq!(amounts(&bobs.amounts), [(USDC, 7)]);
+    let carols: AddressAmounts = suite
+        .get(&format!("/v1/escrow/refundable/{carol}"))
         .await
         .answer();
-    assert_eq!(amounts(&carols.refundable), [(USDC, 7)]);
+    assert_eq!(amounts(&carols.amounts), [(USDC, 7)]);
 
     // A held handle is paid straight through: nothing escrows.
-    apply(
-        &store,
-        7,
-        NamesEvent::Forwarded {
-            handle_node: bob_node,
-            token: NATIVE,
-            depositor: carol,
-            holder: bob,
-            platform_id: x(),
-            amount: U256::from(5u64),
-            received: U256::from(5u64),
-        },
-    )
-    .await;
-    let held: HandleBalances = get(&store, "/v1/escrow/handle/x/bob_1").await.answer();
-    assert_eq!(amounts(&held.held), [(USDC, 7)]);
-    assert_eq!(held.held[0].round, U256::ZERO);
+    suite
+        .apply(
+            7,
+            NamesEvent::Escrow(EscrowEvent::Forwarded {
+                handle_node: bob_node,
+                token: NATIVE,
+                depositor: carol,
+                holder: bob,
+                platform_id: KnownPlatform::X.id(),
+                amount: U256::from(5u64),
+                received: U256::from(5u64),
+            }),
+        )
+        .await;
+
+    // The books balance: per token, the escrow holds what was deposited less
+    // what claims and refunds released.
+    let history: HandleHistory = suite.get("/v1/history/handle/x/bob_1").await.answer();
+    let held: HandleAmounts = suite.get("/v1/escrow/handle/x/bob_1").await.answer();
+    assert_eq!(owed(&history.entries), by_token(&held.amounts));
+    assert_eq!(amounts(&held.amounts), [(USDC, 7)]);
+    assert_eq!(held.amounts[0].round, U256::ZERO);
 
     // The handle's history spans both sides of the bind, newest first.
-    let history: HandleHistory = get(&store, "/v1/history/handle/x/bob_1").await.answer();
-    assert_eq!(
-        kinds(&history.entries),
-        [
-            "forwarded",
-            "claimed",
-            "identity_bound",
-            "refunded",
-            "deposited",
-            "deposited",
-            "deposited"
-        ]
+    assert!(
+        matches!(
+            events(&history.entries)[..],
+            [
+                HistoryEvent::Forwarded { .. },
+                HistoryEvent::Claimed { .. },
+                HistoryEvent::IdentityBound { .. },
+                HistoryEvent::Refunded { .. },
+                HistoryEvent::Deposited { .. },
+                HistoryEvent::Deposited { .. },
+                HistoryEvent::Deposited { .. },
+            ]
+        ),
+        "{history:?}"
     );
     assert!(history.next.is_none());
-    assert!(history
-        .entries
-        .iter()
-        .all(
-            |e| e.handle.as_ref().map(|h| h.handle_node) == Some(bob_node)
-                && e.handle.as_ref().and_then(|h| h.handle.as_deref()) == Some("bob_1")
-                && e.roles.is_empty()
-        ));
+    assert!(history.entries.iter().all(|e| {
+        let handle = e.handle.as_ref();
+        handle.map(|h| h.handle_node) == Some(bob_node)
+            && handle.and_then(|h| h.handle.as_deref()) == Some("bob_1")
+            && e.roles.is_empty()
+    }));
     assert_eq!(history.entries[0].block_time, 1_700_000_007);
 
     // Each address's history: what it did and was paid, with its parts.
-    let history: AddressHistory = get(&store, &format!("/v1/history/address/{bob}"))
+    let history: AddressHistory = suite
+        .get(&format!("/v1/history/address/{bob}"))
         .await
         .answer();
-    assert_eq!(
-        kinds(&history.entries),
-        ["forwarded", "claimed", "identity_bound"]
-    );
+    assert!(matches!(
+        events(&history.entries)[..],
+        [
+            HistoryEvent::Forwarded { .. },
+            HistoryEvent::Claimed { .. },
+            HistoryEvent::IdentityBound { .. },
+        ]
+    ));
     assert_eq!(history.entries[0].roles, [Role::Holder]);
     assert_eq!(history.entries[1].roles, [Role::Claimer, Role::Recipient]);
     // Carol sees Bob's claim take her native deposit, the one she could no
     // longer refund after it; Dave had refunded his before it.
-    let history: AddressHistory = get(&store, &format!("/v1/history/address/{carol}"))
+    let history: AddressHistory = suite
+        .get(&format!("/v1/history/address/{carol}"))
         .await
         .answer();
-    assert_eq!(
-        kinds(&history.entries),
-        ["forwarded", "claimed", "deposited", "deposited"]
-    );
+    assert!(matches!(
+        events(&history.entries)[..],
+        [
+            HistoryEvent::Forwarded { .. },
+            HistoryEvent::Claimed { .. },
+            HistoryEvent::Deposited { .. },
+            HistoryEvent::Deposited { .. },
+        ]
+    ));
     assert_eq!(history.entries[0].roles, [Role::Depositor]);
     assert_eq!(history.entries[1].roles, [Role::RefundTo]);
     assert_eq!(history.entries[2].roles, [Role::Depositor, Role::RefundTo]);
-    let history: AddressHistory = get(&store, &format!("/v1/history/address/{dave}"))
+    let history: AddressHistory = suite
+        .get(&format!("/v1/history/address/{dave}"))
         .await
         .answer();
-    assert_eq!(kinds(&history.entries), ["refunded", "deposited"]);
+    assert!(matches!(
+        events(&history.entries)[..],
+        [
+            HistoryEvent::Refunded { .. },
+            HistoryEvent::Deposited { .. }
+        ]
+    ));
     assert_eq!(history.entries[0].roles, [Role::RefundTo]);
     assert_eq!(history.entries[1].roles, [Role::RefundTo]);
-    let history: AddressHistory =
-        get(&store, &format!("/v1/history/address/{dave_wallet}"))
-            .await
-            .answer();
+    let history: AddressHistory = suite
+        .get(&format!("/v1/history/address/{dave_wallet}"))
+        .await
+        .answer();
     assert_eq!(history.entries[0].roles, [Role::Recipient]);
-    let HistoryEvent::Refunded { received, .. } = &history.entries[0].event else {
-        panic!("{:?}", history.entries[0]);
-    };
-    assert_eq!(*received, U256::from(50u64));
-    let history: AddressHistory = get(&store, &format!("/v1/history/address/{erin}"))
+    assert!(matches!(
+        history.entries[0].event,
+        HistoryEvent::Refunded { received, .. } if received == U256::from(49u64)
+    ));
+    let history: AddressHistory = suite
+        .get(&format!("/v1/history/address/{erin}"))
         .await
         .answer();
     assert_eq!(history.entries[0].roles, [Role::Depositor]);
 
     // Only USDC is still waiting anywhere on this chain.
-    let unclaimed: Unclaimed = get(&store, "/v1/escrow/unclaimed").await.answer();
-    assert_eq!(amounts(&unclaimed.slots), [(USDC, 7)]);
-    drop(guard);
+    let unclaimed: Unclaimed = suite.get("/v1/escrow/unclaimed").await.answer();
+    assert_eq!(amounts(&unclaimed.amounts), [(USDC, 7)]);
+    suite.done();
 }
 
-#[tokio::test]
-async fn the_unclaimed_list_groups_by_token_and_ranks_by_amount() {
-    let Some((store, _pool, guard)) = test_store().await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+/// Six slots over three tokens, one deposit each.
+async fn six_unclaimed_slots(suite: &Suite) {
     let payer = addr(0xC0);
     let deposits = [
         ("h1", USDC, 5),
@@ -404,20 +394,26 @@ async fn the_unclaimed_list_groups_by_token_and_ranks_by_amount() {
         ("h5", USDC, 60),
         ("h6", DAI, 1),
     ];
-    for (block, (handle, token, amount)) in deposits.into_iter().enumerate() {
-        apply(
-            &store,
-            block as u64 + 1,
-            deposited(handle, token, payer, payer, 0, amount),
-        )
-        .await;
+    for (block, (handle, token, amount)) in (1u64..).zip(deposits) {
+        suite
+            .apply(block, deposited(handle, token, payer, payer, amount))
+            .await;
     }
+}
+
+#[tokio::test]
+async fn the_unclaimed_list_runs_by_token_then_by_amount() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    six_unclaimed_slots(&suite).await;
 
     // Token by token, descending, each token's largest amount first: the
     // native coin's address sorts above DAI's, DAI's above USDC's.
-    let all: Unclaimed = get(&store, "/v1/escrow/unclaimed").await.answer();
+    let all: Unclaimed = suite.get("/v1/escrow/unclaimed").await.answer();
     assert_eq!(
-        amounts(&all.slots),
+        amounts(&all.amounts),
         [
             (NATIVE, 3),
             (DAI, 40),
@@ -428,68 +424,127 @@ async fn the_unclaimed_list_groups_by_token_and_ranks_by_amount() {
         ]
     );
     assert!(all.next.is_none());
+    suite.done();
+}
 
-    let usdc: Unclaimed = get(&store, &format!("/v1/escrow/unclaimed?token={USDC}"))
+#[tokio::test]
+async fn the_unclaimed_list_narrows_to_one_token() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    six_unclaimed_slots(&suite).await;
+
+    let usdc: Unclaimed = suite
+        .get(&format!("/v1/escrow/unclaimed?token={USDC}"))
         .await
         .answer();
     assert_eq!(usdc.token, Some(USDC));
-    assert_eq!(amounts(&usdc.slots), [(USDC, 900), (USDC, 60), (USDC, 5)]);
+    assert_eq!(amounts(&usdc.amounts), [(USDC, 900), (USDC, 60), (USDC, 5)]);
+    suite.done();
+}
 
-    // A cursor resumes after the last slot served, and the last page hands
-    // out none.
-    let first: Unclaimed = get(&store, "/v1/escrow/unclaimed?limit=4").await.answer();
-    assert_eq!(
-        amounts(&first.slots),
-        [(NATIVE, 3), (DAI, 40), (DAI, 1), (USDC, 900)]
-    );
-    let next = first.next.expect("two slots remain");
-    let rest: Unclaimed = get(
-        &store,
-        &format!("/v1/escrow/unclaimed?limit=4&before={next}"),
-    )
-    .await
-    .answer();
-    assert_eq!(amounts(&rest.slots), [(USDC, 60), (USDC, 5)]);
-    assert!(rest.next.is_none());
+/// The key each amount sits under: chain, node and token.
+fn keys(list: &[EscrowAmount]) -> Vec<(i64, B256, Address)> {
+    list.iter()
+        .map(|a| (a.chain_id, a.handle.handle_node, a.token))
+        .collect()
+}
 
-    let github: Unclaimed = get(&store, "/v1/escrow/unclaimed?platform=github")
-        .await
-        .answer();
-    assert!(github.slots.is_empty());
-    drop(guard);
+/// Every page of a list one row at a time, following each page's cursor
+/// until the last hands out none: the keys in the order served.
+async fn every_page<T: DeserializeOwned + Debug>(
+    suite: &Suite,
+    path: &str,
+    page: impl Fn(T) -> (Vec<EscrowAmount>, Option<String>),
+) -> Vec<(i64, B256, Address)> {
+    let mut seen = Vec::new();
+    let mut before = None;
+    loop {
+        let query = match &before {
+            Some(cursor) => format!("{path}?limit=1&before={cursor}"),
+            None => format!("{path}?limit=1"),
+        };
+        let (amounts, next) = page(suite.get(&query).await.answer());
+        seen.extend(keys(&amounts));
+        match next {
+            Some(next) => before = Some(next),
+            None => return seen,
+        }
+    }
+}
+
+#[tokio::test]
+async fn every_escrow_list_pages_by_cursor_without_gaps_or_repeats() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let (bob, carol) = (addr(0xB0), addr(0xC0));
+    // Two handles Bob will hold and one nobody does, three tokens each.
+    for (block, handle) in (1u64..).step_by(3).zip(["p1", "p2", "p3"]) {
+        for (offset, token) in (0u64..).zip([NATIVE, USDC, DAI]) {
+            suite
+                .apply(block + offset, deposited(handle, token, carol, carol, 10))
+                .await;
+        }
+    }
+    suite.apply(20, bind(bob, "1", "p1", 1_000)).await;
+    suite.apply(21, bind(bob, "2", "p2", 1_000)).await;
+
+    let path = format!("/v1/escrow/claimable/{bob}");
+    let whole: AddressAmounts = suite.get(&path).await.answer();
+    let paged = every_page(&suite, &path, |p: AddressAmounts| (p.amounts, p.next)).await;
+    assert_eq!((paged.len(), paged), (6, keys(&whole.amounts)));
+
+    let path = format!("/v1/escrow/refundable/{carol}");
+    let whole: AddressAmounts = suite.get(&path).await.answer();
+    let paged = every_page(&suite, &path, |p: AddressAmounts| (p.amounts, p.next)).await;
+    assert_eq!((paged.len(), paged), (9, keys(&whole.amounts)));
+
+    let path = format!("/v1/escrow/node/{}", node("p3"));
+    let whole: HandleAmounts = suite.get(&path).await.answer();
+    let paged = every_page(&suite, &path, |p: HandleAmounts| (p.amounts, p.next)).await;
+    assert_eq!((paged.len(), paged), (3, keys(&whole.amounts)));
+
+    let path = "/v1/escrow/unclaimed";
+    let whole: Unclaimed = suite.get(path).await.answer();
+    let paged = every_page(&suite, path, |p: Unclaimed| (p.amounts, p.next)).await;
+    assert_eq!((paged.len(), paged), (9, keys(&whole.amounts)));
+    suite.done();
 }
 
 #[tokio::test]
 async fn a_history_pages_by_cursor_without_gaps_or_repeats() {
-    let Some((store, _pool, guard)) = test_store().await else {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
     let payer = addr(0xC0);
     // Two events in one transaction and three alone: five entries, two of
     // them sharing a block.
-    apply_tx(
-        &store,
-        1,
-        vec![
-            deposited("p1", NATIVE, payer, payer, 0, 1),
-            deposited("p2", NATIVE, payer, payer, 0, 2),
-        ],
-    )
-    .await;
-    for block in 2..=4 {
-        apply(
-            &store,
-            block,
-            deposited(&format!("p{}", block + 1), NATIVE, payer, payer, 0, block),
+    suite
+        .apply_tx(
+            1,
+            vec![
+                deposited("p1", NATIVE, payer, payer, 1),
+                deposited("p2", NATIVE, payer, payer, 2),
+            ],
         )
         .await;
+    for block in 2..=4 {
+        suite
+            .apply(
+                block,
+                deposited(&format!("p{}", block + 1), NATIVE, payer, payer, block),
+            )
+            .await;
     }
 
     let mut seen = Vec::new();
     let mut path = format!("/v1/history/address/{payer}?limit=2");
     loop {
-        let page: AddressHistory = get(&store, &path).await.answer();
+        let page: AddressHistory = suite.get(&path).await.answer();
         assert!(page.entries.len() <= 2);
         seen.extend(page.entries.iter().map(|e| (e.block_number, e.log_index)));
         match page.next {
@@ -500,45 +555,39 @@ async fn a_history_pages_by_cursor_without_gaps_or_repeats() {
         }
     }
     assert_eq!(seen, [(4, 0), (3, 0), (2, 0), (1, 1), (1, 0)]);
-
-    let refusal = get::<AddressHistory>(
-        &store,
-        &format!("/v1/history/address/{payer}?before=yesterday"),
-    )
-    .await
-    .refusal();
-    assert_eq!(
-        refusal,
-        (StatusCode::BAD_REQUEST, "invalid_cursor".to_string())
-    );
-    drop(guard);
+    suite.done();
 }
 
 #[tokio::test]
 async fn a_bind_names_what_it_took_and_from_whom() {
-    let Some((store, _pool, guard)) = test_store().await else {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
     let (alice, bob, carol, dave) = (addr(0xA1), addr(0xB2), addr(0xC3), addr(0xD4));
 
-    // The platform recycled @alice to another account, which Bob proves.
-    apply(&store, 1, bind(alice, "111", "kim", 1_000)).await;
-    apply(&store, 2, bind(bob, "222", "kim", 2_000)).await;
-    // Carol's account moves to Dave's wallet, handle and all.
-    apply(&store, 3, bind(carol, "333", "carol", 3_000)).await;
-    apply(&store, 4, bind(dave, "333", "carol", 4_000)).await;
+    // The platform recycled @kim to another account, which Bob proves.
+    suite.apply(1, bind(alice, "111", "kim", 1_000)).await;
+    suite.apply(2, bind(bob, "222", "kim", 2_000)).await;
+    // Carol's account moves to Dave's address, handle and all.
+    suite.apply(3, bind(carol, "333", "carol", 3_000)).await;
+    suite.apply(4, bind(dave, "333", "carol", 4_000)).await;
 
-    let history: AddressHistory = get(&store, &format!("/v1/history/address/{alice}"))
+    let history: AddressHistory = suite
+        .get(&format!("/v1/history/address/{alice}"))
         .await
         .answer();
-    assert_eq!(
-        kinds(&history.entries),
-        ["identity_bound", "identity_bound"]
-    );
+    assert!(matches!(
+        events(&history.entries)[..],
+        [
+            HistoryEvent::IdentityBound { .. },
+            HistoryEvent::IdentityBound { .. },
+        ]
+    ));
     assert_eq!(history.entries[0].roles, [Role::PreviousHandleHolder]);
     assert_eq!(history.entries[1].roles, [Role::Holder]);
-    let history: AddressHistory = get(&store, &format!("/v1/history/address/{carol}"))
+    let history: AddressHistory = suite
+        .get(&format!("/v1/history/address/{carol}"))
         .await
         .answer();
     assert_eq!(
@@ -546,139 +595,151 @@ async fn a_bind_names_what_it_took_and_from_whom() {
         [Role::PreviousHandleHolder, Role::PreviousIdHolder]
     );
     // The new holder's own bind names only it.
-    let history: AddressHistory = get(&store, &format!("/v1/history/address/{bob}"))
+    let history: AddressHistory = suite
+        .get(&format!("/v1/history/address/{bob}"))
         .await
         .answer();
     assert_eq!(history.entries[0].roles, [Role::Holder]);
-    drop(guard);
+    suite.done();
 }
 
 #[tokio::test]
-async fn a_retired_handle_is_in_the_history_of_the_wallet_that_held_it() {
-    let Some((store, _pool, guard)) = test_store().await else {
+async fn a_retired_handle_is_in_the_history_of_the_address_that_held_it() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
     let (alice, bob) = (addr(0xA1), addr(0xB2));
     let retire = |handle: &str, holder: Address| NamesEvent::HandleRetired {
-        platform_id: x(),
+        platform_id: KnownPlatform::X.id(),
         handle_node: node(handle),
         holder,
     };
     // Alice renames @kim1 to @kim2: her own bind retires her own handle.
-    apply(&store, 1, bind(alice, "777", "kim1", 1_000)).await;
-    apply_tx(
-        &store,
-        2,
-        vec![retire("kim1", alice), bind(alice, "777", "kim2", 2_000)],
-    )
-    .await;
-    // The account moves to Bob's wallet and renames to @kim3 in one bind:
+    suite.apply(1, bind(alice, "777", "kim1", 1_000)).await;
+    suite
+        .apply_tx(
+            2,
+            vec![retire("kim1", alice), bind(alice, "777", "kim2", 2_000)],
+        )
+        .await;
+    // The account moves to Bob's address and renames to @kim3 in one bind:
     // the retirement names Bob, but @kim2 was Alice's.
-    apply_tx(
-        &store,
-        3,
-        vec![retire("kim2", bob), bind(bob, "777", "kim3", 3_000)],
-    )
-    .await;
+    suite
+        .apply_tx(
+            3,
+            vec![retire("kim2", bob), bind(bob, "777", "kim3", 3_000)],
+        )
+        .await;
 
-    let history: AddressHistory = get(&store, &format!("/v1/history/address/{alice}"))
+    let history: AddressHistory = suite
+        .get(&format!("/v1/history/address/{alice}"))
         .await
         .answer();
-    let entries: Vec<(&str, &[Role], Option<&str>)> = kinds(&history.entries)
-        .into_iter()
-        .zip(&history.entries)
-        .map(|(kind, e)| {
+    let entries: Vec<(&[Role], Option<&str>)> = history
+        .entries
+        .iter()
+        .map(|e| {
             (
-                kind,
                 e.roles.as_slice(),
                 e.handle.as_ref().and_then(|h| h.handle.as_deref()),
             )
         })
         .collect();
+    assert!(matches!(
+        events(&history.entries)[..],
+        [
+            HistoryEvent::IdentityBound { .. },
+            HistoryEvent::HandleRetired { .. },
+            HistoryEvent::IdentityBound { .. },
+            HistoryEvent::HandleRetired { .. },
+            HistoryEvent::IdentityBound { .. },
+        ]
+    ));
     assert_eq!(
         entries,
         [
-            (
-                "identity_bound",
-                &[Role::PreviousIdHolder][..],
-                Some("kim3")
-            ),
-            (
-                "handle_retired",
-                &[Role::PreviousHandleHolder][..],
-                Some("kim2")
-            ),
-            ("identity_bound", &[Role::Holder][..], Some("kim2")),
-            ("handle_retired", &[Role::Holder][..], Some("kim1")),
-            ("identity_bound", &[Role::Holder][..], Some("kim1")),
+            (&[Role::PreviousIdHolder][..], Some("kim3")),
+            (&[Role::PreviousHandleHolder][..], Some("kim2")),
+            (&[Role::Holder][..], Some("kim2")),
+            (&[Role::Holder][..], Some("kim1")),
+            (&[Role::Holder][..], Some("kim1")),
         ]
     );
     // Bob never held @kim2: his history is his own bind.
-    let history: AddressHistory = get(&store, &format!("/v1/history/address/{bob}"))
+    let history: AddressHistory = suite
+        .get(&format!("/v1/history/address/{bob}"))
         .await
         .answer();
-    assert_eq!(kinds(&history.entries), ["identity_bound"]);
-    drop(guard);
+    assert!(matches!(
+        events(&history.entries)[..],
+        [HistoryEvent::IdentityBound { .. }]
+    ));
+    suite.done();
 }
 
 #[tokio::test]
 async fn a_bind_fee_is_in_the_payers_history_under_the_handle_it_bought() {
-    let Some((store, _pool, guard)) = test_store().await else {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
     let (alice, app) = (addr(0xA1), addr(0xFE));
     let digest = B256::repeat_byte(0xD1);
     // One bind's transaction: the binding, its ceremony, its fee.
-    apply_tx(
-        &store,
-        1,
-        vec![
-            bind(alice, "111", "ann_1", 1_000),
-            NamesEvent::CeremonyBound {
-                authorization_digest: digest,
-                holder: alice,
-                platform_id: x(),
-                client_identifier: Bytes::from_static(b"app"),
-            },
-            NamesEvent::BindFeePaid {
-                authorization_digest: digest,
-                receiver: app,
-                amount: U256::from(1_000u64),
-            },
-        ],
-    )
-    .await;
+    suite
+        .apply_tx(
+            1,
+            vec![
+                bind(alice, "111", "ann_1", 1_000),
+                NamesEvent::CeremonyBound {
+                    authorization_digest: digest,
+                    holder: alice,
+                    platform_id: KnownPlatform::X.id(),
+                    client_identifier: Bytes::from_static(b"app"),
+                },
+                NamesEvent::BindFeePaid {
+                    authorization_digest: digest,
+                    receiver: app,
+                    amount: U256::from(1_000u64),
+                },
+            ],
+        )
+        .await;
 
-    let history: AddressHistory = get(&store, &format!("/v1/history/address/{alice}"))
+    let history: AddressHistory = suite
+        .get(&format!("/v1/history/address/{alice}"))
         .await
         .answer();
-    assert_eq!(
-        kinds(&history.entries),
-        ["bind_fee_paid", "ceremony_bound", "identity_bound"]
-    );
+    assert!(matches!(
+        events(&history.entries)[..],
+        [
+            HistoryEvent::BindFeePaid { amount, .. },
+            HistoryEvent::CeremonyBound { .. },
+            HistoryEvent::IdentityBound { .. },
+        ] if *amount == U256::from(1_000u64)
+    ));
     assert!(history.entries.iter().all(|e| e.roles == [Role::Holder]
         && e.handle.as_ref().and_then(|h| h.handle.as_deref()) == Some("ann_1")));
-    let HistoryEvent::BindFeePaid { amount, .. } = &history.entries[0].event else {
-        panic!("{:?}", history.entries[0]);
-    };
-    assert_eq!(*amount, U256::from(1_000u64));
 
-    let history: AddressHistory = get(&store, &format!("/v1/history/address/{app}"))
+    let history: AddressHistory = suite
+        .get(&format!("/v1/history/address/{app}"))
         .await
         .answer();
-    assert_eq!(kinds(&history.entries), ["bind_fee_paid"]);
+    assert!(matches!(
+        events(&history.entries)[..],
+        [HistoryEvent::BindFeePaid { .. }]
+    ));
     assert_eq!(history.entries[0].roles, [Role::FeeReceiver]);
 
-    let history: HandleHistory = get(&store, "/v1/history/handle/x/ann_1").await.answer();
+    let history: HandleHistory = suite.get("/v1/history/handle/x/ann_1").await.answer();
     assert_eq!(history.entries.len(), 3);
-    drop(guard);
+    suite.done();
 }
 
 #[tokio::test]
 async fn an_unpublish_concerns_the_handle_it_withdrew() {
-    let Some((store, _pool, guard)) = test_store().await else {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -687,118 +748,114 @@ async fn an_unpublish_concerns_the_handle_it_withdrew() {
     if let NamesEvent::IdentityBound { published, .. } = &mut published {
         *published = true;
     }
-    apply(&store, 1, published).await;
-    let unpublish = NamesEvent::HandleUnpublished {
-        holder: alice,
-        platform_id: x(),
-    };
-    apply(&store, 2, unpublish.clone()).await;
-    // Nothing is published now: the contract accepts the call, and it
-    // concerns no handle.
-    apply(&store, 3, unpublish).await;
+    suite.apply(1, published).await;
+    suite
+        .apply(
+            2,
+            NamesEvent::HandleUnpublished {
+                holder: alice,
+                platform_id: KnownPlatform::X.id(),
+            },
+        )
+        .await;
 
-    let history: HandleHistory = get(&store, "/v1/history/handle/x/ann_1").await.answer();
-    assert_eq!(
-        kinds(&history.entries),
-        ["handle_unpublished", "identity_bound"]
-    );
-    let history: AddressHistory = get(&store, &format!("/v1/history/address/{alice}"))
-        .await
-        .answer();
-    assert_eq!(
-        kinds(&history.entries),
-        ["handle_unpublished", "handle_unpublished", "identity_bound"]
-    );
-    assert!(history.entries[0].handle.is_none());
-    assert!(history.entries[1].handle.is_some());
-    drop(guard);
+    let history: HandleHistory = suite.get("/v1/history/handle/x/ann_1").await.answer();
+    assert!(matches!(
+        events(&history.entries)[..],
+        [
+            HistoryEvent::HandleUnpublished { .. },
+            HistoryEvent::IdentityBound { .. },
+        ]
+    ));
+    suite.done();
 }
 
 #[tokio::test]
-async fn the_escrow_routes_name_what_they_refuse() {
-    let Some((store, _pool, guard)) = test_store().await else {
+async fn an_unpublish_with_nothing_published_concerns_no_handle() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    // Before the first window: not synced, not empty.
-    let refusal = get::<Unclaimed>(&store, "/v1/escrow/unclaimed")
+    let alice = addr(0xA1);
+    suite.apply(1, bind(alice, "111", "ann_1", 1_000)).await;
+    suite
+        .apply(
+            2,
+            NamesEvent::HandleUnpublished {
+                holder: alice,
+                platform_id: KnownPlatform::X.id(),
+            },
+        )
+        .await;
+
+    let history: AddressHistory = suite
+        .get(&format!("/v1/history/address/{alice}"))
+        .await
+        .answer();
+    assert!(matches!(
+        events(&history.entries)[..],
+        [
+            HistoryEvent::HandleUnpublished { .. },
+            HistoryEvent::IdentityBound { .. },
+        ]
+    ));
+    assert!(history.entries[0].handle.is_none());
+    suite.done();
+}
+
+#[tokio::test]
+async fn an_escrow_list_before_the_first_window_is_not_synced() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let refusal = suite
+        .get::<Unclaimed>("/v1/escrow/unclaimed")
         .await
         .refusal();
     assert_eq!(
         refusal,
         (StatusCode::SERVICE_UNAVAILABLE, "not_synced".to_string())
     );
-
-    apply(
-        &store,
-        1,
-        NamesEvent::PlatformConfigured { platform_id: x() },
-    )
-    .await;
-    let bad = |code: &str| (StatusCode::BAD_REQUEST, code.to_string());
-    assert_eq!(
-        refused::<HandleBalances>(&store, "/v1/escrow/node/0x1234").await,
-        bad("invalid_node")
-    );
-    assert_eq!(
-        refused::<HandleHistory>(&store, "/v1/history/node/alice").await,
-        bad("invalid_node")
-    );
-    assert_eq!(
-        refused::<Unclaimed>(&store, "/v1/escrow/unclaimed?token=usdc").await,
-        bad("invalid_address")
-    );
-    assert_eq!(
-        refused::<AddressBalances>(&store, "/v1/escrow/address/0xnope").await,
-        bad("invalid_address")
-    );
-    assert_eq!(
-        refused::<HandleHistory>(&store, "/v1/history/handle/x/no%20spaces").await,
-        (StatusCode::NOT_FOUND, "handle_impossible".to_string())
-    );
-    assert_eq!(
-        refused::<HandleBalances>(&store, "/v1/escrow/handle/myspace/tom").await,
-        bad("invalid_platform")
-    );
-    assert_eq!(
-        refused::<Unclaimed>(&store, "/v1/escrow/unclaimed?limit=ten").await,
-        bad("invalid_argument")
-    );
-    assert_eq!(
-        refused::<Unclaimed>(&store, "/v1/escrow/unclaimed?before=nope").await,
-        bad("invalid_cursor")
-    );
-    assert_eq!(
-        refused::<HandleHistory>(&store, "/v1/history/handle/x/nobody?limit=1.5").await,
-        bad("invalid_argument")
-    );
-
-    // Nothing held is an answer, not an error.
-    let held: HandleBalances = get(&store, "/v1/escrow/handle/x/nobody").await.answer();
-    assert!(held.held.is_empty());
-    let history: HandleHistory =
-        get(&store, "/v1/history/handle/x/nobody").await.answer();
-    assert!(history.entries.is_empty() && history.next.is_none());
-    drop(guard);
+    suite.done();
 }
 
 #[tokio::test]
-async fn the_status_names_the_escrow_and_a_new_one_replays_the_chain() {
-    let Some((store, pool, guard)) = test_store().await else {
+async fn a_handle_nothing_was_sent_to_holds_nothing() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let registry = addr(0x11);
-    let (escrow, other_escrow) = (addr(0x22), addr(0x33));
-    let writer = store.acquire_writer().await.expect("lease");
-    store
+    suite
+        .apply(
+            1,
+            NamesEvent::PlatformConfigured {
+                platform_id: KnownPlatform::X.id(),
+            },
+        )
+        .await;
+    let held: HandleAmounts = suite.get("/v1/escrow/handle/x/nobody").await.answer();
+    assert!(held.amounts.is_empty() && held.next.is_none());
+    let history: HandleHistory = suite.get("/v1/history/handle/x/nobody").await.answer();
+    assert!(history.entries.is_empty() && history.next.is_none());
+    suite.done();
+}
+
+#[tokio::test]
+async fn the_status_names_the_escrow_the_chain_was_indexed_from() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let (registry, escrow) = (addr(0x11), addr(0x22));
+    let writer = suite.store.acquire_writer().await.expect("lease");
+    suite
+        .store
         .prepare(&writer, registry, Some(escrow))
         .await
         .expect("prepare");
-    let payer = addr(0xC0);
-    apply(&store, 1, deposited("h1", NATIVE, payer, payer, 0, 1)).await;
 
-    let status: Status = common::get(&store, "/v1/status").await.answer();
+    let status: Status = common::get(&suite.store, "/v1/status").await.answer();
     let chain = status
         .chains
         .iter()
@@ -806,33 +863,52 @@ async fn the_status_names_the_escrow_and_a_new_one_replays_the_chain() {
         .unwrap_or_else(|| panic!("chain {CHAIN} is listed: {status:?}"));
     assert_eq!(chain.escrow, Some(escrow));
     assert_eq!(chain.contract, Some(registry));
+    writer.release().await.expect("release");
+    suite.done();
+}
 
-    // The same escrow keeps everything; another one clears the chain.
-    store
+#[tokio::test]
+async fn another_escrow_replays_the_chain_and_the_same_one_keeps_it() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let registry = addr(0x11);
+    let (escrow, other_escrow) = (addr(0x22), addr(0x33));
+    let writer = suite.store.acquire_writer().await.expect("lease");
+    suite
+        .store
+        .prepare(&writer, registry, Some(escrow))
+        .await
+        .expect("prepare");
+    let payer = addr(0xC0);
+    suite
+        .apply(1, deposited("h1", NATIVE, payer, payer, 1))
+        .await;
+
+    suite
+        .store
         .prepare(&writer, registry, Some(escrow))
         .await
         .expect("prepare again");
-    let rows = |pool: PgPool| async move {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM names.escrow_held WHERE chain_id = $1",
-        )
-        .bind(CHAIN)
-        .fetch_one(&pool)
-        .await
-        .expect("count")
-    };
-    assert_eq!(rows(pool.clone()).await, 1);
-    store
+    let kept: Unclaimed = suite.get("/v1/escrow/unclaimed").await.answer();
+    assert_eq!(amounts(&kept.amounts), [(NATIVE, 1)]);
+
+    // Another escrow clears the chain, cursor included: nothing is served
+    // until the replay commits its first window.
+    suite
+        .store
         .prepare(&writer, registry, Some(other_escrow))
         .await
         .expect("prepare another");
-    assert_eq!(rows(pool.clone()).await, 0);
-    assert_eq!(store.escrow().await.expect("escrow"), Some(other_escrow));
-    store
-        .prepare(&writer, registry, None)
+    let refusal = suite
+        .get::<Unclaimed>("/v1/escrow/unclaimed")
         .await
-        .expect("prepare none");
-    assert_eq!(store.escrow().await.expect("escrow"), None);
+        .refusal();
+    assert_eq!(
+        refusal,
+        (StatusCode::SERVICE_UNAVAILABLE, "not_synced".to_string())
+    );
     writer.release().await.expect("release");
-    drop(guard);
+    suite.done();
 }

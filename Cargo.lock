@@ -364,6 +364,7 @@ dependencies = [
  "secp256k1 0.31.1",
  "serde",
  "sha3",
+ "sqlx-core",
 ]
 
 [[package]]
@@ -4410,6 +4411,8 @@ dependencies = [
  "rlp",
  "ruint-macro",
  "serde_core",
+ "sqlx-core",
+ "thiserror",
  "valuable",
  "zeroize",
 ]
@@ -5756,6 +5759,7 @@ name = "usernames-core"
 version = "0.4.0"
 dependencies = [
  "alloy",
+ "alloy-primitives",
  "anyhow",
  "axum",
  "http-body-util",

@@ -2,6 +2,7 @@
 //! one contract read the indexer makes.
 
 use alloy::{
+    contract,
     eips::BlockNumberOrTag,
     primitives::Address,
     providers::Provider,
@@ -74,12 +75,52 @@ pub async fn fetch_logs(
     provider.get_logs(&f).await
 }
 
-/// The registry a HandleEscrow resolves holders through. An escrow keeps one
-/// for life, so an indexer reads it once, at startup, to refuse an escrow that
-/// pays the holders of a registry it is not indexing.
-pub async fn escrow_registry(
+/// Why an escrow is refused beside the registry an indexer follows.
+#[derive(Debug, thiserror::Error)]
+pub enum EscrowRefused {
+    /// The escrow's `registry()` could not be read.
+    #[error("escrow {escrow}: registry(): {source}")]
+    Unread {
+        /// The escrow asked.
+        escrow: Address,
+        /// The call's failure.
+        #[source]
+        source: contract::Error,
+    },
+    /// The escrow pays the holders of another registry.
+    #[error(
+        "escrow {escrow} resolves holders through registry {registry}, not {indexed}"
+    )]
+    OtherRegistry {
+        /// The escrow asked.
+        escrow: Address,
+        /// The registry it resolves holders through.
+        registry: Address,
+        /// The registry the indexer follows.
+        indexed: Address,
+    },
+}
+
+/// Refuse an escrow that does not resolve holders through `registry`. An
+/// escrow keeps its registry for life, so an indexer checks once, at startup,
+/// before it touches a row.
+pub async fn check_escrow(
     provider: &impl Provider,
     escrow: Address,
-) -> Result<Address, alloy::contract::Error> {
-    HandleEscrow::new(escrow, provider).registry().call().await
+    registry: Address,
+) -> Result<(), EscrowRefused> {
+    let resolves = HandleEscrow::new(escrow, provider)
+        .registry()
+        .call()
+        .await
+        .map_err(|source| EscrowRefused::Unread { escrow, source })?;
+    if resolves == registry {
+        Ok(())
+    } else {
+        Err(EscrowRefused::OtherRegistry {
+            escrow,
+            registry: resolves,
+            indexed: registry,
+        })
+    }
 }

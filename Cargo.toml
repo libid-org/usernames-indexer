@@ -13,6 +13,7 @@ usernames-core = { path = "crates/usernames-core" }
 usernames-fixtures = { path = "crates/usernames-fixtures" }
 
 alloy = { version = "1", features = ["contract", "providers", "transport-http", "network", "serde"] }
+alloy-primitives = { version = "1", features = ["sqlx"] }
 anyhow = "1"
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }

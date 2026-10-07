@@ -2,8 +2,8 @@
 //!
 //! Each window commits through [`crate::db::Window`] — journal rows, projection
 //! writes and the cursor together — so a crash replays a whole window instead
-//! of resuming inside one, and every write in the window is an idempotent
-//! upsert so the replay converges.
+//! of resuming inside one, and the journal's conflict gates every write, so
+//! the replay converges.
 
 use std::time::Duration;
 

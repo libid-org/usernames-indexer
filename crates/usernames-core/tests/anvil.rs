@@ -6,7 +6,10 @@
 //! Skips silently in exactly two cases: `DATABASE_URL` unset, or no `anvil`
 //! binary on PATH. Everything past those checks panics on failure.
 
-use std::time::Duration;
+use std::{
+    process::Command,
+    time::Duration,
+};
 
 use alloy::{
     primitives::{
@@ -28,12 +31,11 @@ use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
 use usernames_core::{
     api::model::{
-        AddressBalances,
+        AddressAmounts,
         AddressHistory,
         AddressResolution,
         HandleHistory,
         HandleResolution,
-        HistoryEntry,
         HistoryEvent,
         IdResolution,
         Role,
@@ -50,7 +52,10 @@ use usernames_core::{
 };
 
 mod common;
-use common::Reply;
+use common::{
+    events,
+    Reply,
+};
 
 /// A request scoped to this suite's chain: the store is shared with the
 /// read-model suite's chain.
@@ -159,11 +164,7 @@ async fn indexes_a_real_chain_end_to_end() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    if std::process::Command::new("anvil")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
+    if Command::new("anvil").arg("--version").output().is_err() {
         eprintln!("skipping: anvil not on PATH");
         return;
     }
@@ -315,13 +316,9 @@ async fn indexes_a_real_chain_end_to_end() {
     let escrow = MockHandleEscrow::deploy(provider.clone(), *mock.address())
         .await
         .expect("deploy the escrow");
-    // The startup check the indexer binary makes before it prepares a chain.
-    assert_eq!(
-        chain::escrow_registry(&provider, *escrow.address())
-            .await
-            .expect("registry()"),
-        *mock.address()
-    );
+    chain::check_escrow(&provider, *escrow.address(), *mock.address())
+        .await
+        .expect("the escrow resolves holders through the registry");
     let native = address!("EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
     let (payer, bob) = (Address::repeat_byte(0xC0), Address::repeat_byte(0xB0));
     let bob_node = nodes::handle_node(x, &nodes::NormalizedHandle::from_chain("bob_x"));
@@ -593,17 +590,37 @@ async fn indexes_a_real_chain_end_to_end() {
     ));
 
     // Claimed: nothing waits for Bob, and the payer's refund ended with it.
-    let bobs: AddressBalances = get(&store, &format!("/v1/escrow/address/{bob}"))
+    let bobs: AddressAmounts = get(&store, &format!("/v1/escrow/claimable/{bob}"))
         .await
         .answer();
-    assert!(bobs.claimable.is_empty(), "{bobs:?}");
-    let payers: AddressBalances = get(&store, &format!("/v1/escrow/address/{payer}"))
+    assert!(bobs.amounts.is_empty(), "{bobs:?}");
+    let payers: AddressAmounts = get(&store, &format!("/v1/escrow/refundable/{payer}"))
         .await
         .answer();
-    assert!(payers.refundable.is_empty(), "{payers:?}");
+    assert!(payers.amounts.is_empty(), "{payers:?}");
 }
 
-/// A history's events, in the order served.
-fn events(entries: &[HistoryEntry]) -> Vec<&HistoryEvent> {
-    entries.iter().map(|entry| &entry.event).collect()
+#[tokio::test]
+async fn an_escrow_of_another_registry_is_refused() {
+    if Command::new("anvil").arg("--version").output().is_err() {
+        eprintln!("skipping: anvil not on PATH");
+        return;
+    }
+    let provider = ProviderBuilder::new()
+        .connect_anvil_with_wallet_and_config(|anvil| anvil.chain_id(CHAIN))
+        .expect("anvil spawns");
+    let (indexed, other) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
+    let escrow = MockHandleEscrow::deploy(provider.clone(), other)
+        .await
+        .expect("deploy the escrow");
+
+    let refused = chain::check_escrow(&provider, *escrow.address(), indexed).await;
+    assert!(
+        matches!(
+            refused,
+            Err(chain::EscrowRefused::OtherRegistry { registry, indexed: asked, .. })
+                if registry == other && asked == indexed
+        ),
+        "{refused:?}"
+    );
 }

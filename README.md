@@ -70,10 +70,11 @@ indexer's settings.
 | `GET /v1/search?q=gre&platform=x&owner=0x…&limit=10&offset=0` | Live handles matching a partial query (exact, then prefix, then substring, then trigram-fuzzy), linked to a wallet, or both; one of `q` and `owner` is required. `limit` (1..50, default 10) and `offset` (up to 10000) page the ranked list; a page shorter than `limit` is the last |
 | `GET /v1/history/address/{address}?before=&limit=` | Every event the address took part in, newest first, each with its `roles`: `holder`, `previousHandleHolder` and `previousIdHolder` (an event took that handle or account from it), `feeReceiver`, `depositor`, `refundTo` (a claim took its deposit, too), `claimer`, `recipient` |
 | `GET /v1/history/handle/{platform}/{handle}?before=&limit=` | Every event on the handle: deposits while nobody held it, the binds that gave it a holder, and every claim, refund and payment after |
-| `GET /v1/history/node/{node}` | The same, by handle node: for a handle nobody has bound, whose text no event carried |
-| `GET /v1/escrow/address/{address}` | What waits for an address: `claimable`, held for the handles it holds now, and `refundable`, what deposits naming it as `refundTo` booked that nobody has claimed yet |
-| `GET /v1/escrow/handle/{platform}/{handle}` | What a handle holds, token by token, and its holder; `/v1/escrow/node/{node}` by node |
-| `GET /v1/escrow/unclaimed?token=0x…&platform=x&before=&limit=` | Every slot still holding something, bound or not: token by token, descending, the largest amount first within each |
+| `GET /v1/history/node/{node}?before=&limit=` | The same, by handle node: for a handle nobody has bound, whose text no event carried |
+| `GET /v1/escrow/claimable/{address}?before=&limit=` | What `claim` would pay the address: everything held for the handles it holds now |
+| `GET /v1/escrow/refundable/{address}?before=&limit=` | What `refund` would pay the address: what deposits naming it as `refundTo` booked that nobody has claimed yet |
+| `GET /v1/escrow/handle/{platform}/{handle}?before=&limit=` | What a handle holds, token by token, and its holder; `/v1/escrow/node/{node}` by node |
+| `GET /v1/escrow/unclaimed?token=0x…&before=&limit=` | Every slot still holding something, bound or not: token by token, descending, the largest amount first within each |
 | `GET /v1/status` | Every chain the store holds: chain id, contract, escrow, last indexed block, chain head, lag, when the indexer last reported and how long that report is still good, last window error, the Proof Verifier the contract is wired to; and the read-model version |
 | `GET /health` | Liveness |
 
@@ -82,9 +83,11 @@ Every read spans every chain the store holds, and every result carries its
 or contracts is configured on the API: the indexers wrote it.
 
 A history is ordered by block time, then chain, block and log index, so one
-spanning chains interleaves them in time. Histories and the unclaimed list page
+spanning chains interleaves them in time. Every history and escrow list pages
 by cursor: a page holds `limit` entries (1..100, default 20) and, while more
-remain, a `next` to pass back as `before`. Each entry carries the event in `event`, tagged by `kind`
+remain, a `next` to pass back as `before`. The unclaimed list ranks by
+amount, so a slot whose amount moves between two pages may show twice or not
+at all. Each entry carries the event in `event`, tagged by `kind`
 (the journal's kinds, fields named as the contract names them), and the
 handle it concerns. Amounts and rounds are `uint256` decimal strings; the
 chain's own coin is the EIP-7528 token `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`.
@@ -108,7 +111,8 @@ Resolution 404s distinguish `handle_not_bound`, `handle_retired`,
 `id_not_bound`, `platform_not_configured`, and `handle_impossible` (text the
 platform could never hold); `not_synced` is the 503 before the first window;
 bad input is `invalid_platform`, `invalid_address`, `invalid_node`,
-`invalid_cursor`, or `invalid_argument`;
+`invalid_chain`, `invalid_cursor`, `invalid_argument`, or, for a path or query
+string that does not parse at all, `invalid_path` and `invalid_query`;
 `internal` is a 500.
 
 ## ENS gateway
@@ -243,10 +247,10 @@ could not have covered these accounts, or any others.
 Schema `names`, all tables keyed by `chain_id` (one process follows one
 chain; a second deployment can share the database):
 
-- `events` — append-only journal of every decoded log, the audit trail.
-  `CeremonyBound` and `BindFeePaid` live only here: which client
-  authenticated a binding and what fee it paid are an operator's questions,
-  and nothing resolves by them
+- `events` — append-only journal of every decoded log, the audit trail and
+  what the histories list. `CeremonyBound` and `BindFeePaid` have no
+  projection of their own: nothing resolves by which client authenticated a
+  binding or what fee it paid
 - `ids` — mirrors `idBindings` + `handleNodeById`: id → holder, current handle
 - `handles` — mirrors `handleBindings` + `idNodeByHandle`: handle node → holder;
   `owner NULL` mirrors the contract's retirement, and the `observed_at`
@@ -255,8 +259,10 @@ chain; a second deployment can share the database):
   stored string is nonempty
 - `platforms` — one row per platform the contract configured; the Proof
   Verifier it is wired to is chain metadata, reported by `/v1/status`
+- `handle_nodes` — the platform of every handle node an event named one for:
+  binds, retirements, deposits and forwards
 - `escrow_held` — mirrors HandleEscrow's `held` and `round` per handle node
-  and token, with the platform its first deposit named
+  and token
 - `escrow_refundable` — mirrors `refundable`: each `refundTo`'s contribution
   in a slot's current round; a refund deletes its row, a claim the round's
 - `address_events`, `handle_events` — which addresses (with their roles) and
@@ -313,14 +319,14 @@ refuses a database 0.3 migrated, as above. Start it on a fresh database with
 `IDENTITY_NAMES_ADDRESS` set to the 0.15 registry; it indexes from that
 registry's deployment block.
 
-**Upgrading from 0.4:** roll the indexer first. It migrates the database in
+**Upgrading from 0.5:** roll the indexer first. It migrates the database in
 place (`002_escrow_and_history.sql`) and, because `INDEXER_VERSION` is 2,
 replays every chain from its registry's deployment block, filling the escrow
 books and the histories. Set `HANDLE_ESCROW_ADDRESS` before that start, or the
-chain replays again when it is set. A 0.4 API keeps serving its routes over the
-migrated database; a 0.5 API started before the migration answers `internal`
-on the new routes until it lands. A 0.4 indexer refuses a database 002 has
-migrated: to go back, start it on a fresh database, or run
+chain replays again when it is set. A 0.5 API keeps serving its routes over the
+migrated database; a newer API started before the migration answers
+`internal` on the new routes until it lands. A 0.5 indexer refuses a database
+002 has migrated: to go back, start it on a fresh database, or run
 `DROP SCHEMA names CASCADE; DROP TABLE _sqlx_migrations;` first, as above.
 
 Probes belong to the API: `GET /health` for liveness; for readiness gate on

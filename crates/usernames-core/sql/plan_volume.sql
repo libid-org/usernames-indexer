@@ -33,16 +33,17 @@ SELECT 1, substring(sha256(('address' || i % 1000)::bytea) FROM 1 FOR 20),
        i, 0, i, ARRAY['depositor']
 FROM generate_series(1, 5000) i;
 INSERT INTO names.handle_events
-    (chain_id, block_number, log_index, handle_node, platform_id, block_time)
-SELECT 1, i, 0, sha256(('node' || i % 1000)::bytea),
-       sha256('platform1'::bytea), i
+    (chain_id, block_number, log_index, handle_node, block_time)
+SELECT 1, i, 0, sha256(('node' || i % 1000)::bytea), i
+FROM generate_series(1, 5000) i;
+INSERT INTO names.handle_nodes (chain_id, handle_node, platform_id)
+SELECT 1, sha256(('node' || i)::bytea), sha256(('platform' || i % 3)::bytea)
 FROM generate_series(1, 5000) i;
 INSERT INTO names.escrow_held
-    (chain_id, handle_node, token, platform_id, held, round,
-     block_number, log_index)
+    (chain_id, handle_node, token, held, round, block_number, log_index)
 SELECT 1, sha256(('node' || i)::bytea),
        substring(sha256(('token' || i % 5)::bytea) FROM 1 FOR 20),
-       sha256('platform1'::bytea), i, 0, i, 0
+       i, 0, i, 0
 FROM generate_series(1, 5000) i;
 INSERT INTO names.escrow_refundable
     (refund_to, chain_id, handle_node, token, round, amount)
@@ -51,5 +52,5 @@ SELECT substring(sha256(('address' || i % 1000)::bytea) FROM 1 FOR 20), 1,
        substring(sha256(('token' || i % 5)::bytea) FROM 1 FOR 20), 0, i
 FROM generate_series(1, 5000) i;
 ANALYZE names.handles, names.ids, names.published, names.events,
-        names.address_events, names.handle_events, names.escrow_held,
-        names.escrow_refundable;
+        names.address_events, names.handle_events, names.handle_nodes,
+        names.escrow_held, names.escrow_refundable;
