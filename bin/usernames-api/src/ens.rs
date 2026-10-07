@@ -42,6 +42,7 @@
 //! the indexer's own report guard.
 
 use std::{
+    fmt,
     sync::Arc,
     time::{
         Duration,
@@ -57,6 +58,7 @@ use alloy::primitives::{
 };
 use axum::{
     extract::{
+        rejection::PathRejection,
         Path,
         State,
     },
@@ -219,11 +221,7 @@ impl Config {
         // chain, or no chain any indexer declared, is simply not this chain's
         // name.
         if let Some(label) = &query.chain_label {
-            let named = self
-                .store
-                .chain_named(label)
-                .await
-                .map_err(GatewayError::internal)?;
+            let named = self.store.chain_named(label).await?;
             if named != Some(indexed.chain_id()) {
                 return Ok(null);
             }
@@ -271,18 +269,19 @@ impl Config {
         &self,
         coin_type: CoinType,
     ) -> Result<ChainMatch, GatewayError> {
-        let candidates: Vec<u64> = self
+        let mut candidates: Vec<(u64, IndexedChain)> = self
             .indexed_chains()
             .await?
             .into_iter()
-            .filter(|id| coin_type.names_chain(*id, self.ens_chain))
+            .filter(|(id, _)| coin_type.names_chain(*id, self.ens_chain))
             .collect();
-        Ok(match candidates.as_slice() {
-            [chain_id] => ChainMatch::One(self.indexed_chain(*chain_id)),
-            [] => ChainMatch::None,
-            both => {
+        let ids: Vec<u64> = candidates.iter().map(|(id, _)| *id).collect();
+        Ok(match candidates.pop() {
+            Some((_, chain)) if candidates.is_empty() => ChainMatch::One(chain),
+            None => ChainMatch::None,
+            Some(_) => {
                 tracing::warn!(
-                    chains = ?both,
+                    chains = ?ids,
                     %coin_type,
                     "two indexed chains share one coin type"
                 );
@@ -291,24 +290,18 @@ impl Config {
         })
     }
 
-    /// Every chain an indexer has written into the store.
-    async fn indexed_chains(&self) -> Result<Vec<u64>, GatewayError> {
+    /// Every chain an indexer has written into the store, by the id a coin
+    /// type names it with, beside its index.
+    async fn indexed_chains(&self) -> Result<Vec<(u64, IndexedChain)>, GatewayError> {
         Ok(self
             .store
             .indexed_chains()
-            .await
-            .map_err(GatewayError::internal)?
+            .await?
             .into_iter()
-            .filter_map(|id| u64::try_from(id).ok())
+            .filter_map(|id| {
+                Some((u64::try_from(id).ok()?, IndexedChain(self.store.chain(id))))
+            })
             .collect())
-    }
-
-    /// One chain's index.
-    fn indexed_chain(&self, chain_id: u64) -> IndexedChain {
-        IndexedChain(
-            self.store
-                .chain(i64::try_from(chain_id).expect("came from an i64")),
-        )
     }
 
     /// Sign a result for one request, and encode what the resolver's callback
@@ -375,20 +368,16 @@ impl Config {
     /// One row per chain the store holds, as supervision should see it.
     async fn status(&self) -> Result<GatewayStatus, GatewayError> {
         let indexed = self.indexed_chains().await?;
+        let ids: Vec<u64> = indexed.iter().map(|(id, _)| *id).collect();
         let mut chains = Vec::with_capacity(indexed.len());
-        for &chain_id in &indexed {
-            let chain = self.indexed_chain(chain_id);
+        for (chain_id, chain) in indexed {
             let position = chain.position().await;
-            let names = chain
-                .0
-                .chain_names()
-                .await
-                .map_err(GatewayError::internal)?;
+            let names = chain.0.chain_names().await?;
             let lag = Lag::of(position);
             // What the gate sees: a chain sharing its coin type with another
             // in the store is refused for that coin type however fresh either
             // is.
-            let ambiguous = indexed
+            let ambiguous = ids
                 .iter()
                 .any(|other| CoinType::shared_by(chain_id, *other));
             chains.push(ChainStatus {
@@ -436,8 +425,7 @@ impl IndexedChain {
         Ok(self
             .0
             .resolve_handle(platform, handle)
-            .await
-            .map_err(GatewayError::internal)?
+            .await?
             .and_then(|row| row.owner))
     }
 
@@ -714,15 +702,10 @@ impl GatewayError {
         }
     }
 
-    /// A failure of ours. The cause is LOGGED, never serialized — the same
-    /// split `api.rs` makes.
-    ///
-    /// A `sqlx` error carries schema names and connection strings, and this
-    /// route is unauthenticated. Returning it would tell a caller things the
-    /// REST half of the same process deliberately withholds, and returning it
-    /// INSTEAD of logging it — which is what this used to do — leaves the
-    /// operator with nothing while the caller has everything.
-    fn internal(e: impl std::fmt::Display) -> Self {
+    /// A failure of ours: the cause is logged, never served, since a `sqlx`
+    /// error carries schema names and connection strings and this route is
+    /// unauthenticated.
+    fn internal(e: impl fmt::Display) -> Self {
         tracing::error!(cause = %e, "gateway lookup failed");
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -731,14 +714,37 @@ impl GatewayError {
     }
 }
 
+impl From<sqlx::Error> for GatewayError {
+    fn from(e: sqlx::Error) -> Self {
+        Self::internal(e)
+    }
+}
+
+/// A path axum could not take apart, such as invalid UTF-8.
+impl From<PathRejection> for GatewayError {
+    fn from(rejection: PathRejection) -> Self {
+        if rejection.status().is_server_error() {
+            Self::internal(rejection.body_text())
+        } else {
+            Self::bad_request(rejection.body_text())
+        }
+    }
+}
+
 impl IntoResponse for GatewayError {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(serde_json::json!({ "message": self.message })),
-        )
-            .into_response()
+        let refusal = GatewayRefusal {
+            message: self.message,
+        };
+        (self.status, Json(refusal)).into_response()
     }
+}
+
+/// The body of a refusal, the shape ERC-3668 clients read an error in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayRefusal {
+    /// Why, for humans.
+    pub message: String,
 }
 
 /// One request's calldata, as the path carried it and as it decodes.
@@ -768,8 +774,9 @@ impl Request {
 /// The ERC-3668 route: accept the sender, decode the call, answer, sign.
 async fn resolve(
     State(state): State<GatewayState>,
-    Path((sender, data)): Path<(String, String)>,
+    path: Result<Path<(String, String)>, PathRejection>,
 ) -> Result<Json<GatewayResponse>, GatewayError> {
+    let Path((sender, data)) = path?;
     let config = &state.config;
     config.accept(&sender)?;
     let request = Request::from_path(&data)?;

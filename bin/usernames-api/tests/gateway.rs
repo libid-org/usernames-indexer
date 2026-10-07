@@ -7,14 +7,20 @@
 //!
 //! Skips silently when `DATABASE_URL` is unset, like the other suites.
 
-use std::time::Duration;
+use std::{
+    fmt,
+    time::Duration,
+};
 
 use alloy::{
     primitives::Address,
     signers::local::PrivateKeySigner,
 };
 use axum::{
-    body::Body,
+    body::{
+        Body,
+        Bytes,
+    },
     http::{
         Request,
         StatusCode,
@@ -32,6 +38,7 @@ use tower::ServiceExt;
 use usernames_api::ens::{
     ChainStatus,
     Config,
+    GatewayRefusal,
     GatewayResponse,
     GatewayState,
     GatewayStatus,
@@ -171,7 +178,37 @@ async fn gateway_over(
     ))
 }
 
-async fn ask(router: &Router, sender: Address, call: &[u8]) -> (StatusCode, String) {
+/// What the gateway sent back: a signed answer or a refusal, read as one of
+/// its two types.
+struct Reply(Bytes);
+
+impl Reply {
+    /// The signed answer; anything else fails the test.
+    fn answer(&self) -> GatewayResponse {
+        serde_json::from_slice(&self.0)
+            .unwrap_or_else(|e| panic!("not an answer ({e}): {self}"))
+    }
+
+    /// The refusal's message. A refusal that also reads as an answer fails
+    /// the test: it must carry none.
+    fn refused(&self) -> String {
+        assert!(
+            serde_json::from_slice::<GatewayResponse>(&self.0).is_err(),
+            "a refusal must carry no answer: {self}"
+        );
+        let refusal: GatewayRefusal = serde_json::from_slice(&self.0)
+            .unwrap_or_else(|e| panic!("not a refusal ({e}): {self}"));
+        refusal.message
+    }
+}
+
+impl fmt::Display for Reply {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&String::from_utf8_lossy(&self.0))
+    }
+}
+
+async fn ask(router: &Router, sender: Address, call: &[u8]) -> (StatusCode, Reply) {
     let uri = format!("/{sender}/0x{}.json", hex::encode(call));
     let response = router
         .clone()
@@ -180,16 +217,14 @@ async fn ask(router: &Router, sender: Address, call: &[u8]) -> (StatusCode, Stri
         .expect("router");
     let status = response.status();
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    let text = String::from_utf8_lossy(&body).to_string();
-    (status, text)
+    (status, Reply(body))
 }
 
 /// The signed result inside a gateway answer, once the signature is checked
 /// to be one the resolver would accept. These are the bytes the callback
 /// returns to the wallet, in whatever shape the record call asked for.
-fn signed_result(body: &str, call: &[u8]) -> Vec<u8> {
-    let answer: GatewayResponse = serde_json::from_str(body).expect("a gateway answer");
-    let data = answer.data;
+fn signed_result(body: &Reply, call: &[u8]) -> Vec<u8> {
+    let data = body.answer().data;
 
     // (bytes result, uint64 expires, bytes signature), by hand.
     let word = |at: usize| -> u64 {
@@ -223,7 +258,7 @@ fn signed_result(body: &str, call: &[u8]) -> Vec<u8> {
 }
 
 /// The address in a gateway answer, or `None` for a null in either shape.
-fn verify(body: &str, call: &[u8]) -> Option<Address> {
+fn verify(body: &Reply, call: &[u8]) -> Option<Address> {
     let result = signed_result(body, call);
     // Both shapes, because the caller chooses which to ask in and a helper that
     // knows only one reports a correct legacy answer as a null.
@@ -298,7 +333,7 @@ async fn a_chain_this_gateway_does_not_serve_is_refused_not_signed() {
     );
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert!(!body.contains("\"data\""), "a refusal must carry no answer");
+    body.refused();
 }
 
 /// A coin type naming no EVM chain at all IS a signed null: no libID binding
@@ -428,7 +463,7 @@ async fn an_unreadable_name_off_our_chains_is_still_refused_unsigned() {
     let call = resolve_call(&wire_name(&labels), &addr_call(&labels, 0x8000_2105));
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert!(!body.contains("\"data\""), "a refusal must carry no answer");
+    body.refused();
 }
 
 #[tokio::test]
@@ -492,7 +527,7 @@ async fn a_stale_index_refuses_rather_than_signing_a_null() {
     );
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert!(!body.contains("\"data\""), "a refusal must carry no answer");
+    body.refused();
 }
 
 #[tokio::test]
@@ -566,7 +601,7 @@ async fn an_index_that_cannot_report_its_position_refuses() {
     );
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert!(!body.contains("\"data\""), "a refusal must carry no answer");
+    body.refused();
 }
 
 /// The block gate cannot see a stopped indexer: target and cursor are both
@@ -588,8 +623,7 @@ async fn an_expired_report_is_too_stale_however_small_the_lag() {
     );
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert!(body.contains("expired"), "{body}");
-    assert!(!body.contains("\"data\""), "a refusal must carry no answer");
+    assert!(body.refused().contains("expired"), "{body}");
 }
 
 /// One chain's dead indexer is that chain's problem. Every row the gate reads
@@ -615,7 +649,7 @@ async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
     let (status, body) = ask(&router, RESOLVER, &dead).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert!(
-        body.contains("expired"),
+        body.refused().contains("expired"),
         "refused for the right reason: {body}"
     );
 
@@ -699,7 +733,7 @@ async fn a_chain_that_appears_in_the_store_is_served_without_a_restart() {
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert!(
-        body.contains("serves no chain"),
+        body.refused().contains("serves no chain"),
         "refused for the right reason: {body}"
     );
 
@@ -740,8 +774,7 @@ async fn two_indexed_chains_on_one_coin_type_are_refused_unsigned() {
     );
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert!(body.contains("share"), "{body}");
-    assert!(!body.contains("\"data\""), "a refusal must carry no answer");
+    assert!(body.refused().contains("share"), "{body}");
 
     // And supervision sees the same verdict, on both halves of the pair.
     let response = router
@@ -851,7 +884,7 @@ async fn bare_addr_asks_for_the_chain_of_the_gateways_registry() {
     // this store holds no mainnet.
     let (status, body) = ask(&in_the_mainnet_registry, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert!(!body.contains("\"data\""), "a refusal must carry no answer");
+    body.refused();
 }
 
 /// What the binary actually serves: both halves on one router, with the
