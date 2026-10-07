@@ -17,7 +17,10 @@ use alloy::{
         U256,
     },
     rpc::types::Log,
-    sol_types::SolEvent,
+    sol_types::{
+        self,
+        SolEvent,
+    },
 };
 use libid_contracts::bindings::{
     escrow::HandleEscrow,
@@ -351,35 +354,19 @@ impl EscrowEvent {
 /// these are not: a caller must fail the window on them, because skipping a
 /// log the contract really emitted would silently fork the read model from
 /// the chain.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
     /// The RPC returned a log without a field every mined log carries.
+    #[error("log without a {0}")]
     MissingField(&'static str),
     /// A known topic whose payload did not decode.
+    #[error("{event}: {source}")]
     Payload {
         /// The event the topic names.
         event: &'static str,
         /// The decoder's reason.
-        source: alloy::sol_types::Error,
+        source: sol_types::Error,
     },
-}
-
-impl std::fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::MissingField(field) => write!(f, "log without a {field}"),
-            Self::Payload { event, source } => write!(f, "{event}: {source}"),
-        }
-    }
-}
-
-impl std::error::Error for DecodeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::MissingField(_) => None,
-            Self::Payload { source, .. } => Some(source),
-        }
-    }
 }
 
 /// The payload of a log whose topic named `E`. Failing here is
@@ -550,9 +537,12 @@ pub fn decode_escrow(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{
-        b256,
-        LogData,
+    use alloy::{
+        primitives,
+        primitives::{
+            b256,
+            LogData,
+        },
     };
 
     use super::*;
@@ -563,7 +553,7 @@ mod tests {
     /// A log carrying `data`, as the RPC returns it once mined.
     fn mined(data: LogData) -> Log {
         Log {
-            inner: alloy::primitives::Log {
+            inner: primitives::Log {
                 address: Address::repeat_byte(0x11),
                 data,
             },

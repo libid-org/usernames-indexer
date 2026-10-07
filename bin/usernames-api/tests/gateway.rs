@@ -7,16 +7,29 @@
 //!
 //! Skips silently when `DATABASE_URL` is unset, like the other suites.
 
+use std::{
+    fmt,
+    sync::Arc,
+    time::Duration,
+};
+
 use alloy::{
-    primitives::Address,
+    primitives::{
+        Address,
+        Signature,
+    },
     signers::local::PrivateKeySigner,
 };
 use axum::{
-    body::Body,
+    body::{
+        Body,
+        Bytes,
+    },
     http::{
         Request,
         StatusCode,
     },
+    response::Response,
     Router,
 };
 use http_body_util::BodyExt;
@@ -28,13 +41,20 @@ use tokio::sync::{
 };
 use tower::ServiceExt;
 use usernames_api::ens::{
+    ChainStatus,
     Config,
+    GatewayRefusal,
+    GatewayResponse,
     GatewayState,
+    GatewayStatus,
+    ROUTE_PREFIX,
 };
 use usernames_core::{
+    api::AppState,
     db::{
         self,
         ChainStore,
+        Store,
     },
     ens,
 };
@@ -53,6 +73,7 @@ const TWIN: i64 = 1_588_445_166;
 /// Every chain any test here may write, so a fixture can clear them all: the
 /// gateway serves whatever the store holds, so a leftover would be served.
 const SUITE_CHAINS: [i64; 5] = [CHAIN, OTHER, EDEN, TWIN, 1];
+/// The suite's resolver, which sits in the mainnet registry.
 const RESOLVER: Address = Address::new([0xaa; 20]);
 const SIGNER_KEY: &str =
     "0x00000000000000000000000000000000000000000000000000000000000a11ce";
@@ -61,7 +82,7 @@ static DB_LOCK: Mutex<()> = Mutex::const_new(());
 
 async fn gateway(
     max_lag_blocks: u64,
-) -> Option<(Router, ChainStore, MutexGuard<'static, ()>)> {
+) -> Option<(Router, ChainStore, PgPool, MutexGuard<'static, ()>)> {
     gateway_over(&[CHAIN], max_lag_blocks).await
 }
 
@@ -70,7 +91,7 @@ async fn gateway(
 async fn gateway_parts(
     chains: &[i64],
     max_lag_blocks: u64,
-) -> Option<(Config, ChainStore, MutexGuard<'static, ()>)> {
+) -> Option<(Config, ChainStore, PgPool, MutexGuard<'static, ()>)> {
     let guard = DB_LOCK.lock().await;
     let url = std::env::var("DATABASE_URL").ok()?;
     let pool = PgPool::connect(&url)
@@ -81,23 +102,17 @@ async fn gateway_parts(
     // serves: the store IS what the gateway serves, so a leftover chain from
     // another test would be served here too.
     for id in SUITE_CHAINS {
-        for table in db::PROJECTION_TABLES {
-            sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
+        for statement in [
+            db::CLEAR_CHAIN,
+            db::CLEAR_CHAIN_METADATA,
+            db::CLEAR_CHAIN_NAMES,
+        ] {
+            sqlx::query(statement)
                 .bind(id)
                 .execute(&pool)
                 .await
                 .expect("cleanup");
         }
-        sqlx::query("DELETE FROM names.chain_metadata WHERE chain_id = $1")
-            .bind(id)
-            .execute(&pool)
-            .await
-            .expect("metadata cleanup");
-        sqlx::query("DELETE FROM names.chain_names WHERE chain_id = $1")
-            .bind(id)
-            .execute(&pool)
-            .await
-            .expect("names cleanup");
     }
 
     // Every chain starts SYNCED AND EMPTY, which is a different state from
@@ -119,20 +134,22 @@ async fn gateway_parts(
         // The gate measures the cursor against the TARGET — what the indexer
         // intends to reach — not the raw head, so a fixture that records only
         // the head reads as "cannot tell" and refuses every query.
-        store.set_chain_target(1, 120).await;
+        store.set_chain_target(1, Duration::from_secs(120)).await;
     }
 
     let store = ChainStore::new(pool.clone(), chains[0]);
     let config = Config {
+        domain: ens::DEFAULT_DOMAIN.parse().expect("domain"),
         resolver: RESOLVER,
+        ens_chain: 1,
         store: db::Store::new(pool.clone()),
-        ttl_secs: 300,
+        ttl: Duration::from_secs(300),
         max_lag_blocks,
-        signer: std::sync::Arc::new(ManagedSigner::Local(
+        signer: Arc::new(ManagedSigner::Local(
             SIGNER_KEY.parse::<PrivateKeySigner>().expect("key"),
         )),
     };
-    Some((config, store, guard))
+    Some((config, store, pool, guard))
 }
 
 /// What a chain's indexer does at startup: declare the names the chain goes
@@ -140,7 +157,7 @@ async fn gateway_parts(
 async fn declare_names(store: &ChainStore, names: &[&str]) {
     let names: Vec<_> = names
         .iter()
-        .map(|name| ens::ChainName::parse(name).expect("a chain name"))
+        .map(|name| name.parse::<ens::ChainName>().expect("a chain name"))
         .collect();
     let writer = store.acquire_writer().await.expect("lease");
     store
@@ -154,16 +171,47 @@ async fn declare_names(store: &ChainStore, names: &[&str]) {
 async fn gateway_over(
     chains: &[i64],
     max_lag_blocks: u64,
-) -> Option<(Router, ChainStore, MutexGuard<'static, ()>)> {
-    let (config, store, guard) = gateway_parts(chains, max_lag_blocks).await?;
+) -> Option<(Router, ChainStore, PgPool, MutexGuard<'static, ()>)> {
+    let (config, store, pool, guard) = gateway_parts(chains, max_lag_blocks).await?;
     Some((
         usernames_api::ens::router(GatewayState::new(config)),
         store,
+        pool,
         guard,
     ))
 }
 
-async fn ask(router: &Router, sender: Address, call: &[u8]) -> (StatusCode, String) {
+/// What the gateway sent back: a signed answer or a refusal, read as one of
+/// its two types.
+struct Reply(Bytes);
+
+impl Reply {
+    /// The signed answer; anything else fails the test.
+    fn answer(&self) -> GatewayResponse {
+        serde_json::from_slice(&self.0)
+            .unwrap_or_else(|e| panic!("not an answer ({e}): {self}"))
+    }
+
+    /// The refusal's message. A refusal that also reads as an answer fails
+    /// the test: it must carry none.
+    fn refused(&self) -> String {
+        assert!(
+            serde_json::from_slice::<GatewayResponse>(&self.0).is_err(),
+            "a refusal must carry no answer: {self}"
+        );
+        let refusal: GatewayRefusal = serde_json::from_slice(&self.0)
+            .unwrap_or_else(|e| panic!("not a refusal ({e}): {self}"));
+        refusal.message
+    }
+}
+
+impl fmt::Display for Reply {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&String::from_utf8_lossy(&self.0))
+    }
+}
+
+async fn ask(router: &Router, sender: Address, call: &[u8]) -> (StatusCode, Reply) {
     let uri = format!("/{sender}/0x{}.json", hex::encode(call));
     let response = router
         .clone()
@@ -172,22 +220,14 @@ async fn ask(router: &Router, sender: Address, call: &[u8]) -> (StatusCode, Stri
         .expect("router");
     let status = response.status();
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    let text = String::from_utf8_lossy(&body).to_string();
-    (status, text)
+    (status, Reply(body))
 }
 
 /// The signed result inside a gateway answer, once the signature is checked
 /// to be one the resolver would accept. These are the bytes the callback
 /// returns to the wallet, in whatever shape the record call asked for.
-fn signed_result(body: &str, call: &[u8]) -> Vec<u8> {
-    let value: serde_json::Value = serde_json::from_str(body).expect("json");
-    let data = hex::decode(
-        value["data"]
-            .as_str()
-            .expect("a data field")
-            .trim_start_matches("0x"),
-    )
-    .expect("hex");
+fn signed_result(body: &Reply, call: &[u8]) -> Vec<u8> {
+    let data = body.answer().data;
 
     // (bytes result, uint64 expires, bytes signature), by hand.
     let word = |at: usize| -> u64 {
@@ -208,7 +248,7 @@ fn signed_result(body: &str, call: &[u8]) -> Vec<u8> {
         expires,
     }
     .digest(RESOLVER, call);
-    let recovered = alloy::primitives::Signature::try_from(signature)
+    let recovered = Signature::try_from(signature)
         .expect("65-byte signature")
         .recover_address_from_prehash(&digest)
         .expect("recover");
@@ -221,7 +261,7 @@ fn signed_result(body: &str, call: &[u8]) -> Vec<u8> {
 }
 
 /// The address in a gateway answer, or `None` for a null in either shape.
-fn verify(body: &str, call: &[u8]) -> Option<Address> {
+fn verify(body: &Reply, call: &[u8]) -> Option<Address> {
     let result = signed_result(body, call);
     // Both shapes, because the caller chooses which to ask in and a helper that
     // knows only one reports a correct legacy answer as a null.
@@ -249,7 +289,7 @@ macro_rules! gateway_or_skip {
 
 #[tokio::test]
 async fn a_bound_handle_resolves_and_the_signature_verifies() {
-    let (router, store, _g) = gateway_or_skip!(32);
+    let (router, store, _pool, guard) = gateway_or_skip!(32);
     let owner = Address::from([0xbe; 20]);
     bind(&store, "alice", owner).await;
 
@@ -260,13 +300,14 @@ async fn a_bound_handle_resolves_and_the_signature_verifies() {
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(verify(&body, &call), Some(owner));
+    drop(guard);
 }
 
 #[tokio::test]
 async fn a_name_nobody_holds_gets_a_signed_null() {
     // The point of signing a null: a wallet must be able to trust "nobody
     // holds this" as much as it trusts an address.
-    let (router, _store, _g) = gateway_or_skip!(32);
+    let (router, _store, _pool, guard) = gateway_or_skip!(32);
     let call = resolve_call(
         &wire_name(&["nobody", "x"]),
         &addr_call(&["nobody", "x"], 0x8000_0000 | CHAIN as u64),
@@ -274,6 +315,7 @@ async fn a_name_nobody_holds_gets_a_signed_null() {
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(verify(&body, &call), None);
+    drop(guard);
 }
 
 /// A chain this gateway does not serve must be REFUSED, not answered null.
@@ -286,7 +328,7 @@ async fn a_name_nobody_holds_gets_a_signed_null() {
 /// chains rather than one.
 #[tokio::test]
 async fn a_chain_this_gateway_does_not_serve_is_refused_not_signed() {
-    let (router, store, _g) = gateway_or_skip!(32);
+    let (router, store, _pool, guard) = gateway_or_skip!(32);
     bind(&store, "alice", Address::from([0xbe; 20])).await;
 
     // Base, while this gateway serves only the test chain.
@@ -296,25 +338,27 @@ async fn a_chain_this_gateway_does_not_serve_is_refused_not_signed() {
     );
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert!(!body.contains("\"data\""), "a refusal must carry no answer");
+    body.refused();
+    drop(guard);
 }
 
 /// A coin type naming no EVM chain at all IS a signed null: no libID binding
 /// is ever a Bitcoin address, and knowing that needs no chain.
 #[tokio::test]
 async fn a_non_evm_coin_type_is_answered_null() {
-    let (router, store, _g) = gateway_or_skip!(32);
+    let (router, store, _pool, guard) = gateway_or_skip!(32);
     bind(&store, "alice", Address::from([0xbe; 20])).await;
 
     let call = resolve_call(&wire_name(&["alice", "x"]), &addr_call(&["alice", "x"], 0));
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(verify(&body, &call), None);
+    drop(guard);
 }
 
 #[tokio::test]
 async fn a_chain_label_narrows_and_never_widens() {
-    let Some((router, store, _g)) = gateway_over(&[EDEN], 32).await else {
+    let Some((router, store, _pool, guard)) = gateway_over(&[EDEN], 32).await else {
         return;
     };
     bind(&store, "alice", Address::from([0xbe; 20])).await;
@@ -336,13 +380,14 @@ async fn a_chain_label_narrows_and_never_widens() {
     );
     let (_, body) = ask(&router, RESOLVER, &theirs).await;
     assert_eq!(verify(&body, &theirs), None);
+    drop(guard);
 }
 
 /// A chain may go by several names, and each one names it alike: the
 /// unlabelled form and every declared label resolve to the same binding.
 #[tokio::test]
 async fn every_name_a_chain_declares_resolves_it() {
-    let Some((router, store, _g)) = gateway_over(&[EDEN], 32).await else {
+    let Some((router, store, _pool, guard)) = gateway_over(&[EDEN], 32).await else {
         return;
     };
     let owner = Address::from([0xbe; 20]);
@@ -360,24 +405,26 @@ async fn every_name_a_chain_declares_resolves_it() {
         assert_eq!(status, StatusCode::OK, "{labels:?}: {body}");
         assert_eq!(verify(&body, &call), Some(owner), "{labels:?}");
     }
+    drop(guard);
 }
 
 #[tokio::test]
 async fn a_record_that_is_not_addr_degrades_to_null() {
     // A client asking for `text()` must not see an error on a name that
     // resolves fine for addresses.
-    let (router, store, _g) = gateway_or_skip!(32);
+    let (router, store, _pool, guard) = gateway_or_skip!(32);
     bind(&store, "alice", Address::from([0xbe; 20])).await;
 
     let call = resolve_call(&wire_name(&["alice", "x"]), &[0xaa, 0xbb, 0xcc, 0xdd]);
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(verify(&body, &call), None);
+    drop(guard);
 }
 
 #[tokio::test]
 async fn a_name_this_build_cannot_read_is_null_rather_than_an_error() {
-    let (router, _store, _g) = gateway_or_skip!(32);
+    let (router, _store, _pool, guard) = gateway_or_skip!(32);
     let coin = 0x8000_0000 | CHAIN as u64;
     for labels in [
         ["alice", "myspace"].as_slice(), // a platform nobody knows
@@ -388,6 +435,7 @@ async fn a_name_this_build_cannot_read_is_null_rather_than_an_error() {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(verify(&body, &call), None);
     }
+    drop(guard);
 }
 
 /// The null for an unreadable name takes the shape of the record asked in.
@@ -401,7 +449,7 @@ async fn a_name_this_build_cannot_read_is_null_rather_than_an_error() {
 async fn an_unreadable_name_is_null_in_the_shape_the_caller_asked_in() {
     // Mainnet, because the legacy form is coin type 60 and a gateway that does
     // not serve it refuses unsigned rather than answering.
-    let Some((router, _store, _g)) = gateway_over(&[1], 32).await else {
+    let Some((router, _store, _pool, guard)) = gateway_over(&[1], 32).await else {
         return;
     };
     let labels = ["alice", "myspace"];
@@ -414,6 +462,7 @@ async fn an_unreadable_name_is_null_in_the_shape_the_caller_asked_in() {
         "the legacy null is the zero address, 32 bytes"
     );
     assert_eq!(verify(&body, &call), None);
+    drop(guard);
 }
 
 /// A chain this gateway does not serve keeps its unsigned refusal for an
@@ -421,36 +470,72 @@ async fn an_unreadable_name_is_null_in_the_shape_the_caller_asked_in() {
 /// the client walks on to a sibling that may read the name.
 #[tokio::test]
 async fn an_unreadable_name_off_our_chains_is_still_refused_unsigned() {
-    let (router, _store, _g) = gateway_or_skip!(32);
+    let (router, _store, _pool, guard) = gateway_or_skip!(32);
     let labels = ["alice", "myspace"];
     let call = resolve_call(&wire_name(&labels), &addr_call(&labels, 0x8000_2105));
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert!(!body.contains("\"data\""), "a refusal must carry no answer");
+    body.refused();
+    drop(guard);
 }
 
 #[tokio::test]
 async fn a_request_for_another_resolver_is_refused_not_signed() {
     // The signature names its target, so signing for a caller-supplied sender
     // would lend this key's authority to any contract that asked.
-    let (router, _store, _g) = gateway_or_skip!(32);
+    let (router, _store, _pool, guard) = gateway_or_skip!(32);
     let call = resolve_call(
         &wire_name(&["alice", "x"]),
         &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
     );
     let (status, _) = ask(&router, Address::from([0xcc; 20]), &call).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    drop(guard);
+}
+
+/// A deployment may answer under a subname of the domain. Its names carry
+/// the subname, and the parent's own names are not its to speak about.
+#[tokio::test]
+async fn a_gateway_under_a_subname_answers_its_names_and_refuses_the_parents() {
+    let Some((mut config, store, _pool, guard)) = gateway_parts(&[CHAIN], 32).await
+    else {
+        return;
+    };
+    config.domain = "testnet.handles.link".parse().expect("domain");
+    let router = usernames_api::ens::router(GatewayState::new(config));
+    let owner = Address::from([0xbe; 20]);
+    bind(&store, "alice", owner).await;
+    let coin = 0x8000_0000 | CHAIN as u64;
+
+    // `wire_name` appends `handles.link`, so the subname rides as a label.
+    let ours = resolve_call(
+        &wire_name(&["alice", "x", "testnet"]),
+        &addr_call(&["alice", "x", "testnet"], coin),
+    );
+    let (status, body) = ask(&router, RESOLVER, &ours).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(verify(&body, &ours), Some(owner));
+
+    let parents = resolve_call(
+        &wire_name(&["alice", "x"]),
+        &addr_call(&["alice", "x"], coin),
+    );
+    let (status, body) = ask(&router, RESOLVER, &parents).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    drop(guard);
 }
 
 #[tokio::test]
 async fn a_stale_index_refuses_rather_than_signing_a_null() {
     // The distinction the lag gate exists for: a signed null asserts that no
     // binding exists, and an index this far behind has not earned that.
-    let (router, store, _g) = gateway_or_skip!(0);
+    let (router, store, _pool, guard) = gateway_or_skip!(0);
     bind(&store, "alice", Address::from([0xbe; 20])).await;
     // Far ahead of the cursor, as the TARGET: that is the quantity the gate
     // compares, and the head alone no longer moves it.
-    store.set_chain_target(10_000, 120).await;
+    store
+        .set_chain_target(10_000, Duration::from_secs(120))
+        .await;
 
     let call = resolve_call(
         &wire_name(&["alice", "x"]),
@@ -458,23 +543,26 @@ async fn a_stale_index_refuses_rather_than_signing_a_null() {
     );
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert!(!body.contains("\"data\""), "a refusal must carry no answer");
+    body.refused();
+    drop(guard);
 }
 
 #[tokio::test]
 async fn garbage_in_the_path_is_the_callers_error() {
-    let (router, _store, _g) = gateway_or_skip!(32);
+    let (router, _store, _pool, guard) = gateway_or_skip!(32);
     for call in [vec![0xde, 0xad, 0xbe, 0xef], vec![]] {
         let (status, _) = ask(&router, RESOLVER, &call).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
+    drop(guard);
 }
 
 /// The fix, stated as a test: one gateway, two chains, and each coin type gets
 /// its own chain's answer rather than the first one's.
 #[tokio::test]
 async fn one_gateway_answers_for_every_chain_it_serves() {
-    let Some((router, store, _g)) = gateway_over(&[CHAIN, OTHER], 32).await else {
+    let Some((router, store, _pool, guard)) = gateway_over(&[CHAIN, OTHER], 32).await
+    else {
         return;
     };
     let here = Address::from([0xbe; 20]);
@@ -503,6 +591,7 @@ async fn one_gateway_answers_for_every_chain_it_serves() {
             "chain {chain} answered with another chain's wallet"
         );
     }
+    drop(guard);
 }
 
 /// An index that cannot report its own position must refuse, not deny.
@@ -511,18 +600,18 @@ async fn one_gateway_answers_for_every_chain_it_serves() {
 /// both absent on a fresh database, and again while `prepare` replays a chain
 /// after a version bump — and an unreadable Postgres looks the same. Folding
 /// that into "no lag" made the gateway sign an authoritative "nobody holds
-/// this" for every name, cached by wallets for the whole `ENS_TTL_SECS`
+/// this" for every name, cached by wallets for the whole `ENS_TTL`
 /// window.
 #[tokio::test]
 async fn an_index_that_cannot_report_its_position_refuses() {
-    let (router, store, _g) = gateway_or_skip!(32);
+    let (router, store, pool, guard) = gateway_or_skip!(32);
     bind(&store, "alice", Address::from([0xbe; 20])).await;
 
     // Wipe what the index knows about its own progress, leaving the binding
     // in place: the rows say one thing, the cursor says nothing.
-    sqlx::query("DELETE FROM names.chain_metadata WHERE chain_id = $1")
+    sqlx::query(db::CLEAR_CHAIN_METADATA)
         .bind(CHAIN)
-        .execute(store.pool())
+        .execute(&pool)
         .await
         .expect("clear metadata");
 
@@ -532,18 +621,19 @@ async fn an_index_that_cannot_report_its_position_refuses() {
     );
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert!(!body.contains("\"data\""), "a refusal must carry no answer");
+    body.refused();
+    drop(guard);
 }
 
 /// The block gate cannot see a stopped indexer: target and cursor are both
 /// its own writes, so they freeze together and lag reads zero for as long as
 /// it stays down — signed nulls for bindings made since, and old addresses
-/// after a rebind, for the whole `ENS_TTL_SECS` each. The report the indexer
+/// after a rebind, for the whole `ENS_TTL` each. The report the indexer
 /// makes beside the target expires on the indexer's own schedule, and that is
 /// what notices.
 #[tokio::test]
 async fn an_expired_report_is_too_stale_however_small_the_lag() {
-    let (router, store, _g) = gateway_or_skip!(32);
+    let (router, store, _pool, guard) = gateway_or_skip!(32);
     bind(&store, "alice", Address::from([0xbe; 20])).await;
     // Caught up by the block measure, and the report long expired.
     store.set_chain_target_valid_until(1).await;
@@ -554,8 +644,8 @@ async fn an_expired_report_is_too_stale_however_small_the_lag() {
     );
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert!(body.contains("expired"), "{body}");
-    assert!(!body.contains("\"data\""), "a refusal must carry no answer");
+    assert!(body.refused().contains("expired"), "{body}");
+    drop(guard);
 }
 
 /// One chain's dead indexer is that chain's problem. Every row the gate reads
@@ -564,12 +654,13 @@ async fn an_expired_report_is_too_stale_however_small_the_lag() {
 /// sees exactly what the gate sees, one row per chain.
 #[tokio::test]
 async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
-    let Some((router, store, _g)) = gateway_over(&[CHAIN, OTHER], 32).await else {
+    let Some((router, store, pool, guard)) = gateway_over(&[CHAIN, OTHER], 32).await
+    else {
         return;
     };
     let here = Address::from([0xbe; 20]);
     bind(&store, "alice", here).await;
-    let other_store = ChainStore::new(store.pool().clone(), OTHER);
+    let other_store = ChainStore::new(pool.clone(), OTHER);
     bind(&other_store, "alice", Address::from([0xed; 20])).await;
     // The other chain's indexer stopped long ago.
     other_store.set_chain_target_valid_until(1).await;
@@ -581,7 +672,7 @@ async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
     let (status, body) = ask(&router, RESOLVER, &dead).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert!(
-        body.contains("expired"),
+        body.refused().contains("expired"),
         "refused for the right reason: {body}"
     );
 
@@ -605,27 +696,24 @@ async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
         .expect("router");
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    let status: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    let stale_of = |id: i64| {
-        status["chains"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["chainId"] == id)
-            .map(|c| c["stale"].as_bool().unwrap())
-    };
-    assert_eq!(stale_of(OTHER), Some(true), "{status}");
-    assert_eq!(stale_of(CHAIN), Some(false), "{status}");
-    let valid_for_of = |id: i64| {
-        status["chains"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["chainId"] == id)
-            .and_then(|c| c["reportValidFor"].as_i64())
-    };
-    assert!(valid_for_of(OTHER).is_some_and(|s| s < 0), "{status}");
-    assert!(valid_for_of(CHAIN).is_some_and(|s| s > 0), "{status}");
+    let status: GatewayStatus = serde_json::from_slice(&body).expect("a gateway status");
+    let other = row_of(&status, OTHER);
+    let chain = row_of(&status, CHAIN);
+    assert!(other.stale, "{status:?}");
+    assert!(!chain.stale, "{status:?}");
+    assert!(other.report_valid_for.is_some_and(|s| s < 0), "{status:?}");
+    assert!(chain.report_valid_for.is_some_and(|s| s > 0), "{status:?}");
+    drop(guard);
+}
+
+/// The status row of one chain; a chain the status does not list fails the
+/// test.
+fn row_of(status: &GatewayStatus, chain_id: i64) -> &ChainStatus {
+    status
+        .chains
+        .iter()
+        .find(|row| i64::try_from(row.chain_id) == Ok(chain_id))
+        .unwrap_or_else(|| panic!("chain {chain_id} is listed: {status:?}"))
 }
 
 /// A chain has only the names its indexer declared. With none declared, the
@@ -633,7 +721,7 @@ async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
 /// name nobody holds.
 #[tokio::test]
 async fn a_chain_with_no_declared_name_answers_only_the_unlabelled_name() {
-    let (router, store, _g) = gateway_or_skip!(32);
+    let (router, store, _pool, guard) = gateway_or_skip!(32);
     let here = Address::from([0xbe; 20]);
     bind(&store, "alice", here).await;
     let coin = 0x8000_0000 | CHAIN as u64;
@@ -652,6 +740,7 @@ async fn a_chain_with_no_declared_name_answers_only_the_unlabelled_name() {
     let (status, body) = ask(&router, RESOLVER, &labelled).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(verify(&body, &labelled), None);
+    drop(guard);
 }
 
 /// The chains served are whatever the store holds. Nothing is configured, so
@@ -659,7 +748,7 @@ async fn a_chain_with_no_declared_name_answers_only_the_unlabelled_name() {
 /// with no restart, and no list anywhere to forget it in.
 #[tokio::test]
 async fn a_chain_that_appears_in_the_store_is_served_without_a_restart() {
-    let (router, store, _g) = gateway_or_skip!(32);
+    let (router, _store, pool, guard) = gateway_or_skip!(32);
     let call = resolve_call(
         &wire_name(&["alice", "x"]),
         &addr_call(&["alice", "x"], 0x8000_0000 | OTHER as u64),
@@ -669,12 +758,12 @@ async fn a_chain_that_appears_in_the_store_is_served_without_a_restart() {
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert!(
-        body.contains("serves no chain"),
+        body.refused().contains("serves no chain"),
         "refused for the right reason: {body}"
     );
 
     // An indexer for it commits its first window and reports.
-    let other = ChainStore::new(store.pool().clone(), OTHER);
+    let other = ChainStore::new(pool.clone(), OTHER);
     other
         .begin_window()
         .await
@@ -683,7 +772,7 @@ async fn a_chain_that_appears_in_the_store_is_served_without_a_restart() {
         .await
         .expect("commit");
     other.set_chain_head(1).await;
-    other.set_chain_target(1, 120).await;
+    other.set_chain_target(1, Duration::from_secs(120)).await;
     let there = Address::from([0xed; 20]);
     bind(&other, "alice", there).await;
 
@@ -691,6 +780,7 @@ async fn a_chain_that_appears_in_the_store_is_served_without_a_restart() {
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(verify(&body, &call), Some(there));
+    drop(guard);
 }
 
 /// Two indexed chains that share one coin type cannot be told apart by a
@@ -700,7 +790,8 @@ async fn a_chain_that_appears_in_the_store_is_served_without_a_restart() {
 /// chains.
 #[tokio::test]
 async fn two_indexed_chains_on_one_coin_type_are_refused_unsigned() {
-    let Some((router, store, _g)) = gateway_over(&[EDEN, TWIN], 32).await else {
+    let Some((router, store, _pool, guard)) = gateway_over(&[EDEN, TWIN], 32).await
+    else {
         return;
     };
     bind(&store, "alice", Address::from([0xed; 20])).await;
@@ -710,8 +801,7 @@ async fn two_indexed_chains_on_one_coin_type_are_refused_unsigned() {
     );
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert!(body.contains("share"), "{body}");
-    assert!(!body.contains("\"data\""), "a refusal must carry no answer");
+    assert!(body.refused().contains("share"), "{body}");
 
     // And supervision sees the same verdict, on both halves of the pair.
     let response = router
@@ -725,17 +815,12 @@ async fn two_indexed_chains_on_one_coin_type_are_refused_unsigned() {
         .await
         .expect("router");
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    let status: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    let status: GatewayStatus = serde_json::from_slice(&body).expect("a gateway status");
     for id in [EDEN, TWIN] {
-        let row = status["chains"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["chainId"] == id)
-            .expect("listed");
-        assert_eq!(row["ambiguous"], true, "{status}");
-        assert_eq!(row["stale"], true, "{status}");
+        let row = row_of(&status, id);
+        assert!(row.ambiguous && row.stale, "{status:?}");
     }
+    drop(guard);
 }
 
 /// The eden testnet resolves, and that it does is the whole point of matching
@@ -749,7 +834,7 @@ async fn two_indexed_chains_on_one_coin_type_are_refused_unsigned() {
 /// per request instead.
 #[tokio::test]
 async fn the_eden_testnet_resolves_despite_its_chain_id() {
-    let Some((router, store, _g)) = gateway_over(&[EDEN], 32).await else {
+    let Some((router, store, _pool, guard)) = gateway_over(&[EDEN], 32).await else {
         return;
     };
     let owner = Address::from([0xed; 20]);
@@ -765,20 +850,22 @@ async fn the_eden_testnet_resolves_despite_its_chain_id() {
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "eden must resolve: {body}");
     assert_eq!(verify(&body, &call), Some(owner));
+    drop(guard);
 }
 
 /// The legacy shape decodes, and a gateway that does not serve mainnet refuses
 /// it UNSIGNED.
 ///
 /// Both halves matter. The decode had no coverage at all, and the refusal is
-/// the multi-chain invariant: coin type 60 names Ethereum mainnet, so a
-/// gateway serving only some other chain has nothing to say about it. Saying
+/// the multi-chain invariant: through the mainnet registry coin type 60 names
+/// Ethereum mainnet, so a gateway serving only some other chain has nothing
+/// to say about it. Saying
 /// so with a 5xx keeps the client walking the resolver's `urls`; a signed null
 /// would be an authoritative "nobody holds this" and would end that walk at
 /// the first gateway asked.
 #[tokio::test]
 async fn the_legacy_addr_shape_is_refused_unsigned_off_mainnet() {
-    let (router, store, _g) = gateway_or_skip!(32);
+    let (router, store, _pool, guard) = gateway_or_skip!(32);
     bind(&store, "alice", Address::from([0xbe; 20])).await;
 
     let call = resolve_call(
@@ -791,27 +878,61 @@ async fn the_legacy_addr_shape_is_refused_unsigned_off_mainnet() {
         StatusCode::SERVICE_UNAVAILABLE,
         "a signed null here would end the client's url walk: {body}"
     );
+    drop(guard);
 }
 
-/// What the binary actually serves: both halves on one router, with the
-/// middleware over the whole of it.
+/// Bare `addr(node)` asks for the chain of the registry it went through, which
+/// the deployment names beside its resolver.
 ///
-/// The halves were only ever built apart, so three things had no coverage —
-/// that the gateway route does not swallow the API's namespace, that a `/v1`
-/// path which matches nothing is a 404 rather than the gateway's "sender is
-/// not an address", and that CORS is applied once rather than layered twice.
+/// It is the only query MetaMask sends on a network that carries ENS: on
+/// Sepolia it asks Sepolia's registry with coin type 60 and sends on Sepolia.
+/// Read as Ethereum mainnet, that query is refused by a deployment that
+/// indexes Sepolia, and the wallet shows no resolution for a bound name.
+#[tokio::test]
+async fn bare_addr_asks_for_the_chain_of_the_gateways_registry() {
+    let Some((config, store, _pool, guard)) = gateway_parts(&[CHAIN], 32).await else {
+        return;
+    };
+    let in_the_mainnet_registry =
+        usernames_api::ens::router(GatewayState::new(config.clone()));
+    let in_our_chains_registry = usernames_api::ens::router(GatewayState::new(Config {
+        ens_chain: CHAIN as u64,
+        ..config
+    }));
+    let owner = Address::from([0xbe; 20]);
+    bind(&store, "alice", owner).await;
+
+    let call = resolve_call(
+        &wire_name(&["alice", "x"]),
+        &legacy_addr_call(&["alice", "x"]),
+    );
+    let (status, body) = ask(&in_our_chains_registry, RESOLVER, &call).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(verify(&body, &call), Some(owner));
+
+    // The same question through the mainnet registry is a mainnet one, and
+    // this store holds no mainnet.
+    let (status, body) = ask(&in_the_mainnet_registry, RESOLVER, &call).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    body.refused();
+    drop(guard);
+}
+
+/// What the binary serves: the `/v1` routes and the gateway on one router,
+/// with the middleware over the whole of it. The gateway route does not
+/// swallow the API's namespace, a `/v1` path that matches nothing is a 404
+/// rather than the gateway's "sender is not an address", and CORS is applied
+/// once rather than layered twice.
 #[tokio::test]
 async fn the_merged_router_keeps_both_halves_intact() {
-    let Some((config, store, _g)) = gateway_parts(&[CHAIN], 32).await else {
+    let Some((config, store, pool, guard)) = gateway_parts(&[CHAIN], 32).await else {
         return;
     };
     let owner = Address::from([0xbe; 20]);
     bind(&store, "alice", owner).await;
 
     let app = usernames_api::build_router(
-        usernames_core::api::AppState::new(usernames_core::db::Store::new(
-            store.pool().clone(),
-        )),
+        AppState::new(Store::new(pool.clone())),
         Some(config),
     );
 
@@ -858,10 +979,10 @@ async fn the_merged_router_keeps_both_halves_intact() {
     );
     let uri = format!(
         "{}/{RESOLVER:?}/0x{}.json",
-        usernames_api::ens::ROUTE_PREFIX,
+        ROUTE_PREFIX,
         hex::encode(&call)
     );
-    let allowed_origin = |response: &axum::response::Response| {
+    let allowed_origin = |response: &Response| {
         response
             .headers()
             .get("access-control-allow-origin")
@@ -874,17 +995,14 @@ async fn the_merged_router_keeps_both_halves_intact() {
         Some(&b"*"[..]),
         "the gateway route carries no CORS header"
     );
-    let refused = get(format!(
-        "{}/not-an-address/0x00.json",
-        usernames_api::ens::ROUTE_PREFIX
-    ))
-    .await;
+    let refused = get(format!("{}/not-an-address/0x00.json", ROUTE_PREFIX)).await;
     assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         allowed_origin(&refused).as_deref(),
         Some(&b"*"[..]),
         "a refusal without the CORS header is one a browser cannot even read"
     );
+    drop(guard);
 }
 
 /// The request names one thing twice — once as a name, once as the node inside
@@ -893,7 +1011,7 @@ async fn the_merged_router_keeps_both_halves_intact() {
 /// would be true of the name and attributed to the node.
 #[tokio::test]
 async fn a_node_that_is_not_this_name_is_refused() {
-    let (router, store, _g) = gateway_or_skip!(32);
+    let (router, store, _pool, guard) = gateway_or_skip!(32);
     bind(&store, "alice", Address::from([0xbe; 20])).await;
 
     let coin = 0x8000_0000 | CHAIN as u64;
@@ -914,6 +1032,7 @@ async fn a_node_that_is_not_this_name_is_refused() {
     let (status, body) = ask(&router, RESOLVER, &ok).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(verify(&body, &ok).is_some());
+    drop(guard);
 }
 
 /// A name outside this resolver's domain is refused, not answered.
@@ -926,7 +1045,7 @@ async fn a_node_that_is_not_this_name_is_refused() {
 /// unnormalized second, and "unreadable" would have earned it a signed null.
 #[tokio::test]
 async fn a_name_outside_the_domain_is_refused_whatever_the_record() {
-    let (router, _store, _g) = gateway_or_skip!(32);
+    let (router, _store, _pool, guard) = gateway_or_skip!(32);
     let node =
         ens::Name::from_labels(vec!["vitalik".to_string(), "eth".to_string()]).node();
 
@@ -945,4 +1064,5 @@ async fn a_name_outside_the_domain_is_refused_whatever_the_record() {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         }
     }
+    drop(guard);
 }

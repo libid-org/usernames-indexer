@@ -4,9 +4,9 @@
 #   docker build --target indexer -t usernames-indexer .
 #   docker build --target api     -t usernames-api     .
 #
-# There is deliberately no image carrying both. A single entrypoint would have
-# to default to one of them, and a deployment that pulled it expecting the
-# other would run a container that looks healthy while doing half the job.
+# No image carries both: a single entrypoint would have to default to one of
+# them, and a deployment that pulled it expecting the other would run a
+# container that looks healthy while doing half the job.
 
 # === Builder ===
 # Pin the builder to bookworm so its glibc matches the bookworm-slim runtime
@@ -67,6 +67,6 @@ COPY --from=builder /app/target/release/usernames-api /usr/local/bin/usernames-a
 # Inside a container the API must bind the container interface, not loopback.
 ENV LISTEN_ADDR=0.0.0.0:8080
 EXPOSE 8080
-# Liveness: GET /health. Readiness for resolution: GET /v1/status (503s from
-# the resolve endpoints until the first window lands are by design).
+# Liveness: GET /health. Readiness for resolution: GET /v1/status; the resolve
+# endpoints answer 503 until the first window lands.
 ENTRYPOINT ["/usr/local/bin/usernames-api"]

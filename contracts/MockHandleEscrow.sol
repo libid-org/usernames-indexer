@@ -5,7 +5,7 @@ pragma solidity ^0.8.20;
 ///         HandleEscrow, each behind a function that just emits it, and the
 ///         `registry` view the indexer reads at startup. The integration test
 ///         deploys this on anvil beside MockIdentityRegistry, so the indexer
-///         decodes REAL ABI-encoded logs from two emitters.
+///         decodes real ABI-encoded logs from two emitters.
 ///
 ///         Event signatures are copied verbatim from
 ///         libid-contracts/solidity/contracts/escrow/HandleEscrow.sol — a

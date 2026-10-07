@@ -22,7 +22,13 @@
 //!
 //! Skips silently without `DATABASE_URL`, and needs `anvil` on PATH.
 
+use std::{
+    sync::Arc,
+    time::Duration,
+};
+
 use alloy::{
+    contract,
     node_bindings::Anvil,
     primitives::{
         Address,
@@ -52,11 +58,15 @@ use tokio::sync::Mutex;
 use tower::ServiceExt;
 use usernames_api::ens::{
     Config,
+    GatewayResponse,
     GatewayState,
 };
-use usernames_core::db::{
-    self,
-    ChainStore,
+use usernames_core::{
+    db::{
+        self,
+        ChainStore,
+    },
+    ens::DEFAULT_DOMAIN,
 };
 
 use usernames_fixtures::*;
@@ -119,11 +129,9 @@ async fn ask_gateway(router: &Router, sender: Address, call_data: &Bytes) -> Byt
         response.status()
     );
     let body = response.into_body().collect().await.unwrap().to_bytes();
-    let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
-    let data = value["data"].as_str().expect("a data field");
-    hex::decode(data.trim_start_matches("0x"))
-        .expect("hex")
-        .into()
+    let answer: GatewayResponse =
+        serde_json::from_slice(&body).expect("a gateway answer");
+    answer.data
 }
 
 #[tokio::test]
@@ -172,26 +180,25 @@ enum WhoSigns {
 }
 
 /// The four protocol steps, end to end. `None` means the suite skipped.
-async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> {
-    let _guard = DB_LOCK.lock().await;
+async fn walk(who: WhoSigns) -> Option<Result<Address, contract::Error>> {
+    let guard = DB_LOCK.lock().await;
     let url = std::env::var("DATABASE_URL").ok()?;
 
     // ── the read model the gateway answers from ──────────────────────
     let pool = sqlx::PgPool::connect(&url).await.expect("connect");
     db::MIGRATOR.run(&pool).await.expect("migrations");
-    for table in db::PROJECTION_TABLES {
-        sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
+    for statement in [
+        db::CLEAR_CHAIN,
+        db::CLEAR_CHAIN_METADATA,
+        db::CLEAR_CHAIN_NAMES,
+    ] {
+        sqlx::query(statement)
             .bind(CHAIN)
             .execute(&pool)
             .await
             .expect("cleanup");
     }
-    sqlx::query("DELETE FROM names.chain_metadata WHERE chain_id = $1")
-        .bind(CHAIN)
-        .execute(&pool)
-        .await
-        .expect("cleanup");
-    let store = ChainStore::new(pool, CHAIN);
+    let store = ChainStore::new(pool.clone(), CHAIN);
     let owner = Address::from([0xbe; 20]);
     bind(&store, "alice", owner).await;
 
@@ -231,11 +238,13 @@ async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> 
 
     // The gateway is bound to THIS resolver, because the signature names it.
     let router = usernames_api::ens::router(GatewayState::new(Config {
+        domain: DEFAULT_DOMAIN.parse().expect("domain"),
         resolver: resolver_address,
-        store: db::Store::new(store.pool().clone()),
-        ttl_secs: 300,
+        ens_chain: anvil.chain_id(),
+        store: db::Store::new(pool),
+        ttl: Duration::from_secs(300),
         max_lag_blocks: 32,
-        signer: std::sync::Arc::new(ManagedSigner::Local(signer)),
+        signer: Arc::new(ManagedSigner::Local(signer)),
     }));
 
     // ── 1. the wallet asks the resolver, and is told where to look ───
@@ -257,6 +266,9 @@ async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> 
 
     // ── 3. the client fetches a signed blob ──────────────────────────
     let response = ask_gateway(&router, lookup.sender, &lookup.callData).await;
+    // The gateway's answer is the last read of the chain's rows; the other
+    // test may wipe them from here.
+    drop(guard);
 
     // ── 4. and the chain turns it into an address, or refuses ────────
     Some(
@@ -267,9 +279,8 @@ async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> 
             .map(|returned| {
                 // ENSIP-11 `addr` returns `bytes`; a wallet reads an address
                 // out of them.
-                let decoded =
-                    <Bytes as alloy::sol_types::SolValue>::abi_decode(&returned)
-                        .expect("the record decodes as bytes");
+                let decoded = <Bytes as SolValue>::abi_decode(&returned)
+                    .expect("the record decodes as bytes");
                 Address::from_slice(&decoded)
             }),
     )

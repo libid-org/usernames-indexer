@@ -1850,8 +1850,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-link",
 ]
 
@@ -2917,6 +2919,12 @@ name = "httpdate"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
+name = "humantime"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
 
 [[package]]
 name = "hybrid-array"
@@ -5723,15 +5731,17 @@ checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "usernames-api"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "alloy",
  "anyhow",
  "axum",
+ "chrono",
  "clap",
  "dotenvy",
  "hex",
  "http-body-util",
+ "humantime",
  "libid-contracts",
  "libid-signer",
  "serde",
@@ -5749,12 +5759,14 @@ dependencies = [
 
 [[package]]
 name = "usernames-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "alloy",
  "alloy-primitives",
  "anyhow",
  "axum",
+ "chrono",
+ "futures-util",
  "http-body-util",
  "libid-contracts",
  "libid-identity",
@@ -5772,7 +5784,7 @@ dependencies = [
 
 [[package]]
 name = "usernames-fixtures"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "alloy",
  "usernames-core",
@@ -5780,12 +5792,13 @@ dependencies = [
 
 [[package]]
 name = "usernames-indexer"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "alloy",
  "anyhow",
  "clap",
  "dotenvy",
+ "humantime",
  "tokio",
  "tokio-util",
  "tracing",
