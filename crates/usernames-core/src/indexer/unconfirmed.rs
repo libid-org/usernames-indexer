@@ -39,34 +39,25 @@ pub(crate) struct UnplacedLog;
 
 impl Unconfirmed {
     /// Hold a log. One marked `removed` belonged to a block a reorg replaced:
-    /// it takes its twin out instead, and a height left empty is dropped, so
-    /// it costs no canonical check.
+    /// it takes its twin out instead, and leaves its height held even when
+    /// empty, so the canonical block there is read before the height commits
+    /// — the replacement's logs may not have been pushed yet.
     pub(crate) fn push(&mut self, log: Log) -> Result<(), UnplacedLog> {
         let (Some(height), Some(hash), Some(index)) =
             (log.block_number, log.block_hash, log.log_index)
         else {
             return Err(UnplacedLog);
         };
+        let forks = self.heights.entry(height).or_default();
         if log.removed {
-            if let Some(forks) = self.heights.get_mut(&height) {
-                forks.remove(hash, index);
-                if forks.0.is_empty() {
-                    self.heights.remove(&height);
-                }
-            }
+            forks.remove(hash, index);
         } else {
-            self.heights
-                .entry(height)
-                .or_default()
-                .0
-                .entry(hash)
-                .or_default()
-                .insert(index, log);
+            forks.0.entry(hash).or_default().insert(index, log);
         }
         Ok(())
     }
 
-    /// Whether any log waits for its confirmations.
+    /// Whether any height waits for its confirmations.
     pub(crate) fn is_empty(&self) -> bool {
         self.heights.is_empty()
     }
@@ -142,13 +133,14 @@ mod tests {
     }
 
     #[test]
-    fn a_removed_log_takes_its_twin_and_its_height_out() {
+    fn a_removed_log_takes_its_twin_out_and_leaves_its_height_to_check() {
         let mut unconfirmed = Unconfirmed::default();
         unconfirmed.push(mined(10, 0xA1, 0)).unwrap();
         unconfirmed.push(removed(mined(10, 0xA1, 0))).unwrap();
 
-        assert!(unconfirmed.is_empty());
-        assert!(unconfirmed.confirmed(10).is_empty());
+        assert!(!unconfirmed.is_empty());
+        let forks = unconfirmed.confirmed(10).remove(&10).unwrap();
+        assert!(forks.into_canonical(B256::repeat_byte(0xA1)).is_none());
     }
 
     #[test]
@@ -164,20 +156,22 @@ mod tests {
     }
 
     #[test]
-    fn a_removed_log_for_a_block_never_held_changes_nothing() {
+    fn a_removed_log_for_a_block_never_held_marks_its_height_to_check() {
         let mut unconfirmed = Unconfirmed::default();
         unconfirmed.push(mined(10, 0xA1, 0)).unwrap();
         unconfirmed.push(removed(mined(10, 0xB2, 0))).unwrap();
         unconfirmed.push(removed(mined(11, 0xC3, 0))).unwrap();
 
         let mut confirmed = unconfirmed.confirmed(11);
-        assert_eq!(confirmed.keys().copied().collect::<Vec<_>>(), [10]);
+        assert_eq!(confirmed.keys().copied().collect::<Vec<_>>(), [10, 11]);
         let kept = confirmed
             .remove(&10)
             .unwrap()
             .into_canonical(B256::repeat_byte(0xA1))
             .unwrap();
         assert_eq!(positions(&kept), [(10, 0)]);
+        let replaced = confirmed.remove(&11).unwrap();
+        assert!(replaced.into_canonical(B256::repeat_byte(0xD4)).is_none());
     }
 
     #[test]

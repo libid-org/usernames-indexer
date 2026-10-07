@@ -1,9 +1,9 @@
 //! A WebSocket relay between the indexer and anvil: it records the JSON-RPC
-//! methods the indexer calls, and on demand cuts every connection and
-//! refuses new ones until it reopens — a dropped socket, when a test wants
-//! one.
+//! methods the indexer calls, and on demand cuts every connection, holds new
+//! ones until it reopens, or answers one head read from behind the chain.
 
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{
         Arc,
@@ -11,11 +11,15 @@ use std::{
     },
 };
 
+use alloy::primitives::U64;
 use futures::{
     SinkExt,
     StreamExt,
 };
-use serde::Deserialize;
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use tokio::{
     net::{
         TcpListener,
@@ -30,19 +34,37 @@ use tokio_tungstenite::{
 };
 use url::Url;
 
-/// The relay's listening end and what it saw.
+/// The relay's listening end, its switches, and what it saw.
 pub struct Relay {
     addr: SocketAddr,
-    calls: Arc<Mutex<Vec<String>>>,
+    shared: Arc<Shared>,
     open: watch::Sender<bool>,
     /// How many connections are being relayed right now.
     live: watch::Sender<usize>,
 }
 
-/// The part of a JSON-RPC request the relay records.
+/// What every relayed connection reads and writes.
+#[derive(Default)]
+struct Shared {
+    /// Every method the indexer called, in order.
+    calls: Mutex<Vec<String>>,
+    /// Blocks to take off the next `eth_blockNumber` answer.
+    head_lag: Mutex<Option<u64>>,
+}
+
+/// The part of a JSON-RPC request the relay reads.
 #[derive(Deserialize)]
 struct Call {
+    id: u64,
     method: String,
+}
+
+/// A JSON-RPC answer carrying a quantity, as `eth_blockNumber` answers.
+#[derive(Deserialize, Serialize)]
+struct Quantity {
+    jsonrpc: String,
+    id: u64,
+    result: U64,
 }
 
 impl Relay {
@@ -52,27 +74,33 @@ impl Relay {
             .await
             .expect("a local port");
         let addr = listener.local_addr().expect("the bound address");
-        let calls = Arc::new(Mutex::new(Vec::new()));
+        let shared = Arc::new(Shared::default());
         let (open, _) = watch::channel(true);
         let (live, _) = watch::channel(0);
         let relay = Self {
             addr,
-            calls: calls.clone(),
+            shared: shared.clone(),
             open: open.clone(),
             live: live.clone(),
         };
         tokio::spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
-                if *open.borrow() {
-                    let (upstream, calls, open) =
-                        (upstream.clone(), calls.clone(), open.subscribe());
-                    live.send_modify(|live| *live += 1);
-                    let live = live.clone();
-                    tokio::spawn(async move {
-                        pipe(socket, upstream, calls, open).await;
+                let (upstream, shared, mut open, live) = (
+                    upstream.clone(),
+                    shared.clone(),
+                    open.subscribe(),
+                    live.clone(),
+                );
+                tokio::spawn(async move {
+                    // A connection made while the relay is cut waits for it to
+                    // reopen, its handshake stalled as on an unreachable host.
+                    let reopened = open.wait_for(|open| *open).await.is_ok();
+                    if reopened {
+                        live.send_modify(|live| *live += 1);
+                        pipe(socket, upstream, shared, open).await;
                         live.send_modify(|live| *live -= 1);
-                    });
-                }
+                    }
+                });
             }
         });
         relay
@@ -84,7 +112,7 @@ impl Relay {
         format!("http://{}", self.addr).parse().expect("a URL")
     }
 
-    /// Drop every relayed connection, and refuse new ones until reopened.
+    /// Drop every relayed connection and hold new ones until reopened.
     /// Returns once the last relayed connection is closed.
     pub async fn cut(&self) {
         self.open.send_replace(false);
@@ -96,23 +124,30 @@ impl Relay {
             .expect("the relay outlives its connections");
     }
 
-    /// Relay new connections again.
+    /// Relay again, the held connections first.
     pub fn reopen(&self) {
         self.open.send_replace(true);
     }
 
+    /// Answer the next `eth_blockNumber` `blocks` short of the chain head, as
+    /// a node behind the rest of a balanced endpoint would.
+    pub fn lag_next_head(&self, blocks: u64) {
+        *self.shared.head_lag.lock().expect("the head lag") = Some(blocks);
+    }
+
     /// Every method the indexer called through the relay, in order.
     pub fn calls(&self) -> Vec<String> {
-        self.calls.lock().expect("the call log").clone()
+        self.shared.calls.lock().expect("the call log").clone()
     }
 }
 
-/// Relay one connection both ways, recording each request's method, until
-/// either side closes or the relay is cut.
+/// Relay one connection both ways, recording each request's method and
+/// lagging the head read it was told to, until either side closes or the
+/// relay is cut.
 async fn pipe(
     socket: TcpStream,
     upstream: Url,
-    calls: Arc<Mutex<Vec<String>>>,
+    shared: Arc<Shared>,
     mut open: watch::Receiver<bool>,
 ) {
     let Ok(client) = accept_async(socket).await else {
@@ -123,6 +158,8 @@ async fn pipe(
     };
     let (mut to_client, mut from_client) = client.split();
     let (mut to_server, mut from_server) = server.split();
+    // Request ids whose answers are to be lagged, and by how much.
+    let mut lagged = HashMap::new();
     loop {
         tokio::select! {
             _ = async { open.wait_for(|open| !*open).await.map(drop) } => return,
@@ -130,7 +167,11 @@ async fn pipe(
                 let Some(Ok(message)) = message else { return };
                 if let Message::Text(text) = &message {
                     if let Ok(call) = serde_json::from_str::<Call>(text.as_str()) {
-                        calls.lock().expect("the call log").push(call.method);
+                        let lag = shared.head_lag.lock().expect("the head lag").take_if(|_| call.method == "eth_blockNumber");
+                        if let Some(blocks) = lag {
+                            lagged.insert(call.id, blocks);
+                        }
+                        shared.calls.lock().expect("the call log").push(call.method);
                     }
                 }
                 if to_server.send(message).await.is_err() {
@@ -139,6 +180,20 @@ async fn pipe(
             }
             message = from_server.next() => {
                 let Some(Ok(message)) = message else { return };
+                let message = match &message {
+                    Message::Text(text) => match serde_json::from_str::<Quantity>(text.as_str()) {
+                        Ok(answer) if lagged.contains_key(&answer.id) => {
+                            let blocks = lagged.remove(&answer.id).unwrap_or_default();
+                            let behind = Quantity {
+                                result: answer.result.saturating_sub(U64::from(blocks)),
+                                ..answer
+                            };
+                            Message::text(serde_json::to_string(&behind).expect("an answer"))
+                        }
+                        _ => message,
+                    },
+                    _ => message,
+                };
                 if to_client.send(message).await.is_err() {
                     return;
                 }

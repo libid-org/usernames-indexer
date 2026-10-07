@@ -1,7 +1,7 @@
 //! The subscription source against a real chain. anvil streams the mock
-//! contracts' logs over a WebSocket, through a relay that can drop the socket
-//! and records every call the indexer makes, so each test checks what the
-//! indexer committed and what the RPC was asked for it.
+//! contracts' logs over a WebSocket, through a relay that can drop the socket,
+//! lag a head read and records every call the indexer makes, so each test
+//! checks what the indexer committed and what the RPC was asked for it.
 //!
 //! Skips silently in exactly two cases: `DATABASE_URL` unset, or no `anvil`
 //! binary on PATH. Everything past those checks panics on failure.
@@ -36,7 +36,11 @@ use axum::http::StatusCode;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use usernames_core::{
-    api::model::HandleResolution,
+    api::model::{
+        HandleHistory,
+        HandleResolution,
+        HistoryEvent,
+    },
     db::{
         self,
         ChainStore,
@@ -111,18 +115,7 @@ impl Chain {
         }
 
         let pool = db::connect_and_migrate(&url).await.expect("database");
-        for table in db::PROJECTION_TABLES {
-            sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
-                .bind(chain_id as i64)
-                .execute(&pool)
-                .await
-                .expect("cleanup");
-        }
-        sqlx::query("DELETE FROM names.chain_metadata WHERE chain_id = $1")
-            .bind(chain_id as i64)
-            .execute(&pool)
-            .await
-            .expect("metadata cleanup");
+        common::clear_chain(&pool, chain_id as i64).await;
         let store = ChainStore::new(pool, chain_id as i64);
 
         let anvil = Anvil::new().chain_id(chain_id).spawn();
@@ -156,10 +149,10 @@ impl Chain {
         })
     }
 
-    /// Run the indexer over the relay with a log subscription, staying
-    /// `confirmations` behind the head.
-    fn index(&self, confirmations: u64) -> Running {
-        let config = IndexerConfig {
+    /// The suite's indexer settings: a log subscription over the relay,
+    /// `confirmations` behind the head, on short intervals.
+    fn config(&self, confirmations: u64) -> IndexerConfig {
+        IndexerConfig {
             contract: *self.registry.address(),
             escrow: Some(*self.escrow.address()),
             confirmations,
@@ -169,7 +162,11 @@ impl Chain {
             max_block_range: 5,
             start_block: Some(0),
             stale_after: Duration::from_secs(120),
-        };
+        }
+    }
+
+    /// Run the indexer over the relay.
+    fn run(&self, config: IndexerConfig) -> Running {
         let cancel = CancellationToken::new();
         let indexer = Indexer::new(self.store.clone(), self.relay.url(), config);
         let task = tokio::spawn(indexer.run(cancel.clone()));
@@ -269,6 +266,21 @@ impl Chain {
         }
     }
 
+    /// Wait for the indexer's next head read. After a catch-up that is the
+    /// session's first settle, which fetches whatever the catch-up's head
+    /// may have missed: nothing, when no block arrived in between.
+    async fn wait_for_head_read(&self) {
+        let reads = self.called("eth_blockNumber");
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        while self.called("eth_blockNumber") == reads {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the indexer read no head"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Who `handle` on X resolves to, or the refusal's status.
     async fn resolve(&self, handle: &str) -> Result<Address, StatusCode> {
         let chain = self.store.chain_id();
@@ -284,16 +296,21 @@ impl Chain {
         }
     }
 
-    /// The journal's event kinds by block, in chain order.
-    async fn journal(&self) -> Vec<(i64, String)> {
-        sqlx::query_as(
-            "SELECT block_number, kind FROM names.events WHERE chain_id = $1 \
-             ORDER BY block_number, log_index",
+    /// The events of `handle` on X, oldest first, each with its block.
+    async fn history(&self, handle: &str) -> Vec<(u64, HistoryEvent)> {
+        let chain = self.store.chain_id();
+        let history: HandleHistory = common::get(
+            &self.store,
+            &format!("/v1/history/handle/x/{handle}?chain={chain}"),
         )
-        .bind(self.store.chain_id())
-        .fetch_all(self.store.pool())
         .await
-        .expect("journal")
+        .answer();
+        history
+            .entries
+            .into_iter()
+            .rev()
+            .map(|entry| (entry.block_number as u64, entry.event))
+            .collect()
     }
 
     /// How many times the indexer called `method` through the relay.
@@ -320,8 +337,9 @@ async fn with_no_events_the_cursor_follows_the_head_on_head_reads_alone() {
     let Some(chain) = Chain::start(43120).await else {
         return;
     };
-    let running = chain.index(2);
+    let running = chain.run(chain.config(2));
     chain.wait_for_index(chain.head().await - 2).await;
+    chain.wait_for_head_read().await;
     let windows = chain.called("eth_getLogs");
 
     chain.mine(10).await;
@@ -345,6 +363,40 @@ async fn with_no_events_the_cursor_follows_the_head_on_head_reads_alone() {
     chain.stop(running).await;
 }
 
+/// Between head reads the report is renewed from the store alone, so an idle
+/// indexer stays trusted for longer than one report lasts without asking the
+/// RPC anything.
+#[tokio::test]
+async fn between_head_reads_the_report_is_renewed_without_the_rpc() {
+    let Some(chain) = Chain::start(43125).await else {
+        return;
+    };
+    let running = chain.run(IndexerConfig {
+        head_interval: Duration::from_secs(3600),
+        stale_after: Duration::from_secs(2),
+        ..chain.config(2)
+    });
+    chain.wait_for_index(chain.head().await - 2).await;
+    let reported = chain.position().await.reported_at;
+    let calls = chain.relay.calls().len();
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let position = chain.position().await;
+    assert!(
+        position.valid_for.is_some_and(|valid_for| valid_for > 0),
+        "{position:?}"
+    );
+    assert!(position.reported_at > reported, "{position:?}");
+    assert_eq!(
+        chain.relay.calls().len(),
+        calls,
+        "{:?}",
+        chain.relay.calls()
+    );
+    chain.stop(running).await;
+}
+
 /// A pushed event commits once its block is confirmed, both watched
 /// contracts' alike, and costs one canonical block read per block holding
 /// events rather than any window.
@@ -353,8 +405,9 @@ async fn pushed_events_commit_once_confirmed_at_one_block_read_each() {
     let Some(chain) = Chain::start(43121).await else {
         return;
     };
-    let running = chain.index(2);
+    let running = chain.run(chain.config(2));
     chain.wait_for_index(chain.head().await - 2).await;
+    chain.wait_for_head_read().await;
     let windows = chain.called("eth_getLogs");
 
     let holder = Address::repeat_byte(0x51);
@@ -366,12 +419,21 @@ async fn pushed_events_commit_once_confirmed_at_one_block_read_each() {
     chain.wait_for_index(deposited).await;
 
     assert_eq!(chain.resolve("pushed_1").await, Ok(holder));
-    assert_eq!(
-        chain.journal().await,
-        [
-            (bound as i64, "identity_bound".to_string()),
-            (deposited as i64, "deposited".to_string()),
-        ]
+    let history = chain.history("pushed_1").await;
+    assert!(
+        matches!(
+            history[..],
+            [(block, HistoryEvent::IdentityBound { .. })] if block == bound
+        ),
+        "{history:?}"
+    );
+    let history = chain.history("deposited_1").await;
+    assert!(
+        matches!(
+            history[..],
+            [(block, HistoryEvent::Deposited { .. })] if block == deposited
+        ),
+        "{history:?}"
     );
     assert_eq!(
         chain.called("eth_getLogs"),
@@ -384,14 +446,19 @@ async fn pushed_events_commit_once_confirmed_at_one_block_read_each() {
 }
 
 /// Logs emitted while the socket is down are never pushed; the next session
-/// fetches them from the cursor, once.
+/// fetches them from the cursor, once. The relay holds the reconnect until
+/// it reopens, so a client that reconnected and re-subscribed on its own,
+/// skipping the gap, would fail here.
 #[tokio::test]
 async fn a_dropped_socket_is_backfilled_from_the_cursor_on_reconnect() {
     let Some(chain) = Chain::start(43122).await else {
         return;
     };
-    let running = chain.index(2);
+    let running = chain.run(chain.config(2));
     chain.wait_for_index(chain.head().await - 2).await;
+    // Past the first settle, whose fetch past the catch-up's head would
+    // find the gap too.
+    chain.wait_for_head_read().await;
 
     // The stream is gone before the event is emitted, so only a backfill
     // can find it.
@@ -403,9 +470,13 @@ async fn a_dropped_socket_is_backfilled_from_the_cursor_on_reconnect() {
     chain.wait_for_index(bound).await;
 
     assert_eq!(chain.resolve("backfilled_1").await, Ok(holder));
-    assert_eq!(
-        chain.journal().await,
-        [(bound as i64, "identity_bound".to_string())]
+    let history = chain.history("backfilled_1").await;
+    assert!(
+        matches!(
+            history[..],
+            [(block, HistoryEvent::IdentityBound { .. })] if block == bound
+        ),
+        "{history:?}"
     );
     assert_eq!(
         chain.called("eth_subscribe"),
@@ -413,6 +484,29 @@ async fn a_dropped_socket_is_backfilled_from_the_cursor_on_reconnect() {
         "{:?}",
         chain.relay.calls()
     );
+    chain.stop(running).await;
+}
+
+/// A head read answered from behind the node that streams leaves a block
+/// neither fetched nor pushed; the session's first settle fetches past the
+/// catch-up's head and finds it.
+#[tokio::test]
+async fn a_block_behind_a_lagging_head_read_is_fetched_at_the_first_settle() {
+    let Some(chain) = Chain::start(43124).await else {
+        return;
+    };
+    let holder = Address::repeat_byte(0x56);
+    let missed = chain.bind("lagged_1", holder).await;
+    chain.relay.lag_next_head(2);
+
+    let running = chain.run(chain.config(1));
+    // The catch-up's head was two short: it stopped before the binding,
+    // which was mined before the stream opened.
+    chain.wait_for_index(missed - 3).await;
+    chain.mine(1).await;
+    chain.wait_for_index(missed).await;
+
+    assert_eq!(chain.resolve("lagged_1").await, Ok(holder));
     chain.stop(running).await;
 }
 
@@ -425,8 +519,9 @@ async fn a_reorg_at_the_confirmation_depth_drops_the_event_it_orphaned() {
     let Some(chain) = Chain::start(43123).await else {
         return;
     };
-    let running = chain.index(3);
+    let running = chain.run(chain.config(3));
     chain.wait_for_index(chain.head().await - 3).await;
+    chain.wait_for_head_read().await;
     let windows = chain.called("eth_getLogs");
 
     let (orphan, heir) = (Address::repeat_byte(0x54), Address::repeat_byte(0x55));
@@ -454,9 +549,14 @@ async fn a_reorg_at_the_confirmation_depth_drops_the_event_it_orphaned() {
         chain.resolve("orphaned_1").await,
         Err(StatusCode::NOT_FOUND)
     );
-    assert_eq!(
-        chain.journal().await,
-        [((orphaned + 1) as i64, "identity_bound".to_string())]
+    assert!(chain.history("orphaned_1").await.is_empty());
+    let history = chain.history("replacing_1").await;
+    assert!(
+        matches!(
+            history[..],
+            [(block, HistoryEvent::IdentityBound { .. })] if block == orphaned + 1
+        ),
+        "{history:?}"
     );
     // One refetch: the height whose pushed block the reorg replaced.
     assert_eq!(

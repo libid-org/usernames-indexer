@@ -90,6 +90,15 @@ pub struct IndexerConfig {
     pub stale_after: Duration,
 }
 
+impl IndexerConfig {
+    /// The last block of the `eth_getLogs` window that starts at `from`, at
+    /// most `through`.
+    fn window_end(&self, from: u64, through: u64) -> u64 {
+        from.saturating_add(self.max_block_range.max(1) - 1)
+            .min(through)
+    }
+}
+
 /// One chain's indexer: the store, the RPC endpoint and the knobs fused, so
 /// the loop's operations take only what actually varies between calls.
 pub struct Indexer {
@@ -209,6 +218,9 @@ struct Session<'a> {
     indexer: &'a Indexer,
     provider: RootProvider,
     feed: Feed,
+    /// With a subscription, the head the last catch-up fetched through, until
+    /// the next settle fetches past it.
+    fetched_through: Option<u64>,
 }
 
 impl<'a> Session<'a> {
@@ -226,6 +238,7 @@ impl<'a> Session<'a> {
             indexer,
             provider,
             feed,
+            fetched_through: None,
         })
     }
 
@@ -272,25 +285,25 @@ impl<'a> Session<'a> {
         let config = &indexer.config;
         let (head, mut from) = tokio::try_join!(self.head(), self.next_block())?;
         let target = head.saturating_sub(config.confirmations);
-        indexer.store.set_chain_head(head).await;
         // Both, because they answer different questions: `head` is how far
         // the chain has grown, `target` is how far this loop intends to get.
         // A reader measuring staleness must use the second — the cursor is
         // never advanced past it.
-        let vouched = indexer
-            .store
-            .set_chain_target(target, config.stale_after)
-            .await;
+        let ((), vouched) = tokio::join!(
+            indexer.store.set_chain_head(head),
+            indexer.store.set_chain_target(target, config.stale_after)
+        );
         let through = match self.feed {
             Feed::Poll => target,
-            Feed::Subscribe { .. } => head,
+            Feed::Subscribe { .. } => {
+                self.fetched_through = Some(head);
+                head
+            }
         };
 
         let mut total = 0usize;
         while from <= through && !cancel.is_cancelled() {
-            let to = from
-                .saturating_add(config.max_block_range.max(1) - 1)
-                .min(through);
+            let to = config.window_end(from, through);
             // Renewed before the fetch as well as after the commit: the fetch
             // is the slow part, and a report expiring during it would refuse
             // a loop that is busy catching up.
@@ -338,24 +351,30 @@ impl<'a> Session<'a> {
     async fn settle(&mut self) -> anyhow::Result<bool> {
         let indexer = self.indexer;
         let (head, from) = tokio::try_join!(self.head(), self.next_block())?;
-        indexer.store.set_chain_head(head).await;
         let target = head.saturating_sub(indexer.config.confirmations);
         // Read after the head, so every log of a block below it is in hand,
         // however long the loop took to come round to the stream.
         self.feed.take_delivered()?;
+        // On an endpoint that balances requests, the catch-up's head may have
+        // come from a node behind the one streaming, and the blocks between
+        // were neither fetched nor pushed.
+        if let Some(fetched) = self.fetched_through.take() {
+            self.hold(fetched + 1, head).await?;
+        }
         let confirmed = self
             .feed
             .unconfirmed()
             .map(|unconfirmed| unconfirmed.confirmed(target))
             .unwrap_or_default();
 
+        let blocks = confirmed
+            .into_iter()
+            .filter(|(height, _)| *height >= from)
+            .map(|(height, forks)| self.canonical(height, forks));
+        let ((), logs) =
+            tokio::join!(indexer.store.set_chain_head(head), try_join_all(blocks));
+        let logs: Vec<Log> = logs?.into_iter().flatten().collect();
         if from <= target {
-            let blocks = confirmed
-                .into_iter()
-                .filter(|(height, _)| *height >= from)
-                .map(|(height, forks)| self.canonical(height, forks));
-            let logs: Vec<Log> =
-                try_join_all(blocks).await?.into_iter().flatten().collect();
             let applied = indexer
                 .commit(&logs, target)
                 .await
@@ -366,12 +385,30 @@ impl<'a> Session<'a> {
         }
         // Written after the commit, unlike a catch-up's target: nothing is
         // left to catch up, so no reader sees the target ahead of the cursor.
-        let vouched = indexer
-            .store
-            .set_chain_target(target, indexer.config.stale_after)
-            .await;
-        indexer.store.set_window_error(None).await;
+        let (vouched, ()) = tokio::join!(
+            indexer
+                .store
+                .set_chain_target(target, indexer.config.stale_after),
+            indexer.store.set_window_error(None)
+        );
         Ok(vouched)
+    }
+
+    /// Fetch blocks `from..=to` in `eth_getLogs` windows and hold their logs
+    /// beside the pushed ones, for the canonical check to settle alike.
+    async fn hold(&mut self, from: u64, to: u64) -> anyhow::Result<()> {
+        let mut start = from;
+        while start <= to {
+            let end = self.indexer.config.window_end(start, to);
+            let logs = self.fetch(start, end).await?;
+            if let Some(unconfirmed) = self.feed.unconfirmed() {
+                for log in logs {
+                    unconfirmed.push(log)?;
+                }
+            }
+            start = end + 1;
+        }
+        Ok(())
     }
 
     /// The logs of the canonical block at `height`: the pushed ones when the
