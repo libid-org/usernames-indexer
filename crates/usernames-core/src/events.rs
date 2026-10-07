@@ -271,12 +271,8 @@ impl NamesEvent {
         }
     }
 
-    /// The addresses the event itself names, each with the part it plays. The
-    /// apply path adds what a bind takes from addresses it does not name, the
-    /// payer of a bind fee, which only the ceremony beside it names, and the
-    /// `refundTo` of every deposit a claim takes. A retirement names the
-    /// address whose bind retired the handle, which need not be the one that
-    /// held it, so the apply path names the parties of that one too.
+    /// The addresses the event itself names, each with the part it plays; the
+    /// apply path finds the ones it involves without naming them.
     pub fn parties(&self) -> Vec<(Address, Role)> {
         match self {
             Self::IdentityBound { holder, .. }
@@ -395,10 +391,8 @@ fn payload_of<E: SolEvent>(log: &Log, event: &'static str) -> Result<E, DecodeEr
 }
 
 impl LogPosition {
-    /// Where a mined log sat. Every field is one a mined log carries; the
-    /// block's timestamp is one `eth_getLogs` has returned since execution-apis
-    /// added it (reth, geth, anvil), and an RPC without it fails the window
-    /// rather than writing a history with no time in it.
+    /// Where a mined log sat. An RPC that omits the block's timestamp fails
+    /// the window rather than writing a history with no time in it.
     fn of(log: &Log) -> Result<Self, DecodeError> {
         Ok(Self {
             block_number: log
