@@ -5762,6 +5762,7 @@ dependencies = [
  "alloy-primitives",
  "anyhow",
  "axum",
+ "futures-util",
  "http-body-util",
  "libid-contracts",
  "libid-identity",

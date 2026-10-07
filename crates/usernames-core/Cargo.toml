@@ -13,6 +13,7 @@ alloy.workspace = true
 alloy-primitives.workspace = true
 anyhow.workspace = true
 axum.workspace = true
+futures-util = "0.3"
 libid-contracts.workspace = true
 libid-identity.workspace = true
 serde.workspace = true

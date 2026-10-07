@@ -40,6 +40,7 @@ use axum::{
     Json,
     Router,
 };
+use futures_util::future::try_join_all;
 use serde::{
     de::DeserializeOwned,
     Deserialize,
@@ -434,32 +435,53 @@ async fn health() -> &'static str {
 }
 
 impl ChainStatus {
-    async fn of(store: &ChainStore) -> Result<Self, ApiError> {
-        let last = store.cursor().await?;
-        let head = store.chain_head().await?;
-        let position = store.index_position().await?;
+    async fn of(store: ChainStore) -> Result<Self, ApiError> {
+        let (
+            last,
+            head,
+            position,
+            names,
+            contract,
+            escrow,
+            last_window_error,
+            proof_verifier,
+        ) = tokio::try_join!(
+            store.cursor(),
+            store.chain_head(),
+            store.index_position(),
+            store.chain_names(),
+            store.contract(),
+            store.escrow(),
+            store.window_error(),
+            store.proof_verifier(),
+        )?;
         Ok(Self {
             chain_id: store.chain_id(),
-            names: store.chain_names().await?,
-            contract: store.contract().await?,
-            escrow: store.escrow().await?,
+            names,
+            contract,
+            escrow,
             last_indexed_block: last,
             chain_head_block: head,
             lag_blocks: head.map(|h| h.saturating_sub(last.unwrap_or(0))),
             indexer_reported_at: position.reported_at,
             report_valid_for: position.valid_for,
-            last_window_error: store.window_error().await?,
-            proof_verifier: store.proof_verifier().await?,
+            last_window_error,
+            proof_verifier,
         })
     }
 }
 
 /// `GET /v1/status` — every chain in the store, as its indexer last left it.
 async fn status(State(state): State<AppState>) -> Result<Json<Status>, ApiError> {
-    let mut chains = Vec::new();
-    for chain_id in state.store.known_chains().await? {
-        chains.push(ChainStatus::of(&state.store.chain(chain_id)).await?);
-    }
+    let chains = try_join_all(
+        state
+            .store
+            .known_chains()
+            .await?
+            .into_iter()
+            .map(|chain_id| ChainStatus::of(state.store.chain(chain_id))),
+    )
+    .await?;
     Ok(Json(Status {
         chains,
         indexer_version: db::INDEXER_VERSION.to_string(),

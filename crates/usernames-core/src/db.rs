@@ -354,9 +354,11 @@ impl ChainStore {
             "writer lease locks chain {}, but this store prepares chain {}",
             writer.chain_id, self.chain_id
         );
-        let version = self.get_metadata(SCHEMA_VERSION_KEY).await?;
-        let known_contract = self.get_metadata(CONTRACT_KEY).await?;
-        let known_escrow = self.get_metadata(ESCROW_KEY).await?;
+        let (version, known_contract, known_escrow) = tokio::try_join!(
+            self.get_metadata(SCHEMA_VERSION_KEY),
+            self.get_metadata(CONTRACT_KEY),
+            self.get_metadata(ESCROW_KEY),
+        )?;
         let contract_now = contract.to_string().to_lowercase();
         let escrow_now = escrow.map(|escrow| escrow.to_string().to_lowercase());
         let version_ok = version.as_deref() == Some(INDEXER_VERSION);
