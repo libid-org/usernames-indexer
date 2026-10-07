@@ -179,47 +179,22 @@ pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
 /// every failure is the database's: a chain value that does not fit a BIGINT
 /// is this indexer's limit, and blaming the driver for it would send an
 /// operator debugging the wrong layer.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
     /// The database refused or the connection failed.
-    Db(sqlx::Error),
+    #[error("database: {0}")]
+    Db(#[from] sqlx::Error),
     /// A chain value does not fit the column that stores it.
+    #[error("{what} {value} does not fit in a BIGINT")]
     OutOfRange {
         /// Which value, named the way the event names it.
         what: &'static str,
         /// The value itself.
         value: u64,
     },
-    /// The event did not serialize into its journal payload.
-    Journal(serde_json::Error),
-}
-
-impl std::fmt::Display for ApplyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Db(e) => write!(f, "database: {e}"),
-            Self::OutOfRange { what, value } => {
-                write!(f, "{what} {value} does not fit in a BIGINT")
-            }
-            Self::Journal(e) => write!(f, "journal payload: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for ApplyError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Db(e) => Some(e),
-            Self::OutOfRange { .. } => None,
-            Self::Journal(e) => Some(e),
-        }
-    }
-}
-
-impl From<sqlx::Error> for ApplyError {
-    fn from(e: sqlx::Error) -> Self {
-        Self::Db(e)
-    }
+    /// The event did not serialize into, or read back from, its journal row.
+    #[error("journal payload: {0}")]
+    Journal(#[from] serde_json::Error),
 }
 
 /// Why a chain's names could not be declared.
@@ -821,7 +796,7 @@ impl Window {
         let at = Position::of(pos)?;
         let (block, log_index) = (at.block, at.log_index);
 
-        let mut payload = event.payload().map_err(ApplyError::Journal)?;
+        let mut payload = event.payload()?;
         if sanitize_json(&mut payload) {
             tracing::error!(
                 kind = event.kind(),

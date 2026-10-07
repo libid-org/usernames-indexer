@@ -94,22 +94,14 @@ static KNOWN_BY_ID: LazyLock<HashMap<B256, KnownPlatform>> =
 /// A platform reference that is neither a known key nor a 0x-hex 32-byte id.
 /// The message derives the key list from the registry, so it cannot rot as
 /// platforms are added.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "unknown platform {raw:?}: use {keys}or a 0x-hex platform id",
+    keys = KnownPlatform::ALL.iter().map(|p| format!("{}, ", p.key())).collect::<String>()
+)]
 pub struct UnknownPlatform {
     raw: String,
 }
-
-impl std::fmt::Display for UnknownPlatform {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "unknown platform {:?}: use ", self.raw)?;
-        for platform in KnownPlatform::ALL {
-            write!(f, "{}, ", platform.key())?;
-        }
-        write!(f, "or a 0x-hex platform id")
-    }
-}
-
-impl std::error::Error for UnknownPlatform {}
 
 /// A platform named by its short key ('x') or its 0x-hex 32-byte id. The key
 /// form also carries this build's normalization rules; the hex form indexes

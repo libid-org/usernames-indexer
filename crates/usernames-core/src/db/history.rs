@@ -202,8 +202,7 @@ impl Window {
                     return Ok(involvement);
                 };
                 if let NamesEvent::CeremonyBound { holder, .. } =
-                    NamesEvent::from_journal(&ceremony.kind, ceremony.payload)
-                        .map_err(ApplyError::Journal)?
+                    NamesEvent::from_journal(&ceremony.kind, ceremony.payload)?
                 {
                     involvement.add(holder, Role::Holder);
                 }
