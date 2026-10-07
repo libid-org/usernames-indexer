@@ -212,9 +212,7 @@ const RESOLVER_MAX_LIFETIME: Duration = Duration::from_secs(3600);
 const BLOCK_TIMESTAMP_SLACK: Duration = Duration::from_secs(300);
 
 /// The longest TTL a gateway may be configured with.
-const MAX_TTL: Duration = Duration::from_secs(
-    RESOLVER_MAX_LIFETIME.as_secs() - BLOCK_TIMESTAMP_SLACK.as_secs(),
-);
+const MAX_TTL: Duration = RESOLVER_MAX_LIFETIME.saturating_sub(BLOCK_TIMESTAMP_SLACK);
 
 impl Config {
     /// Where the gateway's key lives, and the resolver it signs for.

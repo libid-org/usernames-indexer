@@ -106,10 +106,10 @@ pub struct IndexPosition {
     pub valid_for: Option<i64>,
 }
 
-/// The longest validity the store will write: ten years. Anything larger is
-/// a mistake, and a value near `i64::MAX` would overflow the `bigint` addition
-/// in Postgres and fail the whole statement, target included.
-const MAX_VALID_FOR: Duration = Duration::from_secs(10 * 366 * 24 * 60 * 60);
+/// The longest a report may be trusted: a year. A longer setting is a
+/// mistake, and the store clamps what it writes to this, so the `bigint`
+/// addition in Postgres never overflows and fails the statement.
+pub const MAX_VALID_FOR: Duration = Duration::from_secs(366 * 24 * 60 * 60);
 
 /// The whole store: every chain any indexer has written into one database.
 ///
@@ -492,9 +492,7 @@ impl ChainStore {
     }
 
     /// The validity the store will write for a report, in the whole seconds
-    /// the SQL adds to its clock: at most ten years, so the `bigint` addition
-    /// in Postgres can never overflow and fail the whole statement, target
-    /// included.
+    /// the SQL adds to its clock, at most [`MAX_VALID_FOR`].
     fn valid_for_bind(valid_for: Duration) -> i64 {
         i64::try_from(valid_for.min(MAX_VALID_FOR).as_secs()).unwrap_or(i64::MAX)
     }

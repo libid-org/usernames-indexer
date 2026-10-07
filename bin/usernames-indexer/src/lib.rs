@@ -93,10 +93,6 @@ pub struct Config {
     pub stale_after: Option<Duration>,
 }
 
-/// The longest a report may be trusted: a year. Past that the setting is a
-/// mistake, and the store would clamp it anyway.
-const MAX_STALE_AFTER: Duration = Duration::from_secs(366 * 24 * 60 * 60);
-
 impl Config {
     /// How long readers may trust a report: `STALE_AFTER`, or four poll
     /// intervals plus a minute. Refused unless it outlasts a poll interval,
@@ -116,7 +112,7 @@ impl Config {
             humantime::format_duration(self.poll_interval)
         );
         anyhow::ensure!(
-            validity <= MAX_STALE_AFTER,
+            validity <= db::MAX_VALID_FOR,
             "STALE_AFTER ({}) is more than a year; a report nobody expects to \
              expire is not a report",
             humantime::format_duration(validity)
