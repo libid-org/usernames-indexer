@@ -125,7 +125,7 @@ pub fn router(state: AppState) -> Router {
 /// sentences that may be reworded.
 struct ApiError {
     status: StatusCode,
-    code: &'static str,
+    code: ErrorCode,
     message: String,
     /// The operator-facing cause, logged when the response renders and never
     /// serialized to the client.
@@ -133,7 +133,7 @@ struct ApiError {
 }
 
 impl ApiError {
-    fn not_found(code: &'static str, message: impl Into<String>) -> Self {
+    fn not_found(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
             code,
@@ -142,7 +142,7 @@ impl ApiError {
         }
     }
 
-    fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
+    fn bad_request(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             code,
@@ -157,7 +157,7 @@ impl ApiError {
         tracing::error!(%what, "unreadable stored value");
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: "internal",
+            code: ErrorCode::Internal,
             message: "internal error".into(),
             source: None,
         }
@@ -172,7 +172,7 @@ impl ApiError {
         };
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "not_synced",
+            code: ErrorCode::NotSynced,
             message,
             source: None,
         }
@@ -185,7 +185,7 @@ impl ApiError {
 impl From<libid_identity::HandleError> for ApiError {
     fn from(e: libid_identity::HandleError) -> Self {
         Self::not_found(
-            "handle_impossible",
+            ErrorCode::HandleImpossible,
             format!("no handle can exist on this platform for this text: {e}"),
         )
     }
@@ -198,7 +198,7 @@ impl From<PathRejection> for ApiError {
         if rejection.status().is_server_error() {
             Self::internal(rejection.body_text())
         } else {
-            Self::bad_request("invalid_path", rejection.body_text())
+            Self::bad_request(ErrorCode::InvalidPath, rejection.body_text())
         }
     }
 }
@@ -206,13 +206,13 @@ impl From<PathRejection> for ApiError {
 /// A query string axum could not take apart, such as a repeated key.
 impl From<QueryRejection> for ApiError {
     fn from(rejection: QueryRejection) -> Self {
-        Self::bad_request("invalid_query", rejection.body_text())
+        Self::bad_request(ErrorCode::InvalidQuery, rejection.body_text())
     }
 }
 
 impl From<InvalidCursor> for ApiError {
     fn from(e: InvalidCursor) -> Self {
-        Self::bad_request("invalid_cursor", e.to_string())
+        Self::bad_request(ErrorCode::InvalidCursor, e.to_string())
     }
 }
 
@@ -222,7 +222,7 @@ impl From<sqlx::Error> for ApiError {
     fn from(e: sqlx::Error) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: "internal",
+            code: ErrorCode::Internal,
             message: "internal error".into(),
             source: Some(e),
         }
@@ -236,7 +236,7 @@ impl IntoResponse for ApiError {
         }
         let body = ErrorBody {
             error: ErrorDetail {
-                code: self.code.to_string(),
+                code: self.code,
                 message: self.message,
             },
         };
@@ -363,7 +363,7 @@ impl HandleRef {
 
 fn parse_platform(raw: &str) -> Result<nodes::Platform, ApiError> {
     raw.parse::<nodes::Platform>()
-        .map_err(|e| ApiError::bad_request("invalid_platform", e.to_string()))
+        .map_err(|e| ApiError::bad_request(ErrorCode::InvalidPlatform, e.to_string()))
 }
 
 /// Postgres cannot compare TEXT holding a NUL byte, and no stored value ever
@@ -371,7 +371,7 @@ fn parse_platform(raw: &str) -> Result<nodes::Platform, ApiError> {
 fn reject_nul(raw: &str, what: &str) -> Result<(), ApiError> {
     if raw.contains('\0') {
         return Err(ApiError::bad_request(
-            "invalid_argument",
+            ErrorCode::InvalidArgument,
             format!("{what} must not contain a NUL byte"),
         ));
     }
@@ -392,7 +392,7 @@ impl ChainFilter {
             .map(|raw| {
                 raw.parse().map_err(|_| {
                     ApiError::bad_request(
-                        "invalid_chain",
+                        ErrorCode::InvalidChain,
                         format!("{raw:?} is not a chain id"),
                     )
                 })
@@ -403,7 +403,10 @@ impl ChainFilter {
 
 fn parse_address(raw: &str) -> Result<Address, ApiError> {
     Address::from_str(raw).map_err(|_| {
-        ApiError::bad_request("invalid_address", format!("{raw:?} is not an address"))
+        ApiError::bad_request(
+            ErrorCode::InvalidAddress,
+            format!("{raw:?} is not an address"),
+        )
     })
 }
 
@@ -413,7 +416,7 @@ fn parse_count(raw: Option<&str>, name: &str) -> Result<Option<i64>, ApiError> {
     raw.map(|raw| {
         raw.parse::<i64>().map_err(|_| {
             ApiError::bad_request(
-                "invalid_argument",
+                ErrorCode::InvalidArgument,
                 format!("{name} must be an integer, not {raw:?}"),
             )
         })
@@ -424,7 +427,7 @@ fn parse_count(raw: Option<&str>, name: &str) -> Result<Option<i64>, ApiError> {
 fn parse_node(raw: &str) -> Result<B256, ApiError> {
     B256::from_str(raw).map_err(|_| {
         ApiError::bad_request(
-            "invalid_node",
+            ErrorCode::InvalidNode,
             format!("{raw:?} is not a 0x-hex 32-byte handle node"),
         )
     })
@@ -514,12 +517,12 @@ async fn resolve_handle(
         // an unclaimed handle.
         if !state.store.platform_wired(chain, platform.id()).await? {
             return Err(ApiError::not_found(
-                "platform_not_configured",
+                ErrorCode::PlatformNotConfigured,
                 "this platform is not configured on any chain in scope",
             ));
         }
         return Err(ApiError::not_found(
-            "handle_not_bound",
+            ErrorCode::HandleNotBound,
             format!("{:?} is not bound", normalized.as_str()),
         ));
     }
@@ -539,7 +542,7 @@ async fn resolve_handle(
         .collect();
     if bindings.is_empty() {
         return Err(ApiError::not_found(
-            "handle_retired",
+            ErrorCode::HandleRetired,
             format!(
                 "{:?} was retired: its account proved a different handle",
                 normalized.as_str()
@@ -576,12 +579,12 @@ async fn resolve_id(
     if rows.is_empty() {
         if !state.store.platform_wired(chain, platform.id()).await? {
             return Err(ApiError::not_found(
-                "platform_not_configured",
+                ErrorCode::PlatformNotConfigured,
                 "this platform is not configured on any chain in scope",
             ));
         }
         return Err(ApiError::not_found(
-            "id_not_bound",
+            ErrorCode::IdNotBound,
             format!("{user_id:?} is not bound"),
         ));
     }
@@ -683,7 +686,7 @@ async fn search(
             let folded = nodes::fold_search_query(raw);
             if folded.is_empty() {
                 return Err(ApiError::bad_request(
-                    "invalid_argument",
+                    ErrorCode::InvalidArgument,
                     "q must be nonempty",
                 ));
             }
@@ -694,7 +697,7 @@ async fn search(
     let owner = params.owner.as_deref().map(parse_address).transpose()?;
     if query.is_none() && owner.is_none() {
         return Err(ApiError::bad_request(
-            "invalid_argument",
+            ErrorCode::InvalidArgument,
             "q or owner is required",
         ));
     }
@@ -752,7 +755,7 @@ mod tests {
 
     /// The status and code a route refuses `path` with. Every refusal here
     /// comes before the store is read, so the pool never connects.
-    async fn refusal(path: &str) -> (StatusCode, String) {
+    async fn refusal(path: &str) -> (StatusCode, ErrorCode) {
         let pool =
             PgPool::connect_lazy("postgres://localhost/unread").expect("lazy pool");
         let response = router(AppState::new(Store::new(pool)))
@@ -779,68 +782,83 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_list_request_is_refused_in_the_envelope() {
         let address = Address::repeat_byte(0xA1);
-        let bad = |code: &str| (StatusCode::BAD_REQUEST, code.to_string());
+        let bad = |code: ErrorCode| (StatusCode::BAD_REQUEST, code);
         let cases = [
-            ("/v1/escrow/node/0x1234".to_string(), bad("invalid_node")),
-            ("/v1/history/node/alice".to_string(), bad("invalid_node")),
+            (
+                "/v1/escrow/node/0x1234".to_string(),
+                bad(ErrorCode::InvalidNode),
+            ),
+            (
+                "/v1/history/node/alice".to_string(),
+                bad(ErrorCode::InvalidNode),
+            ),
             (
                 "/v1/escrow/claimable/0xnope".to_string(),
-                bad("invalid_address"),
+                bad(ErrorCode::InvalidAddress),
             ),
             (
                 "/v1/escrow/unclaimed?token=usdc".to_string(),
-                bad("invalid_address"),
+                bad(ErrorCode::InvalidAddress),
             ),
             (
                 "/v1/escrow/handle/myspace/tom".to_string(),
-                bad("invalid_platform"),
+                bad(ErrorCode::InvalidPlatform),
             ),
             (
                 "/v1/history/handle/x/no%20spaces".to_string(),
-                (StatusCode::NOT_FOUND, "handle_impossible".to_string()),
+                (StatusCode::NOT_FOUND, ErrorCode::HandleImpossible),
             ),
             (
                 "/v1/escrow/unclaimed?limit=ten".to_string(),
-                bad("invalid_argument"),
+                bad(ErrorCode::InvalidArgument),
             ),
             (
                 "/v1/history/handle/x/nobody?limit=1.5".to_string(),
-                bad("invalid_argument"),
+                bad(ErrorCode::InvalidArgument),
             ),
             (
                 "/v1/escrow/unclaimed?chain=base".to_string(),
-                bad("invalid_chain"),
+                bad(ErrorCode::InvalidChain),
             ),
             (
                 "/v1/escrow/unclaimed?before=nope".to_string(),
-                bad("invalid_cursor"),
+                bad(ErrorCode::InvalidCursor),
             ),
             (
                 format!("/v1/history/address/{address}?before=yesterday"),
-                bad("invalid_cursor"),
+                bad(ErrorCode::InvalidCursor),
             ),
             (
                 format!("/v1/escrow/refundable/{address}?before=1-2"),
-                bad("invalid_cursor"),
+                bad(ErrorCode::InvalidCursor),
             ),
-            ("/v1/history/address/%FF".to_string(), bad("invalid_path")),
-            ("/v1/resolve/address/%FF".to_string(), bad("invalid_path")),
-            ("/v1/search?q=al&q=bo".to_string(), bad("invalid_query")),
+            (
+                "/v1/history/address/%FF".to_string(),
+                bad(ErrorCode::InvalidPath),
+            ),
+            (
+                "/v1/resolve/address/%FF".to_string(),
+                bad(ErrorCode::InvalidPath),
+            ),
+            (
+                "/v1/search?q=al&q=bo".to_string(),
+                bad(ErrorCode::InvalidQuery),
+            ),
             (
                 "/v1/search?q=ali&limit=ten".to_string(),
-                bad("invalid_argument"),
+                bad(ErrorCode::InvalidArgument),
             ),
             (
                 "/v1/search?q=ali&offset=1.5".to_string(),
-                bad("invalid_argument"),
+                bad(ErrorCode::InvalidArgument),
             ),
             (
                 "/v1/resolve/handle/x/alice?chain=1&chain=2".to_string(),
-                bad("invalid_query"),
+                bad(ErrorCode::InvalidQuery),
             ),
             (
                 format!("/v1/escrow/claimable/{address}?chain=1&chain=2"),
-                bad("invalid_query"),
+                bad(ErrorCode::InvalidQuery),
             ),
         ];
         for (path, expected) in cases {

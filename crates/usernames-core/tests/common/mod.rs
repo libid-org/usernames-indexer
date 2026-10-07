@@ -28,6 +28,7 @@ use usernames_core::{
         self,
         model::{
             ErrorBody,
+            ErrorCode,
             HistoryEntry,
             HistoryEvent,
         },
@@ -135,14 +136,14 @@ impl<T: Debug> Reply<T> {
         match self.body {
             Ok(answer) => answer,
             Err(refusal) => panic!(
-                "{}: {}: {}",
+                "{}: {:?}: {}",
                 self.status, refusal.error.code, refusal.error.message
             ),
         }
     }
 
     /// The status and code of a refusal; an answer here fails the test.
-    pub fn refusal(self) -> (StatusCode, String) {
+    pub fn refusal(self) -> (StatusCode, ErrorCode) {
         match self.body {
             Err(refusal) => (self.status, refusal.error.code),
             Ok(answer) => panic!("answered {}: {answer:?}", self.status),

@@ -30,6 +30,7 @@ use usernames_core::{
     api::model::{
         AddressAmounts,
         AddressHistory,
+        ErrorCode,
         EscrowAmount,
         HandleAmounts,
         HandleHistory,
@@ -815,7 +816,7 @@ async fn an_escrow_list_before_the_first_window_is_not_synced() {
         .refusal();
     assert_eq!(
         refusal,
-        (StatusCode::SERVICE_UNAVAILABLE, "not_synced".to_string())
+        (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::NotSynced)
     );
     suite.done();
 }
@@ -907,7 +908,7 @@ async fn another_escrow_replays_the_chain_and_the_same_one_keeps_it() {
         .refusal();
     assert_eq!(
         refusal,
-        (StatusCode::SERVICE_UNAVAILABLE, "not_synced".to_string())
+        (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::NotSynced)
     );
     writer.release().await.expect("release");
     suite.done();

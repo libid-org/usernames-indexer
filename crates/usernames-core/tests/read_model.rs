@@ -37,6 +37,7 @@ use usernames_core::{
     api::model::{
         AddressHistory,
         AddressResolution,
+        ErrorCode,
         HandleResolution,
         HistoryEvent,
         IdResolution,
@@ -221,10 +222,7 @@ async fn rename_retires_the_previous_handle() {
     let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/alice_1")
         .await
         .refusal();
-    assert_eq!(
-        refusal,
-        (StatusCode::NOT_FOUND, "handle_retired".to_string())
-    );
+    assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::HandleRetired));
 
     let resolved: HandleResolution =
         get(&pool, "/v1/resolve/handle/x/alice_2").await.answer();
@@ -395,14 +393,14 @@ async fn search_ranks_exact_prefix_substring() {
     let refusal = get::<SearchResults>(&pool, "/v1/search").await.refusal();
     assert_eq!(
         refusal,
-        (StatusCode::BAD_REQUEST, "invalid_argument".to_string())
+        (StatusCode::BAD_REQUEST, ErrorCode::InvalidArgument)
     );
     let refusal = get::<SearchResults>(&pool, "/v1/search?owner=nobody")
         .await
         .refusal();
     assert_eq!(
         refusal,
-        (StatusCode::BAD_REQUEST, "invalid_address".to_string())
+        (StatusCode::BAD_REQUEST, ErrorCode::InvalidAddress)
     );
 
     // A retired handle stops matching. Its fuzzy neighbors still do — that
@@ -478,15 +476,12 @@ async fn unclaimed_names_on_a_configured_platform_are_coded_404s() {
     let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/zzz")
         .await
         .refusal();
-    assert_eq!(
-        refusal,
-        (StatusCode::NOT_FOUND, "handle_not_bound".to_string())
-    );
+    assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::HandleNotBound));
 
     let refusal = get::<IdResolution>(&pool, "/v1/resolve/id/x/999999")
         .await
         .refusal();
-    assert_eq!(refusal, (StatusCode::NOT_FOUND, "id_not_bound".to_string()));
+    assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::IdNotBound));
     drop(guard);
 }
 
@@ -503,7 +498,7 @@ async fn api_refuses_to_answer_before_the_first_window() {
         .refusal();
     assert_eq!(
         refusal,
-        (StatusCode::SERVICE_UNAVAILABLE, "not_synced".to_string())
+        (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::NotSynced)
     );
     let (status, _) = get::<SearchResults>(&pool, "/v1/search?q=ali")
         .await
@@ -551,7 +546,7 @@ async fn nul_bytes_neither_stall_the_indexer_nor_crash_the_api() {
         .refusal();
     assert_eq!(
         refusal,
-        (StatusCode::BAD_REQUEST, "invalid_argument".to_string())
+        (StatusCode::BAD_REQUEST, ErrorCode::InvalidArgument)
     );
     let (status, _) = get::<SearchResults>(&pool, "/v1/search?q=evil%00")
         .await
@@ -683,14 +678,14 @@ async fn unconfigured_platform_and_impossible_text_name_their_codes() {
             .refusal();
     assert_eq!(
         refusal,
-        (StatusCode::NOT_FOUND, "platform_not_configured".to_string())
+        (StatusCode::NOT_FOUND, ErrorCode::PlatformNotConfigured)
     );
     let refusal = get::<IdResolution>(&pool, &format!("/v1/resolve/id/{foreign}/111"))
         .await
         .refusal();
     assert_eq!(
         refusal,
-        (StatusCode::NOT_FOUND, "platform_not_configured".to_string())
+        (StatusCode::NOT_FOUND, ErrorCode::PlatformNotConfigured)
     );
 
     // Text X's rules can never hold (an interior space) mirrors the
@@ -701,7 +696,7 @@ async fn unconfigured_platform_and_impossible_text_name_their_codes() {
         .refusal();
     assert_eq!(
         refusal,
-        (StatusCode::NOT_FOUND, "handle_impossible".to_string())
+        (StatusCode::NOT_FOUND, ErrorCode::HandleImpossible)
     );
     drop(guard);
 }
@@ -784,16 +779,13 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
     .refusal();
     assert_eq!(
         refusal,
-        (StatusCode::SERVICE_UNAVAILABLE, "not_synced".to_string())
+        (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::NotSynced)
     );
     let refusal =
         common::get::<HandleResolution>(&pool, "/v1/resolve/handle/x/alice_1?chain=eden")
             .await
             .refusal();
-    assert_eq!(
-        refusal,
-        (StatusCode::BAD_REQUEST, "invalid_chain".to_string())
-    );
+    assert_eq!(refusal, (StatusCode::BAD_REQUEST, ErrorCode::InvalidChain));
     drop(guard);
 }
 
