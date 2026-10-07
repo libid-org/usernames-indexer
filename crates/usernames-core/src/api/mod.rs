@@ -677,7 +677,6 @@ async fn search(
         chain: params.chain,
     }
     .parse()?;
-    state.synced(chain).await?;
     let query = match params.q.as_deref() {
         Some(raw) => {
             reject_nul(raw, "q")?;
@@ -711,6 +710,7 @@ async fn search(
         .map(parse_platform)
         .transpose()?
         .map(|p| p.id());
+    state.synced(chain).await?;
 
     let rows = state
         .store
@@ -826,6 +826,14 @@ mod tests {
             ("/v1/history/address/%FF".to_string(), bad("invalid_path")),
             ("/v1/resolve/address/%FF".to_string(), bad("invalid_path")),
             ("/v1/search?q=al&q=bo".to_string(), bad("invalid_query")),
+            (
+                "/v1/search?q=ali&limit=ten".to_string(),
+                bad("invalid_argument"),
+            ),
+            (
+                "/v1/search?q=ali&offset=1.5".to_string(),
+                bad("invalid_argument"),
+            ),
             (
                 "/v1/resolve/handle/x/alice?chain=1&chain=2".to_string(),
                 bad("invalid_query"),
