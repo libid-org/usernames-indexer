@@ -1,6 +1,8 @@
-//! Chain access: deployment-block discovery and windowed log fetching.
+//! Chain access: deployment-block discovery, windowed log fetching, and the
+//! one contract read the indexer makes.
 
 use alloy::{
+    contract,
     eips::BlockNumberOrTag,
     primitives::Address,
     providers::Provider,
@@ -10,6 +12,7 @@ use alloy::{
     },
     transports::TransportError,
 };
+use libid_contracts::bindings::escrow::HandleEscrow;
 
 /// Binary search for the block at which a contract was deployed: the first
 /// block where `eth_getCode` returns non-empty bytecode. `Ok(None)` means the
@@ -70,4 +73,54 @@ pub async fn fetch_logs(
         .from_block(BlockNumberOrTag::Number(from))
         .to_block(BlockNumberOrTag::Number(to));
     provider.get_logs(&f).await
+}
+
+/// Why an escrow is refused beside the registry an indexer follows.
+#[derive(Debug, thiserror::Error)]
+pub enum EscrowRefused {
+    /// The escrow's `registry()` could not be read.
+    #[error("escrow {escrow}: registry(): {source}")]
+    Unread {
+        /// The escrow asked.
+        escrow: Address,
+        /// The call's failure.
+        #[source]
+        source: contract::Error,
+    },
+    /// The escrow pays the holders of another registry.
+    #[error(
+        "escrow {escrow} resolves holders through registry {registry}, not {indexed}"
+    )]
+    OtherRegistry {
+        /// The escrow asked.
+        escrow: Address,
+        /// The registry it resolves holders through.
+        registry: Address,
+        /// The registry the indexer follows.
+        indexed: Address,
+    },
+}
+
+/// Refuse an escrow that does not resolve holders through `registry`. An
+/// escrow keeps its registry for life, so an indexer checks once, at startup,
+/// before it touches a row.
+pub async fn check_escrow(
+    provider: &impl Provider,
+    escrow: Address,
+    registry: Address,
+) -> Result<(), EscrowRefused> {
+    let resolves = HandleEscrow::new(escrow, provider)
+        .registry()
+        .call()
+        .await
+        .map_err(|source| EscrowRefused::Unread { escrow, source })?;
+    if resolves == registry {
+        Ok(())
+    } else {
+        Err(EscrowRefused::OtherRegistry {
+            escrow,
+            registry: resolves,
+            indexed: registry,
+        })
+    }
 }

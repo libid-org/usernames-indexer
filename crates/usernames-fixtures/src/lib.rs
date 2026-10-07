@@ -140,6 +140,7 @@ pub async fn bind(store: &ChainStore, handle: &str, holder: Address) {
                 block_number: 1,
                 log_index: 0,
                 tx_hash: B256::from([1u8; 32]),
+                block_time: 1_700_000_000,
             },
         )
         .await
