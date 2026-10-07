@@ -15,6 +15,7 @@ use alloy::{
         RootProvider,
     },
 };
+use anyhow::Context;
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -147,16 +148,9 @@ pub async fn run() -> anyhow::Result<()> {
     if let Some(escrow) = escrow {
         // Before `prepare`, which clears the chain when the escrow changes: a
         // misconfiguration refuses without touching the rows.
-        let registry = chain::escrow_registry(&provider, escrow)
+        chain::check_escrow(&provider, escrow, contract)
             .await
-            .map_err(|e| {
-                anyhow::anyhow!("HANDLE_ESCROW_ADDRESS {escrow}: registry(): {e}")
-            })?;
-        anyhow::ensure!(
-            registry == contract,
-            "HANDLE_ESCROW_ADDRESS {escrow} resolves through registry {registry}, \
-             not IDENTITY_NAMES_ADDRESS {contract}"
-        );
+            .context("HANDLE_ESCROW_ADDRESS")?;
     }
 
     // The indexer migrates because the indexer writes. The read API connects
