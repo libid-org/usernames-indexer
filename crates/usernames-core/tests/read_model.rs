@@ -162,7 +162,7 @@ async fn bind_resolves_all_three_directions() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::Platform::from_key("x").unwrap().id();
+    let x = KnownPlatform::X.id();
     let alice = addr(0xA1);
     apply(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
 
@@ -202,7 +202,7 @@ async fn rename_retires_the_previous_handle() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::Platform::from_key("x").unwrap().id();
+    let x = KnownPlatform::X.id();
     let alice = addr(0xA1);
     apply(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
     // The contract emits the retirement before the new bind in the same tx.
@@ -245,7 +245,7 @@ async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::Platform::from_key("x").unwrap().id();
+    let x = KnownPlatform::X.id();
     let (alice, bob) = (addr(0xA1), addr(0xB2));
     // Alice holds the handle, renames her platform account, re-proves under
     // the same handle... then the platform recycles the name to Bob's
@@ -275,7 +275,7 @@ async fn publish_flag_is_the_post_state() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::Platform::from_key("x").unwrap().id();
+    let x = KnownPlatform::X.id();
     let alice = addr(0xA1);
     apply(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
     // A later bind that reports published=false clears the display name.
@@ -317,8 +317,8 @@ async fn search_ranks_exact_prefix_substring() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::Platform::from_key("x").unwrap().id();
-    let github = nodes::Platform::from_key("github").unwrap().id();
+    let x = KnownPlatform::X.id();
+    let github = KnownPlatform::GitHub.id();
     apply(&store, 1, bind(addr(1), x, "1", "ali", 1000, false)).await;
     apply(&store, 2, bind(addr(2), x, "2", "alice_1", 1000, true)).await;
     apply(&store, 3, bind(addr(3), x, "3", "malice", 1000, false)).await;
@@ -420,7 +420,7 @@ async fn replay_converges_instead_of_duplicating() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::Platform::from_key("x").unwrap().id();
+    let x = KnownPlatform::X.id();
     let alice = addr(0xA1);
     let event = bind(alice, x, "111", "alice_1", 1000, true);
     apply(&store, 1, event.clone()).await;
@@ -463,7 +463,7 @@ async fn unclaimed_names_on_a_configured_platform_are_coded_404s() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::Platform::from_key("x").unwrap().id();
+    let x = KnownPlatform::X.id();
     // The platform row EXISTS — the branch the absent-platform test cannot
     // reach, and the one that once shipped a decode 500.
     apply(&store, 1, NamesEvent::PlatformConfigured { platform_id: x }).await;
@@ -518,7 +518,7 @@ async fn nul_bytes_neither_stall_the_indexer_nor_crash_the_api() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::Platform::from_key("x").unwrap().id();
+    let x = KnownPlatform::X.id();
     // An adversarial platform emits an id with a NUL byte. The window must
     // apply — lossily, loudly — rather than stall the chain forever behind a
     // value Postgres cannot store.
@@ -559,7 +559,7 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::Platform::from_key("x").unwrap().id();
+    let x = KnownPlatform::X.id();
     let digest = B256::repeat_byte(0xD1);
     apply(&store, 1, NamesEvent::PlatformConfigured { platform_id: x }).await;
     apply(
@@ -663,7 +663,7 @@ async fn unconfigured_platform_and_impossible_text_name_their_codes() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::Platform::from_key("x").unwrap().id();
+    let x = KnownPlatform::X.id();
     apply(&store, 1, bind(addr(0xA1), x, "111", "alice_1", 1000, true)).await;
 
     // A platform id the chain never configured is a different fact than an
@@ -709,7 +709,7 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
         return;
     };
     let other = ChainStore::new(pool.clone(), OTHER_CHAIN);
-    let x = nodes::Platform::from_key("x").unwrap().id();
+    let x = KnownPlatform::X.id();
     let (alice, bob) = (addr(0xA1), addr(0xB2));
     // The same handle, held by different wallets on the two chains.
     apply(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
@@ -808,14 +808,7 @@ async fn seed(store: &ChainStore) {
     apply(
         store,
         1,
-        bind(
-            addr(1),
-            nodes::Platform::from_key("x").unwrap().id(),
-            "1",
-            "alice",
-            1,
-            true,
-        ),
+        bind(addr(1), KnownPlatform::X.id(), "1", "alice", 1, true),
     )
     .await;
     store
@@ -848,7 +841,7 @@ async fn preparing_an_unchanged_chain_keeps_everything() {
     assert!(
         store
             .resolve_handle(
-                nodes::Platform::from_key("x").unwrap().id(),
+                KnownPlatform::X.id(),
                 &nodes::NormalizedHandle::from_chain("alice"),
             )
             .await
@@ -886,7 +879,7 @@ async fn watching_another_contract_clears_the_chain() {
     assert!(
         store
             .resolve_handle(
-                nodes::Platform::from_key("x").unwrap().id(),
+                KnownPlatform::X.id(),
                 &nodes::NormalizedHandle::from_chain("alice"),
             )
             .await

@@ -49,7 +49,10 @@ use usernames_core::{
         ChainStore,
     },
     indexer,
-    nodes,
+    nodes::{
+        self,
+        KnownPlatform,
+    },
 };
 
 mod common;
@@ -188,8 +191,8 @@ async fn indexes_a_real_chain_end_to_end() {
         .expect("deploy");
     let deploy_block = provider.get_block_number().await.expect("block");
 
-    let x = nodes::Platform::from_key("x").unwrap().id();
-    let google = nodes::Platform::from_key("google").unwrap().id();
+    let x = KnownPlatform::X.id();
+    let google = KnownPlatform::Google.id();
     let alice = Address::repeat_byte(0xA1);
     let verifier = Address::repeat_byte(0xEE);
     let fee_receiver = Address::repeat_byte(0xFE);

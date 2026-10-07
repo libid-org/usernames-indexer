@@ -48,7 +48,10 @@ use usernames_core::{
         LogPosition,
         NamesEvent,
     },
-    nodes,
+    nodes::{
+        self,
+        KnownPlatform,
+    },
 };
 
 mod calls {
@@ -118,7 +121,7 @@ pub fn legacy_addr_call(labels: &[&str]) -> Vec<u8> {
 
 /// Seed one binding into the read model the gateway answers from.
 pub async fn bind(store: &ChainStore, handle: &str, holder: Address) {
-    let platform = nodes::Platform::from_key("x").unwrap().id();
+    let platform = KnownPlatform::X.id();
     let event = NamesEvent::IdentityBound {
         holder,
         id_node: nodes::id_node(platform, "42"),

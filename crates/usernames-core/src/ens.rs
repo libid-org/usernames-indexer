@@ -121,10 +121,16 @@ impl FromStr for ChainName {
         if !Name::label_is_wellformed(name) {
             return Err(ChainNameError::Malformed(name.to_string()));
         }
-        if KnownPlatform::from_key(name).is_some() {
+        if name.parse::<KnownPlatform>().is_ok() {
             return Err(ChainNameError::Platform(name.to_string()));
         }
         Ok(Self(name.to_string()))
+    }
+}
+
+impl fmt::Display for ChainName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -441,7 +447,7 @@ impl Name {
 
     /// The alphabet a handle-derived label may use: what X and GitHub reduce
     /// to after the substitution, and what Gmail's local part already is. A
-    /// chain name must satisfy it too, which [`ChainName::parse`] enforces.
+    /// chain name must satisfy it too, which parsing a [`ChainName`] enforces.
     pub fn label_is_wellformed(label: &str) -> bool {
         !label.is_empty()
             && label
@@ -477,9 +483,7 @@ impl Name {
         // Right to left. The rightmost label is either the platform, or a
         // chain label with the platform one further in.
         let (chain_label, marker_at) = match rest.last().map(String::as_str) {
-            Some(last) if KnownPlatform::from_key(last).is_some() => {
-                (None, rest.len() - 1)
-            }
+            Some(last) if last.parse::<KnownPlatform>().is_ok() => (None, rest.len() - 1),
             Some(chain) => {
                 if rest.len() < 2 {
                     return Err(EnsError::EmptyName);
@@ -498,7 +502,7 @@ impl Name {
         // A platform label this build does not know is not a parse failure —
         // it is a name nobody can hold, which the caller learns as a null
         // answer.
-        let platform = KnownPlatform::from_key(marker).ok_or(EnsError::EmptyName)?;
+        let platform: KnownPlatform = marker.parse().map_err(|_| EnsError::EmptyName)?;
         let handle = platform
             .handle_from_labels(head)
             .ok_or_else(|| EnsError::UnnormalizedLabel(head.join(".")))?;
@@ -1121,7 +1125,7 @@ mod chain_names {
     fn a_chain_name_is_a_label_apart_from_the_platforms() {
         for ok in ["eden", "base", "op-mainnet", "l2"] {
             assert_eq!(
-                ok.parse::<ChainName>().map(|n| n.as_str().to_string()),
+                ok.parse::<ChainName>().map(|n| n.to_string()),
                 Ok(ok.to_string())
             );
         }

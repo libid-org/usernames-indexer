@@ -12,6 +12,7 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     str::FromStr,
     sync::LazyLock,
 };
@@ -24,6 +25,10 @@ use libid_identity::handle_vectors::{
     PLATFORM_GITHUB_KEY,
     PLATFORM_GOOGLE_KEY,
     PLATFORM_X_KEY,
+};
+use serde_with::{
+    DeserializeFromStr,
+    SerializeDisplay,
 };
 
 /// keccak256 of a platform key is its id. [`Platform`] is the one entry
@@ -41,9 +46,8 @@ fn platform_id(key: &str) -> B256 {
 /// a test noticing later. Adding a platform is a variant here plus its rules in
 /// `libid-identity`; everything that must follow stops compiling until it does.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+    Debug, Clone, Copy, PartialEq, Eq, Hash, SerializeDisplay, DeserializeFromStr,
 )]
-#[serde(rename_all = "lowercase")]
 pub enum KnownPlatform {
     /// X, formerly Twitter.
     X,
@@ -68,11 +72,6 @@ impl KnownPlatform {
         }
     }
 
-    /// The platform a short key names, when this build knows it.
-    pub fn from_key(key: &str) -> Option<Self> {
-        Self::ALL.iter().copied().find(|p| p.key() == key)
-    }
-
     /// The 32-byte id the chain keys this platform by.
     pub fn id(self) -> B256 {
         platform_id(self.key())
@@ -85,6 +84,28 @@ impl KnownPlatform {
     /// boundary rather than spreading from here.
     pub fn rules(self) -> Option<libid_identity::Rules> {
         libid_identity::rules_for(self.key())
+    }
+}
+
+/// The platform a short key names.
+impl FromStr for KnownPlatform {
+    type Err = UnknownPlatform;
+
+    fn from_str(key: &str) -> Result<Self, UnknownPlatform> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|p| p.key() == key)
+            .ok_or_else(|| UnknownPlatform {
+                raw: key.to_string(),
+            })
+    }
+}
+
+/// The short key, which the API's JSON and the parse spell the same way.
+impl fmt::Display for KnownPlatform {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.key())
     }
 }
 
@@ -127,8 +148,8 @@ impl FromStr for Platform {
     type Err = UnknownPlatform;
 
     fn from_str(raw: &str) -> Result<Self, UnknownPlatform> {
-        if let Some(platform) = Self::from_key(raw) {
-            return Ok(platform);
+        if let Ok(known) = raw.parse::<KnownPlatform>() {
+            return Ok(Self::from(known));
         }
         if let Ok(id) = raw.parse::<B256>() {
             return Ok(Self {
@@ -142,12 +163,18 @@ impl FromStr for Platform {
     }
 }
 
-impl Platform {
-    /// The platform a short key names, when this build knows it.
-    pub fn from_key(key: &str) -> Option<Self> {
-        KnownPlatform::from_key(key).map(Self::from)
+/// The short key when this build knows the platform, its 0x-hex id when
+/// not: the forms the parse reads back.
+impl fmt::Display for Platform {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.known {
+            Some(known) => known.fmt(f),
+            None => self.id.fmt(f),
+        }
     }
+}
 
+impl Platform {
     /// The 32-byte id the chain keys this platform by.
     pub fn id(&self) -> B256 {
         self.id
@@ -282,15 +309,15 @@ mod tests {
             ),
         ];
         for (key, expected) in cases {
-            let got = Platform::from_key(key).unwrap().id();
+            let got = key.parse::<Platform>().unwrap().id();
             assert_eq!(hex::encode(got), expected, "platform {key}");
         }
     }
 
     #[test]
     fn nodes_match_the_chain() {
-        let x = Platform::from_key("x").unwrap().id();
-        let google = Platform::from_key("google").unwrap().id();
+        let x = KnownPlatform::X.id();
+        let google = KnownPlatform::Google.id();
         assert_eq!(
             hex::encode(handle_node(x, &NormalizedHandle::from_chain("alice_1"))),
             "1c43d5d3cf3d99e9d5b6e8c74c23d14bcbb6a743712cf7fa7c15750c4fc2150d"
@@ -342,6 +369,20 @@ mod tests {
         let err = "myspace".parse::<Platform>().unwrap_err().to_string();
         for platform in KnownPlatform::ALL {
             assert!(err.contains(platform.key()), "{err}");
+        }
+    }
+    #[test]
+    fn a_platform_prints_what_its_parse_reads_back() {
+        let foreign = B256::repeat_byte(7).to_string();
+        for raw in ["x", "github", "google", foreign.as_str()] {
+            let platform: Platform = raw.parse().unwrap();
+            assert_eq!(platform.to_string(), raw);
+        }
+        for known in KnownPlatform::ALL {
+            assert_eq!(
+                known.to_string().parse::<KnownPlatform>().ok(),
+                Some(*known)
+            );
         }
     }
 }
