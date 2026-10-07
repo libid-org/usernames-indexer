@@ -186,19 +186,21 @@ pub async fn run() -> anyhow::Result<()> {
     tracing::info!(chain_id, %contract, ?escrow, "indexing");
     let mut task = tokio::spawn(indexer.run(cancel.clone()));
 
-    tokio::select! {
+    let stopped = tokio::select! {
         r = tokio::signal::ctrl_c() => {
             tracing::info!("shutting down");
             cancel.cancel();
             let _ = task.await;
-            r?;
-            Ok(())
+            r.map_err(anyhow::Error::from)
         }
         r = &mut task => match r {
             Ok(()) => Err(anyhow::anyhow!("indexer task exited unexpectedly")),
             Err(e) => Err(anyhow::anyhow!("indexer task died: {e}")),
         },
-    }
+    };
+    // The loop no longer writes: the chain is the next instance's.
+    writer.release().await?;
+    stopped
 }
 
 #[cfg(test)]
