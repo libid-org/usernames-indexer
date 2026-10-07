@@ -180,19 +180,18 @@ async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> 
     // ── the read model the gateway answers from ──────────────────────
     let pool = sqlx::PgPool::connect(&url).await.expect("connect");
     db::MIGRATOR.run(&pool).await.expect("migrations");
-    for table in db::PROJECTION_TABLES {
-        sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
+    for statement in [
+        db::CLEAR_CHAIN,
+        db::CLEAR_CHAIN_METADATA,
+        db::CLEAR_CHAIN_NAMES,
+    ] {
+        sqlx::query(statement)
             .bind(CHAIN)
             .execute(&pool)
             .await
             .expect("cleanup");
     }
-    sqlx::query("DELETE FROM names.chain_metadata WHERE chain_id = $1")
-        .bind(CHAIN)
-        .execute(&pool)
-        .await
-        .expect("cleanup");
-    let store = ChainStore::new(pool, CHAIN);
+    let store = ChainStore::new(pool.clone(), CHAIN);
     let owner = Address::from([0xbe; 20]);
     bind(&store, "alice", owner).await;
 
@@ -235,7 +234,7 @@ async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> 
         domain: "handles.link".parse().expect("domain"),
         resolver: resolver_address,
         ens_chain: anvil.chain_id(),
-        store: db::Store::new(store.pool().clone()),
+        store: db::Store::new(pool),
         ttl: Duration::from_secs(300),
         max_lag_blocks: 32,
         signer: std::sync::Arc::new(ManagedSigner::Local(signer)),

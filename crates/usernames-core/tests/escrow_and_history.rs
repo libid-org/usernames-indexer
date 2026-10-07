@@ -855,7 +855,7 @@ async fn the_status_names_the_escrow_the_chain_was_indexed_from() {
         .await
         .expect("prepare");
 
-    let status: Status = common::get(&suite.store, "/v1/status").await.answer();
+    let status: Status = suite.get("/v1/status").await.answer();
     let chain = status
         .chains
         .iter()

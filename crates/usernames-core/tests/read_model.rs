@@ -79,23 +79,7 @@ async fn test_store_with(
     // Scoped to this suite's chain, like the anvil suite scopes to its own:
     // neither depends on cargo happening to run test binaries sequentially.
     for chain in [CHAIN, OTHER_CHAIN] {
-        for table in db::PROJECTION_TABLES {
-            sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
-                .bind(chain)
-                .execute(&pool)
-                .await
-                .expect("cleanup failed");
-        }
-        sqlx::query("DELETE FROM names.chain_metadata WHERE chain_id = $1")
-            .bind(chain)
-            .execute(&pool)
-            .await
-            .expect("metadata cleanup failed");
-        sqlx::query("DELETE FROM names.chain_names WHERE chain_id = $1")
-            .bind(chain)
-            .execute(&pool)
-            .await
-            .expect("names cleanup failed");
+        common::clear_chain(&pool, chain).await;
     }
     Some((ChainStore::new(pool.clone(), CHAIN), pool, guard))
 }
@@ -157,9 +141,9 @@ fn retire(platform: B256, handle: &str, holder: Address) -> NamesEvent {
 /// A request scoped to this suite's chain: the store is shared with the
 /// anvil suite's chain, and an unscoped read would see both. The reads that
 /// span chains have their own test below.
-async fn get<T: DeserializeOwned>(store: &ChainStore, path: &str) -> Reply<T> {
+async fn get<T: DeserializeOwned>(pool: &PgPool, path: &str) -> Reply<T> {
     let separator = if path.contains('?') { '&' } else { '?' };
-    common::get(store, &format!("{path}{separator}chain={CHAIN}")).await
+    common::get(pool, &format!("{path}{separator}chain={CHAIN}")).await
 }
 
 /// The one binding a resolution carries in these single-chain scenarios.
@@ -172,7 +156,7 @@ fn only<T: std::fmt::Debug>(bindings: &[T]) -> &T {
 
 #[tokio::test]
 async fn bind_resolves_all_three_directions() {
-    let Some((store, _pool, guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -181,7 +165,7 @@ async fn bind_resolves_all_three_directions() {
     apply(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
 
     let resolved: HandleResolution =
-        get(&store, "/v1/resolve/handle/x/alice_1").await.answer();
+        get(&pool, "/v1/resolve/handle/x/alice_1").await.answer();
     let binding = only(&resolved.bindings);
     assert_eq!(binding.chain_id, CHAIN);
     assert_eq!(binding.owner, alice);
@@ -190,20 +174,19 @@ async fn bind_resolves_all_three_directions() {
 
     // The path normalizes the way the chain did: raw form finds the same row.
     let resolved: HandleResolution =
-        get(&store, "/v1/resolve/handle/x/@Alice_1").await.answer();
+        get(&pool, "/v1/resolve/handle/x/@Alice_1").await.answer();
     assert_eq!(resolved.handle, "alice_1");
     assert_eq!(resolved.platform, Some(KnownPlatform::X));
 
-    let resolved: IdResolution = get(&store, "/v1/resolve/id/x/111").await.answer();
+    let resolved: IdResolution = get(&pool, "/v1/resolve/id/x/111").await.answer();
     let binding = only(&resolved.bindings);
     assert_eq!(binding.owner, alice);
     assert_eq!(binding.handle.as_deref(), Some("alice_1"));
     assert!(binding.published);
 
-    let resolved: AddressResolution =
-        get(&store, &format!("/v1/resolve/address/{alice}"))
-            .await
-            .answer();
+    let resolved: AddressResolution = get(&pool, &format!("/v1/resolve/address/{alice}"))
+        .await
+        .answer();
     let identity = only(&resolved.identities);
     assert_eq!(identity.handle.as_deref(), Some("alice_1"));
     assert!(identity.published);
@@ -226,7 +209,7 @@ async fn rename_retires_the_previous_handle() {
 
     // The code is the machine-readable half: a UI renders "retired"
     // differently from "never claimed" without parsing prose.
-    let refusal = get::<HandleResolution>(&store, "/v1/resolve/handle/x/alice_1")
+    let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/alice_1")
         .await
         .refusal();
     assert_eq!(
@@ -235,10 +218,10 @@ async fn rename_retires_the_previous_handle() {
     );
 
     let resolved: HandleResolution =
-        get(&store, "/v1/resolve/handle/x/alice_2").await.answer();
+        get(&pool, "/v1/resolve/handle/x/alice_2").await.answer();
     assert_eq!(only(&resolved.bindings).owner, alice);
 
-    let resolved: IdResolution = get(&store, "/v1/resolve/id/x/111").await.answer();
+    let resolved: IdResolution = get(&pool, "/v1/resolve/id/x/111").await.answer();
     assert_eq!(only(&resolved.bindings).handle.as_deref(), Some("alice_2"));
 
     // The retired node keeps its watermark, mirroring the contract's
@@ -256,7 +239,7 @@ async fn rename_retires_the_previous_handle() {
 
 #[tokio::test]
 async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
-    let Some((store, _pool, guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -270,14 +253,14 @@ async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
 
     // The handle resolves to Bob now, paired with Bob's id.
     let resolved: HandleResolution =
-        get(&store, "/v1/resolve/handle/x/popular").await.answer();
+        get(&pool, "/v1/resolve/handle/x/popular").await.answer();
     let binding = only(&resolved.bindings);
     assert_eq!(binding.owner, bob);
     assert_eq!(binding.user_id.as_deref(), Some("222"));
 
     // Alice's id still resolves to her wallet, but the handle is no longer
     // hers to display: the node points at Bob's id.
-    let resolved: IdResolution = get(&store, "/v1/resolve/id/x/111").await.answer();
+    let resolved: IdResolution = get(&pool, "/v1/resolve/id/x/111").await.answer();
     let binding = only(&resolved.bindings);
     assert_eq!(binding.owner, alice);
     assert_eq!(binding.handle, None);
@@ -286,7 +269,7 @@ async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
 
 #[tokio::test]
 async fn publish_flag_is_the_post_state() {
-    let Some((store, _pool, guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -297,10 +280,9 @@ async fn publish_flag_is_the_post_state() {
     apply(&store, 2, retire(x, "alice_1", alice)).await;
     apply(&store, 3, bind(alice, x, "111", "alice_2", 2000, false)).await;
 
-    let resolved: AddressResolution =
-        get(&store, &format!("/v1/resolve/address/{alice}"))
-            .await
-            .answer();
+    let resolved: AddressResolution = get(&pool, &format!("/v1/resolve/address/{alice}"))
+        .await
+        .answer();
     assert!(!only(&resolved.identities).published);
 
     // And HandleUnpublished after a published bind does the same.
@@ -315,10 +297,9 @@ async fn publish_flag_is_the_post_state() {
         },
     )
     .await;
-    let resolved: AddressResolution =
-        get(&store, &format!("/v1/resolve/address/{alice}"))
-            .await
-            .answer();
+    let resolved: AddressResolution = get(&pool, &format!("/v1/resolve/address/{alice}"))
+        .await
+        .answer();
     assert!(!only(&resolved.identities).published);
     drop(guard);
 }
@@ -330,7 +311,7 @@ fn handles_of(results: &SearchResults) -> Vec<&str> {
 
 #[tokio::test]
 async fn search_ranks_exact_prefix_substring() {
-    let Some((store, _pool, guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -347,7 +328,7 @@ async fn search_ranks_exact_prefix_substring() {
     )
     .await;
 
-    let results: SearchResults = get(&store, "/v1/search?q=ali").await.answer();
+    let results: SearchResults = get(&pool, "/v1/search?q=ali").await.answer();
     // Exact first, then prefix alphabetically, then substring.
     assert_eq!(
         handles_of(&results),
@@ -362,52 +343,52 @@ async fn search_ranks_exact_prefix_substring() {
     assert_eq!(results.query.as_deref(), Some("ali"));
 
     // Pages walk the same ranked list; a short page is the last one.
-    let page: SearchResults = get(&store, "/v1/search?q=ali&limit=2&offset=1")
+    let page: SearchResults = get(&pool, "/v1/search?q=ali&limit=2&offset=1")
         .await
         .answer();
     assert_eq!((page.limit, page.offset), (2, 1));
     assert_eq!(handles_of(&page), ["alice_1", "alicorn"]);
-    let page: SearchResults = get(&store, "/v1/search?q=ali&limit=2&offset=3")
+    let page: SearchResults = get(&pool, "/v1/search?q=ali&limit=2&offset=3")
         .await
         .answer();
     assert_eq!(page.hits.len(), 1, "{page:?}");
 
     // The platform filter narrows to that keyspace.
-    let results: SearchResults = get(&store, "/v1/search?q=ali&platform=github")
+    let results: SearchResults = get(&pool, "/v1/search?q=ali&platform=github")
         .await
         .answer();
     assert_eq!(handles_of(&results), ["alicorn"]);
     assert_eq!(results.hits[0].platform, Some(KnownPlatform::GitHub));
 
     // Search folds the way normalization does: case and a leading @ vanish.
-    let results: SearchResults = get(&store, "/v1/search?q=%40ALI").await.answer();
+    let results: SearchResults = get(&pool, "/v1/search?q=%40ALI").await.answer();
     assert_eq!(results.hits.len(), 4);
 
     // A wallet's handles, alone or narrowed by text; the two intersect.
-    let results: SearchResults = get(&store, &format!("/v1/search?owner={}", addr(2)))
+    let results: SearchResults = get(&pool, &format!("/v1/search?owner={}", addr(2)))
         .await
         .answer();
     assert_eq!(handles_of(&results), ["alice_1"]);
     assert_eq!(results.owner, Some(addr(2)));
     assert_eq!(results.query, None);
     let results: SearchResults =
-        get(&store, &format!("/v1/search?q=ali&owner={}", addr(1)))
+        get(&pool, &format!("/v1/search?q=ali&owner={}", addr(1)))
             .await
             .answer();
     assert_eq!(handles_of(&results), ["ali"]);
     let results: SearchResults =
-        get(&store, &format!("/v1/search?q=bob&owner={}", addr(1)))
+        get(&pool, &format!("/v1/search?q=bob&owner={}", addr(1)))
             .await
             .answer();
     assert!(results.hits.is_empty(), "{results:?}");
 
     // Neither text nor wallet is not a question, and a wallet must parse.
-    let refusal = get::<SearchResults>(&store, "/v1/search").await.refusal();
+    let refusal = get::<SearchResults>(&pool, "/v1/search").await.refusal();
     assert_eq!(
         refusal,
         (StatusCode::BAD_REQUEST, "invalid_argument".to_string())
     );
-    let refusal = get::<SearchResults>(&store, "/v1/search?owner=nobody")
+    let refusal = get::<SearchResults>(&pool, "/v1/search?owner=nobody")
         .await
         .refusal();
     assert_eq!(
@@ -419,18 +400,18 @@ async fn search_ranks_exact_prefix_substring() {
     // is what the trigram branch is for — but the retired name itself is
     // gone from the results.
     apply(&store, 6, retire(x, "alice_1", addr(2))).await;
-    let results: SearchResults = get(&store, "/v1/search?q=alice_1").await.answer();
+    let results: SearchResults = get(&pool, "/v1/search?q=alice_1").await.answer();
     let handles = handles_of(&results);
     assert!(!handles.contains(&"alice_1"), "{handles:?}");
     assert!(!handles.is_empty(), "fuzzy neighbors should still match");
 
     // LIKE metacharacters match themselves, not everything.
-    let results: SearchResults = get(&store, "/v1/search?q=%25").await.answer();
+    let results: SearchResults = get(&pool, "/v1/search?q=%25").await.answer();
     assert!(results.hits.is_empty());
 
     // A count that is not a number is refused in the API's own envelope.
     for path in ["/v1/search?q=ali&limit=ten", "/v1/search?q=ali&offset=1.5"] {
-        let refusal = get::<SearchResults>(&store, path).await.refusal();
+        let refusal = get::<SearchResults>(&pool, path).await.refusal();
         assert_eq!(
             refusal,
             (StatusCode::BAD_REQUEST, "invalid_argument".to_string()),
@@ -460,7 +441,7 @@ async fn replay_converges_instead_of_duplicating() {
             .expect("count");
     assert_eq!(journal, 1);
     let resolved: HandleResolution =
-        get(&store, "/v1/resolve/handle/x/alice_1").await.answer();
+        get(&pool, "/v1/resolve/handle/x/alice_1").await.answer();
     assert_eq!(only(&resolved.bindings).owner, alice);
 
     // The journal conflict gates every projection write, so the one counter
@@ -485,7 +466,7 @@ async fn replay_converges_instead_of_duplicating() {
 
 #[tokio::test]
 async fn unclaimed_names_on_a_configured_platform_are_coded_404s() {
-    let Some((store, _pool, guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -494,7 +475,7 @@ async fn unclaimed_names_on_a_configured_platform_are_coded_404s() {
     // reach, and the one that once shipped a decode 500.
     apply(&store, 1, NamesEvent::PlatformConfigured { platform_id: x }).await;
 
-    let refusal = get::<HandleResolution>(&store, "/v1/resolve/handle/x/zzz")
+    let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/zzz")
         .await
         .refusal();
     assert_eq!(
@@ -502,7 +483,7 @@ async fn unclaimed_names_on_a_configured_platform_are_coded_404s() {
         (StatusCode::NOT_FOUND, "handle_not_bound".to_string())
     );
 
-    let refusal = get::<IdResolution>(&store, "/v1/resolve/id/x/999999")
+    let refusal = get::<IdResolution>(&pool, "/v1/resolve/id/x/999999")
         .await
         .refusal();
     assert_eq!(refusal, (StatusCode::NOT_FOUND, "id_not_bound".to_string()));
@@ -511,26 +492,26 @@ async fn unclaimed_names_on_a_configured_platform_are_coded_404s() {
 
 #[tokio::test]
 async fn api_refuses_to_answer_before_the_first_window() {
-    let Some((store, _pool, guard)) = test_store().await else {
+    let Some((_store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
     // No window ever committed: resolution must say "not synced", never an
     // authoritative-looking "not bound".
-    let refusal = get::<HandleResolution>(&store, "/v1/resolve/handle/x/alice_1")
+    let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/alice_1")
         .await
         .refusal();
     assert_eq!(
         refusal,
         (StatusCode::SERVICE_UNAVAILABLE, "not_synced".to_string())
     );
-    let (status, _) = get::<SearchResults>(&store, "/v1/search?q=ali")
+    let (status, _) = get::<SearchResults>(&pool, "/v1/search?q=ali")
         .await
         .refusal();
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     // Status still answers — it is how a caller learns the sync state: the
     // chain is simply not among those the store holds.
-    let status: Status = common::get(&store, "/v1/status").await.answer();
+    let status: Status = common::get(&pool, "/v1/status").await.answer();
     assert!(
         status.chains.iter().all(|c| c.chain_id != CHAIN),
         "{status:?}"
@@ -565,14 +546,14 @@ async fn nul_bytes_neither_stall_the_indexer_nor_crash_the_api() {
     assert_eq!(stored, "evil\u{fffd}id");
 
     // And a NUL in a query is a 400, not a 500.
-    let refusal = get::<IdResolution>(&store, "/v1/resolve/id/x/evil%00id")
+    let refusal = get::<IdResolution>(&pool, "/v1/resolve/id/x/evil%00id")
         .await
         .refusal();
     assert_eq!(
         refusal,
         (StatusCode::BAD_REQUEST, "invalid_argument".to_string())
     );
-    let (status, _) = get::<SearchResults>(&store, "/v1/search?q=evil%00")
+    let (status, _) = get::<SearchResults>(&pool, "/v1/search?q=evil%00")
         .await
         .refusal();
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -631,7 +612,7 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
 
     // The Proof Verifier is the chain's one verification component; the
     // status reports it so an operator need not ask the RPC.
-    let status: Status = common::get(&store, "/v1/status").await.answer();
+    let status: Status = common::get(&pool, "/v1/status").await.answer();
     let chain = status
         .chains
         .iter()
@@ -643,7 +624,7 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
     // by — read back here through the histories of the addresses they name —
     // and bind nothing.
     let holder: AddressHistory =
-        get(&store, &format!("/v1/history/address/{}", addr(0xA1)))
+        get(&pool, &format!("/v1/history/address/{}", addr(0xA1)))
             .await
             .answer();
     let [entry] = &holder.entries[..] else {
@@ -659,7 +640,7 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
         }
     );
     let receiver: AddressHistory =
-        get(&store, &format!("/v1/history/address/{}", addr(0xFE)))
+        get(&pool, &format!("/v1/history/address/{}", addr(0xFE)))
             .await
             .answer();
     let [entry] = &receiver.entries[..] else {
@@ -685,7 +666,7 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
 
 #[tokio::test]
 async fn unconfigured_platform_and_impossible_text_name_their_codes() {
-    let Some((store, _pool, guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
@@ -697,14 +678,14 @@ async fn unconfigured_platform_and_impossible_text_name_their_codes() {
     // zero-address answer — and the code says which, on both resolve paths.
     let foreign = B256::repeat_byte(7);
     let refusal =
-        get::<HandleResolution>(&store, &format!("/v1/resolve/handle/{foreign}/alice_1"))
+        get::<HandleResolution>(&pool, &format!("/v1/resolve/handle/{foreign}/alice_1"))
             .await
             .refusal();
     assert_eq!(
         refusal,
         (StatusCode::NOT_FOUND, "platform_not_configured".to_string())
     );
-    let refusal = get::<IdResolution>(&store, &format!("/v1/resolve/id/{foreign}/111"))
+    let refusal = get::<IdResolution>(&pool, &format!("/v1/resolve/id/{foreign}/111"))
         .await
         .refusal();
     assert_eq!(
@@ -715,7 +696,7 @@ async fn unconfigured_platform_and_impossible_text_name_their_codes() {
     // Text X's rules can never hold (an interior space) mirrors the
     // contract's deliberate zero-address answer: "no such handle can exist",
     // a 404 with its own code — not "you asked wrong".
-    let refusal = get::<HandleResolution>(&store, "/v1/resolve/handle/x/a%20b")
+    let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/a%20b")
         .await
         .refusal();
     assert_eq!(
@@ -741,7 +722,7 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
     apply(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
     apply(&other, 1, bind(bob, x, "999", "alice_1", 1000, false)).await;
 
-    let resolved: HandleResolution = common::get(&store, "/v1/resolve/handle/x/alice_1")
+    let resolved: HandleResolution = common::get(&pool, "/v1/resolve/handle/x/alice_1")
         .await
         .answer();
     let chains: Vec<i64> = resolved.bindings.iter().map(|b| b.chain_id).collect();
@@ -749,7 +730,7 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
     assert_eq!(resolved.bindings[1].owner, bob);
 
     let resolved: HandleResolution = common::get(
-        &store,
+        &pool,
         &format!("/v1/resolve/handle/x/alice_1?chain={OTHER_CHAIN}"),
     )
     .await
@@ -758,7 +739,7 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
 
     // An address is asked without a chain; each identity names its own.
     let resolved: AddressResolution =
-        common::get(&store, &format!("/v1/resolve/address/{bob}"))
+        common::get(&pool, &format!("/v1/resolve/address/{bob}"))
             .await
             .answer();
     assert!(
@@ -774,7 +755,7 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
     );
 
     // Search too, and a hit says where it lives.
-    let results: SearchResults = common::get(&store, "/v1/search?q=alice_1&platform=x")
+    let results: SearchResults = common::get(&pool, "/v1/search?q=alice_1&platform=x")
         .await
         .answer();
     let hit_chains: Vec<i64> = results
@@ -791,7 +772,7 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
     // A chain nobody indexed is not an error to ask about; it has nothing
     // to answer from, and says so.
     let refusal = common::get::<HandleResolution>(
-        &store,
+        &pool,
         "/v1/resolve/handle/x/alice_1?chain=424242",
     )
     .await
@@ -800,12 +781,10 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
         refusal,
         (StatusCode::SERVICE_UNAVAILABLE, "not_synced".to_string())
     );
-    let refusal = common::get::<HandleResolution>(
-        &store,
-        "/v1/resolve/handle/x/alice_1?chain=eden",
-    )
-    .await
-    .refusal();
+    let refusal =
+        common::get::<HandleResolution>(&pool, "/v1/resolve/handle/x/alice_1?chain=eden")
+            .await
+            .refusal();
     assert_eq!(
         refusal,
         (StatusCode::BAD_REQUEST, "invalid_chain".to_string())
@@ -849,7 +828,7 @@ async fn seed(store: &ChainStore) {
 
 #[tokio::test]
 async fn preparing_an_unchanged_chain_keeps_everything() {
-    let Some((store, _pool, _g)) = test_store_with(2).await else {
+    let Some((store, _pool, guard)) = test_store_with(2).await else {
         return;
     };
     let writer = store.acquire_writer().await.expect("lease");
@@ -880,13 +859,14 @@ async fn preparing_an_unchanged_chain_keeps_everything() {
         "the binding survived"
     );
     writer.release().await.expect("the lease releases");
+    drop(guard);
 }
 
 #[tokio::test]
 async fn watching_another_contract_clears_the_chain() {
     // The old contract's bindings are not the new contract's bindings, so
     // inheriting them would answer for an account nobody bound here.
-    let Some((store, _pool, _g)) = test_store_with(2).await else {
+    let Some((store, _pool, guard)) = test_store_with(2).await else {
         return;
     };
     let writer = store.acquire_writer().await.expect("lease");
@@ -917,6 +897,7 @@ async fn watching_another_contract_clears_the_chain() {
         "the previous contract's binding must not survive"
     );
     writer.release().await.expect("the lease releases");
+    drop(guard);
 }
 
 #[tokio::test]
@@ -925,7 +906,7 @@ async fn the_deployment_block_cache_survives_a_replay() {
     // contract, and `eth_getCode` history does not change shape with the read
     // model. Losing it would re-run the binary search over the whole chain on
     // every version bump.
-    let Some((store, _pool, _g)) = test_store_with(2).await else {
+    let Some((store, _pool, guard)) = test_store_with(2).await else {
         return;
     };
     let writer = store.acquire_writer().await.expect("lease");
@@ -946,6 +927,7 @@ async fn the_deployment_block_cache_survives_a_replay() {
         "the deployment-block cache is keyed by contract and must outlive the wipe"
     );
     writer.release().await.expect("the lease releases");
+    drop(guard);
 }
 
 /// The lease must give the lock back, not merely stop being referenced.
@@ -957,7 +939,7 @@ async fn the_deployment_block_cache_survives_a_replay() {
 /// smallest thing that would have caught it.
 #[tokio::test]
 async fn a_released_lease_frees_the_chain_for_the_next_holder() {
-    let Some((store, _pool, _g)) = test_store_with(2).await else {
+    let Some((store, _pool, guard)) = test_store_with(2).await else {
         return;
     };
     let first = store.acquire_writer().await.expect("first lease");
@@ -971,6 +953,7 @@ async fn a_released_lease_frees_the_chain_for_the_next_holder() {
         .expect("the second lease was still blocked on the first")
         .expect("second lease");
     second.release().await.expect("release");
+    drop(guard);
 }
 
 /// The report the indexer makes beside the target expires on its own
@@ -978,7 +961,7 @@ async fn a_released_lease_frees_the_chain_for_the_next_holder() {
 /// moving the target — which is what keeps a long catch-up alive.
 #[tokio::test]
 async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
-    let Some((store, _pool, _g)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         return;
     };
     assert!(
@@ -999,6 +982,7 @@ async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
     );
     assert!(position.valid_for.is_some_and(|s| s > 0), "{position:?}");
     assert!(position.reported_at.is_some(), "{position:?}");
+    drop(guard);
 }
 
 /// A chain's names are its indexer's declaration: a set, replaced whole on
@@ -1006,7 +990,7 @@ async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
 /// `/v1/status`.
 #[tokio::test]
 async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
-    let Some((store, pool, _g)) = test_store_with(2).await else {
+    let Some((store, pool, guard)) = test_store_with(2).await else {
         return;
     };
     let name = |s: &str| s.parse::<ens::ChainName>().unwrap();
@@ -1063,7 +1047,7 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
     assert_eq!(reader.chain_named("beta").await.unwrap(), None);
 
     // Supervision sees the declaration.
-    let status: Status = get(&store, "/v1/status").await.answer();
+    let status: Status = get(&pool, "/v1/status").await.answer();
     let row = status
         .chains
         .iter()
@@ -1073,4 +1057,5 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
 
     other_writer.release().await.expect("release");
     writer.release().await.expect("release");
+    drop(guard);
 }

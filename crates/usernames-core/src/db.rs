@@ -62,22 +62,11 @@ pub use self::{
 /// from the deployment block — the re-index IS the migration.
 pub const INDEXER_VERSION: &str = "2";
 
-/// Every projection table, in one place. [`ChainStore::prepare`] clears them
-/// for a replay and the tests clean them between scenarios; a single list
-/// means a new table cannot be wiped in one place and silently survive in
-/// another.
-pub const PROJECTION_TABLES: &[&str] = &[
-    "events",
-    "ids",
-    "handles",
-    "published",
-    "platforms",
-    "escrow_held",
-    "escrow_refundable",
-    "address_events",
-    "handle_events",
-    "handle_nodes",
-];
+pub use self::sql::{
+    CLEAR_CHAIN,
+    CLEAR_CHAIN_METADATA,
+    CLEAR_CHAIN_NAMES,
+};
 
 // The chain_metadata keys. Chain scoping is the table's chain_id column;
 // only the deployment-block cache still carries anything in its key.
@@ -246,7 +235,7 @@ impl WriterLease {
     /// every test that takes a second lease on the same chain.
     pub async fn release(mut self) -> Result<(), sqlx::Error> {
         let key = format!("usernames-indexer:{}", self.chain_id);
-        sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+        sqlx::query(sql::WRITER_UNLOCK)
             .bind(&key)
             .execute(&mut self.conn)
             .await?;
@@ -271,12 +260,6 @@ impl ChainStore {
     /// The chain this store is scoped to.
     pub fn chain_id(&self) -> i64 {
         self.chain_id
-    }
-
-    /// The pool behind this store, for a caller that needs a query this type
-    /// does not offer — a test arranging a state the writer would produce.
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
     }
 
     async fn get_metadata(&self, key: &str) -> Result<Option<String>, sqlx::Error> {
@@ -304,17 +287,16 @@ impl ChainStore {
         let mut conn =
             sqlx::PgConnection::connect_with(&self.pool.connect_options()).await?;
         let key = format!("usernames-indexer:{}", self.chain_id);
-        let taken: bool =
-            sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, 0))")
-                .bind(&key)
-                .fetch_one(&mut conn)
-                .await?;
+        let taken: bool = sqlx::query_scalar(sql::WRITER_TRY_LOCK)
+            .bind(&key)
+            .fetch_one(&mut conn)
+            .await?;
         if !taken {
             tracing::warn!(
                 chain_id = self.chain_id,
                 "another indexer holds this chain's writer lock; waiting"
             );
-            sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+            sqlx::query(sql::WRITER_LOCK)
                 .bind(&key)
                 .execute(&mut conn)
                 .await?;
@@ -378,12 +360,10 @@ impl ChainStore {
             "read-model shape or a watched contract changed; clearing this chain for a full replay"
         );
         let mut tx = self.pool.begin().await?;
-        for table in PROJECTION_TABLES {
-            sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
-                .bind(self.chain_id)
-                .execute(&mut *tx)
-                .await?;
-        }
+        sqlx::query(sql::CLEAR_CHAIN)
+            .bind(self.chain_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(sql::CLEAR_CHAIN_METADATA)
             .bind(self.chain_id)
             .execute(&mut *tx)
@@ -549,12 +529,11 @@ impl ChainStore {
             .await
     }
 
-    /// Set when the report expires, as absolute Unix seconds.
-    ///
-    /// A test seam, and nothing else: production writes validity only through
-    /// [`Self::set_chain_target`] and [`Self::touch_chain_target`], relative
-    /// to the database's clock. Nothing in the binaries may call this.
-    #[doc(hidden)]
+    /// Set when the report expires, as absolute Unix seconds: how a suite
+    /// stands up an indexer that stopped reporting. Production writes
+    /// validity through [`Self::set_chain_target`] and
+    /// [`Self::touch_chain_target`], relative to the database's clock.
+    #[cfg(feature = "test-seams")]
     pub async fn set_chain_target_valid_until(&self, secs: u64) {
         if let Err(e) = self
             .set_metadata(TARGET_VALID_UNTIL_KEY, &secs.to_string())
@@ -1353,8 +1332,15 @@ mod sql {
     pub const GET_METADATA: &str = include_str!("../sql/get_metadata.sql");
     pub const UPSERT_METADATA: &str = include_str!("../sql/upsert_metadata.sql");
     pub const DELETE_METADATA: &str = include_str!("../sql/delete_metadata.sql");
+    /// Every row an indexer wrote for one chain into the read model: what a
+    /// replay clears, and what a suite clears before it writes the chain.
+    pub const CLEAR_CHAIN: &str = include_str!("../sql/clear_chain.sql");
+    /// The chain's metadata but its deployment-block cache.
     pub const CLEAR_CHAIN_METADATA: &str =
         include_str!("../sql/clear_chain_metadata.sql");
+    pub const WRITER_TRY_LOCK: &str = include_str!("../sql/writer_try_lock.sql");
+    pub const WRITER_LOCK: &str = include_str!("../sql/writer_lock.sql");
+    pub const WRITER_UNLOCK: &str = include_str!("../sql/writer_unlock.sql");
     pub const SET_CHAIN_TARGET: &str = include_str!("../sql/set_chain_target.sql");
     pub const TOUCH_CHAIN_TARGET: &str = include_str!("../sql/touch_chain_target.sql");
     pub const INDEX_POSITION: &str = include_str!("../sql/index_position.sql");
@@ -1366,6 +1352,7 @@ mod sql {
     pub const RETIRE_HANDLE: &str = include_str!("../sql/retire_handle.sql");
     pub const CONFIGURE_PLATFORM: &str = include_str!("../sql/configure_platform.sql");
     pub const CHAIN_NAMES_TAKEN: &str = include_str!("../sql/chain_names_taken.sql");
+    /// The names the chain goes by in an ENS name.
     pub const CLEAR_CHAIN_NAMES: &str = include_str!("../sql/clear_chain_names.sql");
     pub const INSERT_CHAIN_NAME: &str = include_str!("../sql/insert_chain_name.sql");
     pub const CHAIN_NAMES: &str = include_str!("../sql/chain_names.sql");

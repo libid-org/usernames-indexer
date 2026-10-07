@@ -29,6 +29,7 @@ sqlx.workspace = true
 tower-http.workspace = true
 
 [dev-dependencies]
+usernames-core = { workspace = true, features = ["test-seams"] }
 usernames-fixtures.workspace = true
 libid-contracts.workspace = true
 alloy = { workspace = true, features = ["signer-local", "node-bindings"] }

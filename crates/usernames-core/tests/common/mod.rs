@@ -47,6 +47,7 @@ use usernames_core::{
 /// [`Suite::done`].
 pub struct Suite {
     pub store: ChainStore,
+    pub pool: PgPool,
     lock: MutexGuard<'static, ()>,
 }
 
@@ -59,20 +60,10 @@ impl Suite {
             .await
             .expect("DATABASE_URL is set but connecting failed");
         db::MIGRATOR.run(&pool).await.expect("migrations failed");
-        for table in db::PROJECTION_TABLES {
-            sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
-                .bind(chain)
-                .execute(&pool)
-                .await
-                .expect("cleanup failed");
-        }
-        sqlx::query("DELETE FROM names.chain_metadata WHERE chain_id = $1")
-            .bind(chain)
-            .execute(&pool)
-            .await
-            .expect("metadata cleanup failed");
+        clear_chain(&pool, chain).await;
         Some(Self {
-            store: ChainStore::new(pool, chain),
+            store: ChainStore::new(pool.clone(), chain),
+            pool,
             lock,
         })
     }
@@ -103,13 +94,26 @@ impl Suite {
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Reply<T> {
         let separator = if path.contains('?') { '&' } else { '?' };
         let chain = self.store.chain_id();
-        get(&self.store, &format!("{path}{separator}chain={chain}")).await
+        get(&self.pool, &format!("{path}{separator}chain={chain}")).await
     }
 
     /// The test is done with the database; the suite's next test may take it.
     pub fn done(self) {
         let Self { lock, .. } = self;
         drop(lock);
+    }
+}
+
+/// Delete every row the store holds for `chain`: what a replay clears, the
+/// deployment-block cache a replay keeps, and the chain's names.
+pub async fn clear_chain(pool: &PgPool, chain: i64) {
+    let forget_metadata = include_str!("forget_chain_metadata.sql");
+    for statement in [db::CLEAR_CHAIN, forget_metadata, db::CLEAR_CHAIN_NAMES] {
+        sqlx::query(statement)
+            .bind(chain)
+            .execute(pool)
+            .await
+            .expect("cleanup");
     }
 }
 
@@ -148,8 +152,8 @@ impl<T: std::fmt::Debug> Reply<T> {
 /// One GET against the same axum router a caller would hit, decoded into the
 /// type the API answers with — or, off the success range, into the error
 /// envelope. A body in neither shape is a failed test, not a value.
-pub async fn get<T: DeserializeOwned>(store: &ChainStore, path: &str) -> Reply<T> {
-    let state = api::AppState::new(Store::new(store.pool().clone()));
+pub async fn get<T: DeserializeOwned>(pool: &PgPool, path: &str) -> Reply<T> {
+    let state = api::AppState::new(Store::new(pool.clone()));
     let response = api::router(state)
         .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
         .await

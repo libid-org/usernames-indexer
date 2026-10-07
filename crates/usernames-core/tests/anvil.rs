@@ -28,6 +28,7 @@ use alloy::{
 };
 use axum::http::StatusCode;
 use serde::de::DeserializeOwned;
+use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use usernames_core::{
     api::model::{
@@ -59,9 +60,9 @@ use common::{
 
 /// A request scoped to this suite's chain: the store is shared with the
 /// read-model suite's chain.
-async fn get<T: DeserializeOwned>(store: &ChainStore, path: &str) -> Reply<T> {
+async fn get<T: DeserializeOwned>(pool: &PgPool, path: &str) -> Reply<T> {
     let separator = if path.contains('?') { '&' } else { '?' };
-    common::get(store, &format!("{path}{separator}chain={CHAIN}")).await
+    common::get(pool, &format!("{path}{separator}chain={CHAIN}")).await
 }
 
 sol! {
@@ -173,18 +174,7 @@ async fn indexes_a_real_chain_end_to_end() {
     let store = ChainStore::new(pool.clone(), CHAIN as i64);
     // A previous run of this test left rows under this chain id; the loop
     // must start from a clean slate to make block-number assertions exact.
-    for table in db::PROJECTION_TABLES {
-        sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
-            .bind(CHAIN as i64)
-            .execute(&pool)
-            .await
-            .expect("cleanup");
-    }
-    sqlx::query("DELETE FROM names.chain_metadata WHERE chain_id = $1")
-        .bind(CHAIN as i64)
-        .execute(&pool)
-        .await
-        .expect("metadata cleanup");
+    common::clear_chain(&pool, CHAIN as i64).await;
 
     let provider = ProviderBuilder::new()
         .connect_anvil_with_wallet_and_config(|anvil| anvil.chain_id(CHAIN))
@@ -438,22 +428,22 @@ async fn indexes_a_real_chain_end_to_end() {
     assert_eq!(cached, Some(deploy_block), "cached deployment block");
 
     // alice_1 retired, alice_2 resolves, and the id followed the rename.
-    let (status, _) = get::<HandleResolution>(&store, "/v1/resolve/handle/x/alice_1")
+    let (status, _) = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/alice_1")
         .await
         .refusal();
     assert_eq!(status, StatusCode::NOT_FOUND);
     let resolved: HandleResolution =
-        get(&store, "/v1/resolve/handle/x/alice_2").await.answer();
+        get(&pool, "/v1/resolve/handle/x/alice_2").await.answer();
     let binding = &resolved.bindings[0];
     assert_eq!(binding.chain_id, CHAIN as i64);
     assert_eq!(binding.owner, alice);
     assert_eq!(binding.ceremony_version, 1);
-    let resolved: IdResolution = get(&store, "/v1/resolve/id/x/111").await.answer();
+    let resolved: IdResolution = get(&pool, "/v1/resolve/id/x/111").await.answer();
     assert_eq!(resolved.bindings[0].handle.as_deref(), Some("alice_2"));
 
     // The Google identity resolves through the URL-encoded raw form.
     let resolved: HandleResolution =
-        get(&store, "/v1/resolve/handle/google/A.B%2Btag%40Example.COM")
+        get(&pool, "/v1/resolve/handle/google/A.B%2Btag%40Example.COM")
             .await
             .answer();
     assert_eq!(resolved.handle, "a.b+tag@example.com");
@@ -462,7 +452,7 @@ async fn indexes_a_real_chain_end_to_end() {
         Some(GOOGLE_USER_ID)
     );
     let resolved: IdResolution =
-        get(&store, &format!("/v1/resolve/id/google/{GOOGLE_USER_ID}"))
+        get(&pool, &format!("/v1/resolve/id/google/{GOOGLE_USER_ID}"))
             .await
             .answer();
     assert_eq!(resolved.bindings[0].owner, alice);
@@ -473,10 +463,9 @@ async fn indexes_a_real_chain_end_to_end() {
 
     // Reverse: both identities, neither displayed (x was unpublished, google
     // never was).
-    let resolved: AddressResolution =
-        get(&store, &format!("/v1/resolve/address/{alice}"))
-            .await
-            .answer();
+    let resolved: AddressResolution = get(&pool, &format!("/v1/resolve/address/{alice}"))
+        .await
+        .answer();
     assert_eq!(resolved.identities.len(), 2, "{resolved:?}");
     assert!(
         resolved.identities.iter().all(|i| !i.published),
@@ -489,13 +478,13 @@ async fn indexes_a_real_chain_end_to_end() {
 
     // Search sees the current handle, not the retired one.
     let results: SearchResults =
-        get(&store, "/v1/search?q=alice&platform=x").await.answer();
+        get(&pool, "/v1/search?q=alice&platform=x").await.answer();
     let handles: Vec<&str> = results.hits.iter().map(|h| h.handle.as_str()).collect();
     assert_eq!(handles, ["alice_2"], "{results:?}");
 
     // Ops metadata filled from the admin events, on this chain's entry of
     // the status.
-    let status: Status = common::get(&store, "/v1/status").await.answer();
+    let status: Status = common::get(&pool, "/v1/status").await.answer();
     let chain = status
         .chains
         .iter()
@@ -550,7 +539,7 @@ async fn indexes_a_real_chain_end_to_end() {
     // Both emitters' logs, in one history: the handle's from the deposit made
     // while nobody held it through the bind to the claim, each dated by its
     // block.
-    let history: HandleHistory = get(&store, "/v1/history/handle/x/bob_x").await.answer();
+    let history: HandleHistory = get(&pool, "/v1/history/handle/x/bob_x").await.answer();
     assert!(
         matches!(
             events(&history.entries)[..],
@@ -564,7 +553,7 @@ async fn indexes_a_real_chain_end_to_end() {
     );
     assert!(history.entries.iter().all(|e| e.block_time > 0));
     // The payer's history ends with Bob's claim taking its deposit.
-    let history: AddressHistory = get(&store, &format!("/v1/history/address/{payer}"))
+    let history: AddressHistory = get(&pool, &format!("/v1/history/address/{payer}"))
         .await
         .answer();
     assert!(
@@ -580,7 +569,7 @@ async fn indexes_a_real_chain_end_to_end() {
     );
     assert_eq!(history.entries[0].roles, [Role::RefundTo]);
     assert_eq!(history.entries[2].roles, [Role::Depositor, Role::RefundTo]);
-    let history: AddressHistory = get(&store, &format!("/v1/history/address/{alice}"))
+    let history: AddressHistory = get(&pool, &format!("/v1/history/address/{alice}"))
         .await
         .answer();
     assert_eq!(history.entries[0].roles, [Role::Holder]);
@@ -590,11 +579,11 @@ async fn indexes_a_real_chain_end_to_end() {
     ));
 
     // Claimed: nothing waits for Bob, and the payer's refund ended with it.
-    let bobs: AddressAmounts = get(&store, &format!("/v1/escrow/claimable/{bob}"))
+    let bobs: AddressAmounts = get(&pool, &format!("/v1/escrow/claimable/{bob}"))
         .await
         .answer();
     assert!(bobs.amounts.is_empty(), "{bobs:?}");
-    let payers: AddressAmounts = get(&store, &format!("/v1/escrow/refundable/{payer}"))
+    let payers: AddressAmounts = get(&pool, &format!("/v1/escrow/refundable/{payer}"))
         .await
         .answer();
     assert!(payers.amounts.is_empty(), "{payers:?}");
