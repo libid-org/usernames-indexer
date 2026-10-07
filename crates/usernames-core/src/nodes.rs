@@ -40,7 +40,7 @@ fn platform_id(key: &str) -> B256 {
 
 /// Every platform this build knows.
 ///
-/// A closed set on purpose. The id derivation, the normalization rules and the
+/// A closed set. The id derivation, the normalization rules and the
 /// ENS label transform each have to be written once per platform, and an
 /// exhaustive `match` on this type is what makes the compiler say so instead of
 /// a test noticing later. Adding a platform is a variant here plus its rules in
@@ -244,7 +244,7 @@ impl NormalizedHandle {
 
 /// Fold a search query the way normalization would, without refusing partial
 /// input: trim spaces, strip one leading `@`, lowercase A-Z. A partial handle
-/// cannot pass shape checks, so full normalization is deliberately not run —
+/// cannot pass shape checks, so full normalization is not run —
 /// which is also why this returns a plain `String` and not a
 /// [`NormalizedHandle`]: folded text is not chain-keyed text.
 pub fn fold_search_query(raw: &str) -> String {

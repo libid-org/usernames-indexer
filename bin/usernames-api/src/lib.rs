@@ -2,9 +2,9 @@
 //! gateway over the indexed read model.
 //!
 //! Stateless and horizontal: it reads the database the indexer writes and
-//! nothing else, so several of these may serve one database. Both halves serve
-//! every chain the store holds, read per request: `/v1` takes an optional
-//! `?chain=`, the ENS gateway is asked by coin type.
+//! nothing else, so several of these may serve one database. The `/v1` routes
+//! and the gateway serve every chain the store holds, read per request: `/v1`
+//! takes an optional `?chain=`, the ENS gateway is asked by coin type.
 //!
 //! It answers `503 not_synced` for a chain until its first window is
 //! committed, which is why readiness must gate on `/v1/status` rather than

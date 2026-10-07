@@ -343,7 +343,7 @@ impl Config {
 
     /// Refuse a request that names another resolver.
     ///
-    /// Bound to one resolver on purpose. The digest names the configured
+    /// Bound to one resolver. The digest names the configured
     /// target, never `sender`, so this check adds no authority — what it adds
     /// is a visible error. Logged, because a 4xx is terminal for an ERC-3668
     /// client (it ends the walk of the resolver's `urls`) and a line here is
@@ -573,7 +573,7 @@ enum Answer {
 impl Answer {
     /// The bytes to sign, or the refusal to send instead.
     ///
-    /// The refusals are unsigned on purpose: a signature would make the answer
+    /// The refusals are unsigned: a signature would make the answer
     /// an assertion, and none of them has earned one. Unsigned lets the client
     /// fall through to the next endpoint in `urls`.
     fn into_result(self) -> Result<Vec<u8>, GatewayError> {

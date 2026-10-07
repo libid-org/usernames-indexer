@@ -18,4 +18,4 @@ jq -r .bytecode.object out/MockHandleEscrow.sol/MockHandleEscrow.json
 ```
 
 The ENS resolver the API's end-to-end test deploys is the `libid-contracts`
-crate's embedded `HandleResolver` artifact; nothing of it lives here.
+crate's embedded `HandleResolver` artifact.

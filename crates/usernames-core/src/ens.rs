@@ -1,4 +1,4 @@
-//! The ENS half: turning a name under `handles.link` back into a question the
+//! ENS: turning a name under `handles.link` back into a question the
 //! read model can answer.
 //!
 //! Everything here is pure. It parses, it inverts, it encodes; it reads no

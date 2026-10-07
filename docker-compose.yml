@@ -11,7 +11,7 @@ services:
       context: .
       target: indexer
     # An explicit map and no `env_file`: `.env` also carries the API's signing
-    # key, and this half has no use for it. Everything the indexer reads is
+    # key, and the indexer has no use for it. Everything the indexer reads is
     # listed here, with the `:?` checks on what it cannot do without. The
     # optional settings use the value-less form, which passes a variable
     # through from `.env` or the shell only when it is set: `${VAR:-}` would

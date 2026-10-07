@@ -341,8 +341,7 @@ migrated database; a newer API started before the migration answers
 
 Probes belong to the API: `GET /health` for liveness; for readiness gate on
 the status code of `GET /v1/status`, which is 200 whenever the database
-answers — the resolve endpoints answer 503 by design until the first window
-lands. It sends permissive CORS for GET, so a browser UI (handle.link) can
+answers — the resolve endpoints answer 503 until the first window lands. It sends permissive CORS for GET, so a browser UI (handle.link) can
 call it directly from any origin. The indexer exposes no port; supervise it on
 process liveness, and alert on `lagBlocks` and `reportValidFor` from the API's
 status — the first cannot move once the loop stops, the second counts down

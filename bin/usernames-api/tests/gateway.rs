@@ -910,13 +910,11 @@ async fn bare_addr_asks_for_the_chain_of_the_gateways_registry() {
     drop(guard);
 }
 
-/// What the binary actually serves: both halves on one router, with the
-/// middleware over the whole of it.
-///
-/// The halves were only ever built apart, so three things had no coverage —
-/// that the gateway route does not swallow the API's namespace, that a `/v1`
-/// path which matches nothing is a 404 rather than the gateway's "sender is
-/// not an address", and that CORS is applied once rather than layered twice.
+/// What the binary serves: the `/v1` routes and the gateway on one router,
+/// with the middleware over the whole of it. The gateway route does not
+/// swallow the API's namespace, a `/v1` path that matches nothing is a 404
+/// rather than the gateway's "sender is not an address", and CORS is applied
+/// once rather than layered twice.
 #[tokio::test]
 async fn the_merged_router_keeps_both_halves_intact() {
     let Some((config, store, pool, guard)) = gateway_parts(&[CHAIN], 32).await else {

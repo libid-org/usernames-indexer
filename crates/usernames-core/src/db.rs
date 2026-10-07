@@ -216,13 +216,9 @@ pub enum ChainNamesError {
 /// makes it safe. The lease remembers which chain it locks, and `prepare`
 /// verifies the match, so a lease from one store cannot vouch for another.
 pub struct WriterLease {
-    /// A connection of its OWN, deliberately not one from the pool. An advisory
-    /// lock taken with `pg_try_advisory_lock` is held for the SESSION, and a
-    /// pooled connection outlives the lease: dropping it returned a live
-    /// session, still holding the lock, to the idle pool, where it sat for the
-    /// idle timeout. A second indexer — or the next test — then blocked on a
-    /// lock nobody was using. Here the session is the lease's own, so dropping
-    /// it closes the socket and Postgres releases the lock.
+    /// The lease's own session, not a pooled one: the advisory lock belongs to
+    /// the session, so a pooled connection would carry the lock back into the
+    /// pool. Dropping this one closes the socket, and Postgres releases it.
     conn: sqlx::PgConnection,
     /// The chain whose advisory lock this connection holds.
     chain_id: i64,
@@ -696,8 +692,8 @@ fn sanitize_json(value: &mut serde_json::Value) -> bool {
             true
         }
         serde_json::Value::String(_) => false,
-        // Deliberately exhaustive: every element must be scrubbed, so no
-        // short-circuiting combinator fits here.
+        // Every element must be scrubbed, so no short-circuiting combinator
+        // fits here.
         serde_json::Value::Array(items) => {
             let mut lossy = false;
             for item in items {

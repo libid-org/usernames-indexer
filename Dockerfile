@@ -67,6 +67,6 @@ COPY --from=builder /app/target/release/usernames-api /usr/local/bin/usernames-a
 # Inside a container the API must bind the container interface, not loopback.
 ENV LISTEN_ADDR=0.0.0.0:8080
 EXPOSE 8080
-# Liveness: GET /health. Readiness for resolution: GET /v1/status (503s from
-# the resolve endpoints until the first window lands are by design).
+# Liveness: GET /health. Readiness for resolution: GET /v1/status; the resolve
+# endpoints answer 503 until the first window lands.
 ENTRYPOINT ["/usr/local/bin/usernames-api"]

@@ -21,10 +21,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # One compile, two runtime images. Deliberately no combined image: an
-        # entrypoint would have to default to one half, and a deployment that
-        # pulled it expecting the other would look healthy while doing half
-        # the job.
+        # One compile, two runtime images. A combined image's entrypoint would
+        # default to one binary, and a deployment that pulled it expecting the
+        # other would look healthy while doing half the job.
         include:
           - target: indexer
             image: usernames-indexer

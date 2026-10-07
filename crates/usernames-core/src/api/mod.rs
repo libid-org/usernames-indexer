@@ -90,7 +90,7 @@ impl AppState {
 
 /// The routes, without middleware.
 ///
-/// No CORS layer here on purpose: a `layer` wraps only the routes already on
+/// No CORS layer here: a `layer` wraps only the routes already on
 /// the router it is called on, so one applied inside this function cannot
 /// cover anything a caller merges afterwards. The binary mounts every route
 /// first and applies CORS once over the whole thing.
