@@ -23,7 +23,7 @@ use super::{
     Store,
     Window,
 };
-use crate::events::NamesEvent;
+use crate::events::EscrowEvent;
 
 impl Window {
     /// Move the escrow's books for one of its events. A claim or refund on a
@@ -32,13 +32,13 @@ impl Window {
     /// stalling the chain would not bring the deposit back.
     pub(crate) async fn book_escrow(
         &mut self,
-        event: &NamesEvent,
+        event: &EscrowEvent,
         block: i64,
         log_index: i64,
     ) -> Result<(), ApplyError> {
         let chain_id = self.chain_id;
         match event {
-            NamesEvent::Deposited {
+            EscrowEvent::Deposited {
                 handle_node,
                 token,
                 refund_to,
@@ -69,7 +69,7 @@ impl Window {
                     .await?;
             }
 
-            NamesEvent::Claimed {
+            EscrowEvent::Claimed {
                 handle_node,
                 token,
                 round,
@@ -101,7 +101,7 @@ impl Window {
                     .await?;
             }
 
-            NamesEvent::Refunded {
+            EscrowEvent::Refunded {
                 handle_node,
                 token,
                 refund_to,
@@ -138,16 +138,7 @@ impl Window {
 
             // Paid straight to the holder: nothing is held, and the
             // histories are the whole record of it.
-            NamesEvent::Forwarded { .. } => {}
-
-            // Not the escrow's.
-            NamesEvent::IdentityBound { .. }
-            | NamesEvent::HandleRetired { .. }
-            | NamesEvent::HandleUnpublished { .. }
-            | NamesEvent::PlatformConfigured { .. }
-            | NamesEvent::ProofVerifierConfigured { .. }
-            | NamesEvent::CeremonyBound { .. }
-            | NamesEvent::BindFeePaid { .. } => {}
+            EscrowEvent::Forwarded { .. } => {}
         }
         Ok(())
     }

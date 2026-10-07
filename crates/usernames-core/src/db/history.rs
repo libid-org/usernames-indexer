@@ -30,6 +30,7 @@ use super::{
     Window,
 };
 use crate::events::{
+    EscrowEvent,
     LogPosition,
     NamesEvent,
     Role,
@@ -199,25 +200,27 @@ impl Window {
                 }
             }
 
-            NamesEvent::Deposited {
-                handle_node,
-                platform_id,
-                ..
-            }
-            | NamesEvent::Forwarded {
-                handle_node,
-                platform_id,
-                ..
-            } => involvement.handle = Some((*handle_node, *platform_id)),
+            NamesEvent::Escrow(
+                EscrowEvent::Deposited {
+                    handle_node,
+                    platform_id,
+                    ..
+                }
+                | EscrowEvent::Forwarded {
+                    handle_node,
+                    platform_id,
+                    ..
+                },
+            ) => involvement.handle = Some((*handle_node, *platform_id)),
 
             // A claim ends the refunds of everybody whose deposit it took:
             // the round's refundable rows, read before the claim deletes them.
-            NamesEvent::Claimed {
+            NamesEvent::Escrow(EscrowEvent::Claimed {
                 handle_node,
                 token,
                 round,
                 ..
-            } => {
+            }) => {
                 let refund_tos: Vec<Address> =
                     sqlx::query_scalar(sql::CLAIMED_REFUND_TOS)
                         .bind(chain_id)
@@ -232,7 +235,7 @@ impl Window {
                 involvement.handle = self.escrow_handle(*handle_node, block).await?;
             }
 
-            NamesEvent::Refunded { handle_node, .. } => {
+            NamesEvent::Escrow(EscrowEvent::Refunded { handle_node, .. }) => {
                 involvement.handle = self.escrow_handle(*handle_node, block).await?;
             }
 

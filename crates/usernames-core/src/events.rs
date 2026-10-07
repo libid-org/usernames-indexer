@@ -23,9 +23,16 @@ use libid_contracts::bindings::{
     escrow::HandleEscrow,
     identity::IdentityRegistry,
 };
-use serde_json::json;
+use serde::{
+    de::Error as _,
+    Deserialize,
+    Serialize,
+};
+use serde_json::Value;
 use serde_with::{
+    serde_as,
     DeserializeFromStr,
+    DisplayFromStr,
     SerializeDisplay,
 };
 
@@ -44,11 +51,19 @@ pub struct LogPosition {
     pub block_time: u64,
 }
 
-/// One decoded `IdentityRegistry` or `HandleEscrow` event. Field names track
-/// the Solidity event parameters one to one, so they carry no docs of their
-/// own — the contracts' natspec is the reference. Every `uint256` stays a
-/// `U256`: escrowed amounts are token units, and nothing bounds them.
-#[derive(Debug, Clone)]
+/// One decoded `IdentityRegistry` or `HandleEscrow` event, and the journal's
+/// record of it: `kind` names the variant, the fields keep their camelCase
+/// names. Field names track the Solidity event parameters one to one, so
+/// they carry no docs of their own — the contracts' natspec is the
+/// reference. Every `uint256` stays a `U256`, a decimal string in the
+/// journal: escrowed amounts are token units, and nothing bounds them.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 #[allow(missing_docs)]
 pub enum NamesEvent {
     /// A holder proved an identity. The main event: carries the plaintext
@@ -93,8 +108,24 @@ pub enum NamesEvent {
     BindFeePaid {
         authorization_digest: B256,
         receiver: Address,
+        #[serde_as(as = "DisplayFromStr")]
         amount: U256,
     },
+    /// One of `HandleEscrow`'s events, journaled under its own kind.
+    #[serde(untagged)]
+    Escrow(EscrowEvent),
+}
+
+/// One decoded `HandleEscrow` event: what moves the escrow's books.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+#[allow(missing_docs)]
+pub enum EscrowEvent {
     /// Value escrowed for a handle node nobody holds, booked under `refund_to`
     /// in `round`, which the node's next `Claimed` closes.
     Deposited {
@@ -103,7 +134,9 @@ pub enum NamesEvent {
         refund_to: Address,
         depositor: Address,
         platform_id: B256,
+        #[serde_as(as = "DisplayFromStr")]
         round: U256,
+        #[serde_as(as = "DisplayFromStr")]
         amount: U256,
     },
     /// A deposit for a held node, paid straight to its holder.
@@ -113,7 +146,9 @@ pub enum NamesEvent {
         depositor: Address,
         holder: Address,
         platform_id: B256,
+        #[serde_as(as = "DisplayFromStr")]
         amount: U256,
+        #[serde_as(as = "DisplayFromStr")]
         received: U256,
     },
     /// The holder took everything held in one token, closing `round`.
@@ -122,8 +157,11 @@ pub enum NamesEvent {
         token: Address,
         claimer: Address,
         recipient: Address,
+        #[serde_as(as = "DisplayFromStr")]
         round: U256,
+        #[serde_as(as = "DisplayFromStr")]
         released: U256,
+        #[serde_as(as = "DisplayFromStr")]
         received: U256,
     },
     /// `refund_to` took its `round` contribution back.
@@ -132,8 +170,11 @@ pub enum NamesEvent {
         token: Address,
         refund_to: Address,
         recipient: Address,
+        #[serde_as(as = "DisplayFromStr")]
         round: U256,
+        #[serde_as(as = "DisplayFromStr")]
         released: U256,
+        #[serde_as(as = "DisplayFromStr")]
         received: U256,
     },
 }
@@ -226,10 +267,7 @@ impl NamesEvent {
             Self::ProofVerifierConfigured { .. } => "proof_verifier_configured",
             Self::CeremonyBound { .. } => "ceremony_bound",
             Self::BindFeePaid { .. } => "bind_fee_paid",
-            Self::Deposited { .. } => "deposited",
-            Self::Forwarded { .. } => "forwarded",
-            Self::Claimed { .. } => "claimed",
-            Self::Refunded { .. } => "refunded",
+            Self::Escrow(event) => event.kind(),
         }
     }
 
@@ -246,6 +284,52 @@ impl NamesEvent {
             | Self::CeremonyBound { holder, .. } => vec![(*holder, Role::Holder)],
             Self::HandleRetired { .. } => Vec::new(),
             Self::BindFeePaid { receiver, .. } => vec![(*receiver, Role::FeeReceiver)],
+            Self::PlatformConfigured { .. } | Self::ProofVerifierConfigured { .. } => {
+                Vec::new()
+            }
+            Self::Escrow(event) => event.parties(),
+        }
+    }
+
+    /// The journal payload: the fields under their camelCase names, without
+    /// the `kind` its own column holds.
+    pub fn payload(&self) -> Result<Value, serde_json::Error> {
+        match serde_json::to_value(self)? {
+            Value::Object(mut fields) => {
+                fields.remove("kind");
+                Ok(Value::Object(fields))
+            }
+            _ => Err(serde_json::Error::custom(
+                "an event serializes to an object",
+            )),
+        }
+    }
+
+    /// The event a journal row holds: its kind, and the payload
+    /// [`NamesEvent::payload`] wrote.
+    pub fn from_journal(kind: &str, payload: Value) -> Result<Self, serde_json::Error> {
+        let Value::Object(mut fields) = payload else {
+            return Err(serde_json::Error::custom("a journal payload is an object"));
+        };
+        fields.insert("kind".into(), Value::String(kind.into()));
+        serde_json::from_value(Value::Object(fields))
+    }
+}
+
+impl EscrowEvent {
+    /// The journal's `kind` discriminator.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Deposited { .. } => "deposited",
+            Self::Forwarded { .. } => "forwarded",
+            Self::Claimed { .. } => "claimed",
+            Self::Refunded { .. } => "refunded",
+        }
+    }
+
+    /// The addresses the event names, each with the part it plays.
+    fn parties(&self) -> Vec<(Address, Role)> {
+        match self {
             Self::Deposited {
                 refund_to,
                 depositor,
@@ -262,166 +346,6 @@ impl NamesEvent {
                 recipient,
                 ..
             } => vec![(*refund_to, Role::RefundTo), (*recipient, Role::Recipient)],
-            Self::PlatformConfigured { .. } | Self::ProofVerifierConfigured { .. } => {
-                Vec::new()
-            }
-        }
-    }
-
-    /// The handle node the event itself names. The apply path finds the node
-    /// of a ceremony, a fee and an unpublish, which name none.
-    pub fn handle_node(&self) -> Option<B256> {
-        match self {
-            Self::IdentityBound { handle_node, .. }
-            | Self::HandleRetired { handle_node, .. }
-            | Self::Deposited { handle_node, .. }
-            | Self::Forwarded { handle_node, .. }
-            | Self::Claimed { handle_node, .. }
-            | Self::Refunded { handle_node, .. } => Some(*handle_node),
-            Self::HandleUnpublished { .. }
-            | Self::PlatformConfigured { .. }
-            | Self::ProofVerifierConfigured { .. }
-            | Self::CeremonyBound { .. }
-            | Self::BindFeePaid { .. } => None,
-        }
-    }
-
-    /// The journal payload. Bytes render as 0x-hex so the journal reads the
-    /// way explorers print the chain; every `uint256` is a decimal string,
-    /// because it does not fit a JSON number.
-    pub fn payload(&self) -> serde_json::Value {
-        match self {
-            Self::IdentityBound {
-                holder,
-                id_node,
-                handle_node,
-                platform_id,
-                id,
-                handle,
-                observed_at,
-                published,
-                ceremony_version,
-            } => json!({
-                "holder": holder.to_string(),
-                "idNode": id_node.to_string(),
-                "handleNode": handle_node.to_string(),
-                "platformId": platform_id.to_string(),
-                "id": id,
-                "handle": handle,
-                "observedAt": observed_at,
-                "published": published,
-                "ceremonyVersion": ceremony_version,
-            }),
-            Self::HandleRetired {
-                platform_id,
-                handle_node,
-                holder,
-            } => json!({
-                "platformId": platform_id.to_string(),
-                "handleNode": handle_node.to_string(),
-                "holder": holder.to_string(),
-            }),
-            Self::HandleUnpublished {
-                holder,
-                platform_id,
-            } => json!({
-                "holder": holder.to_string(),
-                "platformId": platform_id.to_string(),
-            }),
-            Self::PlatformConfigured { platform_id } => json!({
-                "platformId": platform_id.to_string(),
-            }),
-            Self::ProofVerifierConfigured { verifier } => json!({
-                "verifier": verifier.to_string(),
-            }),
-            Self::CeremonyBound {
-                authorization_digest,
-                holder,
-                platform_id,
-                client_identifier,
-            } => json!({
-                "authorizationDigest": authorization_digest.to_string(),
-                "holder": holder.to_string(),
-                "platformId": platform_id.to_string(),
-                "clientIdentifier": client_identifier.to_string(),
-            }),
-            Self::BindFeePaid {
-                authorization_digest,
-                receiver,
-                amount,
-            } => json!({
-                "authorizationDigest": authorization_digest.to_string(),
-                "receiver": receiver.to_string(),
-                "amount": amount.to_string(),
-            }),
-            Self::Deposited {
-                handle_node,
-                token,
-                refund_to,
-                depositor,
-                platform_id,
-                round,
-                amount,
-            } => json!({
-                "handleNode": handle_node.to_string(),
-                "token": token.to_string(),
-                "refundTo": refund_to.to_string(),
-                "depositor": depositor.to_string(),
-                "platformId": platform_id.to_string(),
-                "round": round.to_string(),
-                "amount": amount.to_string(),
-            }),
-            Self::Forwarded {
-                handle_node,
-                token,
-                depositor,
-                holder,
-                platform_id,
-                amount,
-                received,
-            } => json!({
-                "handleNode": handle_node.to_string(),
-                "token": token.to_string(),
-                "depositor": depositor.to_string(),
-                "holder": holder.to_string(),
-                "platformId": platform_id.to_string(),
-                "amount": amount.to_string(),
-                "received": received.to_string(),
-            }),
-            Self::Claimed {
-                handle_node,
-                token,
-                claimer,
-                recipient,
-                round,
-                released,
-                received,
-            } => json!({
-                "handleNode": handle_node.to_string(),
-                "token": token.to_string(),
-                "claimer": claimer.to_string(),
-                "recipient": recipient.to_string(),
-                "round": round.to_string(),
-                "released": released.to_string(),
-                "received": received.to_string(),
-            }),
-            Self::Refunded {
-                handle_node,
-                token,
-                refund_to,
-                recipient,
-                round,
-                released,
-                received,
-            } => json!({
-                "handleNode": handle_node.to_string(),
-                "token": token.to_string(),
-                "refundTo": refund_to.to_string(),
-                "recipient": recipient.to_string(),
-                "round": round.to_string(),
-                "released": released.to_string(),
-                "received": received.to_string(),
-            }),
         }
     }
 }
@@ -581,7 +505,7 @@ pub fn decode_escrow(
 
     let event = if topic0 == HandleEscrow::Deposited::SIGNATURE_HASH {
         let d: HandleEscrow::Deposited = payload_of(log, "Deposited")?;
-        NamesEvent::Deposited {
+        EscrowEvent::Deposited {
             handle_node: d.handleNode,
             token: d.token,
             refund_to: d.refundTo,
@@ -592,7 +516,7 @@ pub fn decode_escrow(
         }
     } else if topic0 == HandleEscrow::Forwarded::SIGNATURE_HASH {
         let d: HandleEscrow::Forwarded = payload_of(log, "Forwarded")?;
-        NamesEvent::Forwarded {
+        EscrowEvent::Forwarded {
             handle_node: d.handleNode,
             token: d.token,
             depositor: d.depositor,
@@ -603,7 +527,7 @@ pub fn decode_escrow(
         }
     } else if topic0 == HandleEscrow::Claimed::SIGNATURE_HASH {
         let d: HandleEscrow::Claimed = payload_of(log, "Claimed")?;
-        NamesEvent::Claimed {
+        EscrowEvent::Claimed {
             handle_node: d.handleNode,
             token: d.token,
             claimer: d.claimer,
@@ -614,7 +538,7 @@ pub fn decode_escrow(
         }
     } else if topic0 == HandleEscrow::Refunded::SIGNATURE_HASH {
         let d: HandleEscrow::Refunded = payload_of(log, "Refunded")?;
-        NamesEvent::Refunded {
+        EscrowEvent::Refunded {
             handle_node: d.handleNode,
             token: d.token,
             refund_to: d.refundTo,
@@ -627,7 +551,7 @@ pub fn decode_escrow(
         return Ok(None);
     };
 
-    Ok(Some((event, position)))
+    Ok(Some((NamesEvent::Escrow(event), position)))
 }
 
 #[cfg(test)]
@@ -747,14 +671,10 @@ mod tests {
         );
         let (event, _) = decode_escrow(&log).unwrap().expect("a known topic");
         assert_eq!(event.kind(), "deposited");
-        assert_eq!(event.handle_node(), Some(node));
         assert_eq!(
             event.parties(),
             [(payer, Role::Depositor), (payer, Role::RefundTo)]
         );
-        // A uint256 is a decimal string in the journal, the largest included.
-        assert_eq!(event.payload()["amount"], U256::MAX.to_string());
-        assert_eq!(event.payload()["round"], "2");
     }
 
     /// An escrow topic means nothing from the registry, and the reverse: each
@@ -798,6 +718,94 @@ mod tests {
             decode_registry(&log),
             Err(DecodeError::MissingField("block timestamp"))
         ));
+    }
+
+    /// Every kind, the largest `uint256` included, reads back from the
+    /// journal row its payload writes.
+    #[test]
+    fn every_event_reads_back_from_its_journal_row() {
+        let (a, b) = (Address::repeat_byte(0xA1), Address::repeat_byte(0xB2));
+        let (n, p) = (B256::repeat_byte(0x0D), B256::repeat_byte(0x0C));
+        let big = U256::MAX - U256::from(1u64);
+        let events = [
+            NamesEvent::IdentityBound {
+                holder: a,
+                id_node: n,
+                handle_node: p,
+                platform_id: PLATFORM,
+                id: "1234".into(),
+                handle: "alice".into(),
+                observed_at: u64::MAX,
+                published: true,
+                ceremony_version: u16::MAX,
+            },
+            NamesEvent::HandleRetired {
+                platform_id: PLATFORM,
+                handle_node: n,
+                holder: a,
+            },
+            NamesEvent::HandleUnpublished {
+                holder: a,
+                platform_id: PLATFORM,
+            },
+            NamesEvent::PlatformConfigured {
+                platform_id: PLATFORM,
+            },
+            NamesEvent::ProofVerifierConfigured { verifier: b },
+            NamesEvent::CeremonyBound {
+                authorization_digest: p,
+                holder: a,
+                platform_id: PLATFORM,
+                client_identifier: Bytes::from_static(b"client"),
+            },
+            NamesEvent::BindFeePaid {
+                authorization_digest: p,
+                receiver: b,
+                amount: big,
+            },
+            NamesEvent::Escrow(EscrowEvent::Deposited {
+                handle_node: n,
+                token: b,
+                refund_to: a,
+                depositor: a,
+                platform_id: PLATFORM,
+                round: U256::from(2u64),
+                amount: U256::MAX,
+            }),
+            NamesEvent::Escrow(EscrowEvent::Forwarded {
+                handle_node: n,
+                token: b,
+                depositor: a,
+                holder: b,
+                platform_id: PLATFORM,
+                amount: big,
+                received: big,
+            }),
+            NamesEvent::Escrow(EscrowEvent::Claimed {
+                handle_node: n,
+                token: b,
+                claimer: a,
+                recipient: b,
+                round: U256::ZERO,
+                released: big,
+                received: U256::from(1u64),
+            }),
+            NamesEvent::Escrow(EscrowEvent::Refunded {
+                handle_node: n,
+                token: b,
+                refund_to: a,
+                recipient: b,
+                round: U256::from(1u64),
+                released: U256::from(5u64),
+                received: U256::from(4u64),
+            }),
+        ];
+        for event in events {
+            let payload = event.payload().unwrap();
+            let read = NamesEvent::from_journal(event.kind(), payload)
+                .unwrap_or_else(|e| panic!("{}: {e}", event.kind()));
+            assert_eq!(read, event);
+        }
     }
 
     #[test]

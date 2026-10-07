@@ -18,7 +18,6 @@ use super::{
         HandleQuery,
         HandleRef,
         HistoryEntry,
-        HistoryEvent,
     },
     parse_address,
     parse_count,
@@ -38,6 +37,7 @@ use crate::{
         HistoryRow,
         HistoryRows,
     },
+    events::NamesEvent,
     nodes,
 };
 
@@ -79,7 +79,7 @@ impl HistoryEntry {
     /// The entry a stored row stands for. The journal is this build's own
     /// writing, so a row it cannot read back is an internal error.
     fn of(row: HistoryRow) -> Result<Self, ApiError> {
-        let event = HistoryEvent::from_journal(&row.kind, row.payload).map_err(|e| {
+        let event = NamesEvent::from_journal(&row.kind, row.payload).map_err(|e| {
             ApiError::internal(format_args!(
                 "journal row {}/{}/{} ({}): {e}",
                 row.chain_id, row.block_number, row.log_index, row.kind
@@ -108,7 +108,7 @@ impl HistoryEntry {
             block_time: row.block_time,
             roles,
             handle,
-            event,
+            event: event.into(),
         })
     }
 }

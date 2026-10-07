@@ -12,18 +12,22 @@ use alloy::primitives::{
     U256,
 };
 use serde::{
-    de::Error as _,
     Deserialize,
     Serialize,
 };
-use serde_json::Value;
 use serde_with::{
     serde_as,
     DisplayFromStr,
 };
 
 pub use crate::events::Role;
-use crate::nodes::KnownPlatform;
+use crate::{
+    events::{
+        EscrowEvent,
+        NamesEvent,
+    },
+    nodes::KnownPlatform,
+};
 
 /// One error shape for the whole API, beside the HTTP status: a stable code
 /// and prose. The code is the machine-readable half of the contract — a UI
@@ -353,16 +357,143 @@ pub enum HistoryEvent {
     },
 }
 
-impl HistoryEvent {
-    /// The event a journal row holds: its kind, and the payload
-    /// [`crate::events::NamesEvent::payload`] wrote, whose keys and encodings
-    /// are these fields'.
-    pub fn from_journal(kind: &str, payload: Value) -> Result<Self, serde_json::Error> {
-        let Value::Object(mut fields) = payload else {
-            return Err(serde_json::Error::custom("a journal payload is an object"));
-        };
-        fields.insert("kind".into(), Value::String(kind.into()));
-        serde_json::from_value(Value::Object(fields))
+/// The wire's copy of a journaled event: the same fields, so a client reads
+/// what the chain emitted, in a type the journal's format does not bind.
+impl From<NamesEvent> for HistoryEvent {
+    fn from(event: NamesEvent) -> Self {
+        match event {
+            NamesEvent::IdentityBound {
+                holder,
+                id_node,
+                handle_node,
+                platform_id,
+                id,
+                handle,
+                observed_at,
+                published,
+                ceremony_version,
+            } => Self::IdentityBound {
+                holder,
+                id_node,
+                handle_node,
+                platform_id,
+                id,
+                handle,
+                observed_at,
+                published,
+                ceremony_version,
+            },
+            NamesEvent::HandleRetired {
+                platform_id,
+                handle_node,
+                holder,
+            } => Self::HandleRetired {
+                platform_id,
+                handle_node,
+                holder,
+            },
+            NamesEvent::HandleUnpublished {
+                holder,
+                platform_id,
+            } => Self::HandleUnpublished {
+                holder,
+                platform_id,
+            },
+            NamesEvent::PlatformConfigured { platform_id } => {
+                Self::PlatformConfigured { platform_id }
+            }
+            NamesEvent::ProofVerifierConfigured { verifier } => {
+                Self::ProofVerifierConfigured { verifier }
+            }
+            NamesEvent::CeremonyBound {
+                authorization_digest,
+                holder,
+                platform_id,
+                client_identifier,
+            } => Self::CeremonyBound {
+                authorization_digest,
+                holder,
+                platform_id,
+                client_identifier,
+            },
+            NamesEvent::BindFeePaid {
+                authorization_digest,
+                receiver,
+                amount,
+            } => Self::BindFeePaid {
+                authorization_digest,
+                receiver,
+                amount,
+            },
+            NamesEvent::Escrow(EscrowEvent::Deposited {
+                handle_node,
+                token,
+                refund_to,
+                depositor,
+                platform_id,
+                round,
+                amount,
+            }) => Self::Deposited {
+                handle_node,
+                token,
+                refund_to,
+                depositor,
+                platform_id,
+                round,
+                amount,
+            },
+            NamesEvent::Escrow(EscrowEvent::Forwarded {
+                handle_node,
+                token,
+                depositor,
+                holder,
+                platform_id,
+                amount,
+                received,
+            }) => Self::Forwarded {
+                handle_node,
+                token,
+                depositor,
+                holder,
+                platform_id,
+                amount,
+                received,
+            },
+            NamesEvent::Escrow(EscrowEvent::Claimed {
+                handle_node,
+                token,
+                claimer,
+                recipient,
+                round,
+                released,
+                received,
+            }) => Self::Claimed {
+                handle_node,
+                token,
+                claimer,
+                recipient,
+                round,
+                released,
+                received,
+            },
+            NamesEvent::Escrow(EscrowEvent::Refunded {
+                handle_node,
+                token,
+                refund_to,
+                recipient,
+                round,
+                released,
+                received,
+            }) => Self::Refunded {
+                handle_node,
+                token,
+                refund_to,
+                recipient,
+                round,
+                released,
+                received,
+            },
+        }
     }
 }
 
@@ -494,241 +625,4 @@ pub struct Unclaimed {
     pub slots: Vec<EscrowAmount>,
     /// Pass as `before` for the next page; absent on the last one.
     pub next: Option<String>,
-}
-
-#[cfg(test)]
-mod tests {
-    use alloy::primitives::{
-        Address,
-        Bytes,
-        B256,
-        U256,
-    };
-
-    use super::HistoryEvent;
-    use crate::events::NamesEvent;
-
-    /// The wire event each decoded event must come back as from its journal
-    /// row, field for field.
-    fn expected(event: &NamesEvent) -> HistoryEvent {
-        match event.clone() {
-            NamesEvent::IdentityBound {
-                holder,
-                id_node,
-                handle_node,
-                platform_id,
-                id,
-                handle,
-                observed_at,
-                published,
-                ceremony_version,
-            } => HistoryEvent::IdentityBound {
-                holder,
-                id_node,
-                handle_node,
-                platform_id,
-                id,
-                handle,
-                observed_at,
-                published,
-                ceremony_version,
-            },
-            NamesEvent::HandleRetired {
-                platform_id,
-                handle_node,
-                holder,
-            } => HistoryEvent::HandleRetired {
-                platform_id,
-                handle_node,
-                holder,
-            },
-            NamesEvent::HandleUnpublished {
-                holder,
-                platform_id,
-            } => HistoryEvent::HandleUnpublished {
-                holder,
-                platform_id,
-            },
-            NamesEvent::PlatformConfigured { platform_id } => {
-                HistoryEvent::PlatformConfigured { platform_id }
-            }
-            NamesEvent::ProofVerifierConfigured { verifier } => {
-                HistoryEvent::ProofVerifierConfigured { verifier }
-            }
-            NamesEvent::CeremonyBound {
-                authorization_digest,
-                holder,
-                platform_id,
-                client_identifier,
-            } => HistoryEvent::CeremonyBound {
-                authorization_digest,
-                holder,
-                platform_id,
-                client_identifier,
-            },
-            NamesEvent::BindFeePaid {
-                authorization_digest,
-                receiver,
-                amount,
-            } => HistoryEvent::BindFeePaid {
-                authorization_digest,
-                receiver,
-                amount,
-            },
-            NamesEvent::Deposited {
-                handle_node,
-                token,
-                refund_to,
-                depositor,
-                platform_id,
-                round,
-                amount,
-            } => HistoryEvent::Deposited {
-                handle_node,
-                token,
-                refund_to,
-                depositor,
-                platform_id,
-                round,
-                amount,
-            },
-            NamesEvent::Forwarded {
-                handle_node,
-                token,
-                depositor,
-                holder,
-                platform_id,
-                amount,
-                received,
-            } => HistoryEvent::Forwarded {
-                handle_node,
-                token,
-                depositor,
-                holder,
-                platform_id,
-                amount,
-                received,
-            },
-            NamesEvent::Claimed {
-                handle_node,
-                token,
-                claimer,
-                recipient,
-                round,
-                released,
-                received,
-            } => HistoryEvent::Claimed {
-                handle_node,
-                token,
-                claimer,
-                recipient,
-                round,
-                released,
-                received,
-            },
-            NamesEvent::Refunded {
-                handle_node,
-                token,
-                refund_to,
-                recipient,
-                round,
-                released,
-                received,
-            } => HistoryEvent::Refunded {
-                handle_node,
-                token,
-                refund_to,
-                recipient,
-                round,
-                released,
-                received,
-            },
-        }
-    }
-
-    /// Every kind the journal holds reads back as the event that wrote it.
-    /// The payload is this crate's own format, so a field renamed on one side
-    /// only fails here, before a history serves a 500.
-    #[test]
-    fn every_journal_row_reads_back_as_its_event() {
-        let (a, b) = (Address::repeat_byte(0xA1), Address::repeat_byte(0xB2));
-        let (n, p) = (B256::repeat_byte(0x0D), B256::repeat_byte(0x0C));
-        let big = U256::MAX - U256::from(1u64);
-        let events = [
-            NamesEvent::IdentityBound {
-                holder: a,
-                id_node: B256::repeat_byte(0x1D),
-                handle_node: n,
-                platform_id: p,
-                id: "111".into(),
-                handle: "alice_1".into(),
-                observed_at: u64::MAX,
-                published: true,
-                ceremony_version: u16::MAX,
-            },
-            NamesEvent::HandleRetired {
-                platform_id: p,
-                handle_node: n,
-                holder: a,
-            },
-            NamesEvent::HandleUnpublished {
-                holder: a,
-                platform_id: p,
-            },
-            NamesEvent::PlatformConfigured { platform_id: p },
-            NamesEvent::ProofVerifierConfigured { verifier: b },
-            NamesEvent::CeremonyBound {
-                authorization_digest: B256::repeat_byte(0xD1),
-                holder: a,
-                platform_id: p,
-                client_identifier: Bytes::from_static(b"client"),
-            },
-            NamesEvent::BindFeePaid {
-                authorization_digest: B256::repeat_byte(0xD1),
-                receiver: b,
-                amount: big,
-            },
-            NamesEvent::Deposited {
-                handle_node: n,
-                token: b,
-                refund_to: a,
-                depositor: b,
-                platform_id: p,
-                round: U256::from(3u64),
-                amount: big,
-            },
-            NamesEvent::Forwarded {
-                handle_node: n,
-                token: b,
-                depositor: a,
-                holder: b,
-                platform_id: p,
-                amount: big,
-                received: U256::from(9u64),
-            },
-            NamesEvent::Claimed {
-                handle_node: n,
-                token: b,
-                claimer: a,
-                recipient: b,
-                round: U256::ZERO,
-                released: big,
-                received: big,
-            },
-            NamesEvent::Refunded {
-                handle_node: n,
-                token: b,
-                refund_to: a,
-                recipient: b,
-                round: U256::from(1u64),
-                released: U256::from(5u64),
-                received: U256::from(4u64),
-            },
-        ];
-        for event in &events {
-            let read = HistoryEvent::from_journal(event.kind(), event.payload())
-                .unwrap_or_else(|e| panic!("{}: {e}", event.kind()));
-            assert_eq!(read, expected(event), "{}", event.kind());
-        }
-    }
 }

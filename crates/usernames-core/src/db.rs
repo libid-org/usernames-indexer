@@ -188,6 +188,8 @@ pub enum ApplyError {
         /// The value itself.
         value: u64,
     },
+    /// The event did not serialize into its journal payload.
+    Journal(serde_json::Error),
 }
 
 impl std::fmt::Display for ApplyError {
@@ -197,6 +199,7 @@ impl std::fmt::Display for ApplyError {
             Self::OutOfRange { what, value } => {
                 write!(f, "{what} {value} does not fit in a BIGINT")
             }
+            Self::Journal(e) => write!(f, "journal payload: {e}"),
         }
     }
 }
@@ -206,6 +209,7 @@ impl std::error::Error for ApplyError {
         match self {
             Self::Db(e) => Some(e),
             Self::OutOfRange { .. } => None,
+            Self::Journal(e) => Some(e),
         }
     }
 }
@@ -796,7 +800,7 @@ impl Window {
         let block = as_i64(pos.block_number, "block number")?;
         let log_index = as_i64(pos.log_index, "log index")?;
 
-        let mut payload = event.payload();
+        let mut payload = event.payload().map_err(ApplyError::Journal)?;
         if sanitize_json(&mut payload) {
             error!(
                 kind = event.kind(),
@@ -976,11 +980,8 @@ impl Window {
             // histories list it. Nothing resolves by it.
             NamesEvent::CeremonyBound { .. } | NamesEvent::BindFeePaid { .. } => {}
 
-            NamesEvent::Deposited { .. }
-            | NamesEvent::Forwarded { .. }
-            | NamesEvent::Claimed { .. }
-            | NamesEvent::Refunded { .. } => {
-                self.book_escrow(event, block, log_index).await?;
+            NamesEvent::Escrow(escrow) => {
+                self.book_escrow(escrow, block, log_index).await?;
             }
         }
 

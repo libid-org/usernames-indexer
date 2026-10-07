@@ -44,6 +44,7 @@ use usernames_core::{
         ChainStore,
     },
     events::{
+        EscrowEvent,
         LogPosition,
         NamesEvent,
     },
@@ -153,7 +154,7 @@ fn deposited(
     round: u64,
     amount: u64,
 ) -> NamesEvent {
-    NamesEvent::Deposited {
+    NamesEvent::Escrow(EscrowEvent::Deposited {
         handle_node: node(handle),
         token,
         refund_to,
@@ -161,7 +162,7 @@ fn deposited(
         platform_id: x(),
         round: U256::from(round),
         amount: U256::from(amount),
-    }
+    })
 }
 
 fn kinds(entries: &[HistoryEntry]) -> Vec<&'static str> {
@@ -241,7 +242,7 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
     apply(
         &store,
         4,
-        NamesEvent::Refunded {
+        NamesEvent::Escrow(EscrowEvent::Refunded {
             handle_node: bob_node,
             token: NATIVE,
             refund_to: dave,
@@ -249,7 +250,7 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
             round: U256::ZERO,
             released: U256::from(50u64),
             received: U256::from(50u64),
-        },
+        }),
     )
     .await;
     let daves: AddressBalances = get(&store, &format!("/v1/escrow/address/{dave}"))
@@ -279,7 +280,7 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
     apply(
         &store,
         6,
-        NamesEvent::Claimed {
+        NamesEvent::Escrow(EscrowEvent::Claimed {
             handle_node: bob_node,
             token: NATIVE,
             claimer: bob,
@@ -287,7 +288,7 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
             round: U256::ZERO,
             released: U256::from(100u64),
             received: U256::from(100u64),
-        },
+        }),
     )
     .await;
     let bobs: AddressBalances = get(&store, &format!("/v1/escrow/address/{bob}"))
@@ -303,7 +304,7 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
     apply(
         &store,
         7,
-        NamesEvent::Forwarded {
+        NamesEvent::Escrow(EscrowEvent::Forwarded {
             handle_node: bob_node,
             token: NATIVE,
             depositor: carol,
@@ -311,7 +312,7 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
             platform_id: x(),
             amount: U256::from(5u64),
             received: U256::from(5u64),
-        },
+        }),
     )
     .await;
     let held: HandleBalances = get(&store, "/v1/escrow/handle/x/bob_1").await.answer();
