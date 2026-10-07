@@ -9,6 +9,8 @@
 
 mod common;
 
+use std::fmt::Debug;
+
 use alloy::primitives::{
     address,
     Address,
@@ -122,7 +124,7 @@ async fn get<T: DeserializeOwned>(store: &ChainStore, path: &str) -> Reply<T> {
 
 /// The status and code a route refuses `path` with, read as the refusal of
 /// the answer type that route serves.
-async fn refused<T: DeserializeOwned + std::fmt::Debug>(
+async fn refused<T: DeserializeOwned + Debug>(
     store: &ChainStore,
     path: &str,
 ) -> (StatusCode, String) {

@@ -8,7 +8,10 @@ mod escrow;
 mod history;
 pub mod model;
 
-use std::str::FromStr;
+use std::{
+    fmt,
+    str::FromStr,
+};
 
 use alloy::primitives::{
     Address,
@@ -132,7 +135,7 @@ impl ApiError {
 
     /// A stored value this build cannot read back. Logged with `what` where
     /// it is found; the client gets the same opaque 500 as a database error.
-    fn internal(what: impl std::fmt::Display) -> Self {
+    fn internal(what: impl fmt::Display) -> Self {
         tracing::error!(%what, "unreadable stored value");
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,

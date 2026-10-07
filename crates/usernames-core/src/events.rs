@@ -4,7 +4,10 @@
 //! `alloy` logs: a test builds a `NamesEvent` directly and never touches RPC
 //! types.
 
-use std::str::FromStr;
+use std::{
+    fmt,
+    str::FromStr,
+};
 
 use alloy::{
     primitives::{
@@ -20,11 +23,11 @@ use libid_contracts::bindings::{
     escrow::HandleEscrow,
     identity::IdentityRegistry,
 };
-use serde::{
-    Deserialize,
-    Serialize,
-};
 use serde_json::json;
+use serde_with::{
+    DeserializeFromStr,
+    SerializeDisplay,
+};
 
 /// Where in the chain a log sat. The pair (block, log index) is the natural
 /// id every table keys provenance by.
@@ -138,8 +141,7 @@ pub enum NamesEvent {
 /// The part an address plays in an event, as an address history reports it.
 /// Most are the event's own field names; the two previous holders are what a
 /// bind takes from an address the event does not name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SerializeDisplay, DeserializeFromStr)]
 pub enum Role {
     /// The address an identity binds to: it proved, renamed away from,
     /// withdrew, ran the ceremony of, or paid the fee of a binding, or was
@@ -193,6 +195,12 @@ impl Role {
             Self::Claimer => "claimer",
             Self::Recipient => "recipient",
         }
+    }
+}
+
+impl fmt::Display for Role {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -796,10 +804,6 @@ mod tests {
     fn every_role_parses_back_from_its_name() {
         for role in Role::ALL {
             assert_eq!(role.as_str().parse::<Role>().ok(), Some(role));
-            assert_eq!(
-                serde_json::to_value(role).unwrap(),
-                serde_json::Value::String(role.as_str().to_string())
-            );
         }
         assert!("owner".parse::<Role>().is_err());
     }

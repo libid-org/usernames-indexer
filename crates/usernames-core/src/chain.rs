@@ -2,6 +2,7 @@
 //! one contract read the indexer makes.
 
 use alloy::{
+    contract,
     eips::BlockNumberOrTag,
     primitives::Address,
     providers::Provider,
@@ -80,6 +81,6 @@ pub async fn fetch_logs(
 pub async fn escrow_registry(
     provider: &impl Provider,
     escrow: Address,
-) -> Result<Address, alloy::contract::Error> {
+) -> Result<Address, contract::Error> {
     HandleEscrow::new(escrow, provider).registry().call().await
 }

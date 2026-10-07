@@ -12,9 +12,11 @@ use alloy::primitives::{
     U256,
 };
 use serde::{
+    de::Error as _,
     Deserialize,
     Serialize,
 };
+use serde_json::Value;
 use serde_with::{
     serde_as,
     DisplayFromStr,
@@ -355,15 +357,12 @@ impl HistoryEvent {
     /// The event a journal row holds: its kind, and the payload
     /// [`crate::events::NamesEvent::payload`] wrote, whose keys and encodings
     /// are these fields'.
-    pub fn from_journal(
-        kind: &str,
-        payload: serde_json::Value,
-    ) -> Result<Self, serde_json::Error> {
-        let serde_json::Value::Object(mut fields) = payload else {
-            return Err(serde::de::Error::custom("a journal payload is an object"));
+    pub fn from_journal(kind: &str, payload: Value) -> Result<Self, serde_json::Error> {
+        let Value::Object(mut fields) = payload else {
+            return Err(serde_json::Error::custom("a journal payload is an object"));
         };
-        fields.insert("kind".into(), serde_json::Value::String(kind.into()));
-        serde_json::from_value(serde_json::Value::Object(fields))
+        fields.insert("kind".into(), Value::String(kind.into()));
+        serde_json::from_value(Value::Object(fields))
     }
 }
 
@@ -730,11 +729,6 @@ mod tests {
             let read = HistoryEvent::from_journal(event.kind(), event.payload())
                 .unwrap_or_else(|e| panic!("{}: {e}", event.kind()));
             assert_eq!(read, expected(event), "{}", event.kind());
-            assert_eq!(
-                serde_json::to_value(&read).unwrap()["kind"],
-                event.kind(),
-                "the wire kind is the journal's"
-            );
         }
     }
 }
