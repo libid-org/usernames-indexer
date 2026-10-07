@@ -1,10 +1,6 @@
 //! `GET /v1/escrow/...`: what the escrow holds — for an address to claim or
 //! refund, against one handle, and every slot still unclaimed.
 
-use alloy::primitives::{
-    Address,
-    B256,
-};
 use axum::{
     extract::{
         Path,
@@ -54,17 +50,16 @@ impl EscrowAmount {
                 row.amount, row.round, row.chain_id
             )));
         };
-        let platform_id = B256::from_slice(&row.platform_id);
         Ok(Self {
             chain_id: row.chain_id,
-            holder: row.holder_address(),
-            token: Address::from_slice(&row.token),
+            holder: row.holder,
+            token: row.token,
             amount,
             round,
             handle: HandleRef {
-                platform: nodes::Platform::known_of(platform_id),
-                platform_id,
-                handle_node: B256::from_slice(&row.handle_node),
+                platform: nodes::Platform::known_of(row.platform_id),
+                platform_id: row.platform_id,
+                handle_node: row.handle_node,
                 handle: row.handle,
             },
         })

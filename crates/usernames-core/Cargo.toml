@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 alloy.workspace = true
+alloy-primitives.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 libid-contracts.workspace = true

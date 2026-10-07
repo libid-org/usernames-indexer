@@ -49,9 +49,9 @@ impl Window {
             } => {
                 sqlx::query(sql::ESCROW_DEPOSIT)
                     .bind(chain_id)
-                    .bind(handle_node.as_slice())
-                    .bind(token.as_slice())
-                    .bind(platform_id.as_slice())
+                    .bind(handle_node)
+                    .bind(token)
+                    .bind(platform_id)
                     .bind(amount.to_string())
                     .bind(round.to_string())
                     .bind(block)
@@ -60,10 +60,10 @@ impl Window {
                     .await?;
                 sqlx::query(sql::ESCROW_BOOK_REFUNDABLE)
                     .bind(chain_id)
-                    .bind(handle_node.as_slice())
-                    .bind(token.as_slice())
+                    .bind(handle_node)
+                    .bind(token)
                     .bind(round.to_string())
-                    .bind(refund_to.as_slice())
+                    .bind(refund_to)
                     .bind(amount.to_string())
                     .execute(&mut *self.tx)
                     .await?;
@@ -77,8 +77,8 @@ impl Window {
             } => {
                 let moved: Option<Vec<u8>> = sqlx::query_scalar(sql::ESCROW_CLAIM)
                     .bind(chain_id)
-                    .bind(handle_node.as_slice())
-                    .bind(token.as_slice())
+                    .bind(handle_node)
+                    .bind(token)
                     .bind(round.to_string())
                     .bind(block)
                     .bind(log_index)
@@ -94,8 +94,8 @@ impl Window {
                 }
                 sqlx::query(sql::ESCROW_CLOSE_ROUND)
                     .bind(chain_id)
-                    .bind(handle_node.as_slice())
-                    .bind(token.as_slice())
+                    .bind(handle_node)
+                    .bind(token)
                     .bind(round.to_string())
                     .execute(&mut *self.tx)
                     .await?;
@@ -111,8 +111,8 @@ impl Window {
             } => {
                 let moved: Option<Vec<u8>> = sqlx::query_scalar(sql::ESCROW_REFUND)
                     .bind(chain_id)
-                    .bind(handle_node.as_slice())
-                    .bind(token.as_slice())
+                    .bind(handle_node)
+                    .bind(token)
                     .bind(released.to_string())
                     .bind(block)
                     .bind(log_index)
@@ -128,10 +128,10 @@ impl Window {
                 }
                 sqlx::query(sql::ESCROW_TAKE_REFUNDABLE)
                     .bind(chain_id)
-                    .bind(handle_node.as_slice())
-                    .bind(token.as_slice())
+                    .bind(handle_node)
+                    .bind(token)
                     .bind(round.to_string())
-                    .bind(refund_to.as_slice())
+                    .bind(refund_to)
                     .execute(&mut *self.tx)
                     .await?;
             }
@@ -160,16 +160,16 @@ pub struct EscrowSlotRow {
     /// The chain the escrow holds it on.
     pub chain_id: i64,
     /// The platform of the handle, as the first deposit named it.
-    pub platform_id: Vec<u8>,
+    pub platform_id: B256,
     /// The handle node the amount is held against.
-    pub handle_node: Vec<u8>,
+    pub handle_node: B256,
     /// The handle, when a bind ever carried its text. A deposit carries only
     /// the node, so a handle nobody has bound is known by its node alone.
     pub handle: Option<String>,
     /// Who holds the handle now and may claim: `None` while nobody does.
-    pub holder: Option<Vec<u8>>,
+    pub holder: Option<Address>,
     /// The token; EIP-7528 `0xEeee…EEeE` is the chain's own coin.
-    pub token: Vec<u8>,
+    pub token: Address,
     /// The amount in token units, as Postgres prints a `numeric`.
     pub amount: String,
     /// The slot's current round: claims so far.
@@ -186,13 +186,6 @@ impl EscrowSlotRow {
     /// The round as the chain counts it, under the same rule.
     pub fn round(&self) -> Option<U256> {
         U256::from_str_radix(&self.round, 10).ok()
-    }
-
-    /// The holder as an address, while somebody holds the handle.
-    pub fn holder_address(&self) -> Option<Address> {
-        self.holder
-            .as_deref()
-            .and_then(|bytes| Address::try_from(bytes).ok())
     }
 }
 
@@ -327,26 +320,24 @@ impl UnclaimedPage {
         let mut statement =
             QueryBuilder::new(format!("{prefix}{}", sql::ESCROW_SLOT_PROJECTION));
         if let Some(token) = self.token {
-            statement
-                .push(" AND e.token = ")
-                .push_bind(token.as_slice().to_vec());
+            statement.push(" AND e.token = ").push_bind(token);
         }
         scoped(&mut statement, "e.chain_id", self.chain);
         if let Some(platform_id) = self.platform_id {
             statement
                 .push(" AND e.platform_id = ")
-                .push_bind(platform_id.as_slice().to_vec());
+                .push_bind(platform_id);
         }
         if let Some(before) = self.before {
             statement
                 .push(" AND (e.token, e.held, e.chain_id, e.handle_node) < (")
-                .push_bind(before.token.as_slice().to_vec())
+                .push_bind(before.token)
                 .push(", ")
                 .push_bind(before.held.to_string())
                 .push("::numeric, ")
                 .push_bind(before.chain_id)
                 .push(", ")
-                .push_bind(before.handle_node.as_slice().to_vec())
+                .push_bind(before.handle_node)
                 .push(")");
         }
         statement
@@ -377,10 +368,10 @@ impl UnclaimedCursor {
     /// stored value the books never write.
     fn after(row: &EscrowSlotRow) -> Option<Self> {
         Some(Self {
-            token: Address::try_from(row.token.as_slice()).ok()?,
+            token: row.token,
             held: row.amount()?,
             chain_id: row.chain_id,
-            handle_node: B256::try_from(row.handle_node.as_slice()).ok()?,
+            handle_node: row.handle_node,
         })
     }
 }
@@ -394,7 +385,7 @@ pub(crate) fn claimable_lookup(
         "{prefix}{} AND h.owner = ",
         sql::CLAIMABLE_PROJECTION
     ));
-    statement.push_bind(holder.as_slice().to_vec());
+    statement.push_bind(holder);
     scoped(&mut statement, "h.chain_id", chain);
     statement.push(" ORDER BY e.chain_id, h.handle, e.token");
     statement
@@ -409,7 +400,7 @@ pub(crate) fn refundable_lookup(
         "{prefix}{} WHERE r.refund_to = ",
         sql::REFUNDABLE_PROJECTION
     ));
-    statement.push_bind(refund_to.as_slice().to_vec());
+    statement.push_bind(refund_to);
     scoped(&mut statement, "r.chain_id", chain);
     statement.push(" ORDER BY r.chain_id, r.handle_node, r.token");
     statement
@@ -424,7 +415,7 @@ pub(crate) fn node_slots_lookup(
         "{prefix}{} AND e.handle_node = ",
         sql::ESCROW_SLOT_PROJECTION
     ));
-    statement.push_bind(handle_node.as_slice().to_vec());
+    statement.push_bind(handle_node);
     scoped(&mut statement, "e.chain_id", chain);
     statement.push(" ORDER BY e.chain_id, e.token");
     statement

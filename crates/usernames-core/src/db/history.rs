@@ -58,9 +58,9 @@ impl Involvement {
 /// handle recorded for it.
 #[derive(sqlx::FromRow)]
 struct FeeCeremony {
-    address: Vec<u8>,
-    handle_node: Option<Vec<u8>>,
-    platform_id: Option<Vec<u8>>,
+    address: Address,
+    handle_node: Option<B256>,
+    platform_id: Option<B256>,
 }
 
 impl Window {
@@ -89,20 +89,18 @@ impl Window {
                 platform_id,
                 ..
             } => {
-                let (handle_holder, id_holder): (Option<Vec<u8>>, Option<Vec<u8>>) =
+                let (handle_holder, id_holder): (Option<Address>, Option<Address>) =
                     sqlx::query_as(sql::PREVIOUS_HOLDERS)
                         .bind(chain_id)
-                        .bind(handle_node.as_slice())
-                        .bind(id_node.as_slice())
+                        .bind(handle_node)
+                        .bind(id_node)
                         .fetch_one(&mut *self.tx)
                         .await?;
                 let previous = [
                     (handle_holder, Role::PreviousHandleHolder),
                     (id_holder, Role::PreviousIdHolder),
                 ];
-                for (bytes, role) in previous {
-                    let previous =
-                        bytes.and_then(|b| Address::try_from(b.as_slice()).ok());
+                for (previous, role) in previous {
                     if let Some(previous) = previous.filter(|p| p != holder) {
                         involvement.add(previous, role);
                     }
@@ -118,16 +116,13 @@ impl Window {
                 handle_node,
                 holder,
             } => {
-                let held_by: Option<Option<Vec<u8>>> =
+                let held_by: Option<Option<Address>> =
                     sqlx::query_scalar(sql::HANDLE_HOLDER)
                         .bind(chain_id)
-                        .bind(handle_node.as_slice())
+                        .bind(handle_node)
                         .fetch_optional(&mut *self.tx)
                         .await?;
-                let held_by = held_by
-                    .flatten()
-                    .and_then(|b| Address::try_from(b.as_slice()).ok());
-                match held_by {
+                match held_by.flatten() {
                     Some(held_by) if held_by != *holder => {
                         involvement.add(held_by, Role::PreviousHandleHolder)
                     }
@@ -140,17 +135,15 @@ impl Window {
                 holder,
                 platform_id,
             } => {
-                let node: Option<Vec<u8>> =
-                    sqlx::query_scalar(sql::PUBLISHED_HANDLE_NODE)
-                        .bind(chain_id)
-                        .bind(holder.as_slice())
-                        .bind(platform_id.as_slice())
-                        .fetch_optional(&mut *self.tx)
-                        .await?;
+                let node: Option<B256> = sqlx::query_scalar(sql::PUBLISHED_HANDLE_NODE)
+                    .bind(chain_id)
+                    .bind(holder)
+                    .bind(platform_id)
+                    .fetch_optional(&mut *self.tx)
+                    .await?;
                 // Nothing published is still a withdrawal the contract
                 // accepts; it concerns no handle.
-                involvement.handle =
-                    node.map(|node| (B256::from_slice(&node), *platform_id));
+                involvement.handle = node.map(|node| (node, *platform_id));
             }
 
             NamesEvent::CeremonyBound {
@@ -158,20 +151,18 @@ impl Window {
                 platform_id,
                 ..
             } => {
-                let node: Option<Vec<u8>> = sqlx::query_scalar(sql::CEREMONY_HANDLE)
+                let node: Option<B256> = sqlx::query_scalar(sql::CEREMONY_HANDLE)
                     .bind(chain_id)
                     .bind(block)
-                    .bind(pos.tx_hash.as_slice())
+                    .bind(pos.tx_hash)
                     .bind(log_index)
-                    .bind(holder.as_slice())
+                    .bind(holder)
                     .bind(Role::Holder.as_str())
-                    .bind(platform_id.as_slice())
+                    .bind(platform_id)
                     .fetch_optional(&mut *self.tx)
                     .await?;
                 match node {
-                    Some(node) => {
-                        involvement.handle = Some((B256::from_slice(&node), *platform_id))
-                    }
+                    Some(node) => involvement.handle = Some((node, *platform_id)),
                     None => tracing::warn!(
                         block,
                         log_index,
@@ -187,23 +178,17 @@ impl Window {
                 let ceremony: Option<FeeCeremony> = sqlx::query_as(sql::FEE_PAYER)
                     .bind(chain_id)
                     .bind(block)
-                    .bind(pos.tx_hash.as_slice())
+                    .bind(pos.tx_hash)
                     .bind(authorization_digest.to_string())
                     .fetch_optional(&mut *self.tx)
                     .await?;
                 match ceremony {
                     Some(ceremony) => {
-                        if let Ok(holder) = Address::try_from(ceremony.address.as_slice())
-                        {
-                            involvement.add(holder, Role::Holder);
-                        }
+                        involvement.add(ceremony.address, Role::Holder);
                         if let (Some(node), Some(platform)) =
                             (ceremony.handle_node, ceremony.platform_id)
                         {
-                            involvement.handle = Some((
-                                B256::from_slice(&node),
-                                B256::from_slice(&platform),
-                            ));
+                            involvement.handle = Some((node, platform));
                         }
                     }
                     None => tracing::warn!(
@@ -233,18 +218,16 @@ impl Window {
                 round,
                 ..
             } => {
-                let refund_tos: Vec<Vec<u8>> =
+                let refund_tos: Vec<Address> =
                     sqlx::query_scalar(sql::CLAIMED_REFUND_TOS)
                         .bind(chain_id)
-                        .bind(handle_node.as_slice())
-                        .bind(token.as_slice())
+                        .bind(handle_node)
+                        .bind(token)
                         .bind(round.to_string())
                         .fetch_all(&mut *self.tx)
                         .await?;
                 for refund_to in refund_tos {
-                    if let Ok(refund_to) = Address::try_from(refund_to.as_slice()) {
-                        involvement.add(refund_to, Role::RefundTo);
-                    }
+                    involvement.add(refund_to, Role::RefundTo);
                 }
                 involvement.handle = self.escrow_handle(*handle_node, block).await?;
             }
@@ -267,9 +250,9 @@ impl Window {
         handle_node: B256,
         block: i64,
     ) -> Result<Option<(B256, B256)>, ApplyError> {
-        let platform: Option<Vec<u8>> = sqlx::query_scalar(sql::ESCROW_PLATFORM)
+        let platform: Option<B256> = sqlx::query_scalar(sql::ESCROW_PLATFORM)
             .bind(self.chain_id)
-            .bind(handle_node.as_slice())
+            .bind(handle_node)
             .fetch_optional(&mut *self.tx)
             .await?;
         if platform.is_none() {
@@ -279,7 +262,7 @@ impl Window {
                 "an escrow payout from a slot this index never saw deposited"
             );
         }
-        Ok(platform.map(|platform| (handle_node, B256::from_slice(&platform))))
+        Ok(platform.map(|platform| (handle_node, platform)))
     }
 
     /// Put the event at `pos` in the histories of everything it involves.
@@ -296,7 +279,7 @@ impl Window {
             let roles: Vec<&str> = roles.into_iter().map(Role::as_str).collect();
             sqlx::query(sql::RECORD_ADDRESS_EVENT)
                 .bind(chain_id)
-                .bind(address.as_slice())
+                .bind(address)
                 .bind(block)
                 .bind(log_index)
                 .bind(block_time)
@@ -309,8 +292,8 @@ impl Window {
                 .bind(chain_id)
                 .bind(block)
                 .bind(log_index)
-                .bind(handle_node.as_slice())
-                .bind(platform_id.as_slice())
+                .bind(handle_node)
+                .bind(platform_id)
                 .bind(block_time)
                 .execute(&mut *self.tx)
                 .await?;
@@ -385,15 +368,15 @@ pub struct HistoryRow {
     /// The parts the address asked about plays; `None` in a handle history.
     pub roles: Option<Vec<String>>,
     /// The transaction that emitted it.
-    pub tx_hash: Vec<u8>,
+    pub tx_hash: B256,
     /// The journal's kind discriminator.
     pub kind: String,
     /// The journal payload, as [`NamesEvent::payload`] wrote it.
     pub payload: serde_json::Value,
     /// The handle node the event concerns, when it concerns one.
-    pub handle_node: Option<Vec<u8>>,
+    pub handle_node: Option<B256>,
     /// That node's platform.
-    pub platform_id: Option<Vec<u8>>,
+    pub platform_id: Option<B256>,
     /// That handle's text, when a bind ever carried it.
     pub handle: Option<String>,
 }
@@ -426,7 +409,7 @@ impl HistoryPage {
             "{prefix}{} WHERE a.address = ",
             sql::ADDRESS_HISTORY_PROJECTION
         ));
-        statement.push_bind(address.as_slice().to_vec());
+        statement.push_bind(address);
         scoped(&mut statement, "a.chain_id", self.chain);
         self.bound(&mut statement, "a");
         statement
@@ -438,7 +421,7 @@ impl HistoryPage {
             "{prefix}{} WHERE he.handle_node = ",
             sql::HANDLE_HISTORY_PROJECTION
         ));
-        statement.push_bind(handle_node.as_slice().to_vec());
+        statement.push_bind(handle_node);
         scoped(&mut statement, "he.chain_id", self.chain);
         self.bound(&mut statement, "he");
         statement

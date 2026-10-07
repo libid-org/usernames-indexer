@@ -1,7 +1,6 @@
 //! `GET /v1/history/...`: what an address took part in, and what happened to
 //! a handle, newest first and paged by a cursor.
 
-use alloy::primitives::B256;
 use axum::{
     extract::{
         Path,
@@ -93,22 +92,19 @@ impl HistoryEntry {
             .map(|name| name.parse().map_err(ApiError::internal))
             .collect::<Result<_, _>>()?;
         let handle = match (row.handle_node, row.platform_id) {
-            (Some(node), Some(platform)) => {
-                let platform_id = B256::from_slice(&platform);
-                Some(HandleRef {
-                    platform: nodes::Platform::known_of(platform_id),
-                    platform_id,
-                    handle_node: B256::from_slice(&node),
-                    handle: row.handle,
-                })
-            }
+            (Some(handle_node), Some(platform_id)) => Some(HandleRef {
+                platform: nodes::Platform::known_of(platform_id),
+                platform_id,
+                handle_node,
+                handle: row.handle,
+            }),
             _ => None,
         };
         Ok(Self {
             chain_id: row.chain_id,
             block_number: row.block_number,
             log_index: row.log_index,
-            tx_hash: B256::from_slice(&row.tx_hash),
+            tx_hash: row.tx_hash,
             block_time: row.block_time,
             roles,
             handle,
