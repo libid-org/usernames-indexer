@@ -1110,11 +1110,15 @@ impl Store {
     /// or on any chain when none is. Before that there is nothing to answer
     /// from, and a 404 would claim more than the store knows.
     pub async fn synced(&self, chain: Option<i64>) -> Result<bool, sqlx::Error> {
-        sqlx::query_scalar(sql::SYNCED)
-            .bind(CURSOR_KEY)
-            .bind(chain)
-            .fetch_one(&self.pool)
-            .await
+        let mut statement = QueryBuilder::new(sql::SYNCED);
+        statement.push(" WHERE key = ").push_bind(CURSOR_KEY);
+        scoped(&mut statement, "chain_id", chain);
+        statement.push(" LIMIT 1");
+        let found: Option<bool> = statement
+            .build_query_scalar()
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(found.is_some())
     }
 
     /// Whether any chain in scope ever configured this platform — the
@@ -1125,11 +1129,17 @@ impl Store {
         chain: Option<i64>,
         platform_id: B256,
     ) -> Result<bool, sqlx::Error> {
-        sqlx::query_scalar(sql::PLATFORM_WIRED)
-            .bind(platform_id)
-            .bind(chain)
-            .fetch_one(&self.pool)
-            .await
+        let mut statement = QueryBuilder::new(sql::PLATFORM_WIRED);
+        statement
+            .push(" WHERE platform_id = ")
+            .push_bind(platform_id);
+        scoped(&mut statement, "chain_id", chain);
+        statement.push(" LIMIT 1");
+        let found: Option<bool> = statement
+            .build_query_scalar()
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(found.is_some())
     }
 
     /// The rows `resolveHandle` answers from, one per chain the handle is
