@@ -286,6 +286,7 @@ pub fn handle_node(platform: B256, handle: &NormalizedHandle) -> B256 {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::hex;
+    use std::collections::BTreeSet;
 
     use super::*;
 
@@ -340,10 +341,9 @@ mod tests {
     /// is named here that no ceremony proves.
     #[test]
     fn the_registry_is_the_launch_profile_set() {
-        let launch: std::collections::BTreeSet<&str> =
+        let launch: BTreeSet<&str> =
             libid_profiles::LAUNCH.iter().map(|p| p.platform).collect();
-        let known: std::collections::BTreeSet<&str> =
-            KnownPlatform::ALL.iter().map(|p| p.key()).collect();
+        let known: BTreeSet<&str> = KnownPlatform::ALL.iter().map(|p| p.key()).collect();
         assert_eq!(known, launch);
     }
 

@@ -22,9 +22,13 @@
 //!
 //! Skips silently without `DATABASE_URL`, and needs `anvil` on PATH.
 
-use std::time::Duration;
+use std::{
+    sync::Arc,
+    time::Duration,
+};
 
 use alloy::{
+    contract,
     node_bindings::Anvil,
     primitives::{
         Address,
@@ -173,7 +177,7 @@ enum WhoSigns {
 }
 
 /// The four protocol steps, end to end. `None` means the suite skipped.
-async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> {
+async fn walk(who: WhoSigns) -> Option<Result<Address, contract::Error>> {
     let guard = DB_LOCK.lock().await;
     let url = std::env::var("DATABASE_URL").ok()?;
 
@@ -237,7 +241,7 @@ async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> 
         store: db::Store::new(pool),
         ttl: Duration::from_secs(300),
         max_lag_blocks: 32,
-        signer: std::sync::Arc::new(ManagedSigner::Local(signer)),
+        signer: Arc::new(ManagedSigner::Local(signer)),
     }));
 
     // ── 1. the wallet asks the resolver, and is told where to look ───
@@ -272,9 +276,8 @@ async fn walk(who: WhoSigns) -> Option<Result<Address, alloy::contract::Error>> 
             .map(|returned| {
                 // ENSIP-11 `addr` returns `bytes`; a wallet reads an address
                 // out of them.
-                let decoded =
-                    <Bytes as alloy::sol_types::SolValue>::abi_decode(&returned)
-                        .expect("the record decodes as bytes");
+                let decoded = <Bytes as SolValue>::abi_decode(&returned)
+                    .expect("the record decodes as bytes");
                 Address::from_slice(&decoded)
             }),
     )

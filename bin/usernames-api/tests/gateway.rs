@@ -9,11 +9,15 @@
 
 use std::{
     fmt,
+    sync::Arc,
     time::Duration,
 };
 
 use alloy::{
-    primitives::Address,
+    primitives::{
+        Address,
+        Signature,
+    },
     signers::local::PrivateKeySigner,
 };
 use axum::{
@@ -25,6 +29,7 @@ use axum::{
         Request,
         StatusCode,
     },
+    response::Response,
     Router,
 };
 use http_body_util::BodyExt;
@@ -44,9 +49,11 @@ use usernames_api::ens::{
     GatewayStatus,
 };
 use usernames_core::{
+    api::AppState,
     db::{
         self,
         ChainStore,
+        Store,
     },
     ens,
 };
@@ -137,7 +144,7 @@ async fn gateway_parts(
         store: db::Store::new(pool.clone()),
         ttl: Duration::from_secs(300),
         max_lag_blocks,
-        signer: std::sync::Arc::new(ManagedSigner::Local(
+        signer: Arc::new(ManagedSigner::Local(
             SIGNER_KEY.parse::<PrivateKeySigner>().expect("key"),
         )),
     };
@@ -240,7 +247,7 @@ fn signed_result(body: &Reply, call: &[u8]) -> Vec<u8> {
         expires,
     }
     .digest(RESOLVER, call);
-    let recovered = alloy::primitives::Signature::try_from(signature)
+    let recovered = Signature::try_from(signature)
         .expect("65-byte signature")
         .recover_address_from_prehash(&digest)
         .expect("recover");
@@ -924,7 +931,7 @@ async fn the_merged_router_keeps_both_halves_intact() {
     bind(&store, "alice", owner).await;
 
     let app = usernames_api::build_router(
-        usernames_core::api::AppState::new(usernames_core::db::Store::new(pool.clone())),
+        AppState::new(Store::new(pool.clone())),
         Some(config),
     );
 
@@ -974,7 +981,7 @@ async fn the_merged_router_keeps_both_halves_intact() {
         usernames_api::ens::ROUTE_PREFIX,
         hex::encode(&call)
     );
-    let allowed_origin = |response: &axum::response::Response| {
+    let allowed_origin = |response: &Response| {
         response
             .headers()
             .get("access-control-allow-origin")

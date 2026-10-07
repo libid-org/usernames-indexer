@@ -17,6 +17,7 @@ use alloy::primitives::{
 };
 use chrono::TimeDelta;
 use sqlx::{
+    migrate::Migrator,
     Connection,
     PgPool,
     Postgres,
@@ -25,6 +26,7 @@ use sqlx::{
 };
 
 use crate::{
+    ens::ChainName,
     events::{
         LogPosition,
         NamesEvent,
@@ -146,7 +148,7 @@ impl Store {
 /// invokes it, so anything outside this crate — a test in either binary —
 /// would have to spell a relative path back to here and would break the day
 /// the layout moves.
-pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 /// Connect and bring the schema current.
 pub async fn connect_and_migrate(database_url: &str) -> anyhow::Result<PgPool> {
@@ -483,7 +485,7 @@ impl ChainStore {
     pub async fn set_chain_names(
         &self,
         lease: &WriterLease,
-        names: &[crate::ens::ChainName],
+        names: &[ChainName],
     ) -> Result<(), ChainNamesError> {
         assert_eq!(
             lease.chain_id, self.chain_id,

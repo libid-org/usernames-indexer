@@ -39,11 +39,13 @@ use alloy::{
     primitives::{
         Address,
         B256,
+        U256,
     },
     sol_types::SolCall,
 };
 use usernames_core::{
     db::ChainStore,
+    ens::Name,
     events::{
         LogPosition,
         NamesEvent,
@@ -90,7 +92,7 @@ pub fn namehash_of(labels: &[&str]) -> B256 {
         .map(|l| (*l).to_string())
         .chain(["handles".to_string(), "link".to_string()])
         .collect();
-    usernames_core::ens::Name::from_labels(full).node()
+    Name::from_labels(full).node()
 }
 
 /// `resolve(name, data)`, encoded by the same codec the gateway decodes with.
@@ -106,7 +108,7 @@ pub fn resolve_call(name: &[u8], inner: &[u8]) -> Vec<u8> {
 pub fn addr_call(labels: &[&str], coin: u64) -> Vec<u8> {
     addr_0Call {
         node: namehash_of(labels),
-        coinType: alloy::primitives::U256::from(coin),
+        coinType: U256::from(coin),
     }
     .abi_encode()
 }

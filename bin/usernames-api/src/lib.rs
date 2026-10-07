@@ -20,9 +20,13 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tokio::net::TcpListener;
 
 use alloy::primitives::Address;
-use axum::Router;
+use axum::{
+    http::Method,
+    Router,
+};
 use clap::Parser;
 use libid_signer::{
     ManagedSigner,
@@ -138,7 +142,7 @@ pub async fn run() -> anyhow::Result<()> {
     }
     let app = build_router(api::AppState::new(store), gateway);
 
-    let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
+    let listener = TcpListener::bind(config.listen_addr).await?;
     tracing::info!(addr = %config.listen_addr, "read API listening");
 
     let shutdown = cancel.clone();
@@ -190,7 +194,7 @@ pub fn build_router(state: api::AppState, gateway: Option<ens::Config>) -> Route
     app.layer(
         CorsLayer::new()
             .allow_origin(Any)
-            .allow_methods([axum::http::Method::GET]),
+            .allow_methods([Method::GET]),
     )
 }
 
@@ -283,13 +287,14 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::postgres::PgPoolOptions;
 
     /// A pool that never dials. Every case below is refused before any query
     /// runs, which is the point: these are startup checks, so they must not
     /// need a database to reject a configuration that cannot work. It still
     /// wants a runtime to be built in, which is why the cases are async.
     fn lazy_pool() -> sqlx::PgPool {
-        sqlx::postgres::PgPoolOptions::new()
+        PgPoolOptions::new()
             .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
             .expect("lazy pool")
     }

@@ -17,6 +17,7 @@ use axum::{
 use http_body_util::BodyExt;
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
+use std::fmt::Debug;
 use tokio::sync::{
     Mutex,
     MutexGuard,
@@ -128,7 +129,7 @@ pub struct Reply<T> {
     pub body: Result<T, ErrorBody>,
 }
 
-impl<T: std::fmt::Debug> Reply<T> {
+impl<T: Debug> Reply<T> {
     /// The answer; a refusal here fails the test with its code and message.
     pub fn answer(self) -> T {
         match self.body {

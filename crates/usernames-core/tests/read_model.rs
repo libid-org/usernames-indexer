@@ -8,7 +8,10 @@
 
 mod common;
 
-use std::time::Duration;
+use std::{
+    fmt::Debug,
+    time::Duration,
+};
 
 use chrono::TimeDelta;
 use tokio::time::Instant;
@@ -22,7 +25,10 @@ use alloy::primitives::{
 use axum::http::StatusCode;
 use common::Reply;
 use serde::de::DeserializeOwned;
-use sqlx::PgPool;
+use sqlx::{
+    postgres::PgPoolOptions,
+    PgPool,
+};
 use tokio::sync::{
     Mutex,
     MutexGuard,
@@ -73,7 +79,7 @@ async fn test_store_with(
 ) -> Option<(ChainStore, PgPool, MutexGuard<'static, ()>)> {
     let guard = DB_LOCK.lock().await;
     let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = sqlx::postgres::PgPoolOptions::new()
+    let pool = PgPoolOptions::new()
         .max_connections(max_connections)
         .connect(&url)
         .await
@@ -150,7 +156,7 @@ async fn get<T: DeserializeOwned>(pool: &PgPool, path: &str) -> Reply<T> {
 }
 
 /// The one binding a resolution carries in these single-chain scenarios.
-fn only<T: std::fmt::Debug>(bindings: &[T]) -> &T {
+fn only<T: Debug>(bindings: &[T]) -> &T {
     match bindings {
         [one] => one,
         many => panic!("one binding expected: {many:?}"),

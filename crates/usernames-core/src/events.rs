@@ -537,9 +537,12 @@ pub fn decode_escrow(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{
-        b256,
-        LogData,
+    use alloy::{
+        primitives,
+        primitives::{
+            b256,
+            LogData,
+        },
     };
 
     use super::*;
@@ -550,7 +553,7 @@ mod tests {
     /// A log carrying `data`, as the RPC returns it once mined.
     fn mined(data: LogData) -> Log {
         Log {
-            inner: alloy::primitives::Log {
+            inner: primitives::Log {
                 address: Address::repeat_byte(0x11),
                 data,
             },
