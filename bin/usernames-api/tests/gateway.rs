@@ -47,6 +47,7 @@ use usernames_api::ens::{
     GatewayResponse,
     GatewayState,
     GatewayStatus,
+    ROUTE_PREFIX,
 };
 use usernames_core::{
     api::AppState,
@@ -978,7 +979,7 @@ async fn the_merged_router_keeps_both_halves_intact() {
     );
     let uri = format!(
         "{}/{RESOLVER:?}/0x{}.json",
-        usernames_api::ens::ROUTE_PREFIX,
+        ROUTE_PREFIX,
         hex::encode(&call)
     );
     let allowed_origin = |response: &Response| {
@@ -994,11 +995,7 @@ async fn the_merged_router_keeps_both_halves_intact() {
         Some(&b"*"[..]),
         "the gateway route carries no CORS header"
     );
-    let refused = get(format!(
-        "{}/not-an-address/0x00.json",
-        usernames_api::ens::ROUTE_PREFIX
-    ))
-    .await;
+    let refused = get(format!("{}/not-an-address/0x00.json", ROUTE_PREFIX)).await;
     assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         allowed_origin(&refused).as_deref(),
