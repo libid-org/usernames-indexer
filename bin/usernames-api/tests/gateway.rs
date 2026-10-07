@@ -138,7 +138,7 @@ async fn gateway_parts(
 
     let store = ChainStore::new(pool.clone(), chains[0]);
     let config = Config {
-        domain: "handles.link".parse().expect("domain"),
+        domain: ens::DEFAULT_DOMAIN.parse().expect("domain"),
         resolver: RESOLVER,
         ens_chain: 1,
         store: db::Store::new(pool.clone()),

@@ -40,7 +40,10 @@ use tower_http::cors::{
 use usernames_core::{
     api,
     db,
-    ens::Domain,
+    ens::{
+        Domain,
+        DEFAULT_DOMAIN,
+    },
 };
 
 /// Everything comes from flags or the environment; a `.env` file is read
@@ -91,7 +94,7 @@ pub struct Config {
     /// The domain this gateway's names sit under: `handles.link`, or
     /// `testnet.handles.link` for a deployment that answers under a subname.
     /// A name outside it is refused.
-    #[arg(long, env = "ENS_DOMAIN", default_value = "handles.link")]
+    #[arg(long, env = "ENS_DOMAIN", default_value = DEFAULT_DOMAIN)]
     pub ens_domain: Domain,
 
     /// How long a signed answer stays good: `5m`, `300s`. The resolver

@@ -61,9 +61,12 @@ use usernames_api::ens::{
     GatewayResponse,
     GatewayState,
 };
-use usernames_core::db::{
-    self,
-    ChainStore,
+use usernames_core::{
+    db::{
+        self,
+        ChainStore,
+    },
+    ens::DEFAULT_DOMAIN,
 };
 
 use usernames_fixtures::*;
@@ -235,7 +238,7 @@ async fn walk(who: WhoSigns) -> Option<Result<Address, contract::Error>> {
 
     // The gateway is bound to THIS resolver, because the signature names it.
     let router = usernames_api::ens::router(GatewayState::new(Config {
-        domain: "handles.link".parse().expect("domain"),
+        domain: DEFAULT_DOMAIN.parse().expect("domain"),
         resolver: resolver_address,
         ens_chain: anvil.chain_id(),
         store: db::Store::new(pool),

@@ -57,6 +57,9 @@ use crate::nodes::{
     Platform,
 };
 
+/// The domain a gateway answers under when its deployment names none.
+pub const DEFAULT_DOMAIN: &str = "handles.link";
+
 /// The domain a gateway's names sit under: `handles.link`, or
 /// `testnet.handles.link` for a deployment that answers under a subname.
 ///
@@ -646,7 +649,7 @@ mod tests {
 
     /// The domain the mainnet deployment answers under.
     fn handles_link() -> Domain {
-        "handles.link".parse().unwrap()
+        DEFAULT_DOMAIN.parse().unwrap()
     }
 
     /// The domain the testnet deployment answers under.
