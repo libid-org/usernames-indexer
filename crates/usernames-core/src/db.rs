@@ -5,9 +5,9 @@
 //! open poll window: applying events and committing-with-cursor are its only
 //! operations, which makes "the cursor and the writes it stands for commit
 //! together or not at all" a fact of the type rather than caller discipline.
-//! Every write in [`Window::apply`] is an idempotent upsert keyed by what the
-//! contract keys its own storage by, so replaying a window — after a crash,
-//! or after a version-bump re-index — converges instead of duplicating.
+//! The journal's `(chain, block, log)` conflict gates every write in
+//! [`Window::apply`], so replaying a window — after a crash, or after a
+//! version-bump re-index — converges instead of counting an event twice.
 
 use alloy::primitives::{
     Address,
@@ -39,20 +39,24 @@ use crate::{
 
 mod escrow;
 mod history;
+mod page;
 
 pub use self::{
     escrow::{
         EscrowSlotRow,
+        RefundCursor,
+        SlotCursor,
         UnclaimedCursor,
-        UnclaimedPage,
-        UnclaimedRows,
     },
     history::{
         HistoryCursor,
-        HistoryPage,
         HistoryRow,
-        HistoryRows,
+    },
+    page::{
+        Cursor,
         InvalidCursor,
+        Page,
+        Rows,
     },
 };
 
@@ -75,6 +79,7 @@ pub const PROJECTION_TABLES: &[&str] = &[
     "escrow_refundable",
     "address_events",
     "handle_events",
+    "handle_nodes",
 ];
 
 // The chain_metadata keys. Chain scoping is the table's chain_id column;
@@ -762,6 +767,25 @@ fn as_i64(value: u64, what: &'static str) -> Result<i64, ApplyError> {
     i64::try_from(value).map_err(|_| ApplyError::OutOfRange { what, value })
 }
 
+/// Where a log sat, in the columns the store keeps it in.
+pub(crate) struct Position {
+    pub(crate) block: i64,
+    pub(crate) log_index: i64,
+    pub(crate) tx_hash: B256,
+    pub(crate) block_time: i64,
+}
+
+impl Position {
+    fn of(pos: &LogPosition) -> Result<Self, ApplyError> {
+        Ok(Self {
+            block: as_i64(pos.block_number, "block number")?,
+            log_index: as_i64(pos.log_index, "log index")?,
+            tx_hash: pos.tx_hash,
+            block_time: as_i64(pos.block_time, "block timestamp")?,
+        })
+    }
+}
+
 /// One open poll window: a transaction that only knows how to apply events
 /// and how to commit together with the cursor. That the cursor cannot be
 /// left behind — or advanced without its writes — is not a convention here,
@@ -797,8 +821,8 @@ impl Window {
         pos: &LogPosition,
     ) -> Result<bool, ApplyError> {
         let chain_id = self.chain_id;
-        let block = as_i64(pos.block_number, "block number")?;
-        let log_index = as_i64(pos.log_index, "log index")?;
+        let at = Position::of(pos)?;
+        let (block, log_index) = (at.block, at.log_index);
 
         let mut payload = event.payload().map_err(ApplyError::Journal)?;
         if sanitize_json(&mut payload) {
@@ -827,7 +851,7 @@ impl Window {
         // Read before the projections move: a bind's previous holders are the
         // rows it is about to overwrite, and an unpublish's handle is the row
         // it deletes.
-        let involvement = self.involvement(event, pos).await?;
+        let involvement = self.involvement(event, &at).await?;
 
         match event {
             NamesEvent::IdentityBound {
@@ -973,19 +997,16 @@ impl Window {
                     .await?;
             }
 
-            // No projection of their own. What a ceremony carried beyond the
-            // binding it proved — which client authenticated it, what fee it
-            // paid — answers an operator's question after the fact, from the
-            // journal row beside the binding's `IdentityBound`, and the
-            // histories list it. Nothing resolves by it.
+            // No projection of their own: nothing resolves by a ceremony's
+            // client or a bind's fee, and the journal and histories hold both.
             NamesEvent::CeremonyBound { .. } | NamesEvent::BindFeePaid { .. } => {}
 
             NamesEvent::Escrow(escrow) => {
-                self.book_escrow(escrow, block, log_index).await?;
+                self.book_escrow(escrow, &at).await?;
             }
         }
 
-        self.record(involvement, pos).await?;
+        self.record(involvement, &at).await?;
         Ok(true)
     }
 }
@@ -1404,7 +1425,6 @@ mod sql {
     pub const ESCROW_REFUND: &str = include_str!("../sql/escrow_refund.sql");
     pub const ESCROW_TAKE_REFUNDABLE: &str =
         include_str!("../sql/escrow_take_refundable.sql");
-    pub const ESCROW_PLATFORM: &str = include_str!("../sql/escrow_platform.sql");
     pub const PREVIOUS_HOLDERS: &str = include_str!("../sql/previous_holders.sql");
     pub const HANDLE_HOLDER: &str = include_str!("../sql/handle_holder.sql");
     pub const CLAIMED_REFUND_TOS: &str = include_str!("../sql/claimed_refund_tos.sql");
@@ -1415,6 +1435,7 @@ mod sql {
     pub const RECORD_ADDRESS_EVENT: &str =
         include_str!("../sql/record_address_event.sql");
     pub const RECORD_HANDLE_EVENT: &str = include_str!("../sql/record_handle_event.sql");
+    pub const RECORD_HANDLE_NODE: &str = include_str!("../sql/record_handle_node.sql");
     /// An address's history: the events it took part in, each with its
     /// roles, the journal row and the handle the event concerns. The caller
     /// names the address, narrows and pages.
@@ -1436,8 +1457,8 @@ mod sql {
 }
 
 #[cfg(test)]
-mod plan_tests {
-    use alloy::primitives::U256;
+pub(crate) mod plan_tests {
+    use sqlx::PgConnection;
 
     use super::*;
 
@@ -1445,79 +1466,82 @@ mod plan_tests {
     /// names; the file says how they are shaped.
     const VOLUME: &str = include_str!("../sql/plan_volume.sql");
 
-    /// Every read over the big tables seeks the index built for it, in every
-    /// shape the API asks it in. The index is named, not just "some index",
-    /// because a lookup missing its leading column walks a whole index and
-    /// reads as an index scan all the same — which is how the chain-less
-    /// reads went unnoticed while every index still led with `chain_id`.
-    ///
-    /// The plans are taken over [`VOLUME`], inside a transaction that rolls
-    /// back with its statistics. On a handful of rows every index costs the
-    /// same and the planner's pick follows whatever an earlier suite left
-    /// behind; sequential scans stay switched off so none hides behind a
-    /// table that small. The text search names no index: the planner filters
-    /// the text off a narrower index rather than reading the trigram one, and
-    /// only the row count decides that.
-    #[tokio::test]
-    async fn every_read_over_the_big_tables_seeks_its_index() {
-        let Ok(url) = std::env::var("DATABASE_URL") else {
-            eprintln!("skipping: DATABASE_URL not set");
-            return;
-        };
-        let pool = PgPool::connect(&url).await.expect("connect");
-        MIGRATOR.run(&pool).await.expect("migrations");
-        let mut conn = pool.begin().await.expect("transaction");
-        sqlx::query("SET LOCAL enable_seqscan = off")
-            .execute(&mut *conn)
-            .await
-            .expect("session setting");
-        sqlx::raw_sql(VOLUME)
-            .execute(&mut *conn)
-            .await
-            .expect("the volume loads");
+    /// One statement's plan, and the indexes it must seek: `a|b` where either
+    /// seeks exactly, `None` where only the row count decides between them.
+    pub(crate) struct Plan {
+        pub(crate) name: &'static str,
+        pub(crate) seeks: Option<&'static [&'static str]>,
+        pub(crate) text: String,
+    }
 
+    impl Plan {
+        /// The plan of a composed lookup, built with an `EXPLAIN ` prefix.
+        pub(crate) async fn of(
+            conn: &mut PgConnection,
+            name: &'static str,
+            seeks: Option<&'static [&'static str]>,
+            mut statement: Statement,
+        ) -> Self {
+            let text = statement
+                .build_query_scalar::<String>()
+                .fetch_all(&mut *conn)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e}"))
+                .join("\n");
+            Self { name, seeks, text }
+        }
+    }
+
+    /// `EXPLAIN` in front of a statement file.
+    pub(crate) fn explain(sql: &str) -> String {
+        format!("EXPLAIN {sql}")
+    }
+
+    /// The resolution and search lookups, in every shape the API asks them.
+    async fn plans(conn: &mut PgConnection) -> Vec<Plan> {
         let platform = B256::repeat_byte(1);
         let handle = NormalizedHandle::from_chain("alice");
         let owner = Address::repeat_byte(2);
-        let shapes: Vec<(&str, Option<&str>, Statement)> = vec![
+        let mut plans = Vec::new();
+        for (name, seeks, statement) in [
             (
                 "handle, any chain",
-                Some("handles_platform_handle_chain_idx"),
+                Some(&["handles_platform_handle_chain_idx"][..]),
                 handle_lookup("EXPLAIN ", None, platform, &handle),
             ),
             (
                 "handle, one chain",
-                Some("handles_platform_handle_chain_idx"),
+                Some(&["handles_platform_handle_chain_idx"][..]),
                 handle_lookup("EXPLAIN ", Some(1), platform, &handle),
             ),
             (
                 "id, any chain",
-                Some("ids_platform_user_chain_idx"),
+                Some(&["ids_platform_user_chain_idx"][..]),
                 id_lookup("EXPLAIN ", None, platform, "111"),
             ),
             (
                 "id, one chain",
-                Some("ids_platform_user_chain_idx"),
+                Some(&["ids_platform_user_chain_idx"][..]),
                 id_lookup("EXPLAIN ", Some(1), platform, "111"),
             ),
             (
                 "wallet, any chain",
-                Some("ids_owner_chain_idx"),
+                Some(&["ids_owner_chain_idx"][..]),
                 identities_lookup("EXPLAIN ", None, owner),
             ),
             (
                 "wallet, one chain",
-                Some("ids_owner_chain_idx"),
+                Some(&["ids_owner_chain_idx"][..]),
                 identities_lookup("EXPLAIN ", Some(1), owner),
             ),
             (
                 "search by wallet, any chain",
-                Some("handles_owner_chain_idx"),
+                Some(&["handles_owner_chain_node_idx"][..]),
                 search_lookup("EXPLAIN ", None, None, Some(owner), None, 10, 0),
             ),
             (
                 "search by wallet on a platform, one chain",
-                Some("handles_owner_chain_idx"),
+                Some(&["handles_owner_chain_node_idx"][..]),
                 search_lookup(
                     "EXPLAIN ",
                     Some(1),
@@ -1546,121 +1570,69 @@ mod plan_tests {
                     0,
                 ),
             ),
-        ];
-        let cursor = Some(HistoryCursor {
-            block_time: 1_700_000_000,
-            chain_id: 1,
-            block_number: 10,
-            log_index: 0,
-        });
-        let page = |chain: Option<i64>, before: Option<HistoryCursor>| HistoryPage {
-            chain,
-            before,
-            limit: 20,
+        ] {
+            plans.push(Plan::of(conn, name, seeks, statement).await);
+        }
+        plans
+    }
+
+    /// Every read over the big tables seeks the index built for it, in every
+    /// shape it is asked in, the indexer's own reads included. The index is
+    /// named, not just "some index": a lookup missing its leading column
+    /// walks a whole index and still reads as an index scan.
+    ///
+    /// The plans are taken over [`VOLUME`], inside a transaction that rolls
+    /// back with its statistics: on a handful of rows every index costs the
+    /// same. Sequential scans stay switched off so none hides behind a small
+    /// table. The text search names no index: the planner filters the text
+    /// off a narrower index rather than reading the trigram one, and only the
+    /// row count decides that.
+    #[tokio::test]
+    async fn every_read_over_the_big_tables_seeks_its_index() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
         };
-        let unclaimed = |token: Option<Address>, chain: Option<i64>| {
-            UnclaimedPage {
-                chain,
-                token,
-                platform_id: None,
-                before: Some(UnclaimedCursor {
-                    token: Address::repeat_byte(3),
-                    held: U256::from(10u64),
-                    chain_id: 1,
-                    handle_node: platform,
-                }),
-                limit: 20,
-            }
-            .lookup("EXPLAIN ")
-        };
-        let shapes: Vec<(&str, Option<&str>, Statement)> = shapes
-            .into_iter()
-            .chain([
-                (
-                    "address history, any chain",
-                    Some("address_events_history_idx"),
-                    page(None, None).address_lookup("EXPLAIN ", owner),
-                ),
-                // One chain: the key seeks (chain, address) and sorts the
-                // few rows an address holds there. An address with many
-                // takes the time-ordered index instead, by its statistics.
-                (
-                    "address history, one chain, past a cursor",
-                    Some("address_events_pkey"),
-                    page(Some(1), cursor).address_lookup("EXPLAIN ", owner),
-                ),
-                (
-                    "handle history, any chain",
-                    Some("handle_events_history_idx"),
-                    page(None, None).node_lookup("EXPLAIN ", platform),
-                ),
-                (
-                    "handle history, one chain, past a cursor",
-                    Some("handle_events_history_idx"),
-                    page(Some(1), cursor).node_lookup("EXPLAIN ", platform),
-                ),
-                (
-                    "claimable, any chain",
-                    Some("handles_owner_chain_idx"),
-                    escrow::claimable_lookup("EXPLAIN ", None, owner),
-                ),
-                (
-                    "refundable, any chain",
-                    Some("escrow_refundable_pkey"),
-                    escrow::refundable_lookup("EXPLAIN ", None, owner),
-                ),
-                (
-                    "refundable, one chain",
-                    Some("escrow_refundable_pkey"),
-                    escrow::refundable_lookup("EXPLAIN ", Some(1), owner),
-                ),
-                (
-                    "a node's slots, any chain",
-                    Some("escrow_held_node_chain_idx"),
-                    escrow::node_slots_lookup("EXPLAIN ", None, platform),
-                ),
-                (
-                    "unclaimed, every token",
-                    Some("escrow_held_unclaimed_idx"),
-                    unclaimed(None, None),
-                ),
-                (
-                    "unclaimed, one token on one chain",
-                    Some("escrow_held_unclaimed_idx"),
-                    unclaimed(Some(owner), Some(1)),
-                ),
-            ])
-            .collect();
-        for (name, index, mut statement) in shapes {
-            let plan: Vec<String> = statement
-                .build_query_scalar()
-                .fetch_all(&mut *conn)
-                .await
-                .unwrap_or_else(|e| panic!("{name}: {e}"));
-            let plan = plan.join("\n");
-            if let Some(index) = index {
+        let pool = PgPool::connect(&url).await.expect("connect");
+        MIGRATOR.run(&pool).await.expect("migrations");
+        let mut conn = pool.begin().await.expect("transaction");
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *conn)
+            .await
+            .expect("session setting");
+        sqlx::raw_sql(VOLUME)
+            .execute(&mut *conn)
+            .await
+            .expect("the volume loads");
+
+        let mut all = plans(&mut conn).await;
+        all.extend(history::plans::all(&mut conn).await);
+        all.extend(escrow::plans::all(&mut conn).await);
+        for plan in all {
+            let Plan { name, seeks, text } = plan;
+            for index in seeks.unwrap_or_default() {
                 assert!(
-                    plan.contains(index),
-                    "{name} does not seek {index}:\n{plan}"
+                    index.split('|').any(|index| text.contains(index)),
+                    "{name} does not seek {index}:\n{text}"
                 );
             }
             for table in [
                 "handles",
                 "ids",
+                "published",
                 "events",
                 "escrow_held",
                 "escrow_refundable",
                 "address_events",
                 "handle_events",
+                "handle_nodes",
             ] {
                 assert!(
-                    !plan.contains(&format!("Seq Scan on {table}")),
-                    "{name} scans {table}:\n{plan}"
+                    !text.contains(&format!("Seq Scan on {table}")),
+                    "{name} scans {table}:\n{text}"
                 );
             }
         }
-        // Explicit, though dropping it would too: nothing the probes loaded
-        // may outlive them, statistics included.
         conn.rollback().await.expect("rollback")
     }
 }

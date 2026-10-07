@@ -1,7 +1,12 @@
-//! Plumbing both integration suites share: drive one request through the
-//! real router and hand back what a caller gets, in the type the API
+//! Plumbing the integration suites share: a suite's chain in the database
+//! they share, events applied through the indexer's own window, and one
+//! request driven through the real router, answered in the type the API
 //! declares for it.
 
+// Every suite compiles its own copy of this module and uses part of it.
+#![allow(dead_code)]
+
+use alloy::primitives::B256;
 use axum::{
     body::Body,
     http::{
@@ -11,17 +16,107 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use serde::de::DeserializeOwned;
+use sqlx::PgPool;
+use tokio::sync::{
+    Mutex,
+    MutexGuard,
+};
 use tower::ServiceExt;
 use usernames_core::{
     api::{
         self,
-        model::ErrorBody,
+        model::{
+            ErrorBody,
+            HistoryEntry,
+            HistoryEvent,
+        },
     },
     db::{
+        self,
         ChainStore,
         Store,
     },
+    events::{
+        LogPosition,
+        NamesEvent,
+    },
 };
+
+/// One suite's chain in the database the suites share: emptied of whatever
+/// an earlier run left there, and held under the suite's lock until
+/// [`Suite::done`].
+pub struct Suite {
+    pub store: ChainStore,
+    lock: MutexGuard<'static, ()>,
+}
+
+impl Suite {
+    /// The suite's `chain`, emptied; `None` when `DATABASE_URL` is unset.
+    pub async fn open(lock: &'static Mutex<()>, chain: i64) -> Option<Self> {
+        let lock = lock.lock().await;
+        let url = std::env::var("DATABASE_URL").ok()?;
+        let pool = PgPool::connect(&url)
+            .await
+            .expect("DATABASE_URL is set but connecting failed");
+        db::MIGRATOR.run(&pool).await.expect("migrations failed");
+        for table in db::PROJECTION_TABLES {
+            sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
+                .bind(chain)
+                .execute(&pool)
+                .await
+                .expect("cleanup failed");
+        }
+        sqlx::query("DELETE FROM names.chain_metadata WHERE chain_id = $1")
+            .bind(chain)
+            .execute(&pool)
+            .await
+            .expect("metadata cleanup failed");
+        Some(Self {
+            store: ChainStore::new(pool, chain),
+            lock,
+        })
+    }
+
+    /// Apply one transaction's events at `block`, in log order, and commit
+    /// like a window. A block's time is its number past a constant, so a
+    /// later block is later in time too.
+    pub async fn apply_tx(&self, block: u64, events: Vec<NamesEvent>) {
+        let mut window = self.store.begin_window().await.expect("begin");
+        for (log_index, event) in (0u64..).zip(events) {
+            let pos = LogPosition {
+                block_number: block,
+                log_index,
+                tx_hash: B256::left_padding_from(&block.to_be_bytes()),
+                block_time: 1_700_000_000 + block,
+            };
+            window.apply(&event, &pos).await.expect("apply");
+        }
+        window.commit(block).await.expect("commit");
+    }
+
+    /// Apply one event alone in its block.
+    pub async fn apply(&self, block: u64, event: NamesEvent) {
+        self.apply_tx(block, vec![event]).await;
+    }
+
+    /// One GET on the suite's chain.
+    pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Reply<T> {
+        let separator = if path.contains('?') { '&' } else { '?' };
+        let chain = self.store.chain_id();
+        get(&self.store, &format!("{path}{separator}chain={chain}")).await
+    }
+
+    /// The test is done with the database; the suite's next test may take it.
+    pub fn done(self) {
+        let Self { lock, .. } = self;
+        drop(lock);
+    }
+}
+
+/// A history's events, in the order served.
+pub fn events(entries: &[HistoryEntry]) -> Vec<&HistoryEvent> {
+    entries.iter().map(|entry| &entry.event).collect()
+}
 
 /// What one GET came back with: the answer in its type, or the refusal.
 pub struct Reply<T> {

@@ -28,12 +28,11 @@ use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
 use usernames_core::{
     api::model::{
-        AddressBalances,
+        AddressAmounts,
         AddressHistory,
         AddressResolution,
         HandleHistory,
         HandleResolution,
-        HistoryEntry,
         HistoryEvent,
         IdResolution,
         Role,
@@ -50,7 +49,10 @@ use usernames_core::{
 };
 
 mod common;
-use common::Reply;
+use common::{
+    events,
+    Reply,
+};
 
 /// A request scoped to this suite's chain: the store is shared with the
 /// read-model suite's chain.
@@ -593,17 +595,12 @@ async fn indexes_a_real_chain_end_to_end() {
     ));
 
     // Claimed: nothing waits for Bob, and the payer's refund ended with it.
-    let bobs: AddressBalances = get(&store, &format!("/v1/escrow/address/{bob}"))
+    let bobs: AddressAmounts = get(&store, &format!("/v1/escrow/claimable/{bob}"))
         .await
         .answer();
-    assert!(bobs.claimable.is_empty(), "{bobs:?}");
-    let payers: AddressBalances = get(&store, &format!("/v1/escrow/address/{payer}"))
+    assert!(bobs.amounts.is_empty(), "{bobs:?}");
+    let payers: AddressAmounts = get(&store, &format!("/v1/escrow/refundable/{payer}"))
         .await
         .answer();
-    assert!(payers.refundable.is_empty(), "{payers:?}");
-}
-
-/// A history's events, in the order served.
-fn events(entries: &[HistoryEntry]) -> Vec<&HistoryEvent> {
-    entries.iter().map(|entry| &entry.event).collect()
+    assert!(payers.amounts.is_empty(), "{payers:?}");
 }

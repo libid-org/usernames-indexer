@@ -586,29 +586,32 @@ pub struct EscrowAmount {
     pub round: U256,
 }
 
-/// `GET /v1/escrow/address/{address}`: what is waiting for an address, and
-/// what it is owed back.
+/// `GET /v1/escrow/claimable/{address}`: held for the handles the address
+/// holds now, which `claim` pays it; `GET /v1/escrow/refundable/{address}`:
+/// what it may take back from deposits nobody has claimed yet, whether or
+/// not the handle has a holder, which `refund` pays it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AddressBalances {
+pub struct AddressAmounts {
     /// The address asked about.
     pub address: Address,
-    /// Held for handles the address holds now: `claim` pays it.
-    pub claimable: Vec<EscrowAmount>,
-    /// What the address may take back from deposits nobody has claimed yet,
-    /// whether or not the handle has a holder: `refund` pays it.
-    pub refundable: Vec<EscrowAmount>,
+    /// By chain, node and token, descending.
+    pub amounts: Vec<EscrowAmount>,
+    /// Pass as `before` for the next page; absent on the last one.
+    pub next: Option<String>,
 }
 
 /// `GET /v1/escrow/handle/{platform}/{handle}` and `GET /v1/escrow/node/{node}`:
 /// what one handle holds, token by token.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HandleBalances {
+pub struct HandleAmounts {
     /// The handle, as far as the store knows it.
     pub handle: HandleQuery,
-    /// One per chain and token still holding something.
-    pub held: Vec<EscrowAmount>,
+    /// One per chain and token still holding something, descending.
+    pub amounts: Vec<EscrowAmount>,
+    /// Pass as `before` for the next page; absent on the last one.
+    pub next: Option<String>,
 }
 
 /// `GET /v1/escrow/unclaimed`: every slot still holding something.
@@ -617,12 +620,10 @@ pub struct HandleBalances {
 pub struct Unclaimed {
     /// The token the list was narrowed to, when one was asked for.
     pub token: Option<Address>,
-    /// The platform the list was narrowed to, when one was asked for.
-    pub platform_id: Option<B256>,
     /// The page size served.
     pub limit: i64,
     /// Token by token, descending, the largest amount first within each.
-    pub slots: Vec<EscrowAmount>,
+    pub amounts: Vec<EscrowAmount>,
     /// Pass as `before` for the next page; absent on the last one.
     pub next: Option<String>,
 }
