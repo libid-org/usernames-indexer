@@ -504,15 +504,14 @@ async fn resolve_handle(
     let bindings: Vec<HandleBinding> = rows
         .iter()
         .filter_map(|row| {
-            let owner = row.owner.as_deref()?;
             Some(HandleBinding {
                 chain_id: row.chain_id,
-                handle_node: B256::from_slice(&row.handle_node),
-                owner: Address::from_slice(owner),
+                handle_node: row.handle_node,
+                owner: row.owner?,
                 observed_at: row.observed_at,
                 ceremony_version: row.ceremony_version,
                 user_id: row.user_id.clone(),
-                id_node: B256::from_slice(&row.id_node),
+                id_node: row.id_node,
             })
         })
         .collect();
@@ -573,12 +572,12 @@ async fn resolve_id(
             .iter()
             .map(|row| IdBinding {
                 chain_id: row.chain_id,
-                id_node: B256::from_slice(&row.id_node),
-                owner: Address::from_slice(&row.owner),
+                id_node: row.id_node,
+                owner: row.owner,
                 observed_at: row.observed_at,
                 ceremony_version: row.ceremony_version,
                 handle: row.presentable_handle().map(str::to_string),
-                handle_node: B256::from_slice(&row.handle_node),
+                handle_node: row.handle_node,
                 published: row.displayed(),
             })
             .collect(),
@@ -600,20 +599,17 @@ async fn resolve_address(
     let rows = state.store.identities_of(chain, address).await?;
     let identities = rows
         .iter()
-        .map(|row| {
-            let platform_id = B256::from_slice(&row.platform_id);
-            AddressIdentity {
-                chain_id: row.chain_id,
-                platform: nodes::Platform::known_of(platform_id),
-                platform_id,
-                user_id: row.user_id.clone(),
-                handle: row.presentable_handle().map(str::to_string),
-                handle_node: B256::from_slice(&row.handle_node),
-                observed_at: row.observed_at,
-                ceremony_version: row.ceremony_version,
-                resolves: row.handle_still_owned(),
-                published: row.displayed(),
-            }
+        .map(|row| AddressIdentity {
+            chain_id: row.chain_id,
+            platform: nodes::Platform::known_of(row.platform_id),
+            platform_id: row.platform_id,
+            user_id: row.user_id.clone(),
+            handle: row.presentable_handle().map(str::to_string),
+            handle_node: row.handle_node,
+            observed_at: row.observed_at,
+            ceremony_version: row.ceremony_version,
+            resolves: row.handle_still_owned(),
+            published: row.displayed(),
         })
         .collect();
 
@@ -698,17 +694,14 @@ async fn search(
         .await?;
     let hits = rows
         .iter()
-        .map(|row| {
-            let platform_id = B256::from_slice(&row.platform_id);
-            SearchHit {
-                chain_id: row.chain_id,
-                platform: nodes::Platform::known_of(platform_id),
-                platform_id,
-                handle: row.handle.clone(),
-                owner: Address::from_slice(&row.owner),
-                user_id: row.user_id.clone(),
-                published: row.published,
-            }
+        .map(|row| SearchHit {
+            chain_id: row.chain_id,
+            platform: nodes::Platform::known_of(row.platform_id),
+            platform_id: row.platform_id,
+            handle: row.handle.clone(),
+            owner: row.owner,
+            user_id: row.user_id.clone(),
+            published: row.published,
         })
         .collect();
 

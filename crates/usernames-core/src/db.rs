@@ -832,7 +832,7 @@ impl Window {
             .bind(chain_id)
             .bind(block)
             .bind(log_index)
-            .bind(pos.tx_hash.as_slice())
+            .bind(pos.tx_hash)
             .bind(event.kind())
             .bind(payload)
             .execute(&mut *self.tx)
@@ -883,13 +883,13 @@ impl Window {
                 let handle = sanitize(handle, "handle");
                 sqlx::query(sql::UPSERT_ID)
                     .bind(chain_id)
-                    .bind(id_node.as_slice())
-                    .bind(platform_id.as_slice())
+                    .bind(id_node)
+                    .bind(platform_id)
                     .bind(&id)
-                    .bind(holder.as_slice())
+                    .bind(holder)
                     .bind(observed)
                     .bind(i64::from(*ceremony_version))
-                    .bind(handle_node.as_slice())
+                    .bind(handle_node)
                     .bind(block)
                     .bind(log_index)
                     .execute(&mut *self.tx)
@@ -897,13 +897,13 @@ impl Window {
 
                 sqlx::query(sql::UPSERT_HANDLE)
                     .bind(chain_id)
-                    .bind(handle_node.as_slice())
-                    .bind(platform_id.as_slice())
+                    .bind(handle_node)
+                    .bind(platform_id)
                     .bind(&handle)
-                    .bind(holder.as_slice())
+                    .bind(holder)
                     .bind(observed)
                     .bind(i64::from(*ceremony_version))
-                    .bind(id_node.as_slice())
+                    .bind(id_node)
                     .bind(block)
                     .bind(log_index)
                     .execute(&mut *self.tx)
@@ -918,16 +918,16 @@ impl Window {
                 if *published {
                     sqlx::query(sql::PUBLISH)
                         .bind(chain_id)
-                        .bind(holder.as_slice())
-                        .bind(platform_id.as_slice())
+                        .bind(holder)
+                        .bind(platform_id)
                         .bind(&handle)
                         .execute(&mut *self.tx)
                         .await?;
                 } else {
                     sqlx::query(sql::UNPUBLISH)
                         .bind(chain_id)
-                        .bind(holder.as_slice())
-                        .bind(platform_id.as_slice())
+                        .bind(holder)
+                        .bind(platform_id)
                         .execute(&mut *self.tx)
                         .await?;
                 }
@@ -940,7 +940,7 @@ impl Window {
             } => {
                 sqlx::query(sql::RETIRE_HANDLE)
                     .bind(chain_id)
-                    .bind(handle_node.as_slice())
+                    .bind(handle_node)
                     .bind(block)
                     .bind(log_index)
                     .execute(&mut *self.tx)
@@ -953,8 +953,8 @@ impl Window {
             } => {
                 sqlx::query(sql::UNPUBLISH)
                     .bind(chain_id)
-                    .bind(holder.as_slice())
-                    .bind(platform_id.as_slice())
+                    .bind(holder)
+                    .bind(platform_id)
                     .execute(&mut *self.tx)
                     .await?;
             }
@@ -963,7 +963,7 @@ impl Window {
                 let key = nodes::Platform::key_of(*platform_id);
                 let reconfigured: bool = sqlx::query_scalar(sql::CONFIGURE_PLATFORM)
                     .bind(chain_id)
-                    .bind(platform_id.as_slice())
+                    .bind(platform_id)
                     .bind(key)
                     .bind(block)
                     .fetch_one(&mut *self.tx)
@@ -1026,9 +1026,9 @@ pub struct HandleRow {
     /// The normalized handle, as the chain emitted it.
     pub handle: String,
     /// The storage key the chain filed this handle under.
-    pub handle_node: Vec<u8>,
-    /// The wallet, or `None` after retirement — the contract's `address(0)`.
-    pub owner: Option<Vec<u8>>,
+    pub handle_node: B256,
+    /// The holder, or `None` after retirement — the contract's `address(0)`.
+    pub owner: Option<Address>,
     /// The proof-freshness watermark, kept even through retirement.
     pub observed_at: i64,
     /// The ceremony version that proved the last binding at this node. Kept
@@ -1036,20 +1036,9 @@ pub struct HandleRow {
     /// only record.
     pub ceremony_version: i64,
     /// The account id node this handle points back at (`idNodeByHandle`).
-    pub id_node: Vec<u8>,
+    pub id_node: B256,
     /// The plaintext account id behind that node, when it was ever bound.
     pub user_id: Option<String>,
-}
-
-impl HandleRow {
-    /// The owner as an address, or `None` after retirement or for a row whose
-    /// bytes are not an address.
-    pub fn owner_address(&self) -> Option<Address> {
-        self.owner
-            .as_deref()
-            .and_then(|bytes| <[u8; 20]>::try_from(bytes).ok())
-            .map(Address::from)
-    }
 }
 
 /// One `names.ids` row joined with the handle node it points at and the
@@ -1060,25 +1049,25 @@ pub struct IdentityRow {
     /// The chain the account is bound on.
     pub chain_id: i64,
     /// The platform the account lives on.
-    pub platform_id: Vec<u8>,
+    pub platform_id: B256,
     /// The plaintext account id, byte-verbatim as the chain keys it.
     pub user_id: String,
     /// The storage key the chain filed this account under.
-    pub id_node: Vec<u8>,
-    /// The wallet that proved the account.
-    pub owner: Vec<u8>,
+    pub id_node: B256,
+    /// The holder that proved the account.
+    pub owner: Address,
     /// The proof-freshness watermark.
     pub observed_at: i64,
     /// The ceremony version that proved the binding.
     pub ceremony_version: i64,
     /// The handle node this account last proved (`handleNodeById`).
-    pub handle_node: Vec<u8>,
+    pub handle_node: B256,
     /// The handle string at that node, when the node was ever bound.
     pub handle: Option<String>,
-    /// The wallet the handle node currently resolves to.
-    pub handle_owner: Option<Vec<u8>>,
+    /// The holder the handle node currently resolves to.
+    pub handle_owner: Option<Address>,
     /// The id node the handle currently points back at.
-    pub handle_id_node: Option<Vec<u8>>,
+    pub handle_id_node: Option<B256>,
     /// Whether a published row exists for (owner, platform, handle).
     pub published: bool,
 }
@@ -1090,8 +1079,7 @@ impl IdentityRow {
     /// account renamed or was overtaken, and showing the stale string would
     /// mis-route a payment.
     pub fn handle_still_owned(&self) -> bool {
-        self.handle_owner.as_deref() == Some(self.owner.as_slice())
-            && self.handle_id_node.as_deref() == Some(self.id_node.as_slice())
+        self.handle_owner == Some(self.owner) && self.handle_id_node == Some(self.id_node)
     }
 
     /// The handle to present, when it is still this account's.
@@ -1116,11 +1104,11 @@ pub struct SearchRow {
     /// The chain the handle is bound on.
     pub chain_id: i64,
     /// The platform the handle lives on.
-    pub platform_id: Vec<u8>,
+    pub platform_id: B256,
     /// The normalized handle.
     pub handle: String,
-    /// The wallet it resolves to (retired handles never match).
-    pub owner: Vec<u8>,
+    /// The holder it resolves to (retired handles never match).
+    pub owner: Address,
     /// The account id behind it, when bound.
     pub user_id: Option<String>,
     /// Whether the owner displays this handle.
@@ -1163,7 +1151,7 @@ impl Store {
         platform_id: B256,
     ) -> Result<bool, sqlx::Error> {
         sqlx::query_scalar(sql::PLATFORM_WIRED)
-            .bind(platform_id.as_slice())
+            .bind(platform_id)
             .bind(chain)
             .fetch_one(&self.pool)
             .await
@@ -1279,7 +1267,7 @@ fn handle_lookup(
         sql::HANDLE_PROJECTION
     ));
     statement
-        .push_bind(platform_id.as_slice().to_vec())
+        .push_bind(platform_id)
         .push(" AND h.handle = ")
         .push_bind(handle.as_str().to_string());
     scoped(&mut statement, "h.chain_id", chain);
@@ -1298,7 +1286,7 @@ fn id_lookup(
         sql::IDENTITY_PROJECTION
     ));
     statement
-        .push_bind(platform_id.as_slice().to_vec())
+        .push_bind(platform_id)
         .push(" AND i.user_id = ")
         .push_bind(user_id.to_string());
     scoped(&mut statement, "i.chain_id", chain);
@@ -1311,7 +1299,7 @@ fn identities_lookup(prefix: &str, chain: Option<i64>, owner: Address) -> Statem
         "{prefix}{} WHERE i.owner = ",
         sql::IDENTITY_PROJECTION
     ));
-    statement.push_bind(owner.as_slice().to_vec());
+    statement.push_bind(owner);
     scoped(&mut statement, "i.chain_id", chain);
     statement.push(" ORDER BY i.chain_id, i.platform_id, i.user_id");
     statement
@@ -1335,12 +1323,10 @@ fn search_lookup(
     if let Some(platform_id) = platform_id {
         statement
             .push(" AND h.platform_id = ")
-            .push_bind(platform_id.as_slice().to_vec());
+            .push_bind(platform_id);
     }
     if let Some(owner) = owner {
-        statement
-            .push(" AND h.owner = ")
-            .push_bind(owner.as_slice().to_vec());
+        statement.push(" AND h.owner = ").push_bind(owner);
     }
     match folded_query {
         Some(query) => {

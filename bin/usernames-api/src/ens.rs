@@ -438,7 +438,7 @@ impl IndexedChain {
             .resolve_handle(platform, handle)
             .await
             .map_err(GatewayError::internal)?
-            .and_then(|row| row.owner_address()))
+            .and_then(|row| row.owner))
     }
 
     /// Where this index stands, or nothing if the store cannot say.
