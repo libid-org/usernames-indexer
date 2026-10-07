@@ -38,7 +38,8 @@ pub struct Config {
 
     /// JSON-RPC endpoint of the chain to follow. With the `subscribe` log
     /// source an `http(s)` URL is dialled as `ws(s)` on the same host and
-    /// path.
+    /// path, which suits Alchemy; a node or provider whose WebSocket sits on
+    /// another port or path takes a `ws(s)` URL here.
     #[arg(long, env = "RPC_URL", hide_env_values = true)]
     pub rpc_url: Url,
 

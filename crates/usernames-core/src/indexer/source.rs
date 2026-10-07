@@ -67,7 +67,8 @@ impl LogSource {
 
     /// A connection to `rpc` for one session. A subscription needs a
     /// WebSocket, so an `http(s)` endpoint is dialled as `ws(s)` on the same
-    /// host and path, where Alchemy and a bare node serve it.
+    /// host and path, where Alchemy serves it; an endpoint whose WebSocket
+    /// sits elsewhere is given as a `ws(s)` URL.
     pub async fn connect(self, rpc: &Url) -> TransportResult<RootProvider> {
         match self {
             Self::Poll => RootProvider::connect(rpc.as_str()).await,
