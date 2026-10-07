@@ -16,18 +16,20 @@
 //! signature turns an answer into an assertion, and neither of these has
 //! earned one.
 //!
-//! * **A chain the store does not hold** — mainnet included, and that is
-//!   the case worth stating plainly, because `addr(node)` with no coin type
-//!   IS a mainnet query and it is what `getAddress()` sends by default. The
-//!   resolver carries ONE `urls` list for every query it ever answers — it
-//!   cannot route by coin type — so ERC-3668 has the client walk that list
-//!   until something succeeds. A signed null is a success, and it ends the
-//!   walk. A gateway that signed null for every chain but its own would
-//!   therefore answer, authoritatively and wrongly, for chains its neighbours
-//!   in the list were there to serve. Refusing steps aside and lets the walk
-//!   continue — which also means a deployment must index every chain it
-//!   wants resolvable, mainnet among them, or the default query shape gets an
-//!   error rather than an address.
+//! * **A chain the store does not hold** — the registry's own included, and
+//!   that is the case worth stating plainly, because `addr(node)` with no
+//!   coin type asks for the chain of the registry it went through — Ethereum
+//!   mainnet from the mainnet registry, Sepolia from Sepolia's — and it is
+//!   what `getAddress()` sends by default. The resolver carries ONE `urls`
+//!   list for every query it ever answers — it cannot route by coin type —
+//!   so ERC-3668 has the client walk that list until something succeeds. A
+//!   signed null is a success, and it ends the walk. A gateway that signed
+//!   null for every chain but its own would therefore answer, authoritatively
+//!   and wrongly, for chains its neighbours in the list were there to serve.
+//!   Refusing steps aside and lets the walk continue — which also means a
+//!   deployment must index every chain it wants resolvable, its registry's
+//!   own among them, or the default query shape gets an error rather than an
+//!   address.
 //! * **An index too far behind.** Same shape: a signed null from a stale
 //!   index denies a binding that may already exist.
 //!
@@ -81,6 +83,7 @@ use usernames_core::{
     ens::{
         AddrShape,
         CoinType,
+        Domain,
         EnsError,
         Name,
         Record,
@@ -94,13 +97,23 @@ use usernames_core::{
 /// What the gateway needs: the store it reads, and the identity it signs with.
 #[derive(Clone)]
 pub struct Config {
-    /// The resolver this gateway answers for. Every answer is signed for this
-    /// address, whatever `{sender}` the path carries: the target is
-    /// configuration, never the request. A request naming another resolver is
-    /// refused rather than answered, so a value that fell behind a
-    /// `setResolver` is a visible 400 instead of a signature the resolver
-    /// rejects.
+    /// The domain this gateway's names sit under. A name outside it is
+    /// refused: a signed null is an assertion, and this gateway has standing
+    /// only over its own names.
+    pub domain: Domain,
+    /// The resolver this gateway answers for: the `HandleResolver` of its
+    /// domain. Every answer is signed for this address, whatever `{sender}`
+    /// the path carries: the target is configuration, never the request. A
+    /// request naming another resolver is refused rather than answered, so a
+    /// value that fell behind a `setResolver` is a visible 400 instead of a
+    /// signature the resolver rejects.
     pub resolver: Address,
+    /// The chain whose ENS registry the resolver is set in. It is what gives
+    /// bare `addr(node)` its meaning: coin type 60 asks for the registry's
+    /// own chain, so the query is a Sepolia question through Sepolia's
+    /// registry and an Ethereum one through the mainnet registry. Nothing in
+    /// a request names the registry, so the deployment does.
+    pub ens_chain: u64,
     /// The store every answer comes from. Which chains it holds is read per
     /// request, never configured: a coin type naming a chain no indexer has
     /// written gets an unsigned refusal, not a signed null — the resolver has
@@ -126,14 +139,15 @@ impl Config {
         // — so the name has to be one this resolver has standing to speak
         // about, whatever record was asked of it.
         let name = Name::parse(&call.name).map_err(GatewayError::bad_request)?;
-        let query = name.query();
+        let query = name.query(&self.domain);
         // Not a name under this resolver's domain. Refused rather than
         // answered: a signed null is an authoritative "nobody holds this", and
         // this gateway has no standing to say that about someone else's name.
         if matches!(query, Err(EnsError::ForeignDomain)) {
-            return Err(GatewayError::bad_request(
-                "this resolver answers only for names under handles.link",
-            ));
+            return Err(GatewayError::bad_request(format!(
+                "this resolver answers only for names under {}",
+                self.domain
+            )));
         }
 
         // Only `addr` has a shape this gateway can fill. Anything else —
@@ -241,7 +255,8 @@ impl Config {
         })
     }
 
-    /// The one chain in the store a coin type names, if there is exactly one.
+    /// The one chain in the store a coin type names when asked through this
+    /// gateway's registry, if there is exactly one.
     ///
     /// Matched against the chains the STORE holds — whatever indexers have
     /// written — never decoded back into a chain id. `0x80000000 | chainId`
@@ -260,7 +275,7 @@ impl Config {
             .indexed_chains()
             .await?
             .into_iter()
-            .filter(|id| coin_type.names_chain(*id))
+            .filter(|id| coin_type.names_chain(*id, self.ens_chain))
             .collect();
         Ok(match candidates.as_slice() {
             [chain_id] => ChainMatch::One(self.indexed_chain(*chain_id)),

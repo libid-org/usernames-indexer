@@ -137,7 +137,9 @@ verifies the signature and returns the record. Both on-chain halves are `view`.
 | Variable | Default | Meaning |
 |---|---|---|
 | `ENS_SIGNER_KEY` | unset | A hex secp256k1 key, or an AWS KMS key id, alias (`alias/…`) or ARN, told apart by shape; with KMS the private material never enters the process, and region and credentials come from the ambient AWS chain (IRSA in the cluster). Setting it mounts the route; startup logs the signer address the resolver must trust |
-| `ENS_RESOLVER_ADDRESS` | — | Required with a key. The one `HandleResolver` on the ENS chain; it answers for every indexed chain, since the request's coin type picks the chain. Every answer is signed for this address, whatever `{sender}` the path carries; a request naming another resolver is refused with a 400, so a value that fell behind a `setResolver` is a visible error rather than a signature the resolver rejects |
+| `ENS_RESOLVER_ADDRESS` | — | Required with a key. The `HandleResolver` of the gateway's domain; it answers for every indexed chain, since the request's coin type picks the chain. Every answer is signed for this address, whatever `{sender}` the path carries; a request naming another resolver is refused with a 400, so a value that fell behind a `setResolver` is a visible error rather than a signature the resolver rejects |
+| `ENS_CHAIN_ID` | `1` | The chain whose ENS registry the resolver is set in: `1` for Ethereum, `11155111` for Sepolia. A bare `addr(node)`, which is all a wallet on either network sends, is answered for this chain |
+| `ENS_DOMAIN` | `handles.link` | The domain the gateway's names sit under. A deployment that answers under a subname sets it (`testnet.handles.link`), and its names are then `alice.x.testnet.handles.link`; a name outside the domain is refused with a 400 |
 | `ENS_TTL` | `5m` | How long an answer stays good; the resolver enforces it. At most `55m`: the resolver's `MAX_LIFETIME` less five minutes for the chain to trail |
 | `ENS_MAX_LAG_BLOCKS` | `32` | How far behind the chain the index may be and still assert anything. The target is set at the top of a cycle and the cursor catches up chunk by chunk, so this must exceed the blocks any served chain produces in one of its indexer's poll intervals |
 
@@ -214,6 +216,14 @@ have got 1588445166 and refused every eden name. The one genuinely ambiguous
 store — holding 3735928814 AND 1588445166 together — is refused per request,
 unsigned, so a wallet walks on rather than being answered with a guess;
 `/ens/status` marks both rows `ambiguous`.
+
+**Bare `addr(node)` asks for the registry's own chain.** It is coin type 60:
+the coin of the chain whose ENS registry was asked, so Ethereum mainnet
+through the mainnet registry and Sepolia through Sepolia's. A wallet on either
+network sends nothing else — MetaMask asks that network's registry and passes
+no coin type — and it sends what it is given on that network. The gateway
+is told its registry's chain as `ENS_CHAIN_ID`; a deployment that does not
+index that chain refuses the bare query.
 
 **Where answers come from.** The indexed model, and nothing else: the gateway
 opens no RPC and takes no per-chain configuration. Answers are as of the

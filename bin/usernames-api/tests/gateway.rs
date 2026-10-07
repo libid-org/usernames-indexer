@@ -58,6 +58,7 @@ const TWIN: i64 = 1_588_445_166;
 /// Every chain any test here may write, so a fixture can clear them all: the
 /// gateway serves whatever the store holds, so a leftover would be served.
 const SUITE_CHAINS: [i64; 5] = [CHAIN, OTHER, EDEN, TWIN, 1];
+/// The suite's resolver, which sits in the mainnet registry.
 const RESOLVER: Address = Address::new([0xaa; 20]);
 const SIGNER_KEY: &str =
     "0x00000000000000000000000000000000000000000000000000000000000a11ce";
@@ -129,7 +130,9 @@ async fn gateway_parts(
 
     let store = ChainStore::new(pool.clone(), chains[0]);
     let config = Config {
+        domain: "handles.link".parse().expect("domain"),
         resolver: RESOLVER,
+        ens_chain: 1,
         store: db::Store::new(pool.clone()),
         ttl: Duration::from_secs(300),
         max_lag_blocks,
@@ -439,6 +442,36 @@ async fn a_request_for_another_resolver_is_refused_not_signed() {
     );
     let (status, _) = ask(&router, Address::from([0xcc; 20]), &call).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// A deployment may answer under a subname of the domain. Its names carry
+/// the subname, and the parent's own names are not its to speak about.
+#[tokio::test]
+async fn a_gateway_under_a_subname_answers_its_names_and_refuses_the_parents() {
+    let Some((mut config, store, _g)) = gateway_parts(&[CHAIN], 32).await else {
+        return;
+    };
+    config.domain = "testnet.handles.link".parse().expect("domain");
+    let router = usernames_api::ens::router(GatewayState::new(config));
+    let owner = Address::from([0xbe; 20]);
+    bind(&store, "alice", owner).await;
+    let coin = 0x8000_0000 | CHAIN as u64;
+
+    // `wire_name` appends `handles.link`, so the subname rides as a label.
+    let ours = resolve_call(
+        &wire_name(&["alice", "x", "testnet"]),
+        &addr_call(&["alice", "x", "testnet"], coin),
+    );
+    let (status, body) = ask(&router, RESOLVER, &ours).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(verify(&body, &ours), Some(owner));
+
+    let parents = resolve_call(
+        &wire_name(&["alice", "x"]),
+        &addr_call(&["alice", "x"], coin),
+    );
+    let (status, body) = ask(&router, RESOLVER, &parents).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
 #[tokio::test]
@@ -762,8 +795,9 @@ async fn the_eden_testnet_resolves_despite_its_chain_id() {
 /// it UNSIGNED.
 ///
 /// Both halves matter. The decode had no coverage at all, and the refusal is
-/// the multi-chain invariant: coin type 60 names Ethereum mainnet, so a
-/// gateway serving only some other chain has nothing to say about it. Saying
+/// the multi-chain invariant: through the mainnet registry coin type 60 names
+/// Ethereum mainnet, so a gateway serving only some other chain has nothing
+/// to say about it. Saying
 /// so with a 5xx keeps the client walking the resolver's `urls`; a signed null
 /// would be an authoritative "nobody holds this" and would end that walk at
 /// the first gateway asked.
@@ -782,6 +816,42 @@ async fn the_legacy_addr_shape_is_refused_unsigned_off_mainnet() {
         StatusCode::SERVICE_UNAVAILABLE,
         "a signed null here would end the client's url walk: {body}"
     );
+}
+
+/// Bare `addr(node)` asks for the chain of the registry it went through, which
+/// the deployment names beside its resolver.
+///
+/// It is the only query MetaMask sends on a network that carries ENS: on
+/// Sepolia it asks Sepolia's registry with coin type 60 and sends on Sepolia.
+/// Read as Ethereum mainnet, that query is refused by a deployment that
+/// indexes Sepolia, and the wallet shows no resolution for a bound name.
+#[tokio::test]
+async fn bare_addr_asks_for_the_chain_of_the_gateways_registry() {
+    let Some((config, store, _g)) = gateway_parts(&[CHAIN], 32).await else {
+        return;
+    };
+    let in_the_mainnet_registry =
+        usernames_api::ens::router(GatewayState::new(config.clone()));
+    let in_our_chains_registry = usernames_api::ens::router(GatewayState::new(Config {
+        ens_chain: CHAIN as u64,
+        ..config
+    }));
+    let owner = Address::from([0xbe; 20]);
+    bind(&store, "alice", owner).await;
+
+    let call = resolve_call(
+        &wire_name(&["alice", "x"]),
+        &legacy_addr_call(&["alice", "x"]),
+    );
+    let (status, body) = ask(&in_our_chains_registry, RESOLVER, &call).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(verify(&body, &call), Some(owner));
+
+    // The same question through the mainnet registry is a mainnet one, and
+    // this store holds no mainnet.
+    let (status, body) = ask(&in_the_mainnet_registry, RESOLVER, &call).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(!body.contains("\"data\""), "a refusal must carry no answer");
 }
 
 /// What the binary actually serves: both halves on one router, with the

@@ -36,6 +36,7 @@ use tower_http::cors::{
 use usernames_core::{
     api,
     db,
+    ens::Domain,
 };
 
 /// Everything comes from flags or the environment; a `.env` file is read
@@ -65,16 +66,29 @@ pub struct Config {
     #[arg(long, env = "ENS_SIGNER_KEY", hide_env_values = true)]
     pub ens_signer_key: Option<String>,
 
-    /// The resolver this gateway answers for: the one `HandleResolver` on
-    /// the ENS chain. It serves every chain the store holds, because the
-    /// request's coin type picks the chain, not the resolver. Nothing the
-    /// indexer watches names it, so it cannot come from the store.
+    /// The resolver this gateway answers for: the `HandleResolver` of its
+    /// domain. It serves every chain the store holds, because the request's
+    /// coin type picks the chain, not the resolver. Nothing the indexer
+    /// watches names it, so it cannot come from the store.
     ///
     /// Required with a signing key: the signature binds an answer to one
     /// resolver, and signing for a caller-supplied one would lend this key
     /// to any contract that asked.
     #[arg(long, env = "ENS_RESOLVER_ADDRESS")]
     pub ens_resolver_address: Option<Address>,
+
+    /// The chain whose ENS registry the resolver is set in: 1 for Ethereum,
+    /// 11155111 for Sepolia. A bare `addr(node)` asks for that chain: coin
+    /// type 60 is the registry's own coin, and a wallet sends what it is
+    /// given on the network whose registry it asked.
+    #[arg(long, env = "ENS_CHAIN_ID", default_value_t = 1)]
+    pub ens_chain_id: u64,
+
+    /// The domain this gateway's names sit under: `handles.link`, or
+    /// `testnet.handles.link` for a deployment that answers under a subname.
+    /// A name outside it is refused.
+    #[arg(long, env = "ENS_DOMAIN", default_value = "handles.link")]
+    pub ens_domain: Domain,
 
     /// How long a signed answer stays good: `5m`, `300s`. The resolver
     /// enforces it on chain.
@@ -112,7 +126,9 @@ pub async fn run() -> anyhow::Result<()> {
     let gateway = config.gateway(pool).await?;
     match &gateway {
         Some(g) => tracing::info!(
+            domain = %g.domain,
             resolver = %g.resolver,
+            ens_chain = g.ens_chain,
             route = %format!("{}/{{sender}}/{{data}}", ens::ROUTE_PREFIX),
             "ENS gateway configured"
         ),
@@ -255,7 +271,9 @@ impl Config {
             "ens gateway signer ready"
         );
         Ok(Some(ens::Config {
+            domain: self.ens_domain.clone(),
             resolver,
+            ens_chain: self.ens_chain_id,
             store: db::Store::new(pool),
             ttl: self.ens_ttl,
             max_lag_blocks: self.ens_max_lag_blocks,
