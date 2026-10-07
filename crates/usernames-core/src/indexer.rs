@@ -181,6 +181,15 @@ impl Indexer {
         Ok(applied)
     }
 
+    /// `error` with the RPC endpoint named by its setting. An HTTP client's
+    /// error carries the URL it called, an endpoint's URL often holds its
+    /// API key, and `/v1/status` shows the stored error to anyone. Matched
+    /// past the scheme, so the WebSocket twin is caught too.
+    fn redacted(&self, error: String) -> String {
+        let endpoint = &self.rpc.as_str()[self.rpc.scheme().len()..];
+        error.replace(endpoint, "://<RPC_URL>")
+    }
+
     /// Run until cancelled. Never returns early on an RPC or database error:
     /// those end the session, which logs, sleeps one interval, and opens
     /// another that resumes from the cursor.
@@ -197,7 +206,7 @@ impl Indexer {
         while !cancel.is_cancelled() {
             let session = async { Session::open(&self).await?.follow(&cancel).await };
             if let Err(e) = session.await {
-                let error = format!("{e:#}");
+                let error = self.redacted(format!("{e:#}"));
                 tracing::warn!(%error, "indexing stopped; resuming from the cursor");
                 // Surfaced in /v1/status: a deterministic failure (an
                 // undecodable log, say) stalls the cursor by design —
@@ -555,5 +564,44 @@ async fn sleep_or_cancel(cancel: &CancellationToken, interval: Duration) {
     tokio::select! {
         _ = cancel.cancelled() => {}
         _ = tokio::time::sleep(interval) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::PgPool;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_stored_error_names_the_rpc_url_by_its_setting() {
+        let pool = PgPool::connect_lazy("postgres://localhost/unused").unwrap();
+        let indexer = Indexer::new(
+            ChainStore::new(pool, 1),
+            "https://eth-mainnet.g.alchemy.com/v2/secret"
+                .parse()
+                .unwrap(),
+            IndexerConfig {
+                contract: Address::ZERO,
+                escrow: None,
+                confirmations: 3,
+                source: LogSource::Subscribe,
+                poll_interval: Duration::from_secs(5),
+                head_interval: Duration::from_secs(60),
+                max_block_range: 10,
+                start_block: None,
+                stale_after: Duration::from_secs(80),
+            },
+        );
+        for called in [
+            "https://eth-mainnet.g.alchemy.com/v2/secret",
+            "wss://eth-mainnet.g.alchemy.com/v2/secret",
+        ] {
+            let error =
+                format!("eth_blockNumber: error sending request for url ({called})");
+            let stored = indexer.redacted(error);
+            assert!(!stored.contains("secret"), "{stored}");
+            assert!(stored.contains("<RPC_URL>"), "{stored}");
+        }
     }
 }
