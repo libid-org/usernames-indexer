@@ -471,8 +471,8 @@ async fn status(State(state): State<AppState>) -> Result<Json<Status>, ApiError>
 /// is bound on or the one named.
 async fn resolve_handle(
     State(state): State<AppState>,
-    Path((platform, handle)): Path<(String, String)>,
-    Query(filter): Query<ChainFilter>,
+    ApiPath((platform, handle)): ApiPath<(String, String)>,
+    ApiQuery(filter): ApiQuery<ChainFilter>,
 ) -> Result<Json<HandleResolution>, ApiError> {
     let platform = parse_platform(&platform)?;
     reject_nul(&handle, "handle")?;
@@ -539,8 +539,8 @@ async fn resolve_handle(
 /// the chain keys it.
 async fn resolve_id(
     State(state): State<AppState>,
-    Path((platform, user_id)): Path<(String, String)>,
-    Query(filter): Query<ChainFilter>,
+    ApiPath((platform, user_id)): ApiPath<(String, String)>,
+    ApiQuery(filter): ApiQuery<ChainFilter>,
 ) -> Result<Json<IdResolution>, ApiError> {
     let platform = parse_platform(&platform)?;
     reject_nul(&user_id, "userId")?;
@@ -589,8 +589,8 @@ async fn resolve_id(
 /// published flag that mirrors `publishedHandleOf`'s reverse display.
 async fn resolve_address(
     State(state): State<AppState>,
-    Path(address): Path<String>,
-    Query(filter): Query<ChainFilter>,
+    ApiPath(address): ApiPath<String>,
+    ApiQuery(filter): ApiQuery<ChainFilter>,
 ) -> Result<Json<AddressResolution>, ApiError> {
     let address = parse_address(&address)?;
     let chain = filter.parse()?;
@@ -631,6 +631,8 @@ struct SearchParams {
 
 /// The page size a search may ask for: at most this many hits per request.
 const SEARCH_MAX_LIMIT: i64 = 50;
+/// A search page holds this many hits when the request names no `limit`.
+const SEARCH_DEFAULT_LIMIT: i64 = 10;
 /// How far into a ranked list a search may page. Deeper pages are a scan the
 /// database repeats per request; a client that far in wants a narrower
 /// query.
@@ -647,7 +649,7 @@ const PAGE_MAX_LIMIT: i64 = 100;
 /// `limit` and `offset` page through the ranked list.
 async fn search(
     State(state): State<AppState>,
-    Query(params): Query<SearchParams>,
+    ApiQuery(params): ApiQuery<SearchParams>,
 ) -> Result<Json<SearchResults>, ApiError> {
     let chain = ChainFilter {
         chain: params.chain,
@@ -676,7 +678,7 @@ async fn search(
         ));
     }
     let limit = parse_count(params.limit.as_deref(), "limit")?
-        .unwrap_or(10)
+        .unwrap_or(SEARCH_DEFAULT_LIMIT)
         .clamp(1, SEARCH_MAX_LIMIT);
     let offset = parse_count(params.offset.as_deref(), "offset")?
         .unwrap_or(0)
@@ -800,6 +802,12 @@ mod tests {
                 bad("invalid_cursor"),
             ),
             ("/v1/history/address/%FF".to_string(), bad("invalid_path")),
+            ("/v1/resolve/address/%FF".to_string(), bad("invalid_path")),
+            ("/v1/search?q=al&q=bo".to_string(), bad("invalid_query")),
+            (
+                "/v1/resolve/handle/x/alice?chain=1&chain=2".to_string(),
+                bad("invalid_query"),
+            ),
             (
                 format!("/v1/escrow/claimable/{address}?chain=1&chain=2"),
                 bad("invalid_query"),
