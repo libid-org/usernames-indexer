@@ -28,6 +28,10 @@ use serde_with::{
     DeserializeFromStr,
     SerializeDisplay,
 };
+use sha2::{
+    Digest,
+    Sha256,
+};
 
 /// keccak256 of a platform key is its id. [`Platform`] is the one entry
 /// point for naming platforms, so this stays private: a caller cannot
@@ -73,15 +77,6 @@ impl KnownPlatform {
     /// The 32-byte id the chain keys this platform by.
     pub fn id(self) -> B256 {
         platform_id(self.key())
-    }
-
-    /// The normalization rules the chain applied before it keyed a handle.
-    ///
-    /// Looked up by the short key because `rules_for` lives in
-    /// `libid-identity` and takes one. The string hop stops at that crate
-    /// boundary rather than spreading from here.
-    pub fn rules(self) -> Option<libid_identity::Rules> {
-        libid_identity::rules_for(self.key())
     }
 
     /// The node a typed handle is bound under, or why no handle can be.
@@ -241,11 +236,18 @@ pub fn fold_search_query(raw: &str) -> String {
 pub struct DisclosedHandle(String);
 
 impl DisclosedHandle {
-    /// `text`, folded, when it hashes to `handle_node` on the platform.
+    /// `text` with A-Z folded to a-z, when `SHA256(handle tag || folded)` is
+    /// `handle_node`. The platform's rules are not applied: the circuits own
+    /// them, and text that hashes to the node is the handle the chain keyed.
     pub fn verify(platform_id: B256, handle_node: B256, text: &str) -> Option<Self> {
         let platform = Platform::known_of(platform_id)?;
-        let folded = libid_identity::normalize(text, platform.rules()?).ok()?;
-        (platform.handle_node(&folded).ok()? == handle_node).then_some(Self(folded))
+        let (_, tag) = libid_identity::tags_for(platform.key())?;
+        let folded = text.to_ascii_lowercase();
+        let node = Sha256::new()
+            .chain_update(tag)
+            .chain_update(&folded)
+            .finalize();
+        (B256::from_slice(&node) == handle_node).then_some(Self(folded))
     }
 
     /// The folded text.
@@ -327,6 +329,22 @@ mod tests {
         let github = KnownPlatform::GitHub.id();
         assert!(DisclosedHandle::verify(github, node, "alice_1").is_none());
         assert!(DisclosedHandle::verify(B256::repeat_byte(7), node, "alice_1").is_none());
+    }
+
+    /// Only A-Z folds. Text the platform's rules refuse is still accepted
+    /// when it hashes to the node, here `SHA256("libid.x.handle" ||
+    /// " @alice")` from `sha256sum`.
+    #[test]
+    fn disclosed_text_is_checked_by_its_hash_alone() {
+        let node = B256::from(hex!(
+            "91f649a873eea530e1610096d7039221f1178ab2c046a8078f3b1de00d1b86fc"
+        ));
+        assert!(KnownPlatform::X.handle_node(" @alice").is_err());
+        let disclosed = DisclosedHandle::verify(KnownPlatform::X.id(), node, " @Alice");
+        assert_eq!(
+            disclosed.as_ref().map(DisclosedHandle::as_str),
+            Some(" @alice")
+        );
     }
 
     /// The registry is the launch profile set, no more and no less: every

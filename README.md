@@ -107,8 +107,9 @@ carries handle text (`handle` in resolutions, search hits, histories and
 escrow amounts) takes it from the `names.visible_handles` view, the one
 place the policy lives:
 
-- text comes only from a disclosure the chain logged, folded, and only when
-  it hashes to the node it names;
+- text comes only from a disclosure the chain logged, with A-Z folded to
+  a-z, and only when it hashes to the node it names. The platform's rules
+  are not applied again;
 - a holder's `HandleUnpublished` hides the text of the name it withdrew. The
   row stays, marked `withdrawn`, until the chain discloses the node again;
 - a disclosure by an escrow depositor counts like any other.
@@ -296,8 +297,8 @@ chain; a second deployment can share the database):
   watermark survives it the way the contract keeps it
 - `published` — the display names, as the node each name hashes to; a row
   exists exactly while the contract's stored string is nonempty
-- `disclosures` — handle text the chain disclosed, folded and checked against
-  its node: one row per node, with the latest disclosure's source (`bind`,
+- `disclosures` — handle text the chain disclosed, A-Z folded and checked
+  against its node by hash alone: one row per node, with the latest disclosure's source (`bind`,
   `publish` or `escrow`) and position, and `withdrawn` once its holder's
   `HandleUnpublished` withdrew it. `visible_handles` is the visibility policy
   over it; `handle_identities` maps each visible handle to its id node
