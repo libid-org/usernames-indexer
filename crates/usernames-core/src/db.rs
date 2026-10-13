@@ -1301,10 +1301,10 @@ pub(crate) mod plan_tests {
     const VOLUME: &str = include_str!("../sql/plan_volume.sql");
 
     /// One statement's plan, and the indexes it must seek: `a|b` where either
-    /// seeks exactly, `None` where only the row count decides between them.
+    /// seeks exactly.
     pub(crate) struct Plan {
         pub(crate) name: &'static str,
-        pub(crate) seeks: Option<&'static [&'static str]>,
+        pub(crate) seeks: &'static [&'static str],
         pub(crate) text: String,
     }
 
@@ -1313,7 +1313,7 @@ pub(crate) mod plan_tests {
         pub(crate) async fn of(
             conn: &mut PgConnection,
             name: &'static str,
-            seeks: Option<&'static [&'static str]>,
+            seeks: &'static [&'static str],
             mut statement: Statement,
         ) -> Self {
             let text = statement
@@ -1322,6 +1322,16 @@ pub(crate) mod plan_tests {
                 .await
                 .unwrap_or_else(|e| panic!("{name}: {e}"))
                 .join("\n");
+            Self { name, seeks, text }
+        }
+
+        /// The plan of a statement file, from its `EXPLAIN` rows.
+        pub(crate) fn explained(
+            name: &'static str,
+            seeks: &'static [&'static str],
+            rows: Result<Vec<String>, sqlx::Error>,
+        ) -> Self {
+            let text = rows.unwrap_or_else(|e| panic!("{name}: {e}")).join("\n");
             Self { name, seeks, text }
         }
     }
@@ -1340,42 +1350,42 @@ pub(crate) mod plan_tests {
         for (name, seeks, statement) in [
             (
                 "handle node, any chain",
-                Some(&["handles_node_chain_idx"][..]),
+                &["handles_node_chain_idx"],
                 handle_lookup("EXPLAIN ", None, node),
             ),
             (
                 "handle node, one chain",
-                Some(&["handles_pkey|handles_node_chain_idx"][..]),
+                &["handles_pkey|handles_node_chain_idx"],
                 handle_lookup("EXPLAIN ", Some(1), node),
             ),
             (
                 "id node, any chain",
-                Some(&["ids_node_chain_idx"][..]),
+                &["ids_node_chain_idx"],
                 id_lookup("EXPLAIN ", None, node),
             ),
             (
                 "id node, one chain",
-                Some(&["ids_pkey|ids_node_chain_idx"][..]),
+                &["ids_pkey|ids_node_chain_idx"],
                 id_lookup("EXPLAIN ", Some(1), node),
             ),
             (
                 "wallet, any chain",
-                Some(&["ids_owner_chain_idx"][..]),
+                &["ids_owner_chain_idx"],
                 identities_lookup("EXPLAIN ", None, owner),
             ),
             (
                 "wallet, one chain",
-                Some(&["ids_owner_chain_idx"][..]),
+                &["ids_owner_chain_idx"],
                 identities_lookup("EXPLAIN ", Some(1), owner),
             ),
             (
                 "search by wallet, any chain",
-                Some(&["handles_owner_chain_node_idx"][..]),
+                &["handles_owner_chain_node_idx"],
                 search_lookup("EXPLAIN ", None, None, Some(owner), None, 10, 0),
             ),
             (
                 "search by wallet on a platform, one chain",
-                Some(&["handles_owner_chain_node_idx"][..]),
+                &["handles_owner_chain_node_idx"],
                 search_lookup(
                     "EXPLAIN ",
                     Some(1),
@@ -1388,18 +1398,12 @@ pub(crate) mod plan_tests {
             ),
             (
                 "search by text, any chain",
-                None,
+                &["disclosures_handle_trgm_idx"],
                 search_lookup("EXPLAIN ", None, None, None, Some("ali"), 10, 0),
             ),
             (
                 "search by text on a platform, one chain",
-                // By its leading column, not walked whole.
-                Some(
-                    &[
-                        "disclosures_platform_chain_idx",
-                        "Index Cond: ((platform_id = ",
-                    ][..],
-                ),
+                &["disclosures_handle_trgm_idx"],
                 search_lookup(
                     "EXPLAIN ",
                     Some(1),
@@ -1414,38 +1418,25 @@ pub(crate) mod plan_tests {
             plans.push(Plan::of(conn, name, seeks, statement).await);
         }
 
-        let reads = [
-            (
-                "the gateway's holder",
-                &["handles_pkey|handles_node_chain_idx"][..],
-                sqlx::query_scalar::<_, String>(&explain(sql::ENS_HOLDER))
-                    .bind(1i64)
-                    .bind(node)
-                    .fetch_all(&mut *conn)
-                    .await,
-            ),
-            (
-                "a withdrawn name",
-                &[
-                    "published_pkey",
-                    "disclosures_pkey|disclosures_node_chain_idx",
-                ][..],
-                sqlx::query_scalar(&explain(sql::WITHDRAW_NAME))
-                    .bind(1i64)
-                    .bind(owner)
-                    .bind(platform)
-                    .fetch_all(&mut *conn)
-                    .await,
-            ),
-        ];
-        for (name, seeks, text) in reads {
-            let text: Vec<String> = text.unwrap_or_else(|e| panic!("{name}: {e}"));
-            plans.push(Plan {
-                name,
-                seeks: Some(seeks),
-                text: text.join("\n"),
-            });
-        }
+        plans.push(Plan::explained(
+            "the gateway's holder",
+            &["handles_pkey|handles_node_chain_idx"],
+            sqlx::query_scalar(&explain(sql::ENS_HOLDER))
+                .bind(1i64)
+                .bind(node)
+                .fetch_all(&mut *conn)
+                .await,
+        ));
+        plans.push(Plan::explained(
+            "a withdrawn name",
+            &["published_pkey", "disclosures_pkey"],
+            sqlx::query_scalar(&explain(sql::WITHDRAW_NAME))
+                .bind(1i64)
+                .bind(owner)
+                .bind(platform)
+                .fetch_all(&mut *conn)
+                .await,
+        ));
         plans
     }
 
@@ -1457,10 +1448,7 @@ pub(crate) mod plan_tests {
     /// The plans are taken over [`VOLUME`], inside a transaction that rolls
     /// back with its statistics: on a handful of rows every index costs the
     /// same. Sequential scans stay switched off so none hides behind a small
-    /// table. A text search names an index only when a platform narrows it:
-    /// across platforms the planner filters the text off a narrower index
-    /// rather than reading the trigram one, and only the row count decides
-    /// that.
+    /// table.
     #[tokio::test]
     async fn every_read_over_the_big_tables_seeks_its_index() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
@@ -1484,7 +1472,7 @@ pub(crate) mod plan_tests {
         all.extend(escrow::plans::all(&mut conn).await);
         for plan in all {
             let Plan { name, seeks, text } = plan;
-            for index in seeks.unwrap_or_default() {
+            for index in seeks {
                 assert!(
                     index.split('|').any(|index| text.contains(index)),
                     "{name} does not seek {index}:\n{text}"

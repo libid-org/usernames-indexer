@@ -810,9 +810,7 @@ async fn a_takeover_hides_the_previous_holders_text_until_disclosed_again() {
     let umas: AddressResolution = h.answer(&format!("/v1/resolve/address/{uma}")).await;
     assert_eq!(umas.identities[0].handle, None);
     assert!(!umas.identities[0].published);
-    assert_eq!(
-        h.withdrawn(node("lee1")).await, Some(true)
-    );
+    assert_eq!(h.withdrawn(node("lee1")).await, Some(true));
 
     // (b) Tom discloses @lee2; Val's account takes it, disclosing it.
     h.bind(Bind {
@@ -842,8 +840,6 @@ async fn a_takeover_hides_the_previous_holders_text_until_disclosed_again() {
             .all(|i| i.handle.is_none() && !i.published),
         "{toms:?}"
     );
-    assert_eq!(
-        h.withdrawn(node("lee2")).await, Some(false)
-    );
+    assert_eq!(h.withdrawn(node("lee2")).await, Some(false));
     h.close().await;
 }

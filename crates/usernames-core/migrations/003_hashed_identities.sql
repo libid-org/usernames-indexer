@@ -44,11 +44,6 @@ CREATE TABLE IF NOT EXISTS names.disclosures (
     withdrawn   BOOLEAN NOT NULL DEFAULT false,
     PRIMARY KEY (chain_id, handle_node)
 );
-CREATE INDEX IF NOT EXISTS disclosures_node_chain_idx
-    ON names.disclosures (handle_node, chain_id);
--- A search on one platform narrows here; the text filters the rows it reads.
-CREATE INDEX IF NOT EXISTS disclosures_platform_chain_idx
-    ON names.disclosures (platform_id, chain_id);
 CREATE INDEX IF NOT EXISTS disclosures_handle_trgm_idx
     ON names.disclosures USING gin (handle gin_trgm_ops);
 

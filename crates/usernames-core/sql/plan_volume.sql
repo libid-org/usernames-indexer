@@ -24,7 +24,7 @@ SELECT DISTINCT ON (owner, platform_id) 1, owner, platform_id, handle_node
 FROM names.handles WHERE chain_id = 1;
 INSERT INTO names.disclosures
     (chain_id, handle_node, platform_id, handle, withdrawn)
-SELECT 1, handle_node, platform_id, 'handle' || block_number,
+SELECT 1, handle_node, platform_id, md5(block_number::text),
        block_number % 10 = 0
 FROM names.handles WHERE chain_id = 1;
 INSERT INTO names.events
@@ -55,6 +55,8 @@ SELECT substring(sha256(('address' || i % 1000)::bytea) FROM 1 FOR 20), 1,
        sha256(('node' || i)::bytea),
        substring(sha256(('token' || i % 5)::bytea) FROM 1 FOR 20), 0, i
 FROM generate_series(1, 5000) i;
+-- Vacuum moves a GIN index's pending entries into it; the rows above wait there.
+SELECT gin_clean_pending_list('names.disclosures_handle_trgm_idx');
 ANALYZE names.handles, names.ids, names.published, names.disclosures, names.events,
         names.address_events, names.handle_events, names.handle_nodes,
         names.escrow_held, names.escrow_refundable;
