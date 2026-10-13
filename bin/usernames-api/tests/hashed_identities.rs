@@ -762,3 +762,81 @@ async fn a_retired_handle_is_in_the_history_of_the_address_that_held_it() {
     );
     h.close().await;
 }
+
+/// Another identity proving a handle withdraws its previous holder's name for
+/// it first, as `bind` does: the text hides on a private takeover, and shows
+/// again, under the new holder, on a disclosing one.
+#[tokio::test]
+async fn a_takeover_hides_the_previous_holders_text_until_disclosed_again() {
+    let Some(h) = Harness::open(43120).await else {
+        return;
+    };
+    let x = KnownPlatform::X;
+    let node = |handle: &str| x.handle_node(handle).expect("a handle");
+    let (tom, uma, val) = (
+        Address::repeat_byte(0xC1),
+        Address::repeat_byte(0xC2),
+        Address::repeat_byte(0xC3),
+    );
+    let holder_text = |resolved: &HandleResolution| {
+        let binding = &resolved.bindings[0];
+        (binding.owner, binding.handle.clone())
+    };
+
+    // (a) Tom discloses @lee1; Uma's account takes it privately.
+    h.bind(Bind {
+        handle: "lee1".into(),
+        ..x_bind(tom, "555", "lee1", 1_000)
+    })
+    .await;
+    h.bind(Bind {
+        takenFrom: tom,
+        ..x_bind(uma, "556", "lee1", 2_000)
+    })
+    .await;
+    let resolved: HandleResolution = h.answer("/v1/resolve/handle/x/lee1").await;
+    assert_eq!(holder_text(&resolved), (uma, None));
+    let found: SearchResults = h.answer("/v1/search?q=lee1").await;
+    assert!(found.hits.is_empty(), "{found:?}");
+    let umas: AddressResolution = h.answer(&format!("/v1/resolve/address/{uma}")).await;
+    assert_eq!(umas.identities[0].handle, None);
+    assert!(!umas.identities[0].published);
+    assert_eq!(
+        h.disclosure(node("lee1")).await,
+        Some(("bind".into(), true))
+    );
+
+    // (b) Tom discloses @lee2; Val's account takes it, disclosing it.
+    h.bind(Bind {
+        handle: "lee2".into(),
+        ..x_bind(tom, "555", "lee2", 3_000)
+    })
+    .await;
+    h.bind(Bind {
+        takenFrom: tom,
+        handle: "lee2".into(),
+        ..x_bind(val, "557", "lee2", 4_000)
+    })
+    .await;
+    let resolved: HandleResolution = h.answer("/v1/resolve/handle/x/lee2").await;
+    assert_eq!(holder_text(&resolved), (val, Some("lee2".into())));
+    let found: SearchResults = h.answer("/v1/search?q=lee2").await;
+    let hits: Vec<(&str, Address, bool)> = found
+        .hits
+        .iter()
+        .map(|hit| (hit.handle.as_str(), hit.owner, hit.published))
+        .collect();
+    assert_eq!(hits, [("lee2", val, true)]);
+    let toms: AddressResolution = h.answer(&format!("/v1/resolve/address/{tom}")).await;
+    assert!(
+        toms.identities
+            .iter()
+            .all(|i| i.handle.is_none() && !i.published),
+        "{toms:?}"
+    );
+    assert_eq!(
+        h.disclosure(node("lee2")).await,
+        Some(("bind".into(), false))
+    );
+    h.close().await;
+}
