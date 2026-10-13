@@ -181,7 +181,7 @@ pub fn unpublish(holder: Address, platform: KnownPlatform) -> NamesEvent {
 
 /// A `depositToHandle`'s disclosure of the handle as typed.
 pub fn deposited_to_handle(platform: KnownPlatform, typed: &str) -> NamesEvent {
-    let handle_node = platform.handle_node(typed).expect("a handle");
+    let (_, handle_node) = platform.folded_handle_node(typed);
     NamesEvent::Escrow(EscrowEvent::DepositedToHandle {
         handle_node,
         platform_id: platform.id(),

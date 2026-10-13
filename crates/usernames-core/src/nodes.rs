@@ -92,6 +92,17 @@ impl KnownPlatform {
             .map(B256::from)
     }
 
+    /// `text` with A-Z folded to a-z, and `SHA256(handle tag || folded)`:
+    /// the chain's `handleNodeOf`, which applies no other rule.
+    pub fn folded_handle_node(self, text: &str) -> (String, B256) {
+        let folded = text.to_ascii_lowercase();
+        let node = Sha256::new()
+            .chain_update(self.spec().handle_tag)
+            .chain_update(&folded)
+            .finalize();
+        (folded, B256::from_slice(&node))
+    }
+
     /// The node a user id is bound under, or why no id can be.
     pub fn id_node(self, id: &str) -> Result<B256, IdError> {
         libid_identity::id_node(self.key(), id)
@@ -233,12 +244,8 @@ impl DisclosedHandle {
         handle_node: B256,
         text: &str,
     ) -> Option<Self> {
-        let folded = text.to_ascii_lowercase();
-        let node = Sha256::new()
-            .chain_update(platform.spec().handle_tag)
-            .chain_update(&folded)
-            .finalize();
-        (B256::from_slice(&node) == handle_node).then_some(Self(folded))
+        let (folded, node) = platform.folded_handle_node(text);
+        (node == handle_node).then_some(Self(folded))
     }
 
     /// The folded text.

@@ -312,8 +312,8 @@ impl PageParams {
     }
 }
 
-/// A handle as a request names it: by its text on a platform, hashed here
-/// into the node the chain keys, or by its node.
+/// A handle as a request names it: by its text on a platform, folded and
+/// hashed here the way `depositToHandle` keys it, or by its node.
 enum HandleKey {
     Text {
         platform: KnownPlatform,
@@ -325,7 +325,7 @@ enum HandleKey {
 impl HandleKey {
     fn of_text(platform: &str, handle: &str) -> Result<Self, ApiError> {
         let platform = parse_known_platform(platform)?;
-        let handle_node = platform.handle_node(handle)?;
+        let (_, handle_node) = platform.folded_handle_node(handle);
         Ok(Self::Text {
             platform,
             handle_node,
@@ -859,10 +859,6 @@ mod tests {
             (
                 "/v1/escrow/handle/myspace/tom".to_string(),
                 bad(ErrorCode::InvalidPlatform),
-            ),
-            (
-                "/v1/history/handle/x/no%20spaces".to_string(),
-                (StatusCode::NOT_FOUND, ErrorCode::HandleImpossible),
             ),
             (
                 "/v1/escrow/unclaimed?limit=ten".to_string(),

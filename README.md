@@ -99,8 +99,9 @@ Anybody can deposit a token they wrote, so show the tokens you recognize.
 
 A `deposit` names a handle by its node alone: the store knows no platform
 for it (`platformId` is absent) until a `DepositedToHandle` or a bind names
-one. Asking by text works from the first deposit, because the API hashes the
-text the way the chain does.
+one. Asking by text works from the first deposit: the escrow and history
+routes fold the text's A-Z and hash it, the way `depositToHandle` does, so
+`/v1/escrow/handle/x/@bob` finds a deposit to `@bob`.
 
 **Handle text is shown only while it is visible.** Every response that
 carries handle text (`handle` in resolutions, search hits, histories and
@@ -114,8 +115,9 @@ without text in the answer.
 `{platform}` is a short key (`x`, `github`, `google`) or a 0x-hex 32-byte
 platform id. A text route hashes its text with `libid-identity`, so it needs a
 platform this build knows: an unknown id is `invalid_platform`, and the node
-routes answer for any platform. The handle is folded and checked by the
-platform's rules; the id is hashed exactly as given. A Google `{userId}` is the
+routes answer for any platform. A resolution route folds the handle and checks
+it by the platform's rules; the escrow and history routes only fold it, as
+the chain does. The id is hashed exactly as given. A Google `{userId}` is the
 OIDC `sub`.
 
 Errors share one envelope — `{ "error": { "code", "message" } }`. The `code`
