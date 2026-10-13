@@ -197,12 +197,6 @@ impl Platform {
         self.known
     }
 
-    /// The short key, when this build knows the id. The API serializes this,
-    /// so the wire form stays a string even though the type behind it is not.
-    pub fn key(&self) -> Option<&'static str> {
-        self.known.map(KnownPlatform::key)
-    }
-
     /// The platform for a bare id — for rows read back from the database,
     /// where only the id survives. An id this build does not know still
     /// indexes; it just has no rules or name on this side.
@@ -210,7 +204,7 @@ impl Platform {
         KNOWN_BY_ID.get(&id).copied()
     }
 
-    /// The short key for a bare id, for the same callers as [`Self::key`].
+    /// The short key for a bare id, when this build knows it.
     pub fn key_of(id: B256) -> Option<&'static str> {
         Self::known_of(id).map(KnownPlatform::key)
     }
@@ -371,12 +365,12 @@ mod tests {
     #[test]
     fn parse_accepts_keys_and_hex_and_names_the_keys_it_knows() {
         let by_key = "x".parse::<Platform>().unwrap();
-        assert_eq!(by_key.key(), Some("x"));
+        assert_eq!(by_key.known(), Some(KnownPlatform::X));
 
         // The hex form of a registered platform picks its key back up.
         let by_id = by_key.id().to_string().parse::<Platform>().unwrap();
         assert_eq!(by_id.id(), by_key.id());
-        assert_eq!(by_id.key(), Some("x"));
+        assert_eq!(by_id.known(), Some(KnownPlatform::X));
 
         // An unregistered id still parses — events are self-describing —
         // it just has no key, and so no rules, on this side.
@@ -384,7 +378,7 @@ mod tests {
             .to_string()
             .parse::<Platform>()
             .unwrap();
-        assert_eq!(foreign.key(), None);
+        assert_eq!(foreign.known(), None);
 
         // The refusal names every registered key, derived from the registry.
         let err = "myspace".parse::<Platform>().unwrap_err().to_string();

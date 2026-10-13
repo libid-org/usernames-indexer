@@ -1,8 +1,4 @@
--- Hashed identities: the chain carries nodes, and handle text only where a
--- holder or a depositor disclosed it. Rows an earlier build wrote hold
--- plaintext ids and handles, so they go here; INDEXER_VERSION 3 replays every
--- chain from its registry's deployment block. The cursors go too, so the API
--- answers not_synced until a chain's replay lands.
+-- Hashed identities; INDEXER_VERSION 3 replays, so old rows and cursors go.
 
 TRUNCATE names.events, names.ids, names.handles, names.published,
          names.platforms, names.handle_nodes, names.escrow_held,

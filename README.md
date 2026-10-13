@@ -104,19 +104,12 @@ text the way the chain does.
 
 **Handle text is shown only while it is visible.** Every response that
 carries handle text (`handle` in resolutions, search hits, histories and
-escrow amounts) takes it from the `names.visible_handles` view, the one
-place the policy lives:
-
-- text comes only from a disclosure the chain logged, with A-Z folded to
-  a-z, and only when it hashes to the node it names. The platform's rules
-  are not applied again;
-- a holder's `HandleUnpublished` hides the text of the name it withdrew. The
-  row stays, marked `withdrawn`, until the chain discloses the node again;
-- a disclosure by an escrow depositor counts like any other.
-
-Search lists visible handles only. `names.handle_identities` maps each visible
-handle to its id node and holder, NULL until a bind takes the node. A private
-binding still resolves by text or by node, without text in the answer.
+escrow amounts) takes it from the `names.visible_handles` view; migration
+003 defines the policy there. Text is A-Z folded and stored only when it
+hashes to the node it names; the platform's rules are not applied again.
+Search lists visible handles only, and `names.handle_identities` maps each to
+its id node and holder. A private binding still resolves by text or by node,
+without text in the answer.
 
 `{platform}` is a short key (`x`, `github`, `google`) or a 0x-hex 32-byte
 platform id. A text route hashes its text with `libid-identity`, so it needs a
@@ -248,10 +241,8 @@ index that chain refuses the bare query.
 
 **A name resolves through its node.** The gateway inverts the label to a
 handle, hashes it with `libid-identity` into the SHA-256 handle node, and
-answers that node's holder. A private binding resolves too, as
-`resolveHandle` does on chain. That default is one statement,
-`sql/ens_holder.sql`; joining `names.visible_handles` there would answer
-disclosed handles only.
+answers that node's holder; `sql/ens_holder.sql` says which bindings it
+answers for.
 
 **Where answers come from.** The indexed model, and nothing else: the gateway
 opens no RPC and takes no per-chain configuration. Answers are as of the
