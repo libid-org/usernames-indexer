@@ -1,14 +1,8 @@
-//! The platform registry and node derivation, mirroring `IdentityNodes.sol`.
+//! The platform registry and node derivation.
 //!
-//! Every node the contract stores under is a keccak of three 32-byte words:
-//! a version tag, the platform id, and the keccak of the string. `abi.encode`
-//! of three static `bytes32` values is their plain concatenation, so no ABI
-//! machinery is needed here.
-//!
-//! The indexer recomputes both nodes for every `IdentityBound` it applies and
-//! compares them against the emitted topics. A mismatch means this build's
-//! constants or normalizer drifted from the chain — it is reported loudly and
-//! the emitted topics win, because the chain already keyed its storage.
+//! A platform id is keccak256 of its key. Handle and id nodes are
+//! libid-identity's `SHA256(tag || value)`, the nodes the circuits output and
+//! the contracts key by; this module only names the platform for it.
 
 use std::{
     collections::HashMap,
@@ -21,10 +15,14 @@ use alloy::primitives::{
     keccak256,
     B256,
 };
-use libid_identity::handle_vectors::{
-    PLATFORM_GITHUB_KEY,
-    PLATFORM_GOOGLE_KEY,
-    PLATFORM_X_KEY,
+use libid_identity::{
+    handle_vectors::{
+        PLATFORM_GITHUB_KEY,
+        PLATFORM_GOOGLE_KEY,
+        PLATFORM_X_KEY,
+    },
+    HandleError,
+    IdError,
 };
 use serde_with::{
     DeserializeFromStr,
@@ -85,6 +83,31 @@ impl KnownPlatform {
     pub fn rules(self) -> Option<libid_identity::Rules> {
         libid_identity::rules_for(self.key())
     }
+
+    /// The node a typed handle is bound under, or why no handle can be.
+    pub fn handle_node(self, raw: &str) -> Result<B256, NodeError<HandleError>> {
+        let node = libid_identity::handle_node(self.key(), raw)
+            .ok_or(NodeError::Untagged(self))??;
+        Ok(B256::from(node))
+    }
+
+    /// The node a user id is bound under, or why no id can be.
+    pub fn id_node(self, id: &str) -> Result<B256, NodeError<IdError>> {
+        let node = libid_identity::id_node(self.key(), id)
+            .ok_or(NodeError::Untagged(self))??;
+        Ok(B256::from(node))
+    }
+}
+
+/// Why a text has no node on a platform.
+#[derive(Debug, thiserror::Error)]
+pub enum NodeError<E> {
+    /// libid-identity names no tags for the platform: a build mismatch.
+    #[error("libid-identity has no node tags for {0}")]
+    Untagged(KnownPlatform),
+    /// The platform could never issue this text.
+    #[error(transparent)]
+    Refused(#[from] E),
 }
 
 /// The platform a short key names.
@@ -124,9 +147,8 @@ pub struct UnknownPlatform {
     raw: String,
 }
 
-/// A platform named by its short key ('x') or its 0x-hex 32-byte id. The key
-/// form also carries this build's normalization rules; the hex form indexes
-/// fine but string queries run un-normalized.
+/// A platform named by its short key ('x') or its 0x-hex 32-byte id. Only a
+/// platform this build knows hashes text into nodes.
 #[derive(Debug, Clone, Copy)]
 pub struct Platform {
     id: B256,
@@ -193,7 +215,7 @@ impl Platform {
 
     /// The platform for a bare id — for rows read back from the database,
     /// where only the id survives. An id this build does not know still
-    /// indexes; it just has no normalization rules or name on this side.
+    /// indexes; it just has no rules or name on this side.
     pub fn known_of(id: B256) -> Option<KnownPlatform> {
         KNOWN_BY_ID.get(&id).copied()
     }
@@ -202,85 +224,34 @@ impl Platform {
     pub fn key_of(id: B256) -> Option<&'static str> {
         Self::known_of(id).map(KnownPlatform::key)
     }
-
-    /// Normalize a full handle exactly the way the chain did before it keyed
-    /// the handle. A platform this build has no rules for passes the text
-    /// through verbatim — its handles were still stored normalized, the
-    /// caller just has to supply that form. An error means the platform could
-    /// never hold this text at all.
-    pub fn normalize_query(
-        &self,
-        raw: &str,
-    ) -> Result<NormalizedHandle, libid_identity::HandleError> {
-        match self.known.and_then(KnownPlatform::rules) {
-            Some(rules) => libid_identity::normalize(raw, rules).map(NormalizedHandle),
-            None => Ok(NormalizedHandle(raw.to_string())),
-        }
-    }
-}
-
-/// A handle in the exact byte form the chain keyed. The only ways to get one
-/// are [`Platform::normalize_query`] — this side running the chain's rules —
-/// and [`NormalizedHandle::from_chain`] for text the chain itself emitted,
-/// which is normalized by definition. What cannot happen is hashing raw user
-/// input by accident: [`handle_node`] refuses plain strings, because a raw
-/// handle writes a node no reader will find.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NormalizedHandle(String);
-
-impl NormalizedHandle {
-    /// Text the chain already keyed: an event field, or a column derived
-    /// from one. The chain is the authority on normalization; this side does
-    /// not second-guess what it emitted.
-    pub fn from_chain(handle: &str) -> Self {
-        Self(handle.to_string())
-    }
-
-    /// The normalized text.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 /// Fold a search query the way normalization would, without refusing partial
 /// input: trim spaces, strip one leading `@`, lowercase A-Z. A partial handle
-/// cannot pass shape checks, so full normalization is not run —
-/// which is also why this returns a plain `String` and not a
-/// [`NormalizedHandle`]: folded text is not chain-keyed text.
+/// cannot pass shape checks, so full normalization is not run.
 pub fn fold_search_query(raw: &str) -> String {
     let trimmed = raw.trim_matches(' ');
     let stripped = trimmed.strip_prefix('@').unwrap_or(trimmed);
     stripped.to_ascii_lowercase()
 }
 
-static ID_NODE_V1: LazyLock<B256> =
-    LazyLock::new(|| keccak256(b"libid.identity.id-node.v1"));
-static HANDLE_NODE_V1: LazyLock<B256> =
-    LazyLock::new(|| keccak256(b"libid.identity.handle-node.v1"));
+/// Handle text an event disclosed: folded, and checked to hash to the node
+/// the event names. [`DisclosedHandle::verify`] is the only way to one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisclosedHandle(String);
 
-fn node(tag: B256, platform: B256, inner: B256) -> B256 {
-    let mut buf = [0u8; 96];
-    buf[..32].copy_from_slice(tag.as_slice());
-    buf[32..64].copy_from_slice(platform.as_slice());
-    buf[64..].copy_from_slice(inner.as_slice());
-    keccak256(buf)
-}
+impl DisclosedHandle {
+    /// `text`, folded, when it hashes to `handle_node` on the platform.
+    pub fn verify(platform_id: B256, handle_node: B256, text: &str) -> Option<Self> {
+        let platform = Platform::known_of(platform_id)?;
+        let folded = libid_identity::normalize(text, platform.rules()?).ok()?;
+        (platform.handle_node(&folded).ok()? == handle_node).then_some(Self(folded))
+    }
 
-/// The node an id is stored under. The id is hashed byte-verbatim: the
-/// contract never normalizes it, so neither does this.
-pub fn id_node(platform: B256, id: &str) -> B256 {
-    node(*ID_NODE_V1, platform, keccak256(id.as_bytes()))
-}
-
-/// The node a handle is stored under. Demanding [`NormalizedHandle`]
-/// instead of a plain string is what keeps "hashed a raw handle" a compile
-/// error rather than a node no reader will ever find.
-pub fn handle_node(platform: B256, handle: &NormalizedHandle) -> B256 {
-    node(
-        *HANDLE_NODE_V1,
-        platform,
-        keccak256(handle.as_str().as_bytes()),
-    )
+    /// The folded text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[cfg(test)]
@@ -315,25 +286,47 @@ mod tests {
         }
     }
 
+    /// libid-identity's README vectors, from `hashlib.sha256` over tag and
+    /// text: numbers this crate never produced.
     #[test]
-    fn nodes_match_the_chain() {
-        let x = KnownPlatform::X.id();
-        let google = KnownPlatform::Google.id();
-        assert_eq!(
-            hex::encode(handle_node(x, &NormalizedHandle::from_chain("alice_1"))),
-            "1c43d5d3cf3d99e9d5b6e8c74c23d14bcbb6a743712cf7fa7c15750c4fc2150d"
-        );
-        assert_eq!(
-            hex::encode(id_node(x, "12345")),
-            "c3a98b9fbd2be3063e652d3d506b3de70b8952e60901fc25bdec89cde86b2214"
-        );
-        assert_eq!(
-            hex::encode(handle_node(
-                google,
-                &NormalizedHandle::from_chain("a.b+tag@example.com")
-            )),
-            "71618d5985c306d64050b15d17f41078c448fc30a93982df14ffd6bbcb4db534"
-        );
+    fn nodes_match_the_circuits() {
+        let node = KnownPlatform::GitHub.handle_node("OctoCat").unwrap();
+        assert_eq!(node[..4], [0x38, 0x1f, 0xb9, 0xd7]);
+        let id = KnownPlatform::GitHub.id_node("583231").unwrap();
+        assert_eq!(id[..4], [0x47, 0x59, 0x02, 0xb2]);
+        assert!(matches!(
+            KnownPlatform::X.handle_node(" @alice"),
+            Err(NodeError::Refused(HandleError::BadCharacter))
+        ));
+        assert!(matches!(
+            KnownPlatform::X.id_node("0123"),
+            Err(NodeError::Refused(IdError::BadShape))
+        ));
+    }
+
+    /// Every known platform has node tags, so [`NodeError::Untagged`] is
+    /// never reached.
+    #[test]
+    fn every_known_platform_is_tagged() {
+        for platform in KnownPlatform::ALL {
+            assert!(
+                libid_identity::tags_for(platform.key()).is_some(),
+                "{platform}"
+            );
+        }
+    }
+
+    #[test]
+    fn disclosed_text_folds_and_must_hash_to_its_node() {
+        let x = KnownPlatform::X;
+        let node = x.handle_node("alice_1").unwrap();
+        let disclosed = DisclosedHandle::verify(x.id(), node, "Alice_1").unwrap();
+        assert_eq!(disclosed.as_str(), "alice_1");
+        assert!(DisclosedHandle::verify(x.id(), node, "alice_2").is_none());
+        assert!(DisclosedHandle::verify(x.id(), node, "alice_1!").is_none());
+        let github = KnownPlatform::GitHub.id();
+        assert!(DisclosedHandle::verify(github, node, "alice_1").is_none());
+        assert!(DisclosedHandle::verify(B256::repeat_byte(7), node, "alice_1").is_none());
     }
 
     /// The registry is the launch profile set, no more and no less: every

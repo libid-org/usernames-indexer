@@ -28,12 +28,13 @@ use sqlx::{
 use crate::{
     ens::ChainName,
     events::{
+        EscrowEvent,
         LogPosition,
         NamesEvent,
     },
     nodes::{
         self,
-        NormalizedHandle,
+        DisclosedHandle,
     },
 };
 
@@ -63,7 +64,7 @@ pub use self::{
 /// Bump on any change to what the indexer writes. A mismatch at startup
 /// clears the chain's rows and cursor, so the next loop replays the chain
 /// from the deployment block — the re-index IS the migration.
-pub const INDEXER_VERSION: &str = "2";
+pub const INDEXER_VERSION: &str = "3";
 
 pub use self::sql::{
     CLEAR_CHAIN,
@@ -667,53 +668,6 @@ impl ChainStore {
     }
 }
 
-/// Postgres TEXT and JSONB cannot hold a NUL byte, but the contract's
-/// strings are byte-verbatim and an adversarial platform could emit one. A
-/// lossy row beats a poison window that stalls the chain forever: the NUL is
-/// replaced, the loss is logged, and the node columns — which is what the
-/// chain actually keys — stay exact.
-fn sanitize(value: &str, what: &str) -> String {
-    if value.contains('\0') {
-        tracing::error!(
-            what,
-            "string contains a NUL byte; storing with U+FFFD in its place"
-        );
-        value.replace('\0', "\u{fffd}")
-    } else {
-        value.to_string()
-    }
-}
-
-/// Scrub NUL bytes anywhere in a JSON payload, reporting whether anything
-/// was replaced — so the caller can log the loss as loudly as the projection
-/// columns do, instead of the journal being scrubbed in silence.
-fn sanitize_json(value: &mut serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::String(s) if s.contains('\0') => {
-            *s = s.replace('\0', "\u{fffd}");
-            true
-        }
-        serde_json::Value::String(_) => false,
-        // Every element must be scrubbed, so no short-circuiting combinator
-        // fits here.
-        serde_json::Value::Array(items) => {
-            let mut lossy = false;
-            for item in items {
-                lossy |= sanitize_json(item);
-            }
-            lossy
-        }
-        serde_json::Value::Object(map) => {
-            let mut lossy = false;
-            for item in map.values_mut() {
-                lossy |= sanitize_json(item);
-            }
-            lossy
-        }
-        _ => false,
-    }
-}
-
 fn as_i64(value: u64, what: &'static str) -> Result<i64, ApplyError> {
     i64::try_from(value).map_err(|_| ApplyError::OutOfRange { what, value })
 }
@@ -775,13 +729,7 @@ impl Window {
         let at = Position::of(pos)?;
         let (block, log_index) = (at.block, at.log_index);
 
-        let mut payload = event.payload()?;
-        if sanitize_json(&mut payload) {
-            tracing::error!(
-                kind = event.kind(),
-                "journal payload contained a NUL byte; stored with U+FFFD in its place"
-            );
-        }
+        let payload = event.payload()?;
         let journaled = sqlx::query(sql::JOURNAL_EVENT)
             .bind(chain_id)
             .bind(block)
@@ -792,8 +740,7 @@ impl Window {
             .execute(&mut *self.tx)
             .await?;
         if journaled.rows_affected() == 0 {
-            // Running the projection writes again would be harmless for the
-            // upserts but would double-count `configured_count` and every
+            // Running the projection writes again would double-count every
             // escrowed amount, so the journal's conflict is the one
             // idempotency gate for everything.
             return Ok(false);
@@ -810,36 +757,14 @@ impl Window {
                 id_node,
                 handle_node,
                 platform_id,
-                id,
-                handle,
                 observed_at,
-                published,
                 ceremony_version,
             } => {
-                // Self-check: this build's constants against the chain's
-                // topics. The emitted nodes win either way — the chain
-                // already keyed its storage by them — but a mismatch means
-                // platform ids or hashing drifted and resolution-by-string is
-                // broken until fixed.
-                if nodes::id_node(*platform_id, id) != *id_node {
-                    tracing::error!(%id_node, id, "recomputed idNode disagrees with the emitted topic");
-                }
-                if nodes::handle_node(
-                    *platform_id,
-                    &nodes::NormalizedHandle::from_chain(handle),
-                ) != *handle_node
-                {
-                    tracing::error!(%handle_node, handle, "recomputed handleNode disagrees with the emitted topic");
-                }
-
                 let observed = as_i64(*observed_at, "observedAt")?;
-                let id = sanitize(id, "id");
-                let handle = sanitize(handle, "handle");
                 sqlx::query(sql::UPSERT_ID)
                     .bind(chain_id)
                     .bind(id_node)
                     .bind(platform_id)
-                    .bind(&id)
                     .bind(holder)
                     .bind(observed)
                     .bind(i64::from(*ceremony_version))
@@ -848,12 +773,10 @@ impl Window {
                     .bind(log_index)
                     .execute(&mut *self.tx)
                     .await?;
-
                 sqlx::query(sql::UPSERT_HANDLE)
                     .bind(chain_id)
                     .bind(handle_node)
                     .bind(platform_id)
-                    .bind(&handle)
                     .bind(holder)
                     .bind(observed)
                     .bind(i64::from(*ceremony_version))
@@ -862,29 +785,42 @@ impl Window {
                     .bind(log_index)
                     .execute(&mut *self.tx)
                     .await?;
+                sqlx::query(sql::RECORD_PLATFORM)
+                    .bind(chain_id)
+                    .bind(platform_id)
+                    .bind(nodes::Platform::key_of(*platform_id))
+                    .execute(&mut *self.tx)
+                    .await?;
+            }
 
-                // The event's flag is the post-state of the contract's
-                // published string: true upserts, false deletes. Deleting on
-                // false is what makes a replay converge — the contract's
-                // bind() refreshes an existing publication even when the
-                // caller passed false, and the flag already accounts for
-                // that.
-                if *published {
-                    sqlx::query(sql::PUBLISH)
-                        .bind(chain_id)
-                        .bind(holder)
-                        .bind(platform_id)
-                        .bind(&handle)
-                        .execute(&mut *self.tx)
-                        .await?;
+            NamesEvent::HandlePublished {
+                holder,
+                platform_id,
+                handle_node,
+                handle,
+            } => {
+                sqlx::query(sql::PUBLISH)
+                    .bind(chain_id)
+                    .bind(holder)
+                    .bind(platform_id)
+                    .bind(handle_node)
+                    .execute(&mut *self.tx)
+                    .await?;
+                let by_bind: bool = sqlx::query_scalar(sql::BOUND_IN_TX)
+                    .bind(chain_id)
+                    .bind(block)
+                    .bind(at.tx_hash)
+                    .bind(log_index)
+                    .bind(handle_node.to_string())
+                    .fetch_one(&mut *self.tx)
+                    .await?;
+                let source = if by_bind {
+                    Disclosure::Bind
                 } else {
-                    sqlx::query(sql::UNPUBLISH)
-                        .bind(chain_id)
-                        .bind(holder)
-                        .bind(platform_id)
-                        .execute(&mut *self.tx)
-                        .await?;
-                }
+                    Disclosure::Publish
+                };
+                self.disclose(*platform_id, *handle_node, handle.as_ref(), source, &at)
+                    .await?;
             }
 
             NamesEvent::HandleRetired {
@@ -905,38 +841,12 @@ impl Window {
                 holder,
                 platform_id,
             } => {
-                sqlx::query(sql::UNPUBLISH)
+                sqlx::query(sql::WITHDRAW_NAME)
                     .bind(chain_id)
                     .bind(holder)
                     .bind(platform_id)
                     .execute(&mut *self.tx)
                     .await?;
-            }
-
-            NamesEvent::PlatformConfigured { platform_id } => {
-                let key = nodes::Platform::key_of(*platform_id);
-                let reconfigured: bool = sqlx::query_scalar(sql::CONFIGURE_PLATFORM)
-                    .bind(chain_id)
-                    .bind(platform_id)
-                    .bind(key)
-                    .bind(block)
-                    .fetch_one(&mut *self.tx)
-                    .await?;
-                if reconfigured {
-                    // setPlatform ran again. If the rules changed, every
-                    // handle node on the platform is re-keyed on chain, and
-                    // this build's compiled-in rules may now normalize
-                    // differently than the contract. The event carries no
-                    // rules payload, so the honest move is to say so loudly
-                    // and keep indexing by node — node lookups stay exact
-                    // either way.
-                    tracing::warn!(
-                        %platform_id,
-                        block,
-                        "platform reconfigured on chain; if its rules changed, \
-                         string lookups need this build's rules updated and a re-index"
-                    );
-                }
             }
 
             NamesEvent::ProofVerifierConfigured { verifier } => {
@@ -952,6 +862,21 @@ impl Window {
             // client or a bind's fee, and the journal and histories hold both.
             NamesEvent::CeremonyBound { .. } | NamesEvent::BindFeePaid { .. } => {}
 
+            NamesEvent::Escrow(EscrowEvent::DepositedToHandle {
+                handle_node,
+                platform_id,
+                handle,
+            }) => {
+                self.disclose(
+                    *platform_id,
+                    *handle_node,
+                    handle.as_ref(),
+                    Disclosure::Escrow,
+                    &at,
+                )
+                .await?;
+            }
+
             NamesEvent::Escrow(escrow) => {
                 self.book_escrow(escrow, &at).await?;
             }
@@ -959,6 +884,54 @@ impl Window {
 
         self.record(involvement, &at).await?;
         Ok(true)
+    }
+
+    /// Record handle text the chain disclosed. Text that did not hash to its
+    /// node was dropped at decode, and there is nothing to record.
+    async fn disclose(
+        &mut self,
+        platform_id: B256,
+        handle_node: B256,
+        handle: Option<&DisclosedHandle>,
+        source: Disclosure,
+        at: &Position,
+    ) -> Result<(), ApplyError> {
+        let Some(handle) = handle else {
+            return Ok(());
+        };
+        sqlx::query(sql::DISCLOSE)
+            .bind(self.chain_id)
+            .bind(handle_node)
+            .bind(platform_id)
+            .bind(handle.as_str())
+            .bind(source.as_str())
+            .bind(at.block)
+            .bind(at.log_index)
+            .execute(&mut *self.tx)
+            .await?;
+        Ok(())
+    }
+}
+
+/// What disclosed a handle's text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disclosure {
+    /// A bind whose ceremony disclosed the handle.
+    Bind,
+    /// `publish`.
+    Publish,
+    /// `depositToHandle`.
+    Escrow,
+}
+
+impl Disclosure {
+    /// The name stored in `names.disclosures.source`.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bind => "bind",
+            Self::Publish => "publish",
+            Self::Escrow => "escrow",
+        }
     }
 }
 
@@ -971,14 +944,14 @@ impl Window {
 // which chain it came from. Handlers translate HTTP to these calls and rows
 // to JSON; they do not own queries.
 
-/// One `names.handles` row joined with the id it points back at: everything
-/// `resolveHandle` answers from.
+/// One `names.handles` row and its visible text: everything `resolveHandle`
+/// answers from.
 #[derive(sqlx::FromRow)]
 pub struct HandleRow {
     /// The chain the handle is bound on.
     pub chain_id: i64,
-    /// The normalized handle, as the chain emitted it.
-    pub handle: String,
+    /// The platform the handle lives on.
+    pub platform_id: B256,
     /// The storage key the chain filed this handle under.
     pub handle_node: B256,
     /// The holder, or `None` after retirement — the contract's `address(0)`.
@@ -991,8 +964,8 @@ pub struct HandleRow {
     pub ceremony_version: i64,
     /// The account id node this handle points back at (`idNodeByHandle`).
     pub id_node: B256,
-    /// The plaintext account id behind that node, when it was ever bound.
-    pub user_id: Option<String>,
+    /// The handle's text, while a disclosure of it is visible.
+    pub handle: Option<String>,
 }
 
 /// One `names.ids` row joined with the handle node it points at and the
@@ -1004,8 +977,6 @@ pub struct IdentityRow {
     pub chain_id: i64,
     /// The platform the account lives on.
     pub platform_id: B256,
-    /// The plaintext account id, byte-verbatim as the chain keys it.
-    pub user_id: String,
     /// The storage key the chain filed this account under.
     pub id_node: B256,
     /// The holder that proved the account.
@@ -1016,27 +987,27 @@ pub struct IdentityRow {
     pub ceremony_version: i64,
     /// The handle node this account last proved (`handleNodeById`).
     pub handle_node: B256,
-    /// The handle string at that node, when the node was ever bound.
+    /// That handle's text, while a disclosure of it is visible.
     pub handle: Option<String>,
     /// The holder the handle node currently resolves to.
     pub handle_owner: Option<Address>,
     /// The id node the handle currently points back at.
     pub handle_id_node: Option<B256>,
-    /// Whether a published row exists for (owner, platform, handle).
+    /// Whether the owner's published name on the platform is this handle.
     pub published: bool,
 }
 
 impl IdentityRow {
     /// The `handleNodeById`/`idNodeByHandle` round trip, written once: the
-    /// stored handle string is presentable only while the node still points
-    /// back at this id and still resolves to this wallet. Otherwise the
-    /// account renamed or was overtaken, and showing the stale string would
-    /// mis-route a payment.
+    /// handle is presentable only while the node still points back at this
+    /// id and still resolves to this wallet. Otherwise the account renamed
+    /// or was overtaken, and showing the stale handle would mis-route a
+    /// payment.
     pub fn handle_still_owned(&self) -> bool {
         self.handle_owner == Some(self.owner) && self.handle_id_node == Some(self.id_node)
     }
 
-    /// The handle to present, when it is still this account's.
+    /// The handle's text to present: visible, and still this account's.
     pub fn presentable_handle(&self) -> Option<&str> {
         if self.handle_still_owned() {
             self.handle.as_deref()
@@ -1052,19 +1023,22 @@ impl IdentityRow {
     }
 }
 
-/// One search hit: a live handle, its owner, and the id it pairs with.
+/// One search hit: a live, visible handle, its owner, and the id node it
+/// pairs with.
 #[derive(sqlx::FromRow)]
 pub struct SearchRow {
     /// The chain the handle is bound on.
     pub chain_id: i64,
     /// The platform the handle lives on.
     pub platform_id: B256,
-    /// The normalized handle.
+    /// The storage key the chain filed the handle under.
+    pub handle_node: B256,
+    /// The account id node behind it (`idNodeByHandle`).
+    pub id_node: B256,
+    /// The handle's text.
     pub handle: String,
     /// The holder it resolves to (retired handles never match).
     pub owner: Address,
-    /// The account id behind it, when bound.
-    pub user_id: Option<String>,
     /// Whether the owner displays this handle.
     pub published: bool,
 }
@@ -1100,9 +1074,8 @@ impl Store {
         Ok(found.is_some())
     }
 
-    /// Whether any chain in scope ever configured this platform — the
-    /// difference between the contract's `UnknownPlatform` revert and its
-    /// zero-address answer.
+    /// Whether any chain in scope ever bound on this platform: the half of
+    /// the contract's `UnknownPlatform` an index can see.
     pub async fn platform_wired(
         &self,
         chain: Option<i64>,
@@ -1121,31 +1094,27 @@ impl Store {
         Ok(found.is_some())
     }
 
-    /// The rows `resolveHandle` answers from, one per chain the handle is
-    /// bound on, by the platform and the chain-normalized handle. Demanding
-    /// [`NormalizedHandle`] keeps a raw query string — which would never
-    /// match a stored row — out of the SQL.
+    /// The rows `resolveHandle` answers from, one per chain the handle node
+    /// is bound on.
     pub async fn resolve_handle(
         &self,
         chain: Option<i64>,
-        platform_id: B256,
-        handle: &NormalizedHandle,
+        handle_node: B256,
     ) -> Result<Vec<HandleRow>, sqlx::Error> {
-        handle_lookup("", chain, platform_id, handle)
+        handle_lookup("", chain, handle_node)
             .build_query_as()
             .fetch_all(&self.pool)
             .await
     }
 
-    /// The rows `resolveId` answers from, one per chain the account is bound
-    /// on. The id is matched byte-verbatim, exactly as the chain keys it.
+    /// The rows `resolveId` answers from, one per chain the id node is bound
+    /// on.
     pub async fn resolve_id(
         &self,
         chain: Option<i64>,
-        platform_id: B256,
-        user_id: &str,
+        id_node: B256,
     ) -> Result<Vec<IdentityRow>, sqlx::Error> {
-        id_lookup("", chain, platform_id, user_id)
+        id_lookup("", chain, id_node)
             .build_query_as()
             .fetch_all(&self.pool)
             .await
@@ -1164,9 +1133,9 @@ impl Store {
             .await
     }
 
-    /// Live handles a search lists, across the chains in scope: those a
-    /// wallet holds, those matching a folded partial query — exact first,
-    /// then prefix, then substring, then trigram-fuzzy — or both.
+    /// Live, visible handles a search lists, across the chains in scope:
+    /// those a wallet holds, those matching a folded partial query — exact
+    /// first, then prefix, then substring, then trigram-fuzzy — or both.
     pub async fn search_handles(
         &self,
         chain: Option<i64>,
@@ -1184,18 +1153,18 @@ impl Store {
 }
 
 impl ChainStore {
-    /// The row `resolveHandle` answers from on this chain, for a reader that
-    /// speaks for one chain at a time — the ENS gateway, which was asked by
-    /// coin type.
-    pub async fn resolve_handle(
+    /// The holder the ENS gateway answers for a handle node on this chain.
+    /// `ens_holder.sql` says which bindings it answers for.
+    pub async fn ens_holder(
         &self,
-        platform_id: B256,
-        handle: &NormalizedHandle,
-    ) -> Result<Option<HandleRow>, sqlx::Error> {
-        let mut rows = Store::new(self.pool.clone())
-            .resolve_handle(Some(self.chain_id), platform_id, handle)
+        handle_node: B256,
+    ) -> Result<Option<Address>, sqlx::Error> {
+        let holder: Option<Option<Address>> = sqlx::query_scalar(sql::ENS_HOLDER)
+            .bind(self.chain_id)
+            .bind(handle_node)
+            .fetch_optional(&self.pool)
             .await?;
-        Ok(rows.pop())
+        Ok(holder.flatten())
     }
 }
 
@@ -1220,39 +1189,23 @@ fn scoped(statement: &mut Statement, column: &'static str, chain: Option<i64>) {
     }
 }
 
-fn handle_lookup(
-    prefix: &str,
-    chain: Option<i64>,
-    platform_id: B256,
-    handle: &NormalizedHandle,
-) -> Statement {
+fn handle_lookup(prefix: &str, chain: Option<i64>, handle_node: B256) -> Statement {
     let mut statement = QueryBuilder::new(format!(
-        "{prefix}{} WHERE h.platform_id = ",
+        "{prefix}{} WHERE h.handle_node = ",
         sql::HANDLE_PROJECTION
     ));
-    statement
-        .push_bind(platform_id)
-        .push(" AND h.handle = ")
-        .push_bind(handle.as_str().to_string());
+    statement.push_bind(handle_node);
     scoped(&mut statement, "h.chain_id", chain);
     statement.push(" ORDER BY h.chain_id");
     statement
 }
 
-fn id_lookup(
-    prefix: &str,
-    chain: Option<i64>,
-    platform_id: B256,
-    user_id: &str,
-) -> Statement {
+fn id_lookup(prefix: &str, chain: Option<i64>, id_node: B256) -> Statement {
     let mut statement = QueryBuilder::new(format!(
-        "{prefix}{} WHERE i.platform_id = ",
+        "{prefix}{} WHERE i.id_node = ",
         sql::IDENTITY_PROJECTION
     ));
-    statement
-        .push_bind(platform_id)
-        .push(" AND i.user_id = ")
-        .push_bind(user_id.to_string());
+    statement.push_bind(id_node);
     scoped(&mut statement, "i.chain_id", chain);
     statement.push(" ORDER BY i.chain_id");
     statement
@@ -1265,7 +1218,7 @@ fn identities_lookup(prefix: &str, chain: Option<i64>, owner: Address) -> Statem
     ));
     statement.push_bind(owner);
     scoped(&mut statement, "i.chain_id", chain);
-    statement.push(" ORDER BY i.chain_id, i.platform_id, i.user_id");
+    statement.push(" ORDER BY i.chain_id, i.platform_id, i.id_node");
     statement
 }
 
@@ -1296,22 +1249,22 @@ fn search_lookup(
         Some(query) => {
             let like = escape_like(query);
             statement
-                .push(" AND (h.handle LIKE '%' || ")
+                .push(" AND (v.handle LIKE '%' || ")
                 .push_bind(like.clone())
-                .push(r#" || '%' ESCAPE '\' OR h.handle % "#)
+                .push(r#" || '%' ESCAPE '\' OR v.handle % "#)
                 .push_bind(query.to_string())
-                .push(") ORDER BY (h.handle = ")
+                .push(") ORDER BY (v.handle = ")
                 .push_bind(query.to_string())
-                .push(") DESC, (h.handle LIKE ")
+                .push(") DESC, (v.handle LIKE ")
                 .push_bind(like.clone())
-                .push(r#" || '%' ESCAPE '\') DESC, (h.handle LIKE '%' || "#)
+                .push(r#" || '%' ESCAPE '\') DESC, (v.handle LIKE '%' || "#)
                 .push_bind(like)
-                .push(r#" || '%' ESCAPE '\') DESC, similarity(h.handle, "#)
+                .push(r#" || '%' ESCAPE '\') DESC, similarity(v.handle, "#)
                 .push_bind(query.to_string())
-                .push(") DESC, h.handle ASC, h.chain_id ASC");
+                .push(") DESC, v.handle ASC, h.chain_id ASC");
         }
         None => {
-            statement.push(" ORDER BY h.handle ASC, h.chain_id ASC");
+            statement.push(" ORDER BY v.handle ASC, h.chain_id ASC");
         }
     }
     statement
@@ -1348,9 +1301,12 @@ mod sql {
     pub const UPSERT_ID: &str = include_str!("../sql/upsert_id.sql");
     pub const UPSERT_HANDLE: &str = include_str!("../sql/upsert_handle.sql");
     pub const PUBLISH: &str = include_str!("../sql/publish.sql");
-    pub const UNPUBLISH: &str = include_str!("../sql/unpublish.sql");
+    pub const WITHDRAW_NAME: &str = include_str!("../sql/withdraw_name.sql");
+    pub const BOUND_IN_TX: &str = include_str!("../sql/bound_in_tx.sql");
+    pub const DISCLOSE: &str = include_str!("../sql/disclose.sql");
     pub const RETIRE_HANDLE: &str = include_str!("../sql/retire_handle.sql");
-    pub const CONFIGURE_PLATFORM: &str = include_str!("../sql/configure_platform.sql");
+    pub const RECORD_PLATFORM: &str = include_str!("../sql/record_platform.sql");
+    pub const ENS_HOLDER: &str = include_str!("../sql/ens_holder.sql");
     pub const CHAIN_NAMES_TAKEN: &str = include_str!("../sql/chain_names_taken.sql");
     /// The names the chain goes by in an ENS name.
     pub const CLEAR_CHAIN_NAMES: &str = include_str!("../sql/clear_chain_names.sql");
@@ -1360,17 +1316,14 @@ mod sql {
     pub const SYNCED: &str = include_str!("../sql/synced.sql");
     pub const PLATFORM_WIRED: &str = include_str!("../sql/platform_wired.sql");
     /// The projection every `names.ids` read shares: the row itself, the
-    /// handle it points at, and whether that pair is displayed. Written once
-    /// because it was written three times: the joins encode which columns
-    /// of which table a row is assembled from, so a change to
-    /// `names.published` — the one most likely to move — has to reach every
-    /// reader. A caller appends its own `WHERE`, the only part that differs.
+    /// handle it points at, and whether that pair is displayed. A caller
+    /// appends its own `WHERE`, the only part that differs.
     pub const IDENTITY_PROJECTION: &str = include_str!("../sql/identity_projection.sql");
-    /// The projection every `names.handles` read shares: the row and the id
-    /// it points back at. A caller appends its `WHERE`.
+    /// The projection every `names.handles` read shares: the row and its
+    /// visible text. A caller appends its `WHERE`.
     pub const HANDLE_PROJECTION: &str = include_str!("../sql/handle_projection.sql");
-    /// Live handles with their id and display flag; the caller narrows,
-    /// orders and pages.
+    /// Live, visible handles with their id node and display flag; the caller
+    /// narrows, orders and pages.
     pub const SEARCH_PROJECTION: &str = include_str!("../sql/search_projection.sql");
     pub const ESCROW_DEPOSIT: &str = include_str!("../sql/escrow_deposit.sql");
     pub const ESCROW_BOOK_REFUNDABLE: &str =
@@ -1455,29 +1408,29 @@ pub(crate) mod plan_tests {
     /// The resolution and search lookups, in every shape the API asks them.
     async fn plans(conn: &mut PgConnection) -> Vec<Plan> {
         let platform = B256::repeat_byte(1);
-        let handle = NormalizedHandle::from_chain("alice");
+        let node = B256::repeat_byte(3);
         let owner = Address::repeat_byte(2);
         let mut plans = Vec::new();
         for (name, seeks, statement) in [
             (
-                "handle, any chain",
-                Some(&["handles_platform_handle_chain_idx"][..]),
-                handle_lookup("EXPLAIN ", None, platform, &handle),
+                "handle node, any chain",
+                Some(&["handles_node_chain_idx"][..]),
+                handle_lookup("EXPLAIN ", None, node),
             ),
             (
-                "handle, one chain",
-                Some(&["handles_platform_handle_chain_idx"][..]),
-                handle_lookup("EXPLAIN ", Some(1), platform, &handle),
+                "handle node, one chain",
+                Some(&["handles_pkey|handles_node_chain_idx"][..]),
+                handle_lookup("EXPLAIN ", Some(1), node),
             ),
             (
-                "id, any chain",
-                Some(&["ids_platform_user_chain_idx"][..]),
-                id_lookup("EXPLAIN ", None, platform, "111"),
+                "id node, any chain",
+                Some(&["ids_node_chain_idx"][..]),
+                id_lookup("EXPLAIN ", None, node),
             ),
             (
-                "id, one chain",
-                Some(&["ids_platform_user_chain_idx"][..]),
-                id_lookup("EXPLAIN ", Some(1), platform, "111"),
+                "id node, one chain",
+                Some(&["ids_pkey|ids_node_chain_idx"][..]),
+                id_lookup("EXPLAIN ", Some(1), node),
             ),
             (
                 "wallet, any chain",
@@ -1528,6 +1481,51 @@ pub(crate) mod plan_tests {
         ] {
             plans.push(Plan::of(conn, name, seeks, statement).await);
         }
+
+        let reads = [
+            (
+                "the gateway's holder",
+                &["handles_pkey|handles_node_chain_idx"][..],
+                sqlx::query_scalar::<_, String>(&explain(sql::ENS_HOLDER))
+                    .bind(1i64)
+                    .bind(node)
+                    .fetch_all(&mut *conn)
+                    .await,
+            ),
+            (
+                "a publish's bind",
+                &["events_pkey"][..],
+                sqlx::query_scalar(&explain(sql::BOUND_IN_TX))
+                    .bind(1i64)
+                    .bind(10i64)
+                    .bind(node)
+                    .bind(3i64)
+                    .bind(node.to_string())
+                    .fetch_all(&mut *conn)
+                    .await,
+            ),
+            (
+                "a withdrawn name",
+                &[
+                    "published_pkey",
+                    "disclosures_pkey|disclosures_node_chain_idx",
+                ][..],
+                sqlx::query_scalar(&explain(sql::WITHDRAW_NAME))
+                    .bind(1i64)
+                    .bind(owner)
+                    .bind(platform)
+                    .fetch_all(&mut *conn)
+                    .await,
+            ),
+        ];
+        for (name, seeks, text) in reads {
+            let text: Vec<String> = text.unwrap_or_else(|e| panic!("{name}: {e}"));
+            plans.push(Plan {
+                name,
+                seeks: Some(seeks),
+                text: text.join("\n"),
+            });
+        }
         plans
     }
 
@@ -1575,6 +1573,7 @@ pub(crate) mod plan_tests {
                 "handles",
                 "ids",
                 "published",
+                "disclosures",
                 "events",
                 "escrow_held",
                 "escrow_refundable",

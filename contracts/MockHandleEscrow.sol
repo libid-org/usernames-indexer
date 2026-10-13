@@ -2,15 +2,15 @@
 pragma solidity ^0.8.20;
 
 /// @notice Test double for the indexer: the exact event surface of
-///         HandleEscrow, each behind a function that just emits it, and the
+///         HandleEscrow, each behind a function that just emits it, a
+///         `depositToHandle`'s two events in the order it emits them, and the
 ///         `registry` view the indexer reads at startup. The integration test
 ///         deploys this on anvil beside MockIdentityRegistry, so the indexer
 ///         decodes real ABI-encoded logs from two emitters.
 ///
 ///         Event signatures are copied verbatim from
-///         libid-contracts/solidity/contracts/escrow/HandleEscrow.sol — a
-///         drifted copy here fails the integration test against the bindings,
-///         which come from the published crate.
+///         libid-contracts/solidity/contracts/escrow/HandleEscrow.sol; the
+///         anvil suite checks every topic against the crate's bindings.
 contract MockHandleEscrow {
     address public immutable registry;
 
@@ -23,16 +23,15 @@ contract MockHandleEscrow {
         address indexed token,
         address indexed refundTo,
         address depositor,
-        bytes32 platformId,
         uint256 round,
         uint256 amount
     );
+    event DepositedToHandle(bytes32 indexed handleNode, bytes32 indexed platformId, string handle);
     event Forwarded(
         bytes32 indexed handleNode,
         address indexed token,
         address indexed depositor,
         address holder,
-        bytes32 platformId,
         uint256 amount,
         uint256 received
     );
@@ -60,11 +59,25 @@ contract MockHandleEscrow {
         address token,
         address refundTo,
         address depositor,
-        bytes32 platformId,
         uint256 round,
         uint256 amount
     ) external {
-        emit Deposited(handleNode, token, refundTo, depositor, platformId, round, amount);
+        emit Deposited(handleNode, token, refundTo, depositor, round, amount);
+    }
+
+    /// @notice A `depositToHandle` into a node nobody holds.
+    function emitDepositedToHandle(
+        bytes32 handleNode,
+        address token,
+        address refundTo,
+        address depositor,
+        uint256 round,
+        uint256 amount,
+        bytes32 platformId,
+        string calldata handle
+    ) external {
+        emit Deposited(handleNode, token, refundTo, depositor, round, amount);
+        emit DepositedToHandle(handleNode, platformId, handle);
     }
 
     function emitForwarded(
@@ -72,11 +85,10 @@ contract MockHandleEscrow {
         address token,
         address depositor,
         address holder,
-        bytes32 platformId,
         uint256 amount,
         uint256 received
     ) external {
-        emit Forwarded(handleNode, token, depositor, holder, platformId, amount, received);
+        emit Forwarded(handleNode, token, depositor, holder, amount, received);
     }
 
     function emitClaimed(

@@ -51,7 +51,7 @@ use usernames_core::{
         NamesEvent,
     },
     nodes::{
-        self,
+        DisclosedHandle,
         KnownPlatform,
     },
 };
@@ -121,36 +121,43 @@ pub fn legacy_addr_call(labels: &[&str]) -> Vec<u8> {
     .abi_encode()
 }
 
-/// Seed one binding into the read model the gateway answers from.
+/// Seed one X binding into the read model the gateway answers from: a
+/// disclosing bind, its `IdentityBound` and `HandlePublished` in one
+/// transaction, with the chain's SHA nodes.
 pub async fn bind(store: &ChainStore, handle: &str, holder: Address) {
-    let platform = KnownPlatform::X.id();
-    let event = NamesEvent::IdentityBound {
-        holder,
-        id_node: nodes::id_node(platform, "42"),
-        handle_node: nodes::handle_node(
-            platform,
-            &nodes::NormalizedHandle::from_chain(handle),
-        ),
-        platform_id: platform,
-        id: "42".into(),
-        handle: handle.into(),
-        observed_at: 1_700_000_000,
-        ceremony_version: 1,
-        published: true,
-    };
+    let x = KnownPlatform::X;
+    let handle_node = x.handle_node(handle).expect("an X handle");
+    let events = [
+        NamesEvent::IdentityBound {
+            holder,
+            id_node: x.id_node("42").expect("an X id"),
+            handle_node,
+            platform_id: x.id(),
+            observed_at: 1_700_000_000,
+            ceremony_version: 1,
+        },
+        NamesEvent::HandlePublished {
+            holder,
+            platform_id: x.id(),
+            handle_node,
+            handle: DisclosedHandle::verify(x.id(), handle_node, handle),
+        },
+    ];
     let mut window = store.begin_window().await.expect("begin");
-    window
-        .apply(
-            &event,
-            &LogPosition {
-                block_number: 1,
-                log_index: 0,
-                tx_hash: B256::from([1u8; 32]),
-                block_time: 1_700_000_000,
-            },
-        )
-        .await
-        .expect("apply");
+    for (log_index, event) in (0u64..).zip(&events) {
+        window
+            .apply(
+                event,
+                &LogPosition {
+                    block_number: 1,
+                    log_index,
+                    tx_hash: B256::from([1u8; 32]),
+                    block_time: 1_700_000_000,
+                },
+            )
+            .await
+            .expect("apply");
+    }
     window.commit(1).await.expect("commit");
     // The indexer records both every cycle, and the gateway refuses to answer
     // from an index that cannot say how far behind it is. Staleness is measured

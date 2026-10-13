@@ -209,18 +209,23 @@ impl Window {
                 involvement.handle_node = ceremony.handle_node;
             }
 
+            NamesEvent::HandlePublished {
+                handle_node,
+                platform_id,
+                ..
+            }
+            | NamesEvent::Escrow(EscrowEvent::DepositedToHandle {
+                handle_node,
+                platform_id,
+                ..
+            }) => involvement.named(*handle_node, *platform_id),
+
+            // A deposit names no platform; the `DepositedToHandle` after it,
+            // or a bind, does.
             NamesEvent::Escrow(
-                EscrowEvent::Deposited {
-                    handle_node,
-                    platform_id,
-                    ..
-                }
-                | EscrowEvent::Forwarded {
-                    handle_node,
-                    platform_id,
-                    ..
-                },
-            ) => involvement.named(*handle_node, *platform_id),
+                EscrowEvent::Deposited { handle_node, .. }
+                | EscrowEvent::Forwarded { handle_node, .. },
+            ) => involvement.handle_node = Some(*handle_node),
 
             // A claim ends the refunds of everybody whose deposit it took:
             // the round's refundable rows, read before the claim deletes them.
@@ -248,8 +253,7 @@ impl Window {
                 involvement.handle_node = Some(*handle_node);
             }
 
-            NamesEvent::PlatformConfigured { .. }
-            | NamesEvent::ProofVerifierConfigured { .. } => {}
+            NamesEvent::ProofVerifierConfigured { .. } => {}
         }
 
         Ok(involvement)
@@ -376,7 +380,7 @@ pub struct HistoryRow {
     pub handle_node: Option<B256>,
     /// That node's platform.
     pub platform_id: Option<B256>,
-    /// That handle's text, when a bind ever carried it.
+    /// That handle's text, while a disclosure of it is visible.
     pub handle: Option<String>,
 }
 
@@ -566,7 +570,10 @@ pub(crate) mod plans {
         let reads = [
             (
                 "previous holders",
-                &["handles_pkey", "ids_pkey"][..],
+                &[
+                    "handles_pkey|handles_node_chain_idx",
+                    "ids_pkey|ids_node_chain_idx",
+                ][..],
                 sqlx::query_scalar::<_, String>(&explain(sql::PREVIOUS_HOLDERS))
                     .bind(1i64)
                     .bind(node)
@@ -576,7 +583,7 @@ pub(crate) mod plans {
             ),
             (
                 "a retired handle's holder",
-                &["handles_pkey"][..],
+                &["handles_pkey|handles_node_chain_idx"][..],
                 sqlx::query_scalar(&explain(sql::HANDLE_HOLDER))
                     .bind(1i64)
                     .bind(node)
@@ -585,7 +592,7 @@ pub(crate) mod plans {
             ),
             (
                 "an unpublished handle",
-                &["published_pkey", "handles_platform_handle_chain_idx"][..],
+                &["published_pkey"][..],
                 sqlx::query_scalar(&explain(sql::PUBLISHED_HANDLE_NODE))
                     .bind(1i64)
                     .bind(address)

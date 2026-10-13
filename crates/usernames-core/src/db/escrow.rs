@@ -140,8 +140,9 @@ impl Window {
             }
 
             // Paid straight to the holder: nothing is held, and the
-            // histories are the whole record of it.
-            EscrowEvent::Forwarded { .. } => {}
+            // histories are the whole record of it. A handle's text is the
+            // disclosures', recorded by the window.
+            EscrowEvent::Forwarded { .. } | EscrowEvent::DepositedToHandle { .. } => {}
         }
         Ok(())
     }
@@ -153,12 +154,12 @@ impl Window {
 pub struct EscrowSlotRow {
     /// The chain the escrow holds it on.
     pub chain_id: i64,
-    /// The platform of the handle.
-    pub platform_id: B256,
+    /// The platform of the handle, once a bind or a `DepositedToHandle`
+    /// named it.
+    pub platform_id: Option<B256>,
     /// The handle node the amount is held against.
     pub handle_node: B256,
-    /// The handle, when a bind ever carried its text. A deposit carries only
-    /// the node, so a handle nobody has bound is known by its node alone.
+    /// The handle's text, while a disclosure of it is visible.
     pub handle: Option<String>,
     /// Who holds the handle now and may claim: `None` while nobody does.
     pub holder: Option<Address>,
@@ -621,8 +622,10 @@ pub(crate) mod plans {
             chain_id: 1,
             handle_node: node,
         });
+        // The slots drive the page; a holder's handle is checked by either
+        // index, at equal cost.
         let claimable: &[&str] = &[
-            "handles_owner_chain_node_idx",
+            "handles_owner_chain_node_idx|handles_node_chain_idx",
             "escrow_held_node_idx|escrow_held_pkey",
         ];
         let refundable: &[&str] = &["escrow_refundable_pkey"];

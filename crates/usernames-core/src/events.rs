@@ -32,6 +32,8 @@ use serde::{
     Serialize,
 };
 use serde_json::Value;
+
+use crate::nodes::DisclosedHandle;
 use serde_with::{
     serde_as,
     DeserializeFromStr,
@@ -69,20 +71,26 @@ pub struct LogPosition {
 )]
 #[allow(missing_docs)]
 pub enum NamesEvent {
-    /// A holder proved an identity. The main event: carries the plaintext
-    /// id and normalized handle, so the read model needs no on-chain
-    /// strings. The ceremony version is logged and never stored on chain, so
-    /// this side is its only record.
+    /// A holder proved an identity: its two nodes, never the id or handle.
+    /// The ceremony version is logged and never stored on chain, so this
+    /// side is its only record.
     IdentityBound {
         holder: Address,
         id_node: B256,
         handle_node: B256,
         platform_id: B256,
-        id: String,
-        handle: String,
         observed_at: u64,
-        published: bool,
         ceremony_version: u16,
+    },
+    /// A holder disclosed its handle as its name on a platform, by a
+    /// disclosing bind or by `publish`. `handle` is the text when it hashes to
+    /// `handle_node`; the journal never holds it.
+    HandlePublished {
+        holder: Address,
+        platform_id: B256,
+        handle_node: B256,
+        #[serde(skip)]
+        handle: Option<DisclosedHandle>,
     },
     /// The identity behind a handle proved a different one; the old node
     /// stops resolving but keeps its observed-at watermark.
@@ -91,10 +99,9 @@ pub enum NamesEvent {
         handle_node: B256,
         holder: Address,
     },
-    /// A holder withdrew its published handle.
+    /// A holder's published handle was withdrawn: by the holder, or by a
+    /// bind that took the handle from it.
     HandleUnpublished { holder: Address, platform_id: B256 },
-    /// A platform's handle rules were configured or reconfigured.
-    PlatformConfigured { platform_id: B256 },
     /// The contract was pointed at the Proof Verifier that checks every claim
     /// and holds the version set the contract itself does not.
     ProofVerifierConfigured { verifier: Address },
@@ -136,11 +143,19 @@ pub enum EscrowEvent {
         token: Address,
         refund_to: Address,
         depositor: Address,
-        platform_id: B256,
         #[serde_as(as = "DisplayFromStr")]
         round: U256,
         #[serde_as(as = "DisplayFromStr")]
         amount: U256,
+    },
+    /// A deposit named its handle as text, after its `Deposited` or
+    /// `Forwarded`. `handle` is the text, folded, when it hashes to
+    /// `handle_node`; the journal never holds it.
+    DepositedToHandle {
+        handle_node: B256,
+        platform_id: B256,
+        #[serde(skip)]
+        handle: Option<DisclosedHandle>,
     },
     /// A deposit for a held node, paid straight to its holder.
     Forwarded {
@@ -148,7 +163,6 @@ pub enum EscrowEvent {
         token: Address,
         depositor: Address,
         holder: Address,
-        platform_id: B256,
         #[serde_as(as = "DisplayFromStr")]
         amount: U256,
         #[serde_as(as = "DisplayFromStr")]
@@ -264,9 +278,9 @@ impl NamesEvent {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::IdentityBound { .. } => "identity_bound",
+            Self::HandlePublished { .. } => "handle_published",
             Self::HandleRetired { .. } => "handle_retired",
             Self::HandleUnpublished { .. } => "handle_unpublished",
-            Self::PlatformConfigured { .. } => "platform_configured",
             Self::ProofVerifierConfigured { .. } => "proof_verifier_configured",
             Self::CeremonyBound { .. } => "ceremony_bound",
             Self::BindFeePaid { .. } => "bind_fee_paid",
@@ -279,13 +293,12 @@ impl NamesEvent {
     pub fn parties(&self) -> Vec<(Address, Role)> {
         match self {
             Self::IdentityBound { holder, .. }
+            | Self::HandlePublished { holder, .. }
             | Self::HandleUnpublished { holder, .. }
             | Self::CeremonyBound { holder, .. } => vec![(*holder, Role::Holder)],
             Self::HandleRetired { .. } => Vec::new(),
             Self::BindFeePaid { receiver, .. } => vec![(*receiver, Role::FeeReceiver)],
-            Self::PlatformConfigured { .. } | Self::ProofVerifierConfigured { .. } => {
-                Vec::new()
-            }
+            Self::ProofVerifierConfigured { .. } => Vec::new(),
             Self::Escrow(event) => event.parties(),
         }
     }
@@ -315,11 +328,27 @@ impl NamesEvent {
     }
 }
 
+#[cfg(test)]
+impl NamesEvent {
+    /// The event as its journal row reads back: disclosed text dropped.
+    fn without_text(mut self) -> Self {
+        match &mut self {
+            Self::HandlePublished { handle, .. }
+            | Self::Escrow(EscrowEvent::DepositedToHandle { handle, .. }) => {
+                *handle = None
+            }
+            _ => {}
+        }
+        self
+    }
+}
+
 impl EscrowEvent {
     /// The journal's `kind` discriminator.
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Deposited { .. } => "deposited",
+            Self::DepositedToHandle { .. } => "deposited_to_handle",
             Self::Forwarded { .. } => "forwarded",
             Self::Claimed { .. } => "claimed",
             Self::Refunded { .. } => "refunded",
@@ -334,6 +363,7 @@ impl EscrowEvent {
                 depositor,
                 ..
             } => vec![(*depositor, Role::Depositor), (*refund_to, Role::RefundTo)],
+            Self::DepositedToHandle { .. } => Vec::new(),
             Self::Forwarded {
                 depositor, holder, ..
             } => vec![(*depositor, Role::Depositor), (*holder, Role::Holder)],
@@ -377,6 +407,26 @@ fn payload_of<E: SolEvent>(log: &Log, event: &'static str) -> Result<E, DecodeEr
         .map_err(|source| DecodeError::Payload { event, source })
 }
 
+/// The text an event disclosed, when it hashes to the node the event names.
+/// Text that does not is dropped and logged without itself.
+fn disclosed(
+    event: &'static str,
+    platform_id: B256,
+    handle_node: B256,
+    text: &str,
+) -> Option<DisclosedHandle> {
+    let verified = DisclosedHandle::verify(platform_id, handle_node, text);
+    if verified.is_none() {
+        tracing::warn!(
+            event,
+            %platform_id,
+            %handle_node,
+            "disclosed text does not hash to its node; not stored"
+        );
+    }
+    verified
+}
+
 impl LogPosition {
     /// Where a mined log sat. An RPC that omits the block's timestamp fails
     /// the window rather than writing a history with no time in it.
@@ -418,11 +468,16 @@ pub fn decode_registry(
             id_node: d.idNode,
             handle_node: d.handleNode,
             platform_id: d.platformId,
-            id: d.id,
-            handle: d.handle,
             observed_at: d.observedAt,
-            published: d.published,
             ceremony_version: d.ceremonyVersion,
+        }
+    } else if topic0 == IdentityRegistry::HandlePublished::SIGNATURE_HASH {
+        let d: IdentityRegistry::HandlePublished = payload_of(log, "HandlePublished")?;
+        NamesEvent::HandlePublished {
+            holder: d.holder,
+            platform_id: d.platformId,
+            handle_node: d.handleNode,
+            handle: disclosed("HandlePublished", d.platformId, d.handleNode, &d.handle),
         }
     } else if topic0 == IdentityRegistry::HandleRetired::SIGNATURE_HASH {
         let d: IdentityRegistry::HandleRetired = payload_of(log, "HandleRetired")?;
@@ -436,12 +491,6 @@ pub fn decode_registry(
             payload_of(log, "HandleUnpublished")?;
         NamesEvent::HandleUnpublished {
             holder: d.holder,
-            platform_id: d.platformId,
-        }
-    } else if topic0 == IdentityRegistry::PlatformConfigured::SIGNATURE_HASH {
-        let d: IdentityRegistry::PlatformConfigured =
-            payload_of(log, "PlatformConfigured")?;
-        NamesEvent::PlatformConfigured {
             platform_id: d.platformId,
         }
     } else if topic0 == IdentityRegistry::ProofVerifierConfigured::SIGNATURE_HASH {
@@ -491,9 +540,15 @@ pub fn decode_escrow(
             token: d.token,
             refund_to: d.refundTo,
             depositor: d.depositor,
-            platform_id: d.platformId,
             round: d.round,
             amount: d.amount,
+        }
+    } else if topic0 == HandleEscrow::DepositedToHandle::SIGNATURE_HASH {
+        let d: HandleEscrow::DepositedToHandle = payload_of(log, "DepositedToHandle")?;
+        EscrowEvent::DepositedToHandle {
+            handle_node: d.handleNode,
+            platform_id: d.platformId,
+            handle: disclosed("DepositedToHandle", d.platformId, d.handleNode, &d.handle),
         }
     } else if topic0 == HandleEscrow::Forwarded::SIGNATURE_HASH {
         let d: HandleEscrow::Forwarded = payload_of(log, "Forwarded")?;
@@ -502,7 +557,6 @@ pub fn decode_escrow(
             token: d.token,
             depositor: d.depositor,
             holder: d.holder,
-            platform_id: d.platformId,
             amount: d.amount,
             received: d.received,
         }
@@ -546,6 +600,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::nodes::KnownPlatform;
 
     const HOLDER: Address = Address::repeat_byte(0xA1);
     const PLATFORM: B256 = B256::repeat_byte(0x0C);
@@ -572,7 +627,15 @@ mod tests {
     fn topics_match_the_contract() {
         assert_eq!(
             IdentityRegistry::IdentityBound::SIGNATURE_HASH,
-            b256!("8ae08d06a548b84d8340ef35ae06cd4c34983cd87b5554e6c818b8180530950c")
+            b256!("7de04595ed86c830556fbd7a7b60045145ee35b154a004b0c530ef91a4bd836c")
+        );
+        assert_eq!(
+            IdentityRegistry::HandlePublished::SIGNATURE_HASH,
+            b256!("e6f96c6f941ac3c40f5739ffdc56fd29f1fa4428e11a3f0640b3531574cfd06c")
+        );
+        assert_eq!(
+            IdentityRegistry::HandleRetired::SIGNATURE_HASH,
+            b256!("278e2122d24782b703f05416ac53a9750d67bcf6fa1603b94ec95660821a8914")
         );
         assert_eq!(
             IdentityRegistry::CeremonyBound::SIGNATURE_HASH,
@@ -615,16 +678,20 @@ mod tests {
         assert_eq!(position.block_time, 1_700_000_000);
     }
 
-    /// The same fixed points for `HandleEscrow.sol`'s four events.
+    /// The same fixed points for `HandleEscrow.sol`'s five events.
     #[test]
     fn escrow_topics_match_the_contract() {
         assert_eq!(
             HandleEscrow::Deposited::SIGNATURE_HASH,
-            b256!("71c8ac17b0d61cd3caffe11aa02503df41a1ce9009949c95908b0acce726a03d")
+            b256!("1ffc9b3e17a608abd621c9a1d46d5ea433d46ee04324e33c270ace681efe77a2")
+        );
+        assert_eq!(
+            HandleEscrow::DepositedToHandle::SIGNATURE_HASH,
+            b256!("97acd3a452fdde6e34045582f8f430e3d6c3bb485e62407340311cf17314fe06")
         );
         assert_eq!(
             HandleEscrow::Forwarded::SIGNATURE_HASH,
-            b256!("03859cb562640b930fb7d5def4727f9aeb85fbed245fad32eb049ee0422dc84d")
+            b256!("afdf4d834a7c59206d8f48e1bb08e8625d11809b936b1eea92c3333534bdf7c3")
         );
         assert_eq!(
             HandleEscrow::Claimed::SIGNATURE_HASH,
@@ -647,7 +714,6 @@ mod tests {
                 token,
                 refundTo: payer,
                 depositor: payer,
-                platformId: PLATFORM,
                 round: U256::from(2u64),
                 amount: U256::MAX,
             }
@@ -705,23 +771,31 @@ mod tests {
     }
 
     /// Every kind, the largest `uint256` included, reads back from the
-    /// journal row its payload writes.
+    /// journal row its payload writes: all of it but disclosed text, which
+    /// the journal never holds.
     #[test]
     fn every_event_reads_back_from_its_journal_row() {
         let (a, b) = (Address::repeat_byte(0xA1), Address::repeat_byte(0xB2));
         let (n, p) = (B256::repeat_byte(0x0D), B256::repeat_byte(0x0C));
         let big = U256::MAX - U256::from(1u64);
+        let x = KnownPlatform::X;
+        let alice = x.handle_node("alice").unwrap();
+        let text = DisclosedHandle::verify(x.id(), alice, "Alice");
+        assert!(text.is_some());
         let events = [
             NamesEvent::IdentityBound {
                 holder: a,
                 id_node: n,
                 handle_node: p,
                 platform_id: PLATFORM,
-                id: "1234".into(),
-                handle: "alice".into(),
                 observed_at: u64::MAX,
-                published: true,
                 ceremony_version: u16::MAX,
+            },
+            NamesEvent::HandlePublished {
+                holder: a,
+                platform_id: x.id(),
+                handle_node: alice,
+                handle: text.clone(),
             },
             NamesEvent::HandleRetired {
                 platform_id: PLATFORM,
@@ -730,9 +804,6 @@ mod tests {
             },
             NamesEvent::HandleUnpublished {
                 holder: a,
-                platform_id: PLATFORM,
-            },
-            NamesEvent::PlatformConfigured {
                 platform_id: PLATFORM,
             },
             NamesEvent::ProofVerifierConfigured { verifier: b },
@@ -752,16 +823,19 @@ mod tests {
                 token: b,
                 refund_to: a,
                 depositor: a,
-                platform_id: PLATFORM,
                 round: U256::from(2u64),
                 amount: U256::MAX,
+            }),
+            NamesEvent::Escrow(EscrowEvent::DepositedToHandle {
+                handle_node: alice,
+                platform_id: x.id(),
+                handle: text,
             }),
             NamesEvent::Escrow(EscrowEvent::Forwarded {
                 handle_node: n,
                 token: b,
                 depositor: a,
                 holder: b,
-                platform_id: PLATFORM,
                 amount: big,
                 received: big,
             }),
@@ -786,10 +860,38 @@ mod tests {
         ];
         for event in events {
             let payload = event.payload().unwrap();
+            assert!(!payload.to_string().contains("alice"), "{payload}");
             let read = NamesEvent::from_journal(event.kind(), payload)
                 .unwrap_or_else(|e| panic!("{}: {e}", event.kind()));
-            assert_eq!(read, event);
+            assert_eq!(read, event.without_text());
         }
+    }
+
+    /// Disclosed text decodes only when it hashes to the node beside it.
+    #[test]
+    fn a_published_handle_keeps_its_text_only_when_it_hashes_to_the_node() {
+        let x = KnownPlatform::X;
+        let node = x.handle_node("alice_1").unwrap();
+        let published = |handle: &str| {
+            let log = mined(
+                IdentityRegistry::HandlePublished {
+                    holder: HOLDER,
+                    platformId: x.id(),
+                    handleNode: node,
+                    handle: handle.into(),
+                }
+                .encode_log_data(),
+            );
+            match decode_registry(&log).unwrap().expect("a known topic").0 {
+                NamesEvent::HandlePublished { handle, .. } => handle,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_eq!(
+            published("Alice_1").as_ref().map(DisclosedHandle::as_str),
+            Some("alice_1")
+        );
+        assert_eq!(published("bob"), None);
     }
 
     #[test]
