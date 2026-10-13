@@ -139,9 +139,8 @@ impl Window {
                     .await?;
             }
 
-            // Paid straight to the holder: nothing is held, and the
-            // histories are the whole record of it. A handle's text is the
-            // disclosures', recorded by the window.
+            // Neither moves what is held: a forward pays the holder, and a
+            // `DepositedToHandle` follows its own `Deposited`.
             EscrowEvent::Forwarded { .. } | EscrowEvent::DepositedToHandle { .. } => {}
         }
         Ok(())

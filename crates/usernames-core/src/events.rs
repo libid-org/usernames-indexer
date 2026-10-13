@@ -306,6 +306,24 @@ impl NamesEvent {
         }
     }
 
+    /// The handle text the event disclosed, with its platform and node.
+    pub fn disclosure(&self) -> Option<(B256, B256, &DisclosedHandle)> {
+        match self {
+            Self::HandlePublished {
+                platform_id,
+                handle_node,
+                handle,
+                ..
+            }
+            | Self::Escrow(EscrowEvent::DepositedToHandle {
+                platform_id,
+                handle_node,
+                handle,
+            }) => Some((*platform_id, *handle_node, handle.as_ref()?)),
+            _ => None,
+        }
+    }
+
     /// The journal payload: the fields under their camelCase names, without
     /// the `kind` its own column holds.
     pub fn payload(&self) -> Result<Value, serde_json::Error> {

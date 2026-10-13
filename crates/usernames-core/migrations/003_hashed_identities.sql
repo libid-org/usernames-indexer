@@ -35,18 +35,13 @@ ALTER TABLE names.platforms
 
 -- Handle text the chain disclosed: by a disclosing bind, a `publish`, or a
 -- `depositToHandle`. Folded, and checked to hash to its node before it is
--- written. One row per node; the latest disclosure names the source, and a
--- holder's HandleUnpublished marks it withdrawn.
+-- written. One row per node; a holder's HandleUnpublished marks it withdrawn.
 CREATE TABLE IF NOT EXISTS names.disclosures (
-    chain_id     BIGINT      NOT NULL,
-    handle_node  BYTEA       NOT NULL,
-    platform_id  BYTEA       NOT NULL,
-    handle       TEXT        NOT NULL,
-    source       TEXT        NOT NULL CHECK (source IN ('bind', 'publish', 'escrow')),
-    block_number BIGINT      NOT NULL,
-    log_index    BIGINT      NOT NULL,
-    withdrawn    BOOLEAN     NOT NULL DEFAULT false,
-    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    chain_id    BIGINT  NOT NULL,
+    handle_node BYTEA   NOT NULL,
+    platform_id BYTEA   NOT NULL,
+    handle      TEXT    NOT NULL,
+    withdrawn   BOOLEAN NOT NULL DEFAULT false,
     PRIMARY KEY (chain_id, handle_node)
 );
 CREATE INDEX IF NOT EXISTS disclosures_node_chain_idx
@@ -61,7 +56,7 @@ CREATE INDEX IF NOT EXISTS disclosures_handle_trgm_idx
 -- Every read that shows text joins this view. A withdrawn disclosure stays
 -- hidden until the chain discloses the node again.
 CREATE OR REPLACE VIEW names.visible_handles AS
-SELECT chain_id, platform_id, handle_node, handle, source
+SELECT chain_id, platform_id, handle_node, handle
 FROM names.disclosures
 WHERE NOT withdrawn;
 

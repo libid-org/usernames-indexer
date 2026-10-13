@@ -28,14 +28,10 @@ use sqlx::{
 use crate::{
     ens::ChainName,
     events::{
-        EscrowEvent,
         LogPosition,
         NamesEvent,
     },
-    nodes::{
-        self,
-        DisclosedHandle,
-    },
+    nodes,
 };
 
 mod escrow;
@@ -751,6 +747,16 @@ impl Window {
         // it deletes.
         let involvement = self.involvement(event, &at).await?;
 
+        if let Some((platform_id, handle_node, handle)) = event.disclosure() {
+            sqlx::query(sql::DISCLOSE)
+                .bind(chain_id)
+                .bind(handle_node)
+                .bind(platform_id)
+                .bind(handle.as_str())
+                .execute(&mut *self.tx)
+                .await?;
+        }
+
         match event {
             NamesEvent::IdentityBound {
                 holder,
@@ -797,7 +803,7 @@ impl Window {
                 holder,
                 platform_id,
                 handle_node,
-                handle,
+                ..
             } => {
                 sqlx::query(sql::PUBLISH)
                     .bind(chain_id)
@@ -805,21 +811,6 @@ impl Window {
                     .bind(platform_id)
                     .bind(handle_node)
                     .execute(&mut *self.tx)
-                    .await?;
-                let by_bind: bool = sqlx::query_scalar(sql::BOUND_IN_TX)
-                    .bind(chain_id)
-                    .bind(block)
-                    .bind(at.tx_hash)
-                    .bind(log_index)
-                    .bind(handle_node.to_string())
-                    .fetch_one(&mut *self.tx)
-                    .await?;
-                let source = if by_bind {
-                    Disclosure::Bind
-                } else {
-                    Disclosure::Publish
-                };
-                self.disclose(*platform_id, *handle_node, handle.as_ref(), source, &at)
                     .await?;
             }
 
@@ -862,21 +853,6 @@ impl Window {
             // client or a bind's fee, and the journal and histories hold both.
             NamesEvent::CeremonyBound { .. } | NamesEvent::BindFeePaid { .. } => {}
 
-            NamesEvent::Escrow(EscrowEvent::DepositedToHandle {
-                handle_node,
-                platform_id,
-                handle,
-            }) => {
-                self.disclose(
-                    *platform_id,
-                    *handle_node,
-                    handle.as_ref(),
-                    Disclosure::Escrow,
-                    &at,
-                )
-                .await?;
-            }
-
             NamesEvent::Escrow(escrow) => {
                 self.book_escrow(escrow, &at).await?;
             }
@@ -884,54 +860,6 @@ impl Window {
 
         self.record(involvement, &at).await?;
         Ok(true)
-    }
-
-    /// Record handle text the chain disclosed. Text that did not hash to its
-    /// node was dropped at decode, and there is nothing to record.
-    async fn disclose(
-        &mut self,
-        platform_id: B256,
-        handle_node: B256,
-        handle: Option<&DisclosedHandle>,
-        source: Disclosure,
-        at: &Position,
-    ) -> Result<(), ApplyError> {
-        let Some(handle) = handle else {
-            return Ok(());
-        };
-        sqlx::query(sql::DISCLOSE)
-            .bind(self.chain_id)
-            .bind(handle_node)
-            .bind(platform_id)
-            .bind(handle.as_str())
-            .bind(source.as_str())
-            .bind(at.block)
-            .bind(at.log_index)
-            .execute(&mut *self.tx)
-            .await?;
-        Ok(())
-    }
-}
-
-/// What disclosed a handle's text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Disclosure {
-    /// A bind whose ceremony disclosed the handle.
-    Bind,
-    /// `publish`.
-    Publish,
-    /// `depositToHandle`.
-    Escrow,
-}
-
-impl Disclosure {
-    /// The name stored in `names.disclosures.source`.
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Bind => "bind",
-            Self::Publish => "publish",
-            Self::Escrow => "escrow",
-        }
     }
 }
 
@@ -1302,7 +1230,6 @@ mod sql {
     pub const UPSERT_HANDLE: &str = include_str!("../sql/upsert_handle.sql");
     pub const PUBLISH: &str = include_str!("../sql/publish.sql");
     pub const WITHDRAW_NAME: &str = include_str!("../sql/withdraw_name.sql");
-    pub const BOUND_IN_TX: &str = include_str!("../sql/bound_in_tx.sql");
     pub const DISCLOSE: &str = include_str!("../sql/disclose.sql");
     pub const RETIRE_HANDLE: &str = include_str!("../sql/retire_handle.sql");
     pub const RECORD_PLATFORM: &str = include_str!("../sql/record_platform.sql");
@@ -1494,18 +1421,6 @@ pub(crate) mod plan_tests {
                 sqlx::query_scalar::<_, String>(&explain(sql::ENS_HOLDER))
                     .bind(1i64)
                     .bind(node)
-                    .fetch_all(&mut *conn)
-                    .await,
-            ),
-            (
-                "a publish's bind",
-                &["events_pkey"][..],
-                sqlx::query_scalar(&explain(sql::BOUND_IN_TX))
-                    .bind(1i64)
-                    .bind(10i64)
-                    .bind(node)
-                    .bind(3i64)
-                    .bind(node.to_string())
                     .fetch_all(&mut *conn)
                     .await,
             ),

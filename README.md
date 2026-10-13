@@ -298,9 +298,8 @@ chain; a second deployment can share the database):
 - `published` — the display names, as the node each name hashes to; a row
   exists exactly while the contract's stored string is nonempty
 - `disclosures` — handle text the chain disclosed, A-Z folded and checked
-  against its node by hash alone: one row per node, with the latest disclosure's source (`bind`,
-  `publish` or `escrow`) and position, and `withdrawn` once its holder's
-  `HandleUnpublished` withdrew it. `visible_handles` is the visibility policy
+  against its node by hash alone: one row per node, `withdrawn` once its
+  holder's `HandleUnpublished` withdrew it. `visible_handles` is the visibility policy
   over it; `handle_identities` maps each visible handle to its id node
 - `platforms` — one row per platform some bind used: what
   `platform_not_configured` answers from. The Proof Verifier is chain

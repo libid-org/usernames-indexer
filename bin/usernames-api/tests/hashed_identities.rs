@@ -29,7 +29,6 @@ use alloy::{
     signers::local::PrivateKeySigner,
     sol,
     sol_types::{
-        SolCall,
         SolEvent,
         SolValue,
     },
@@ -388,10 +387,10 @@ impl Harness {
         }
     }
 
-    /// A disclosure's (source, withdrawn), when the node has one.
-    async fn disclosure(&self, handle_node: B256) -> Option<(String, bool)> {
-        sqlx::query_as(
-            "SELECT source, withdrawn FROM names.disclosures
+    /// Whether the node's disclosure is withdrawn, when it has one.
+    async fn withdrawn(&self, handle_node: B256) -> Option<bool> {
+        sqlx::query_scalar(
+            "SELECT withdrawn FROM names.disclosures
              WHERE chain_id = $1 AND handle_node = $2",
         )
         .bind(self.chain as i64)
@@ -546,7 +545,7 @@ async fn private_binds_stay_private_and_disclosures_show_until_withdrawn() {
     let found: SearchResults = h.answer("/v1/search?q=alice").await;
     let hits: Vec<&str> = found.hits.iter().map(|hit| hit.handle.as_str()).collect();
     assert_eq!(hits, ["alice_1"]);
-    assert_eq!(h.disclosure(alice_node).await, Some(("bind".into(), false)));
+    assert_eq!(h.withdrawn(alice_node).await, Some(false));
 
     // 4. Withdrawn: hidden again, the row kept and marked.
     registry
@@ -567,8 +566,8 @@ async fn private_binds_stay_private_and_disclosures_show_until_withdrawn() {
     let resolved: HandleResolution = h.answer("/v1/resolve/handle/x/alice_1").await;
     assert_eq!(resolved.bindings[0].handle, None);
     assert_eq!(
-        h.disclosure(alice_node).await,
-        Some(("bind".into(), true)),
+        h.withdrawn(alice_node).await,
+        Some(true),
         "the disclosure stays, withdrawn"
     );
     let history = h.raw(&format!("/v1/history/address/{alice}")).await;
@@ -812,8 +811,7 @@ async fn a_takeover_hides_the_previous_holders_text_until_disclosed_again() {
     assert_eq!(umas.identities[0].handle, None);
     assert!(!umas.identities[0].published);
     assert_eq!(
-        h.disclosure(node("lee1")).await,
-        Some(("bind".into(), true))
+        h.withdrawn(node("lee1")).await, Some(true)
     );
 
     // (b) Tom discloses @lee2; Val's account takes it, disclosing it.
@@ -845,46 +843,7 @@ async fn a_takeover_hides_the_previous_holders_text_until_disclosed_again() {
         "{toms:?}"
     );
     assert_eq!(
-        h.disclosure(node("lee2")).await,
-        Some(("bind".into(), false))
+        h.withdrawn(node("lee2")).await, Some(false)
     );
-    h.close().await;
-}
-
-/// A `publish` after a private bind in the same transaction is a publish:
-/// only the HandlePublished right after its bind's IdentityBound is a bind's.
-#[tokio::test]
-async fn a_publish_beside_a_private_bind_is_recorded_as_a_publish() {
-    let Some(h) = Harness::open(43121).await else {
-        return;
-    };
-    let x = KnownPlatform::X;
-    let wes = Address::repeat_byte(0xE1);
-    let ned = x.handle_node("ned1").expect("a handle");
-    let calls = vec![
-        MockIdentityRegistry::emitBindCall {
-            b: x_bind(wes, "558", "ned1", 1_000),
-        }
-        .abi_encode()
-        .into(),
-        MockIdentityRegistry::emitHandlePublishedCall {
-            holder: wes,
-            platformId: x.id(),
-            handleNode: ned,
-            handle: "ned1".into(),
-        }
-        .abi_encode()
-        .into(),
-    ];
-    h.registry
-        .multicall(calls)
-        .send()
-        .await
-        .unwrap()
-        .watch()
-        .await
-        .unwrap();
-    h.caught_up().await;
-    assert_eq!(h.disclosure(ned).await, Some(("publish".into(), false)));
     h.close().await;
 }

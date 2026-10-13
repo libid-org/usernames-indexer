@@ -326,15 +326,6 @@ async fn a_name_shows_while_published_and_hides_once_withdrawn() {
     let identity = only(&resolved.identities);
     assert!(identity.published);
     assert_eq!(identity.handle.as_deref(), Some("alice_2"));
-    let source: String = sqlx::query_scalar(
-        "SELECT source FROM names.disclosures WHERE chain_id = $1 AND handle_node = $2",
-    )
-    .bind(CHAIN)
-    .bind(x.handle_node("alice_2").unwrap())
-    .fetch_one(&pool)
-    .await
-    .expect("a disclosure");
-    assert_eq!(source, "publish");
 
     // HandleUnpublished hides it again, and a history shows no text either.
     apply(&store, 4, unpublish(alice, x)).await;

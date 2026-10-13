@@ -23,10 +23,9 @@ INSERT INTO names.published (chain_id, owner, platform_id, handle_node)
 SELECT DISTINCT ON (owner, platform_id) 1, owner, platform_id, handle_node
 FROM names.handles WHERE chain_id = 1;
 INSERT INTO names.disclosures
-    (chain_id, handle_node, platform_id, handle, source, block_number, log_index,
-     withdrawn)
-SELECT 1, handle_node, platform_id, 'handle' || block_number, 'bind',
-       block_number, 0, block_number % 10 = 0
+    (chain_id, handle_node, platform_id, handle, withdrawn)
+SELECT 1, handle_node, platform_id, 'handle' || block_number,
+       block_number % 10 = 0
 FROM names.handles WHERE chain_id = 1;
 INSERT INTO names.events
     (chain_id, block_number, log_index, tx_hash, kind, payload)
