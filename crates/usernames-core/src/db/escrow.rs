@@ -711,58 +711,68 @@ pub(crate) mod plans {
                 page(Some(1), unclaimed).unclaimed_lookup("EXPLAIN ", Some(token)),
             ),
         ] {
-            plans.push(Plan::of(conn, name, seeks, statement).await);
+            plans.push(Plan::of(conn, name, Some(seeks), statement).await);
         }
 
-        plans.push(Plan::explained(
-            "a claim",
-            &["escrow_held_pkey"],
-            sqlx::query_scalar(&explain(sql::ESCROW_CLAIM))
-                .bind(1i64)
-                .bind(node)
-                .bind(token)
-                .bind("0")
-                .bind(10i64)
-                .bind(0i64)
-                .fetch_all(&mut *conn)
-                .await,
-        ));
-        plans.push(Plan::explained(
-            "a claim closing its round",
-            &["escrow_refundable_round_idx"],
-            sqlx::query_scalar(&explain(sql::ESCROW_CLOSE_ROUND))
-                .bind(1i64)
-                .bind(node)
-                .bind(token)
-                .bind("0")
-                .fetch_all(&mut *conn)
-                .await,
-        ));
-        plans.push(Plan::explained(
-            "a refund",
-            &["escrow_held_pkey"],
-            sqlx::query_scalar(&explain(sql::ESCROW_REFUND))
-                .bind(1i64)
-                .bind(node)
-                .bind(token)
-                .bind("1")
-                .bind(10i64)
-                .bind(0i64)
-                .fetch_all(&mut *conn)
-                .await,
-        ));
-        plans.push(Plan::explained(
-            "a refund taking its contribution",
-            &["escrow_refundable_pkey|escrow_refundable_round_idx"],
-            sqlx::query_scalar(&explain(sql::ESCROW_TAKE_REFUNDABLE))
-                .bind(1i64)
-                .bind(node)
-                .bind(token)
-                .bind("0")
-                .bind(address)
-                .fetch_all(&mut *conn)
-                .await,
-        ));
+        let writes = [
+            (
+                "a claim",
+                &["escrow_held_pkey"][..],
+                sqlx::query_scalar::<_, String>(&explain(sql::ESCROW_CLAIM))
+                    .bind(1i64)
+                    .bind(node)
+                    .bind(token)
+                    .bind("0")
+                    .bind(10i64)
+                    .bind(0i64)
+                    .fetch_all(&mut *conn)
+                    .await,
+            ),
+            (
+                "a claim closing its round",
+                &["escrow_refundable_round_idx"][..],
+                sqlx::query_scalar(&explain(sql::ESCROW_CLOSE_ROUND))
+                    .bind(1i64)
+                    .bind(node)
+                    .bind(token)
+                    .bind("0")
+                    .fetch_all(&mut *conn)
+                    .await,
+            ),
+            (
+                "a refund",
+                &["escrow_held_pkey"][..],
+                sqlx::query_scalar(&explain(sql::ESCROW_REFUND))
+                    .bind(1i64)
+                    .bind(node)
+                    .bind(token)
+                    .bind("1")
+                    .bind(10i64)
+                    .bind(0i64)
+                    .fetch_all(&mut *conn)
+                    .await,
+            ),
+            (
+                "a refund taking its contribution",
+                &["escrow_refundable_pkey|escrow_refundable_round_idx"][..],
+                sqlx::query_scalar(&explain(sql::ESCROW_TAKE_REFUNDABLE))
+                    .bind(1i64)
+                    .bind(node)
+                    .bind(token)
+                    .bind("0")
+                    .bind(address)
+                    .fetch_all(&mut *conn)
+                    .await,
+            ),
+        ];
+        for (name, seeks, text) in writes {
+            let text: Vec<String> = text.unwrap_or_else(|e| panic!("{name}: {e}"));
+            plans.push(Plan {
+                name,
+                seeks: Some(seeks),
+                text: text.join("\n"),
+            });
+        }
         plans
     }
 }

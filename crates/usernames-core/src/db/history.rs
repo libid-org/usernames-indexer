@@ -531,64 +531,74 @@ pub(crate) mod plans {
                 page(Some(1), cursor).node_lookup("EXPLAIN ", node),
             ),
         ] {
-            plans.push(Plan::of(conn, name, seeks, statement).await);
+            plans.push(Plan::of(conn, name, Some(seeks), statement).await);
         }
 
-        plans.push(Plan::explained(
-            "previous holders",
-            &[
-                "handles_pkey|handles_node_chain_idx",
-                "ids_pkey|ids_node_chain_idx",
-            ],
-            sqlx::query_scalar(&explain(sql::PREVIOUS_HOLDERS))
-                .bind(1i64)
-                .bind(node)
-                .bind(node)
-                .fetch_all(&mut *conn)
-                .await,
-        ));
-        plans.push(Plan::explained(
-            "a ceremony's handle",
-            &[
-                "handle_events_pkey",
-                "events_pkey",
-                "handle_nodes_pkey",
-                "address_events_pkey|address_events_history_idx",
-            ],
-            sqlx::query_scalar(&explain(sql::CEREMONY_HANDLE))
-                .bind(1i64)
-                .bind(10i64)
-                .bind(node)
-                .bind(3i64)
-                .bind(address)
-                .bind(1_700_000_000i64)
-                .bind(Role::Holder.as_str())
-                .bind(node)
-                .fetch_all(&mut *conn)
-                .await,
-        ));
-        plans.push(Plan::explained(
-            "a bind fee's ceremony",
-            &["events_pkey"],
-            sqlx::query_scalar(&explain(sql::FEE_PAYER))
-                .bind(1i64)
-                .bind(10i64)
-                .bind(node)
-                .bind(node.to_string())
-                .fetch_all(&mut *conn)
-                .await,
-        ));
-        plans.push(Plan::explained(
-            "the refundTos a claim takes from",
-            &["escrow_refundable_round_idx"],
-            sqlx::query_scalar(&explain(sql::CLAIMED_REFUND_TOS))
-                .bind(1i64)
-                .bind(node)
-                .bind(address)
-                .bind("0")
-                .fetch_all(&mut *conn)
-                .await,
-        ));
+        let reads = [
+            (
+                "previous holders",
+                &[
+                    "handles_pkey|handles_node_chain_idx",
+                    "ids_pkey|ids_node_chain_idx",
+                ][..],
+                sqlx::query_scalar::<_, String>(&explain(sql::PREVIOUS_HOLDERS))
+                    .bind(1i64)
+                    .bind(node)
+                    .bind(node)
+                    .fetch_all(&mut *conn)
+                    .await,
+            ),
+            (
+                "a ceremony's handle",
+                &[
+                    "handle_events_pkey",
+                    "events_pkey",
+                    "handle_nodes_pkey",
+                    "address_events_pkey|address_events_history_idx",
+                ][..],
+                sqlx::query_scalar(&explain(sql::CEREMONY_HANDLE))
+                    .bind(1i64)
+                    .bind(10i64)
+                    .bind(node)
+                    .bind(3i64)
+                    .bind(address)
+                    .bind(1_700_000_000i64)
+                    .bind(Role::Holder.as_str())
+                    .bind(node)
+                    .fetch_all(&mut *conn)
+                    .await,
+            ),
+            (
+                "a bind fee's ceremony",
+                &["events_pkey"][..],
+                sqlx::query_scalar(&explain(sql::FEE_PAYER))
+                    .bind(1i64)
+                    .bind(10i64)
+                    .bind(node)
+                    .bind(node.to_string())
+                    .fetch_all(&mut *conn)
+                    .await,
+            ),
+            (
+                "the refundTos a claim takes from",
+                &["escrow_refundable_round_idx"][..],
+                sqlx::query_scalar(&explain(sql::CLAIMED_REFUND_TOS))
+                    .bind(1i64)
+                    .bind(node)
+                    .bind(address)
+                    .bind("0")
+                    .fetch_all(&mut *conn)
+                    .await,
+            ),
+        ];
+        for (name, seeks, text) in reads {
+            let text: Vec<String> = text.unwrap_or_else(|e| panic!("{name}: {e}"));
+            plans.push(Plan {
+                name,
+                seeks: Some(seeks),
+                text: text.join("\n"),
+            });
+        }
         plans
     }
 }

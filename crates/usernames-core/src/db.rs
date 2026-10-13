@@ -9,10 +9,7 @@
 //! [`Window::apply`], so replaying a window — after a crash, or after a
 //! version-bump re-index — converges instead of counting an event twice.
 
-use std::{
-    collections::HashSet,
-    time::Duration,
-};
+use std::time::Duration;
 
 use alloy::primitives::{
     Address,
@@ -663,7 +660,6 @@ impl ChainStore {
         Ok(Window {
             tx: self.pool.begin().await?,
             chain_id: self.chain_id,
-            platforms: HashSet::new(),
         })
     }
 }
@@ -698,8 +694,6 @@ impl Position {
 pub struct Window {
     tx: Transaction<'static, Postgres>,
     chain_id: i64,
-    /// The platforms this window already recorded.
-    platforms: HashSet<B256>,
 }
 
 impl Window {
@@ -796,14 +790,12 @@ impl Window {
                     .bind(log_index)
                     .execute(&mut *self.tx)
                     .await?;
-                if self.platforms.insert(*platform_id) {
-                    sqlx::query(sql::RECORD_PLATFORM)
-                        .bind(chain_id)
-                        .bind(platform_id)
-                        .bind(nodes::Platform::key_of(*platform_id))
-                        .execute(&mut *self.tx)
-                        .await?;
-                }
+                sqlx::query(sql::RECORD_PLATFORM)
+                    .bind(chain_id)
+                    .bind(platform_id)
+                    .bind(nodes::Platform::key_of(*platform_id))
+                    .execute(&mut *self.tx)
+                    .await?;
             }
 
             NamesEvent::HandlePublished {
@@ -1308,10 +1300,10 @@ pub(crate) mod plan_tests {
     const VOLUME: &str = include_str!("../sql/plan_volume.sql");
 
     /// One statement's plan, and the indexes it must seek: `a|b` where either
-    /// seeks exactly.
+    /// seeks exactly, `None` where only the row count decides between them.
     pub(crate) struct Plan {
         pub(crate) name: &'static str,
-        pub(crate) seeks: &'static [&'static str],
+        pub(crate) seeks: Option<&'static [&'static str]>,
         pub(crate) text: String,
     }
 
@@ -1320,7 +1312,7 @@ pub(crate) mod plan_tests {
         pub(crate) async fn of(
             conn: &mut PgConnection,
             name: &'static str,
-            seeks: &'static [&'static str],
+            seeks: Option<&'static [&'static str]>,
             mut statement: Statement,
         ) -> Self {
             let text = statement
@@ -1329,16 +1321,6 @@ pub(crate) mod plan_tests {
                 .await
                 .unwrap_or_else(|e| panic!("{name}: {e}"))
                 .join("\n");
-            Self { name, seeks, text }
-        }
-
-        /// The plan of a statement file, from its `EXPLAIN` rows.
-        pub(crate) fn explained(
-            name: &'static str,
-            seeks: &'static [&'static str],
-            rows: Result<Vec<String>, sqlx::Error>,
-        ) -> Self {
-            let text = rows.unwrap_or_else(|e| panic!("{name}: {e}")).join("\n");
             Self { name, seeks, text }
         }
     }
@@ -1357,42 +1339,42 @@ pub(crate) mod plan_tests {
         for (name, seeks, statement) in [
             (
                 "handle node, any chain",
-                &["handles_node_chain_idx"],
+                Some(&["handles_node_chain_idx"][..]),
                 handle_lookup("EXPLAIN ", None, node),
             ),
             (
                 "handle node, one chain",
-                &["handles_pkey|handles_node_chain_idx"],
+                Some(&["handles_pkey|handles_node_chain_idx"][..]),
                 handle_lookup("EXPLAIN ", Some(1), node),
             ),
             (
                 "id node, any chain",
-                &["ids_node_chain_idx"],
+                Some(&["ids_node_chain_idx"][..]),
                 id_lookup("EXPLAIN ", None, node),
             ),
             (
                 "id node, one chain",
-                &["ids_pkey|ids_node_chain_idx"],
+                Some(&["ids_pkey|ids_node_chain_idx"][..]),
                 id_lookup("EXPLAIN ", Some(1), node),
             ),
             (
                 "wallet, any chain",
-                &["ids_owner_chain_idx"],
+                Some(&["ids_owner_chain_idx"][..]),
                 identities_lookup("EXPLAIN ", None, owner),
             ),
             (
                 "wallet, one chain",
-                &["ids_owner_chain_idx"],
+                Some(&["ids_owner_chain_idx"][..]),
                 identities_lookup("EXPLAIN ", Some(1), owner),
             ),
             (
                 "search by wallet, any chain",
-                &["handles_owner_chain_node_idx"],
+                Some(&["handles_owner_chain_node_idx"][..]),
                 search_lookup("EXPLAIN ", None, None, Some(owner), None, 10, 0),
             ),
             (
                 "search by wallet on a platform, one chain",
-                &["handles_owner_chain_node_idx"],
+                Some(&["handles_owner_chain_node_idx"][..]),
                 search_lookup(
                     "EXPLAIN ",
                     Some(1),
@@ -1405,12 +1387,12 @@ pub(crate) mod plan_tests {
             ),
             (
                 "search by text, any chain",
-                &["disclosures_handle_trgm_idx"],
+                Some(&["disclosures_handle_trgm_idx"][..]),
                 search_lookup("EXPLAIN ", None, None, None, Some("ali"), 10, 0),
             ),
             (
                 "search by text on a platform, one chain",
-                &["disclosures_handle_trgm_idx"],
+                Some(&["disclosures_handle_trgm_idx"][..]),
                 search_lookup(
                     "EXPLAIN ",
                     Some(1),
@@ -1425,25 +1407,35 @@ pub(crate) mod plan_tests {
             plans.push(Plan::of(conn, name, seeks, statement).await);
         }
 
-        plans.push(Plan::explained(
-            "the gateway's holder",
-            &["handles_pkey|handles_node_chain_idx"],
-            sqlx::query_scalar(&explain(sql::ENS_HOLDER))
-                .bind(1i64)
-                .bind(node)
-                .fetch_all(&mut *conn)
-                .await,
-        ));
-        plans.push(Plan::explained(
-            "a withdrawn name",
-            &["published_pkey", "disclosures_pkey"],
-            sqlx::query_scalar(&explain(sql::WITHDRAW_NAME))
-                .bind(1i64)
-                .bind(owner)
-                .bind(platform)
-                .fetch_all(&mut *conn)
-                .await,
-        ));
+        let reads = [
+            (
+                "the gateway's holder",
+                &["handles_pkey|handles_node_chain_idx"][..],
+                sqlx::query_scalar::<_, String>(&explain(sql::ENS_HOLDER))
+                    .bind(1i64)
+                    .bind(node)
+                    .fetch_all(&mut *conn)
+                    .await,
+            ),
+            (
+                "a withdrawn name",
+                &["published_pkey", "disclosures_pkey"][..],
+                sqlx::query_scalar(&explain(sql::WITHDRAW_NAME))
+                    .bind(1i64)
+                    .bind(owner)
+                    .bind(platform)
+                    .fetch_all(&mut *conn)
+                    .await,
+            ),
+        ];
+        for (name, seeks, text) in reads {
+            let text: Vec<String> = text.unwrap_or_else(|e| panic!("{name}: {e}"));
+            plans.push(Plan {
+                name,
+                seeks: Some(seeks),
+                text: text.join("\n"),
+            });
+        }
         plans
     }
 
@@ -1479,7 +1471,7 @@ pub(crate) mod plan_tests {
         all.extend(escrow::plans::all(&mut conn).await);
         for plan in all {
             let Plan { name, seeks, text } = plan;
-            for index in seeks {
+            for index in seeks.unwrap_or_default() {
                 assert!(
                     index.split('|').any(|index| text.contains(index)),
                     "{name} does not seek {index}:\n{text}"
