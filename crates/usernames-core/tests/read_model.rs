@@ -152,7 +152,7 @@ fn publish(holder: Address, platform: KnownPlatform, handle: &str) -> NamesEvent
         holder,
         platform_id: platform.id(),
         handle_node,
-        handle: DisclosedHandle::verify(platform.id(), handle_node, handle),
+        handle: DisclosedHandle::verify(platform, handle_node, handle),
     }
 }
 

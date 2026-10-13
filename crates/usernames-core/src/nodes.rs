@@ -17,9 +17,10 @@ use alloy::primitives::{
 };
 use libid_identity::{
     handle_vectors::{
-        PLATFORM_GITHUB_KEY,
-        PLATFORM_GOOGLE_KEY,
-        PLATFORM_X_KEY,
+        self,
+        PLATFORM_GITHUB,
+        PLATFORM_GOOGLE,
+        PLATFORM_X,
     },
     HandleError,
     IdError,
@@ -64,14 +65,19 @@ impl KnownPlatform {
     /// an array so adding one is a single line and not also an arity.
     pub const ALL: &'static [Self] = &[Self::X, Self::GitHub, Self::Google];
 
+    /// The platform as libid-identity's table states it: key, tags, rules.
+    const fn spec(self) -> &'static handle_vectors::Platform {
+        match self {
+            Self::X => &PLATFORM_X,
+            Self::GitHub => &PLATFORM_GITHUB,
+            Self::Google => &PLATFORM_GOOGLE,
+        }
+    }
+
     /// The short key: the platform key, whose keccak is the platform id, and
     /// what a name, a URL path and the API's JSON all call the platform.
     pub const fn key(self) -> &'static str {
-        match self {
-            Self::X => PLATFORM_X_KEY,
-            Self::GitHub => PLATFORM_GITHUB_KEY,
-            Self::Google => PLATFORM_GOOGLE_KEY,
-        }
+        self.spec().key
     }
 
     /// The 32-byte id the chain keys this platform by.
@@ -80,29 +86,18 @@ impl KnownPlatform {
     }
 
     /// The node a typed handle is bound under, or why no handle can be.
-    pub fn handle_node(self, raw: &str) -> Result<B256, NodeError<HandleError>> {
-        let node = libid_identity::handle_node(self.key(), raw)
-            .ok_or(NodeError::Untagged(self))??;
-        Ok(B256::from(node))
+    pub fn handle_node(self, raw: &str) -> Result<B256, HandleError> {
+        libid_identity::handle_node(self.key(), raw)
+            .unwrap_or_else(|| panic!("libid-identity has no node tags for {self}"))
+            .map(B256::from)
     }
 
     /// The node a user id is bound under, or why no id can be.
-    pub fn id_node(self, id: &str) -> Result<B256, NodeError<IdError>> {
-        let node = libid_identity::id_node(self.key(), id)
-            .ok_or(NodeError::Untagged(self))??;
-        Ok(B256::from(node))
+    pub fn id_node(self, id: &str) -> Result<B256, IdError> {
+        libid_identity::id_node(self.key(), id)
+            .unwrap_or_else(|| panic!("libid-identity has no node tags for {self}"))
+            .map(B256::from)
     }
-}
-
-/// Why a text has no node on a platform.
-#[derive(Debug, thiserror::Error)]
-pub enum NodeError<E> {
-    /// libid-identity names no tags for the platform: a build mismatch.
-    #[error("libid-identity has no node tags for {0}")]
-    Untagged(KnownPlatform),
-    /// The platform could never issue this text.
-    #[error(transparent)]
-    Refused(#[from] E),
 }
 
 /// The platform a short key names.
@@ -239,12 +234,14 @@ impl DisclosedHandle {
     /// `text` with A-Z folded to a-z, when `SHA256(handle tag || folded)` is
     /// `handle_node`. The platform's rules are not applied: the circuits own
     /// them, and text that hashes to the node is the handle the chain keyed.
-    pub fn verify(platform_id: B256, handle_node: B256, text: &str) -> Option<Self> {
-        let platform = Platform::known_of(platform_id)?;
-        let (_, tag) = libid_identity::tags_for(platform.key())?;
+    pub fn verify(
+        platform: KnownPlatform,
+        handle_node: B256,
+        text: &str,
+    ) -> Option<Self> {
         let folded = text.to_ascii_lowercase();
         let node = Sha256::new()
-            .chain_update(tag)
+            .chain_update(platform.spec().handle_tag)
             .chain_update(&folded)
             .finalize();
         (B256::from_slice(&node) == handle_node).then_some(Self(folded))
@@ -296,18 +293,14 @@ mod tests {
         assert_eq!(node[..4], [0x38, 0x1f, 0xb9, 0xd7]);
         let id = KnownPlatform::GitHub.id_node("583231").unwrap();
         assert_eq!(id[..4], [0x47, 0x59, 0x02, 0xb2]);
-        assert!(matches!(
+        assert_eq!(
             KnownPlatform::X.handle_node(" @alice"),
-            Err(NodeError::Refused(HandleError::BadCharacter))
-        ));
-        assert!(matches!(
-            KnownPlatform::X.id_node("0123"),
-            Err(NodeError::Refused(IdError::BadShape))
-        ));
+            Err(HandleError::BadCharacter)
+        );
+        assert_eq!(KnownPlatform::X.id_node("0123"), Err(IdError::BadShape));
     }
 
-    /// Every known platform has node tags, so [`NodeError::Untagged`] is
-    /// never reached.
+    /// Every known platform has node tags, so the node lookups never panic.
     #[test]
     fn every_known_platform_is_tagged() {
         for platform in KnownPlatform::ALL {
@@ -322,13 +315,30 @@ mod tests {
     fn disclosed_text_folds_and_must_hash_to_its_node() {
         let x = KnownPlatform::X;
         let node = x.handle_node("alice_1").unwrap();
-        let disclosed = DisclosedHandle::verify(x.id(), node, "Alice_1").unwrap();
+        let disclosed = DisclosedHandle::verify(x, node, "Alice_1").unwrap();
         assert_eq!(disclosed.as_str(), "alice_1");
-        assert!(DisclosedHandle::verify(x.id(), node, "alice_2").is_none());
-        assert!(DisclosedHandle::verify(x.id(), node, "alice_1!").is_none());
-        let github = KnownPlatform::GitHub.id();
+        assert!(DisclosedHandle::verify(x, node, "alice_2").is_none());
+        assert!(DisclosedHandle::verify(x, node, "alice_1!").is_none());
+        let github = KnownPlatform::GitHub;
         assert!(DisclosedHandle::verify(github, node, "alice_1").is_none());
-        assert!(DisclosedHandle::verify(B256::repeat_byte(7), node, "alice_1").is_none());
+    }
+
+    /// The hand-rolled hash agrees with libid-identity's on every vector it
+    /// accepts.
+    #[test]
+    fn every_accepted_vector_verifies_to_its_node() {
+        for v in handle_vectors::VECTORS.iter().filter(|v| v.accepted) {
+            let platform: KnownPlatform = v.platform.parse().unwrap();
+            let node: B256 = v.handle_node.parse().unwrap();
+            let disclosed = DisclosedHandle::verify(platform, node, v.input);
+            assert_eq!(
+                disclosed.as_ref().map(DisclosedHandle::as_str),
+                Some(v.output),
+                "{} {:?}",
+                v.platform,
+                v.input
+            );
+        }
     }
 
     /// Only A-Z folds. Text the platform's rules refuse is still accepted
@@ -340,7 +350,7 @@ mod tests {
             "91f649a873eea530e1610096d7039221f1178ab2c046a8078f3b1de00d1b86fc"
         ));
         assert!(KnownPlatform::X.handle_node(" @alice").is_err());
-        let disclosed = DisclosedHandle::verify(KnownPlatform::X.id(), node, " @Alice");
+        let disclosed = DisclosedHandle::verify(KnownPlatform::X, node, " @Alice");
         assert_eq!(
             disclosed.as_ref().map(DisclosedHandle::as_str),
             Some(" @alice")

@@ -94,7 +94,6 @@ use usernames_core::{
         ResolveCall,
         Subject,
     },
-    nodes::NodeError,
 };
 
 /// What the gateway needs: the store it reads, and the identity it signs with.
@@ -238,8 +237,7 @@ impl Config {
             Subject::Handle { platform, handle } => {
                 // The chain's node for the handle: what `resolveHandle`
                 // keys by.
-                let Some(handle_node) = lookup_node(platform.handle_node(&handle))?
-                else {
+                let Ok(handle_node) = platform.handle_node(&handle) else {
                     return Ok(null);
                 };
                 indexed.owner_of(handle_node).await?
@@ -665,19 +663,6 @@ async fn status(
     Ok(Json(state.config.status().await?))
 }
 
-/// The node a handle is looked up by. Text no handle can be is a name nobody
-/// holds; a platform without node tags is a build mismatch, refused unsigned.
-fn lookup_node<E>(node: Result<B256, NodeError<E>>) -> Result<Option<B256>, GatewayError>
-where
-    NodeError<E>: fmt::Display,
-{
-    match node {
-        Ok(node) => Ok(Some(node)),
-        Err(NodeError::Refused(_)) => Ok(None),
-        Err(untagged @ NodeError::Untagged(_)) => Err(GatewayError::internal(untagged)),
-    }
-}
-
 /// What ERC-3668 hands back: one blob the resolver's callback decodes,
 /// 0x-hex on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -791,27 +776,4 @@ async fn resolve(
     let request = Request::from_path(&data)?;
     let result = config.answer(&request.call).await?.into_result()?;
     Ok(Json(config.sign(&request.call_data, result).await?))
-}
-
-#[cfg(test)]
-mod tests {
-    use usernames_core::nodes::KnownPlatform;
-
-    use super::*;
-
-    #[test]
-    fn untagged_fails_unsigned_and_refused_text_is_nobody() {
-        let untagged = NodeError::<fmt::Error>::Untagged(KnownPlatform::X);
-        let Err(error) = lookup_node(Err(untagged)) else {
-            panic!("an untagged platform answered");
-        };
-        assert_eq!(
-            error.into_response().status(),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-        let refused = lookup_node(Err(NodeError::Refused(fmt::Error)));
-        assert!(matches!(refused, Ok(None)));
-        let node = B256::repeat_byte(1);
-        assert!(matches!(lookup_node::<fmt::Error>(Ok(node)), Ok(Some(n)) if n == node));
-    }
 }

@@ -140,7 +140,7 @@ pub async fn bind(store: &ChainStore, handle: &str, holder: Address) {
             holder,
             platform_id: x.id(),
             handle_node,
-            handle: DisclosedHandle::verify(x.id(), handle_node, handle),
+            handle: DisclosedHandle::verify(x, handle_node, handle),
         },
     ];
     let mut window = store.begin_window().await.expect("begin");

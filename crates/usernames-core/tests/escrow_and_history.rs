@@ -93,7 +93,7 @@ fn disclosing_bind(
             holder,
             platform_id: x.id(),
             handle_node: node(handle),
-            handle: DisclosedHandle::verify(x.id(), node(handle), handle),
+            handle: DisclosedHandle::verify(x, node(handle), handle),
         },
     ]
 }
@@ -130,7 +130,7 @@ fn deposited_to_handle(
         NamesEvent::Escrow(EscrowEvent::DepositedToHandle {
             handle_node: node(typed),
             platform_id: x.id(),
-            handle: DisclosedHandle::verify(x.id(), node(typed), typed),
+            handle: DisclosedHandle::verify(x, node(typed), typed),
         }),
     ]
 }

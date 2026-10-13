@@ -58,7 +58,6 @@ use crate::{
     nodes::{
         self,
         KnownPlatform,
-        NodeError,
     },
 };
 
@@ -188,28 +187,22 @@ impl ApiError {
 /// Text the platform could never hold, refused the way the contract's
 /// `resolveHandle` answers it — the zero address, so a 404 and not a 400:
 /// "nobody holds this", not "you asked wrong".
-impl From<NodeError<libid_identity::HandleError>> for ApiError {
-    fn from(e: NodeError<libid_identity::HandleError>) -> Self {
-        match e {
-            NodeError::Refused(e) => Self::not_found(
-                ErrorCode::HandleImpossible,
-                format!("no handle can exist on this platform for this text: {e}"),
-            ),
-            NodeError::Untagged(_) => Self::internal(e),
-        }
+impl From<libid_identity::HandleError> for ApiError {
+    fn from(e: libid_identity::HandleError) -> Self {
+        Self::not_found(
+            ErrorCode::HandleImpossible,
+            format!("no handle can exist on this platform for this text: {e}"),
+        )
     }
 }
 
 /// An id the platform could never issue: nobody can be bound under it.
-impl From<NodeError<libid_identity::IdError>> for ApiError {
-    fn from(e: NodeError<libid_identity::IdError>) -> Self {
-        match e {
-            NodeError::Refused(e) => Self::not_found(
-                ErrorCode::IdImpossible,
-                format!("no id can exist on this platform for this text: {e}"),
-            ),
-            NodeError::Untagged(_) => Self::internal(e),
-        }
+impl From<libid_identity::IdError> for ApiError {
+    fn from(e: libid_identity::IdError) -> Self {
+        Self::not_found(
+            ErrorCode::IdImpossible,
+            format!("no id can exist on this platform for this text: {e}"),
+        )
     }
 }
 

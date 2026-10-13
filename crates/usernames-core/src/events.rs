@@ -33,7 +33,10 @@ use serde::{
 };
 use serde_json::Value;
 
-use crate::nodes::DisclosedHandle;
+use crate::nodes::{
+    DisclosedHandle,
+    Platform,
+};
 use serde_with::{
     serde_as,
     DeserializeFromStr,
@@ -436,7 +439,15 @@ fn disclosed(
     handle_node: B256,
     text: &str,
 ) -> Option<DisclosedHandle> {
-    let verified = DisclosedHandle::verify(platform_id, handle_node, text);
+    let Some(platform) = Platform::known_of(platform_id) else {
+        tracing::warn!(
+            event,
+            %platform_id,
+            "disclosed text on a platform this build does not know; not stored"
+        );
+        return None;
+    };
+    let verified = DisclosedHandle::verify(platform, handle_node, text);
     if verified.is_none() {
         tracing::warn!(
             event,
@@ -801,7 +812,7 @@ mod tests {
         let big = U256::MAX - U256::from(1u64);
         let x = KnownPlatform::X;
         let alice = x.handle_node("alice").unwrap();
-        let text = DisclosedHandle::verify(x.id(), alice, "Alice");
+        let text = DisclosedHandle::verify(x, alice, "Alice");
         assert!(text.is_some());
         let events = [
             NamesEvent::IdentityBound {
