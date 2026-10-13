@@ -330,6 +330,41 @@ async fn a_takeover_hides_the_previous_holders_text_until_disclosed_again() {
     drop(guard);
 }
 
+/// `publish` over a name overwrites it and logs no `HandleUnpublished`; the
+/// old name's text hides all the same, and stays hidden once its handle
+/// passes, privately, to someone else.
+#[tokio::test]
+async fn publishing_another_name_withdraws_the_one_it_replaces() {
+    let Some((store, pool, guard)) = test_store().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let x = KnownPlatform::X;
+    let (alice, bob) = (addr(0xD1), addr(0xD2));
+    apply_tx(&store, 1, bind(alice, x, "71", "kim", 1_000, true)).await;
+    apply_tx(&store, 2, bind(alice, x, "72", "lee", 2_000, false)).await;
+    apply(&store, 3, publish(alice, x, "lee")).await;
+    let kim = x.handle_node("kim").unwrap();
+    assert_eq!(withdrawn(&pool, kim).await, Some(true));
+
+    // Bob's account takes kim privately: Alice's name is lee, so the bind
+    // withdraws nothing on chain.
+    apply_tx(&store, 4, bind(bob, x, "71", "kim", 3_000, false)).await;
+    let resolved: HandleResolution =
+        get(&pool, "/v1/resolve/handle/x/kim").await.answer();
+    let binding = only(&resolved.bindings);
+    assert_eq!((binding.owner, binding.handle.as_deref()), (bob, None));
+    let found: SearchResults = get(&pool, "/v1/search?q=kim").await.answer();
+    assert!(found.hits.is_empty(), "{found:?}");
+    let bobs: AddressResolution = get(&pool, &format!("/v1/resolve/address/{bob}"))
+        .await
+        .answer();
+    assert_eq!(only(&bobs.identities).handle, None);
+    let found: SearchResults = get(&pool, "/v1/search?q=lee").await.answer();
+    assert_eq!(handles_of(&found), ["lee"]);
+    drop(guard);
+}
+
 #[tokio::test]
 async fn a_name_shows_while_published_and_hides_once_withdrawn() {
     let Some((store, pool, guard)) = test_store().await else {

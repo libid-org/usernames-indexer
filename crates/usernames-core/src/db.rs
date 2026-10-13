@@ -60,7 +60,7 @@ pub use self::{
 /// Bump on any change to what the indexer writes. A mismatch at startup
 /// clears the chain's rows and cursor, so the next loop replays the chain
 /// from the deployment block — the re-index IS the migration.
-pub const INDEXER_VERSION: &str = "3";
+pub const INDEXER_VERSION: &str = "4";
 
 pub use self::sql::{
     CLEAR_CHAIN,
@@ -1434,6 +1434,17 @@ pub(crate) mod plan_tests {
                     .bind(1i64)
                     .bind(owner)
                     .bind(platform)
+                    .fetch_all(&mut *conn)
+                    .await,
+            ),
+            (
+                "a name published over another",
+                &["published_pkey", "disclosures_pkey"][..],
+                sqlx::query_scalar(&explain(sql::PUBLISH))
+                    .bind(1i64)
+                    .bind(owner)
+                    .bind(platform)
+                    .bind(node)
                     .fetch_all(&mut *conn)
                     .await,
             ),

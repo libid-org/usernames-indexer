@@ -292,7 +292,8 @@ chain; a second deployment can share the database):
   exists exactly while the contract's stored string is nonempty
 - `disclosures` — handle text the chain disclosed, A-Z folded and checked
   against its node by hash alone: one row per node, `withdrawn` once its
-  holder's `HandleUnpublished` withdrew it. `visible_handles` is the visibility policy
+  holder's `HandleUnpublished` withdrew it or a `publish` of another name
+  replaced it. `visible_handles` is the visibility policy
   over it; `handle_identities` maps each visible handle to its id node
 - `platforms` — one row per platform some bind used: what
   `platform_not_configured` answers from. The Proof Verifier is chain
@@ -367,7 +368,7 @@ migrated database; a newer API started before the migration answers
 002 has migrated: to go back, start it on a fresh database, or run
 `DROP SCHEMA names CASCADE; DROP TABLE _sqlx_migrations;` first, as above.
 
-**Upgrading to hashed identities (`INDEXER_VERSION` 3):** this build indexes
+**Upgrading to hashed identities (`INDEXER_VERSION` 4):** this build indexes
 `IdentityRegistry` and `HandleEscrow` from libID-contracts 0.18, whose events
 carry nodes rather than plaintext. Point `IDENTITY_NAMES_ADDRESS` and
 `HANDLE_ESCROW_ADDRESS` at the 0.18 deployments and roll the indexer first.
