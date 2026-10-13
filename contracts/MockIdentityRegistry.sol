@@ -3,7 +3,7 @@ pragma solidity ^0.8.20;
 
 /// @notice Test double for the indexer: the exact event surface of
 ///         IdentityRegistry, each behind a function that just emits it, and a
-///         disclosing bind's two events in the order `bind` emits them. The
+///         bind's events in the order `bind` emits them. The
 ///         integration test deploys this on anvil and replays scenarios, so
 ///         the indexer decodes real ABI-encoded logs rather than values a
 ///         Rust test constructed for itself.
@@ -31,6 +31,27 @@ contract MockIdentityRegistry {
     );
     event HandleUnpublished(address indexed holder, bytes32 indexed platformId);
 
+    /// @notice One `bind`, and what it finds before it writes.
+    struct Bind {
+        address holder;
+        bytes32 idNode;
+        bytes32 handleNode;
+        bytes32 platformId;
+        uint64 observedAt;
+        uint16 ceremonyVersion;
+        /// The address whose name for `handleNode` the bind withdraws; zero for none.
+        address takenFrom;
+        /// The handle node the identity held before; zero for none.
+        bytes32 retiredNode;
+        /// Who held `retiredNode`.
+        address retiredHolder;
+        /// Whether `retiredHolder`'s name was `retiredNode`.
+        bool retiredNamed;
+        /// The disclosed handle; empty for a private bind.
+        string handle;
+        bytes32 authorizationDigest;
+    }
+
     function emitIdentityBound(
         address holder,
         bytes32 idNode,
@@ -54,6 +75,29 @@ contract MockIdentityRegistry {
     ) external {
         emit IdentityBound(holder, idNode, handleNode, platformId, observedAt, ceremonyVersion);
         emit HandlePublished(holder, platformId, handleNode, handle);
+    }
+
+    /// @notice `bind`'s events, in its order: `_write`'s withdrawal of the
+    ///         taken handle's name, the previous handle's retirement and its
+    ///         name's withdrawal, the binding; then the disclosure and the
+    ///         ceremony.
+    function emitBind(Bind calldata b) external {
+        if (b.takenFrom != address(0)) emit HandleUnpublished(b.takenFrom, b.platformId);
+        if (b.retiredNode != bytes32(0)) {
+            emit HandleRetired(b.platformId, b.retiredNode, b.retiredHolder);
+            if (b.retiredNamed) emit HandleUnpublished(b.retiredHolder, b.platformId);
+        }
+        emit IdentityBound(b.holder, b.idNode, b.handleNode, b.platformId, b.observedAt, b.ceremonyVersion);
+        if (bytes(b.handle).length != 0) emit HandlePublished(b.holder, b.platformId, b.handleNode, b.handle);
+        emit CeremonyBound(b.authorizationDigest, b.holder, b.platformId, "");
+    }
+
+    /// @notice Several calls in one transaction.
+    function multicall(bytes[] calldata calls) external {
+        for (uint256 i = 0; i < calls.length; i++) {
+            (bool ok,) = address(this).call(calls[i]);
+            require(ok, "call failed");
+        }
     }
 
     function emitHandlePublished(address holder, bytes32 platformId, bytes32 handleNode, string calldata handle)
