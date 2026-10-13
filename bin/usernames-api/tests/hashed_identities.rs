@@ -3,8 +3,9 @@
 //! indexer's own loop indexes them; the read API and the ENS gateway answer;
 //! and no plaintext the chain did not disclose is left anywhere in the store.
 //!
-//! Skips without `DATABASE_URL`, or without `anvil` on PATH. Everything past
-//! those checks panics on failure.
+//! Skips without `DATABASE_URL`, or without `anvil` on PATH, unless `CI` is
+//! set: there a missing one fails. Everything past those checks panics on
+//! failure.
 
 use std::{
     process::Command,
@@ -176,6 +177,16 @@ fn the_mocks_emit_the_contracts_topics() {
 
 use MockIdentityRegistry::Bind;
 
+/// Skip the test, except under CI, where missing infrastructure fails it.
+fn skip<T>(missing: &str) -> Option<T> {
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "{missing}: CI runs this suite against Postgres and anvil"
+    );
+    eprintln!("skipping: {missing}");
+    None
+}
+
 type Registry = MockIdentityRegistry::MockIdentityRegistryInstance<DynProvider>;
 type Escrow = MockHandleEscrow::MockHandleEscrowInstance<DynProvider>;
 
@@ -198,12 +209,10 @@ impl Harness {
     /// A fresh `chain`, indexed; `None` when the suite skips.
     async fn open(chain: u64) -> Option<Self> {
         let Ok(url) = std::env::var("DATABASE_URL") else {
-            eprintln!("skipping: DATABASE_URL not set");
-            return None;
+            return skip("DATABASE_URL not set");
         };
         if Command::new("anvil").arg("--version").output().is_err() {
-            eprintln!("skipping: anvil not on PATH");
-            return None;
+            return skip("anvil not on PATH");
         }
         let pool = db::connect_and_migrate(&url).await.expect("database");
         for statement in [
