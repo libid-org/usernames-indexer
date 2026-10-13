@@ -20,10 +20,16 @@ use axum::{
 use http_body_util::BodyExt;
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
-use std::fmt::Debug;
-use tokio::sync::{
-    Mutex,
-    MutexGuard,
+use std::{
+    fmt::Debug,
+    time::Duration,
+};
+use tokio::{
+    sync::{
+        Mutex,
+        MutexGuard,
+    },
+    time::Instant,
 };
 use tower::ServiceExt;
 use usernames_core::{
@@ -187,6 +193,22 @@ pub fn deposited_to_handle(platform: KnownPlatform, typed: &str) -> NamesEvent {
         platform_id: platform.id(),
         handle: DisclosedHandle::verify(platform, handle_node, typed),
     })
+}
+
+/// Wait until the indexer has committed through `block`; fail after 30s.
+pub async fn wait_for_cursor(store: &ChainStore, block: u64) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let cursor = store.cursor().await.expect("cursor");
+        if cursor.is_some_and(|c| c >= block) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the indexer did not reach block {block}; cursor {cursor:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// A history's events, in the order served.

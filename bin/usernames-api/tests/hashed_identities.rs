@@ -41,10 +41,7 @@ use libid_contracts::bindings::{
 };
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
-use tokio::{
-    task::JoinHandle,
-    time::Instant,
-};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use usernames_core::{
     api::model::{
@@ -233,18 +230,7 @@ impl Harness {
     ) {
         send.await.unwrap().watch().await.unwrap();
         let latest = self.provider.get_block_number().await.expect("latest");
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let cursor = self.store.cursor().await.expect("cursor");
-            if cursor.is_some_and(|c| c >= latest) {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "cursor {cursor:?} behind {latest}"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        common::wait_for_cursor(&self.store, latest).await;
     }
 
     /// Whether the node's disclosure is withdrawn, when it has one.

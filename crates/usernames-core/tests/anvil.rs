@@ -10,7 +10,6 @@ use std::{
     process::Command,
     time::Duration,
 };
-use tokio::time::Instant;
 
 use alloy::{
     primitives::{
@@ -307,18 +306,7 @@ async fn indexes_a_real_chain_end_to_end() {
             .run(cancel.clone()),
     );
 
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let cursor = store.cursor().await.expect("cursor");
-        if cursor.is_some_and(|c| c >= latest) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "indexer did not catch up to block {latest}; cursor {cursor:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    common::wait_for_cursor(&store, latest).await;
     cancel.cancel();
     let _ = task.await;
     writer.release().await.expect("the lease releases");
