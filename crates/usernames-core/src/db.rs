@@ -9,7 +9,10 @@
 //! [`Window::apply`], so replaying a window — after a crash, or after a
 //! version-bump re-index — converges instead of counting an event twice.
 
-use std::time::Duration;
+use std::{
+    collections::HashSet,
+    time::Duration,
+};
 
 use alloy::primitives::{
     Address,
@@ -660,6 +663,7 @@ impl ChainStore {
         Ok(Window {
             tx: self.pool.begin().await?,
             chain_id: self.chain_id,
+            platforms: HashSet::new(),
         })
     }
 }
@@ -694,6 +698,8 @@ impl Position {
 pub struct Window {
     tx: Transaction<'static, Postgres>,
     chain_id: i64,
+    /// The platforms this window already recorded.
+    platforms: HashSet<B256>,
 }
 
 impl Window {
@@ -743,9 +749,8 @@ impl Window {
         }
 
         // Read before the projections move: a bind's previous holders are the
-        // rows it is about to overwrite, and an unpublish's handle is the row
-        // it deletes.
-        let involvement = self.involvement(event, &at).await?;
+        // rows it is about to overwrite.
+        let mut involvement = self.involvement(event, &at).await?;
 
         if let Some((platform_id, handle_node, handle)) = event.disclosure() {
             sqlx::query(sql::DISCLOSE)
@@ -791,12 +796,14 @@ impl Window {
                     .bind(log_index)
                     .execute(&mut *self.tx)
                     .await?;
-                sqlx::query(sql::RECORD_PLATFORM)
-                    .bind(chain_id)
-                    .bind(platform_id)
-                    .bind(nodes::Platform::key_of(*platform_id))
-                    .execute(&mut *self.tx)
-                    .await?;
+                if self.platforms.insert(*platform_id) {
+                    sqlx::query(sql::RECORD_PLATFORM)
+                        .bind(chain_id)
+                        .bind(platform_id)
+                        .bind(nodes::Platform::key_of(*platform_id))
+                        .execute(&mut *self.tx)
+                        .await?;
+                }
             }
 
             NamesEvent::HandlePublished {
@@ -828,15 +835,17 @@ impl Window {
                     .await?;
             }
 
+            // Nothing published is still a withdrawal the contract accepts;
+            // it concerns no handle.
             NamesEvent::HandleUnpublished {
                 holder,
                 platform_id,
             } => {
-                sqlx::query(sql::WITHDRAW_NAME)
+                involvement.handle_node = sqlx::query_scalar(sql::WITHDRAW_NAME)
                     .bind(chain_id)
                     .bind(holder)
                     .bind(platform_id)
-                    .execute(&mut *self.tx)
+                    .fetch_optional(&mut *self.tx)
                     .await?;
             }
 
@@ -1264,8 +1273,6 @@ mod sql {
     pub const CLAIMED_REFUND_TOS: &str = include_str!("../sql/claimed_refund_tos.sql");
     pub const CEREMONY_HANDLE: &str = include_str!("../sql/ceremony_handle.sql");
     pub const FEE_PAYER: &str = include_str!("../sql/fee_payer.sql");
-    pub const PUBLISHED_HANDLE_NODE: &str =
-        include_str!("../sql/published_handle_node.sql");
     pub const RECORD_ADDRESS_EVENT: &str =
         include_str!("../sql/record_address_event.sql");
     pub const RECORD_HANDLE_EVENT: &str = include_str!("../sql/record_handle_event.sql");

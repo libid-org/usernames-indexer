@@ -304,9 +304,8 @@ chain; a second deployment can share the database):
 - `platforms` — one row per platform some bind used: what
   `platform_not_configured` answers from. The Proof Verifier is chain
   metadata, reported by `/v1/status`
-- `handle_nodes` — the platform of every handle node an event named one for:
-  binds, retirements, publishes and `DepositedToHandle`; a bare deposit names
-  none
+- `handle_nodes` — the platform of every handle node a bind or a
+  `DepositedToHandle` named; a bare deposit names none
 - `escrow_held` — mirrors HandleEscrow's `held` and `round` per handle node
   and token
 - `escrow_refundable` — mirrors `refundable`: each `refundTo`'s contribution

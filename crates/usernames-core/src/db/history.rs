@@ -3,8 +3,8 @@
 //!
 //! What an event does not name is read from the rows it is about to change,
 //! or from the rows its own transaction recorded just before it: a bind's
-//! previous holders, the handle of a ceremony, a fee or an unpublish, a fee's
-//! payer, and the refundTos a claim takes from.
+//! previous holders, the handle of a ceremony or a fee, a fee's payer, and the
+//! refundTos a claim takes from. An unpublish's handle is the row it deletes.
 
 use std::{
     fmt,
@@ -44,7 +44,7 @@ use crate::events::{
 /// names one.
 pub(crate) struct Involvement {
     parties: Vec<(Address, Vec<Role>)>,
-    handle_node: Option<B256>,
+    pub(crate) handle_node: Option<B256>,
     platform_id: Option<B256>,
 }
 
@@ -119,19 +119,8 @@ impl Window {
                 involvement.named(*handle_node, *platform_id);
             }
 
-            // Nothing published is still a withdrawal the contract accepts;
-            // it concerns no handle.
-            NamesEvent::HandleUnpublished {
-                holder,
-                platform_id,
-            } => {
-                involvement.handle_node = sqlx::query_scalar(sql::PUBLISHED_HANDLE_NODE)
-                    .bind(chain_id)
-                    .bind(holder)
-                    .bind(platform_id)
-                    .fetch_optional(&mut *self.tx)
-                    .await?;
-            }
+            // The withdrawal itself reads which handle it concerns.
+            NamesEvent::HandleUnpublished { .. } => {}
 
             NamesEvent::CeremonyBound {
                 holder,
@@ -185,21 +174,18 @@ impl Window {
                 involvement.handle_node = ceremony.handle_node;
             }
 
-            NamesEvent::HandlePublished {
-                handle_node,
-                platform_id,
-                ..
-            }
-            | NamesEvent::HandleRetired {
-                handle_node,
-                platform_id,
-                ..
-            }
-            | NamesEvent::Escrow(EscrowEvent::DepositedToHandle {
+            // A deposit can come before any bind names the node's platform.
+            NamesEvent::Escrow(EscrowEvent::DepositedToHandle {
                 handle_node,
                 platform_id,
                 ..
             }) => involvement.named(*handle_node, *platform_id),
+
+            // A bind already named the node's platform.
+            NamesEvent::HandlePublished { handle_node, .. }
+            | NamesEvent::HandleRetired { handle_node, .. } => {
+                involvement.handle_node = Some(*handle_node)
+            }
 
             // A deposit names no platform; the `DepositedToHandle` after it,
             // or a bind, does.
@@ -557,16 +543,6 @@ pub(crate) mod plans {
             sqlx::query_scalar(&explain(sql::PREVIOUS_HOLDERS))
                 .bind(1i64)
                 .bind(node)
-                .bind(node)
-                .fetch_all(&mut *conn)
-                .await,
-        ));
-        plans.push(Plan::explained(
-            "an unpublished handle",
-            &["published_pkey"],
-            sqlx::query_scalar(&explain(sql::PUBLISHED_HANDLE_NODE))
-                .bind(1i64)
-                .bind(address)
                 .bind(node)
                 .fetch_all(&mut *conn)
                 .await,
