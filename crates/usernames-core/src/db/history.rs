@@ -3,8 +3,8 @@
 //!
 //! What an event does not name is read from the rows it is about to change,
 //! or from the rows its own transaction recorded just before it: a bind's
-//! previous holders, a retirement's holder, the handle of a ceremony, a fee
-//! or an unpublish, a fee's payer, and the refundTos a claim takes from.
+//! previous holders, the handle of a ceremony, a fee or an unpublish, a fee's
+//! payer, and the refundTos a claim takes from.
 
 use std::{
     fmt,
@@ -119,30 +119,6 @@ impl Window {
                 involvement.named(*handle_node, *platform_id);
             }
 
-            // The event names the address whose bind retired the handle. When
-            // the account moved to another address in that bind, the handle
-            // was held by the one it left, and that is whose history it
-            // belongs in.
-            NamesEvent::HandleRetired {
-                platform_id,
-                handle_node,
-                holder,
-            } => {
-                let held_by: Option<Option<Address>> =
-                    sqlx::query_scalar(sql::HANDLE_HOLDER)
-                        .bind(chain_id)
-                        .bind(handle_node)
-                        .fetch_optional(&mut *self.tx)
-                        .await?;
-                match held_by.flatten() {
-                    Some(held_by) if held_by != *holder => {
-                        involvement.add(held_by, Role::PreviousHandleHolder)
-                    }
-                    _ => involvement.add(*holder, Role::Holder),
-                }
-                involvement.named(*handle_node, *platform_id);
-            }
-
             // Nothing published is still a withdrawal the contract accepts;
             // it concerns no handle.
             NamesEvent::HandleUnpublished {
@@ -210,6 +186,11 @@ impl Window {
             }
 
             NamesEvent::HandlePublished {
+                handle_node,
+                platform_id,
+                ..
+            }
+            | NamesEvent::HandleRetired {
                 handle_node,
                 platform_id,
                 ..
@@ -577,15 +558,6 @@ pub(crate) mod plans {
                 sqlx::query_scalar::<_, String>(&explain(sql::PREVIOUS_HOLDERS))
                     .bind(1i64)
                     .bind(node)
-                    .bind(node)
-                    .fetch_all(&mut *conn)
-                    .await,
-            ),
-            (
-                "a retired handle's holder",
-                &["handles_pkey|handles_node_chain_idx"][..],
-                sqlx::query_scalar(&explain(sql::HANDLE_HOLDER))
-                    .bind(1i64)
                     .bind(node)
                     .fetch_all(&mut *conn)
                     .await,

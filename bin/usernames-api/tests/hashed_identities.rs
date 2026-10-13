@@ -65,6 +65,7 @@ use usernames_core::{
             HandleAmounts,
             HandleResolution,
             IdResolution,
+            Role,
             SearchResults,
         },
     },
@@ -171,6 +172,8 @@ fn the_mocks_emit_the_contracts_topics() {
         assert_eq!(mock, binding, "event {i}");
     }
 }
+
+use MockIdentityRegistry::Bind;
 
 type Registry = MockIdentityRegistry::MockIdentityRegistryInstance<DynProvider>;
 type Escrow = MockHandleEscrow::MockHandleEscrowInstance<DynProvider>;
@@ -345,6 +348,19 @@ impl Harness {
         (!record.is_empty()).then(|| Address::from_slice(&record))
     }
 
+    /// Mine one `bind`'s events and wait for the indexer to commit them.
+    async fn bind(&self, bind: Bind) {
+        self.registry
+            .emitBind(bind)
+            .send()
+            .await
+            .unwrap()
+            .watch()
+            .await
+            .unwrap();
+        self.caught_up().await;
+    }
+
     /// Wait for the indexer to commit through the chain's latest block.
     async fn caught_up(&self) {
         let latest = self.provider.get_block_number().await.expect("latest");
@@ -374,6 +390,45 @@ impl Harness {
         .await
         .expect("a disclosure read")
     }
+}
+
+/// A private bind of `id` to `handle` on X with nothing to withdraw or
+/// retire; a scenario sets what its bind finds.
+fn x_bind(holder: Address, id: &str, handle: &str, observed_at: u64) -> Bind {
+    let x = KnownPlatform::X;
+    Bind {
+        holder,
+        idNode: x.id_node(id).expect("an id"),
+        handleNode: x.handle_node(handle).expect("a handle"),
+        platformId: x.id(),
+        observedAt: observed_at,
+        ceremonyVersion: 1,
+        takenFrom: Address::ZERO,
+        retiredNode: B256::ZERO,
+        retiredHolder: Address::ZERO,
+        retiredNamed: false,
+        handle: String::new(),
+        authorizationDigest: B256::from(U256::from(observed_at)),
+    }
+}
+
+/// An address history as (kind, roles, handle node), newest first.
+fn entries(history: &AddressHistory) -> Vec<(String, Vec<Role>, Option<B256>)> {
+    history
+        .entries
+        .iter()
+        .map(|e| {
+            let kind = serde_json::to_value(&e.event).expect("an event")["kind"]
+                .as_str()
+                .expect("a kind")
+                .to_string();
+            (
+                kind,
+                e.roles.clone(),
+                e.handle.as_ref().map(|h| h.handle_node),
+            )
+        })
+        .collect()
 }
 
 /// Every place the store keeps text, bytes or JSON, and how many rows of it
@@ -632,5 +687,78 @@ async fn private_binds_stay_private_and_disclosures_show_until_withdrawn() {
     for secret in [BOB_ID, "alice_1", "carol_3", "dave_4"] {
         assert!(!bob_history.contains(secret), "{secret}: {bob_history}");
     }
+    h.close().await;
+}
+
+/// A retirement is in the history of the address that held the handle, which
+/// the event names, whoever's bind retired it.
+#[tokio::test]
+async fn a_retired_handle_is_in_the_history_of_the_address_that_held_it() {
+    let Some(h) = Harness::open(43119).await else {
+        return;
+    };
+    let x = KnownPlatform::X;
+    let node = |handle: &str| x.handle_node(handle).expect("a handle");
+    let (alice, bob) = (Address::repeat_byte(0xA1), Address::repeat_byte(0xB2));
+
+    // Alice binds @kim1, disclosing it, then renames to @kim2: her bind
+    // retires @kim1 and withdraws her name for it.
+    h.bind(Bind {
+        handle: "kim1".into(),
+        ..x_bind(alice, "777", "kim1", 1_000)
+    })
+    .await;
+    h.bind(Bind {
+        retiredNode: node("kim1"),
+        retiredHolder: alice,
+        retiredNamed: true,
+        handle: "kim2".into(),
+        ..x_bind(alice, "777", "kim2", 2_000)
+    })
+    .await;
+    // The account moves to Bob's address and renames to @kim3, privately:
+    // @kim2 retires from Alice, and her name for it goes.
+    h.bind(Bind {
+        retiredNode: node("kim2"),
+        retiredHolder: alice,
+        retiredNamed: true,
+        ..x_bind(bob, "777", "kim3", 3_000)
+    })
+    .await;
+
+    let history: AddressHistory = h.answer(&format!("/v1/history/address/{alice}")).await;
+    let (holder, held, moved) = (
+        vec![Role::Holder],
+        vec![Role::PreviousHandleHolder],
+        vec![Role::PreviousIdHolder],
+    );
+    let row = |kind: &str, roles: &Vec<Role>, handle: &str| {
+        (kind.to_string(), roles.clone(), Some(node(handle)))
+    };
+    assert_eq!(
+        entries(&history),
+        [
+            row("identity_bound", &moved, "kim3"),
+            row("handle_unpublished", &holder, "kim2"),
+            row("handle_retired", &held, "kim2"),
+            row("ceremony_bound", &holder, "kim2"),
+            row("handle_published", &holder, "kim2"),
+            row("identity_bound", &holder, "kim2"),
+            row("handle_unpublished", &holder, "kim1"),
+            row("handle_retired", &held, "kim1"),
+            row("ceremony_bound", &holder, "kim1"),
+            row("handle_published", &holder, "kim1"),
+            row("identity_bound", &holder, "kim1"),
+        ]
+    );
+    // Bob never held @kim2: his history is his own bind.
+    let history: AddressHistory = h.answer(&format!("/v1/history/address/{bob}")).await;
+    assert_eq!(
+        entries(&history),
+        [
+            row("ceremony_bound", &holder, "kim3"),
+            row("identity_bound", &holder, "kim3"),
+        ]
+    );
     h.close().await;
 }

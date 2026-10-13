@@ -92,8 +92,9 @@ pub enum NamesEvent {
         #[serde(skip)]
         handle: Option<DisclosedHandle>,
     },
-    /// The identity behind a handle proved a different one; the old node
-    /// stops resolving but keeps its observed-at watermark.
+    /// The identity behind a handle proved a different one; the old node,
+    /// which `holder` held, stops resolving but keeps its observed-at
+    /// watermark.
     HandleRetired {
         platform_id: B256,
         handle_node: B256,
@@ -201,12 +202,12 @@ pub enum EscrowEvent {
 /// bind takes from an address the event does not name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, SerializeDisplay, DeserializeFromStr)]
 pub enum Role {
-    /// The address an identity binds to: it proved, renamed away from,
-    /// withdrew, ran the ceremony of, or paid the fee of a binding, or was
-    /// paid through a handle it holds.
+    /// The address an identity binds to: it proved, withdrew, ran the
+    /// ceremony of, or paid the fee of a binding, or was paid through a
+    /// handle it holds.
     Holder,
     /// Held the handle until this event took it: a bind gave it to another
-    /// address, or retired it from a wallet the account has left.
+    /// address, or retired it.
     PreviousHandleHolder,
     /// Held the account until this bind moved it to another address.
     PreviousIdHolder,
@@ -296,7 +297,9 @@ impl NamesEvent {
             | Self::HandlePublished { holder, .. }
             | Self::HandleUnpublished { holder, .. }
             | Self::CeremonyBound { holder, .. } => vec![(*holder, Role::Holder)],
-            Self::HandleRetired { .. } => Vec::new(),
+            Self::HandleRetired { holder, .. } => {
+                vec![(*holder, Role::PreviousHandleHolder)]
+            }
             Self::BindFeePaid { receiver, .. } => vec![(*receiver, Role::FeeReceiver)],
             Self::ProofVerifierConfigured { .. } => Vec::new(),
             Self::Escrow(event) => event.parties(),
