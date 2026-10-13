@@ -56,10 +56,14 @@ use usernames_core::{
     },
     ens,
     events::{
+        EscrowEvent,
         LogPosition,
         NamesEvent,
     },
-    nodes::KnownPlatform,
+    nodes::{
+        DisclosedHandle,
+        KnownPlatform,
+    },
 };
 
 /// One chain id for every test; arbitrary, only consistency matters.
@@ -596,6 +600,54 @@ async fn a_nul_byte_in_a_query_is_refused_not_a_500() {
         .await
         .refusal();
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    drop(guard);
+}
+
+/// Text that hashes to its node but holds a NUL byte, which Postgres TEXT
+/// cannot store, is left out; the window commits and the chain goes on.
+#[tokio::test]
+async fn disclosed_text_with_a_nul_byte_is_not_stored_and_the_window_commits() {
+    let Some((store, pool, guard)) = test_store().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let x = KnownPlatform::X;
+    let (nul_text, nul_node) = x.folded_handle_node("Bo\0b");
+    let disclosed = DisclosedHandle::verify(x, nul_node, &nul_text);
+    assert!(disclosed.is_some(), "fold and hash accept it");
+    apply_tx(
+        &store,
+        1,
+        vec![
+            NamesEvent::HandlePublished {
+                holder: addr(0xA1),
+                platform_id: x.id(),
+                handle_node: nul_node,
+                handle: disclosed.clone(),
+            },
+            NamesEvent::Escrow(EscrowEvent::DepositedToHandle {
+                handle_node: nul_node,
+                platform_id: x.id(),
+                handle: disclosed,
+            }),
+        ],
+    )
+    .await;
+    assert_eq!(store.cursor().await.expect("cursor"), Some(1));
+    assert_eq!(withdrawn(&pool, nul_node).await, None, "no disclosure row");
+    let published: Option<B256> = sqlx::query_scalar(
+        "SELECT handle_node FROM names.published WHERE chain_id = $1 AND owner = $2",
+    )
+    .bind(CHAIN)
+    .bind(addr(0xA1))
+    .fetch_optional(&pool)
+    .await
+    .expect("a published read");
+    assert_eq!(published, Some(nul_node), "the name's node still lands");
+
+    apply_tx(&store, 2, bind(addr(0xB1), x, "222", "bob_1", 1000, true)).await;
+    let found: SearchResults = get(&pool, "/v1/search?q=bob").await.answer();
+    assert_eq!(handles_of(&found), ["bob_1"]);
     drop(guard);
 }
 

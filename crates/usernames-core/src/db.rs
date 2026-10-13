@@ -747,13 +747,23 @@ impl Window {
         let mut involvement = self.involvement(event, &at).await?;
 
         if let Some((platform_id, handle_node, handle)) = event.disclosure() {
-            sqlx::query(sql::DISCLOSE)
-                .bind(chain_id)
-                .bind(handle_node)
-                .bind(platform_id)
-                .bind(handle.as_str())
-                .execute(&mut *self.tx)
-                .await?;
+            // Postgres TEXT cannot hold a NUL byte.
+            if handle.as_str().contains('\0') {
+                tracing::warn!(
+                    kind = event.kind(),
+                    %platform_id,
+                    %handle_node,
+                    "disclosed text holds a NUL byte; not stored"
+                );
+            } else {
+                sqlx::query(sql::DISCLOSE)
+                    .bind(chain_id)
+                    .bind(handle_node)
+                    .bind(platform_id)
+                    .bind(handle.as_str())
+                    .execute(&mut *self.tx)
+                    .await?;
+            }
         }
 
         match event {
