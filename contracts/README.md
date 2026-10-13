@@ -5,9 +5,9 @@ doubles: the exact event surfaces of `IdentityRegistry` and `HandleEscrow`,
 each event behind a function that emits it, so the anvil suites decode real
 ABI-encoded logs from two emitters. A bind and a `depositToHandle` emit
 several events in one transaction, so each has a function that emits them in
-the contract's order (`emitBind` follows `IdentityRegistry.bind`), and
-`multicall` puts several calls in one transaction. `bin/usernames-api/tests/hashed_identities.rs`
-checks every mock topic against the `libid-contracts` bindings. The escrow double also answers `registry`,
+the contract's order (`emitBind` follows `IdentityRegistry.bind`).
+`bin/usernames-api/tests/hashed_identities.rs` checks every mock topic
+against the `libid-contracts` bindings. The escrow double also answers `registry`,
 which the indexer reads at startup. Each is compiled once, and the ABI and
 creation bytecode of each are committed beside its source as the JSON the
 anvil suite's `sol!` reads.

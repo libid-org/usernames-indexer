@@ -10,7 +10,8 @@ pragma solidity ^0.8.20;
 ///
 ///         Event signatures are copied verbatim from
 ///         libid-contracts/solidity/contracts/escrow/HandleEscrow.sol; the
-///         anvil suite checks every topic against the crate's bindings.
+///         hashed-identities suite checks every topic against the crate's
+///         bindings.
 contract MockHandleEscrow {
     address public immutable registry;
 

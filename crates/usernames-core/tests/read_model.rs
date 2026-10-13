@@ -23,7 +23,13 @@ use alloy::primitives::{
     U256,
 };
 use axum::http::StatusCode;
-use common::Reply;
+use common::{
+    bind,
+    publish,
+    retire,
+    unpublish,
+    Reply,
+};
 use serde::de::DeserializeOwned;
 use sqlx::{
     postgres::PgPoolOptions,
@@ -53,10 +59,7 @@ use usernames_core::{
         LogPosition,
         NamesEvent,
     },
-    nodes::{
-        DisclosedHandle,
-        KnownPlatform,
-    },
+    nodes::KnownPlatform,
 };
 
 /// One chain id for every test; arbitrary, only consistency matters.
@@ -118,57 +121,6 @@ async fn apply_tx(store: &ChainStore, seq: u64, events: Vec<NamesEvent>) {
 /// Apply one event alone in its transaction.
 async fn apply(store: &ChainStore, seq: u64, event: NamesEvent) {
     apply_tx(store, seq, vec![event]).await;
-}
-
-/// A bind's events, as the contract emits them: `IdentityBound`, and
-/// `HandlePublished` when the ceremony disclosed the handle.
-fn bind(
-    holder: Address,
-    platform: KnownPlatform,
-    id: &str,
-    handle: &str,
-    observed_at: u64,
-    disclosed: bool,
-) -> Vec<NamesEvent> {
-    let handle_node = platform.handle_node(handle).expect("a handle");
-    let mut events = vec![NamesEvent::IdentityBound {
-        holder,
-        id_node: platform.id_node(id).expect("an id"),
-        handle_node,
-        platform_id: platform.id(),
-        observed_at,
-        ceremony_version: 1,
-    }];
-    if disclosed {
-        events.push(publish(holder, platform, handle));
-    }
-    events
-}
-
-/// `publish(handle)`'s event.
-fn publish(holder: Address, platform: KnownPlatform, handle: &str) -> NamesEvent {
-    let handle_node = platform.handle_node(handle).expect("a handle");
-    NamesEvent::HandlePublished {
-        holder,
-        platform_id: platform.id(),
-        handle_node,
-        handle: DisclosedHandle::verify(platform, handle_node, handle),
-    }
-}
-
-fn retire(platform: KnownPlatform, handle: &str, holder: Address) -> NamesEvent {
-    NamesEvent::HandleRetired {
-        platform_id: platform.id(),
-        handle_node: platform.handle_node(handle).expect("a handle"),
-        holder,
-    }
-}
-
-fn unpublish(holder: Address, platform: KnownPlatform) -> NamesEvent {
-    NamesEvent::HandleUnpublished {
-        holder,
-        platform_id: platform.id(),
-    }
 }
 
 /// A request scoped to this suite's chain: the store is shared with the
@@ -296,6 +248,81 @@ async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
     let binding = only(&resolved.bindings);
     assert_eq!(binding.owner, alice);
     assert_eq!(binding.handle, None);
+    drop(guard);
+}
+
+/// Whether the node's disclosure is withdrawn, when it has one.
+async fn withdrawn(pool: &PgPool, handle_node: B256) -> Option<bool> {
+    sqlx::query_scalar(
+        "SELECT withdrawn FROM names.disclosures WHERE chain_id = $1 AND handle_node = $2",
+    )
+    .bind(CHAIN)
+    .bind(handle_node)
+    .fetch_optional(pool)
+    .await
+    .expect("a disclosure read")
+}
+
+/// Another identity proving a handle withdraws its previous holder's name for
+/// it first, as `bind` does: the text hides on a private takeover, and shows
+/// again, under the new holder, on a disclosing one.
+#[tokio::test]
+async fn a_takeover_hides_the_previous_holders_text_until_disclosed_again() {
+    let Some((store, pool, guard)) = test_store().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let x = KnownPlatform::X;
+    let (tom, uma, val) = (addr(0xC1), addr(0xC2), addr(0xC3));
+    let holder_text = |resolved: &HandleResolution| {
+        let binding = only(&resolved.bindings);
+        (binding.owner, binding.handle.clone())
+    };
+
+    // (a) Tom discloses @lee1; Uma's account takes it privately.
+    apply_tx(&store, 1, bind(tom, x, "555", "lee1", 1_000, true)).await;
+    let mut takeover = vec![unpublish(tom, x)];
+    takeover.extend(bind(uma, x, "556", "lee1", 2_000, false));
+    apply_tx(&store, 2, takeover).await;
+    let resolved: HandleResolution =
+        get(&pool, "/v1/resolve/handle/x/lee1").await.answer();
+    assert_eq!(holder_text(&resolved), (uma, None));
+    let found: SearchResults = get(&pool, "/v1/search?q=lee1").await.answer();
+    assert!(found.hits.is_empty(), "{found:?}");
+    let umas: AddressResolution = get(&pool, &format!("/v1/resolve/address/{uma}"))
+        .await
+        .answer();
+    assert_eq!(only(&umas.identities).handle, None);
+    assert!(!only(&umas.identities).published);
+    let lee1 = x.handle_node("lee1").unwrap();
+    assert_eq!(withdrawn(&pool, lee1).await, Some(true));
+
+    // (b) Tom discloses @lee2; Val's account takes it, disclosing it.
+    apply_tx(&store, 3, bind(tom, x, "555", "lee2", 3_000, true)).await;
+    let mut takeover = vec![unpublish(tom, x)];
+    takeover.extend(bind(val, x, "557", "lee2", 4_000, true));
+    apply_tx(&store, 4, takeover).await;
+    let resolved: HandleResolution =
+        get(&pool, "/v1/resolve/handle/x/lee2").await.answer();
+    assert_eq!(holder_text(&resolved), (val, Some("lee2".into())));
+    let found: SearchResults = get(&pool, "/v1/search?q=lee2").await.answer();
+    let hits: Vec<(&str, Address, bool)> = found
+        .hits
+        .iter()
+        .map(|hit| (hit.handle.as_str(), hit.owner, hit.published))
+        .collect();
+    assert_eq!(hits, [("lee2", val, true)]);
+    let toms: AddressResolution = get(&pool, &format!("/v1/resolve/address/{tom}"))
+        .await
+        .answer();
+    assert!(
+        toms.identities
+            .iter()
+            .all(|i| i.handle.is_none() && !i.published),
+        "{toms:?}"
+    );
+    let lee2 = x.handle_node("lee2").unwrap();
+    assert_eq!(withdrawn(&pool, lee2).await, Some(false));
     drop(guard);
 }
 

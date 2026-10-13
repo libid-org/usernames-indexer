@@ -6,7 +6,10 @@
 // Every suite compiles its own copy of this module and uses part of it.
 #![allow(dead_code)]
 
-use alloy::primitives::B256;
+use alloy::primitives::{
+    Address,
+    B256,
+};
 use axum::{
     body::Body,
     http::{
@@ -39,8 +42,13 @@ use usernames_core::{
         Store,
     },
     events::{
+        EscrowEvent,
         LogPosition,
         NamesEvent,
+    },
+    nodes::{
+        DisclosedHandle,
+        KnownPlatform,
     },
 };
 
@@ -117,6 +125,68 @@ pub async fn clear_chain(pool: &PgPool, chain: i64) {
             .await
             .expect("cleanup");
     }
+}
+
+/// A bind's events, as the contract emits them: `IdentityBound`, and
+/// `HandlePublished` when the ceremony disclosed the handle.
+pub fn bind(
+    holder: Address,
+    platform: KnownPlatform,
+    id: &str,
+    handle: &str,
+    observed_at: u64,
+    disclosed: bool,
+) -> Vec<NamesEvent> {
+    let mut events = vec![NamesEvent::IdentityBound {
+        holder,
+        id_node: platform.id_node(id).expect("an id"),
+        handle_node: platform.handle_node(handle).expect("a handle"),
+        platform_id: platform.id(),
+        observed_at,
+        ceremony_version: 1,
+    }];
+    if disclosed {
+        events.push(publish(holder, platform, handle));
+    }
+    events
+}
+
+/// `publish(handle)`'s event.
+pub fn publish(holder: Address, platform: KnownPlatform, handle: &str) -> NamesEvent {
+    let handle_node = platform.handle_node(handle).expect("a handle");
+    NamesEvent::HandlePublished {
+        holder,
+        platform_id: platform.id(),
+        handle_node,
+        handle: DisclosedHandle::verify(platform, handle_node, handle),
+    }
+}
+
+/// A bind's retirement of the handle `holder` held.
+pub fn retire(platform: KnownPlatform, handle: &str, holder: Address) -> NamesEvent {
+    NamesEvent::HandleRetired {
+        platform_id: platform.id(),
+        handle_node: platform.handle_node(handle).expect("a handle"),
+        holder,
+    }
+}
+
+/// A withdrawal of `holder`'s name on the platform.
+pub fn unpublish(holder: Address, platform: KnownPlatform) -> NamesEvent {
+    NamesEvent::HandleUnpublished {
+        holder,
+        platform_id: platform.id(),
+    }
+}
+
+/// A `depositToHandle`'s disclosure of the handle as typed.
+pub fn deposited_to_handle(platform: KnownPlatform, typed: &str) -> NamesEvent {
+    let handle_node = platform.handle_node(typed).expect("a handle");
+    NamesEvent::Escrow(EscrowEvent::DepositedToHandle {
+        handle_node,
+        platform_id: platform.id(),
+        handle: DisclosedHandle::verify(platform, handle_node, typed),
+    })
 }
 
 /// A history's events, in the order served.

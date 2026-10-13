@@ -121,28 +121,28 @@ pub fn legacy_addr_call(labels: &[&str]) -> Vec<u8> {
     .abi_encode()
 }
 
-/// Seed one X binding into the read model the gateway answers from: a
-/// disclosing bind, its `IdentityBound` and `HandlePublished` in one
+/// Seed one X binding into the read model the gateway answers from: its
+/// `IdentityBound`, and its `HandlePublished` when `disclosed`, in one
 /// transaction, with the chain's SHA nodes.
-pub async fn bind(store: &ChainStore, handle: &str, holder: Address) {
+pub async fn bind(store: &ChainStore, handle: &str, holder: Address, disclosed: bool) {
     let x = KnownPlatform::X;
     let handle_node = x.handle_node(handle).expect("an X handle");
-    let events = [
-        NamesEvent::IdentityBound {
-            holder,
-            id_node: x.id_node("42").expect("an X id"),
-            handle_node,
-            platform_id: x.id(),
-            observed_at: 1_700_000_000,
-            ceremony_version: 1,
-        },
-        NamesEvent::HandlePublished {
+    let mut events = vec![NamesEvent::IdentityBound {
+        holder,
+        id_node: x.id_node("42").expect("an X id"),
+        handle_node,
+        platform_id: x.id(),
+        observed_at: 1_700_000_000,
+        ceremony_version: 1,
+    }];
+    if disclosed {
+        events.push(NamesEvent::HandlePublished {
             holder,
             platform_id: x.id(),
             handle_node,
             handle: DisclosedHandle::verify(x, handle_node, handle),
-        },
-    ];
+        });
+    }
     let mut window = store.begin_window().await.expect("begin");
     for (log_index, event) in (0u64..).zip(&events) {
         window

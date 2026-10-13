@@ -1,49 +1,44 @@
 //! Hashed identities end to end: mocks with the contracts' event surface emit
-//! private binds, disclosing binds, an unpublish and deposits on anvil; the
-//! indexer's own loop indexes them; the read API and the ENS gateway answer;
-//! and no plaintext the chain did not disclose is left anywhere in the store.
+//! private and disclosing binds, an unpublish and deposits on anvil; the
+//! indexer's own loop indexes them; the read API answers; and no plaintext the
+//! chain did not disclose is left anywhere in the store.
 //!
 //! Skips without `DATABASE_URL`, or without `anvil` on PATH, unless `CI` is
 //! set: there a missing one fails. Everything past those checks panics on
 //! failure.
 
+#[path = "../../../crates/usernames-core/tests/common/mod.rs"]
+mod common;
+
 use std::{
+    fmt::Debug,
+    future::Future,
     process::Command,
-    sync::Arc,
     time::Duration,
 };
 
 use alloy::{
+    network::Ethereum,
     primitives::{
         address,
         Address,
-        Bytes,
         B256,
         U256,
     },
     providers::{
         DynProvider,
+        PendingTransactionBuilder,
         Provider,
         ProviderBuilder,
     },
-    signers::local::PrivateKeySigner,
     sol,
-    sol_types::{
-        SolEvent,
-        SolValue,
-    },
+    sol_types::SolEvent,
 };
-use axum::{
-    body::Body,
-    http::Request,
-    Router,
-};
-use http_body_util::BodyExt;
+use common::Reply;
 use libid_contracts::bindings::{
     escrow::HandleEscrow,
     identity::IdentityRegistry,
 };
-use libid_signer::ManagedSigner;
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
 use tokio::{
@@ -51,42 +46,22 @@ use tokio::{
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
-use tower::ServiceExt;
-use usernames_api::ens::{
-    Config,
-    GatewayResponse,
-    GatewayState,
-};
 use usernames_core::{
-    api::{
-        self,
-        model::{
-            AddressHistory,
-            AddressResolution,
-            HandleAmounts,
-            HandleResolution,
-            IdResolution,
-            Role,
-            SearchResults,
-        },
+    api::model::{
+        AddressHistory,
+        AddressResolution,
+        HandleAmounts,
+        HandleResolution,
+        IdResolution,
+        SearchResults,
     },
     db::{
         self,
         ChainStore,
-        Store,
         WriterLease,
-    },
-    ens::{
-        CoinType,
-        DEFAULT_DOMAIN,
     },
     indexer,
     nodes::KnownPlatform,
-};
-use usernames_fixtures::{
-    addr_call,
-    resolve_call,
-    wire_name,
 };
 
 sol!(
@@ -105,9 +80,6 @@ sol!(
 
 /// This suite's chain, apart from every other suite's.
 const CHAIN: u64 = 43118;
-const RESOLVER: Address = Address::new([0xaa; 20]);
-const SIGNER_KEY: &str =
-    "0x00000000000000000000000000000000000000000000000000000000000a11ce";
 
 /// The plaintext the scenario binds. Ids never reach the chain; a handle
 /// reaches it only when a bind, a publish or a deposit discloses it.
@@ -115,63 +87,24 @@ const ALICE_ID: &str = "4815162342";
 const BOB_ID: &str = "1234567890123";
 const DAVE_ID: &str = "9081726354";
 
-/// The mock's topics are the bindings' topics, for every event the indexer
+/// The mocks' topics are the bindings' topics, for every event the indexer
 /// decodes: a mock that drifted from the contracts would test nothing.
 #[test]
 fn the_mocks_emit_the_contracts_topics() {
-    let pairs = [
-        (
-            MockIdentityRegistry::IdentityBound::SIGNATURE_HASH,
-            IdentityRegistry::IdentityBound::SIGNATURE_HASH,
-        ),
-        (
-            MockIdentityRegistry::HandlePublished::SIGNATURE_HASH,
-            IdentityRegistry::HandlePublished::SIGNATURE_HASH,
-        ),
-        (
-            MockIdentityRegistry::HandleRetired::SIGNATURE_HASH,
-            IdentityRegistry::HandleRetired::SIGNATURE_HASH,
-        ),
-        (
-            MockIdentityRegistry::HandleUnpublished::SIGNATURE_HASH,
-            IdentityRegistry::HandleUnpublished::SIGNATURE_HASH,
-        ),
-        (
-            MockIdentityRegistry::ProofVerifierConfigured::SIGNATURE_HASH,
-            IdentityRegistry::ProofVerifierConfigured::SIGNATURE_HASH,
-        ),
-        (
-            MockIdentityRegistry::CeremonyBound::SIGNATURE_HASH,
-            IdentityRegistry::CeremonyBound::SIGNATURE_HASH,
-        ),
-        (
-            MockIdentityRegistry::BindFeePaid::SIGNATURE_HASH,
-            IdentityRegistry::BindFeePaid::SIGNATURE_HASH,
-        ),
-        (
-            MockHandleEscrow::Deposited::SIGNATURE_HASH,
-            HandleEscrow::Deposited::SIGNATURE_HASH,
-        ),
-        (
-            MockHandleEscrow::DepositedToHandle::SIGNATURE_HASH,
-            HandleEscrow::DepositedToHandle::SIGNATURE_HASH,
-        ),
-        (
-            MockHandleEscrow::Forwarded::SIGNATURE_HASH,
-            HandleEscrow::Forwarded::SIGNATURE_HASH,
-        ),
-        (
-            MockHandleEscrow::Claimed::SIGNATURE_HASH,
-            HandleEscrow::Claimed::SIGNATURE_HASH,
-        ),
-        (
-            MockHandleEscrow::Refunded::SIGNATURE_HASH,
-            HandleEscrow::Refunded::SIGNATURE_HASH,
-        ),
-    ];
-    for (i, (mock, binding)) in pairs.into_iter().enumerate() {
-        assert_eq!(mock, binding, "event {i}");
+    macro_rules! same_topics {
+        ($mock:ident = $binding:ident: $($event:ident),+) => {$(
+            assert_eq!(
+                $mock::$event::SIGNATURE_HASH,
+                $binding::$event::SIGNATURE_HASH,
+                stringify!($event)
+            );
+        )+};
     }
+    same_topics!(MockIdentityRegistry = IdentityRegistry:
+        IdentityBound, HandlePublished, HandleRetired, HandleUnpublished,
+        ProofVerifierConfigured, CeremonyBound, BindFeePaid);
+    same_topics!(MockHandleEscrow = HandleEscrow:
+        Deposited, DepositedToHandle, Forwarded, Claimed, Refunded);
 }
 
 use MockIdentityRegistry::Bind;
@@ -189,8 +122,8 @@ fn skip<T>(missing: &str) -> Option<T> {
 type Registry = MockIdentityRegistry::MockIdentityRegistryInstance<DynProvider>;
 type Escrow = MockHandleEscrow::MockHandleEscrowInstance<DynProvider>;
 
-/// One test's chain: its own anvil with both doubles deployed, the indexer's
-/// loop over them, and the read API and the gateway over the store.
+/// One test's chain: its own anvil with both doubles deployed, and the
+/// indexer's loop over them.
 struct Harness {
     chain: u64,
     pool: PgPool,
@@ -198,7 +131,6 @@ struct Harness {
     provider: DynProvider,
     registry: Registry,
     escrow: Escrow,
-    gateway: Router,
     cancel: CancellationToken,
     indexer: JoinHandle<()>,
     writer: WriterLease,
@@ -229,8 +161,11 @@ impl Harness {
 
         let provider = ProviderBuilder::new()
             .connect_anvil_with_wallet_and_config(|anvil| anvil.chain_id(chain))
-            .expect("anvil spawns")
-            .erased();
+            .expect("anvil spawns");
+        provider
+            .client()
+            .set_poll_interval(Duration::from_millis(10));
+        let provider = provider.erased();
         let registry = MockIdentityRegistry::deploy(provider.clone())
             .await
             .expect("deploy the registry");
@@ -252,7 +187,7 @@ impl Harness {
                     contract: *registry.address(),
                     escrow: Some(*escrow.address()),
                     confirmations: 0,
-                    poll_interval: Duration::from_millis(100),
+                    poll_interval: Duration::from_millis(10),
                     max_block_range: 100,
                     start_block: None,
                     stale_after: Duration::from_secs(120),
@@ -261,18 +196,6 @@ impl Harness {
             .run(cancel.clone()),
         );
 
-        let gateway = usernames_api::ens::router(GatewayState::new(Config {
-            domain: DEFAULT_DOMAIN.parse().expect("domain"),
-            resolver: RESOLVER,
-            ens_chain: 1,
-            store: Store::new(pool.clone()),
-            ttl: Duration::from_secs(300),
-            max_lag_blocks: 32,
-            signer: Arc::new(ManagedSigner::Local(
-                SIGNER_KEY.parse::<PrivateKeySigner>().expect("key"),
-            )),
-        }));
-
         Some(Self {
             chain,
             pool,
@@ -280,7 +203,6 @@ impl Harness {
             provider,
             registry,
             escrow,
-            gateway,
             cancel,
             indexer,
             writer,
@@ -294,84 +216,22 @@ impl Harness {
         self.writer.release().await.expect("the lease releases");
     }
 
-    /// One GET on the read API, scoped to this chain.
-    async fn get<T: DeserializeOwned>(&self, path: &str) -> (u16, Result<T, String>) {
+    /// The answer to one GET on the read API, scoped to this chain.
+    async fn get<T: DeserializeOwned + Debug>(&self, path: &str) -> T {
         let separator = if path.contains('?') { '&' } else { '?' };
-        let response = api::router(api::AppState::new(Store::new(self.pool.clone())))
-            .oneshot(
-                Request::builder()
-                    .uri(format!("{path}{separator}chain={}", self.chain))
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        let status = response.status().as_u16();
-        let bytes = response
-            .into_body()
-            .collect()
-            .await
-            .expect("body")
-            .to_bytes();
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        let body = if status == 200 {
-            Ok(serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("{e}: {text}")))
-        } else {
-            Err(text)
-        };
-        (status, body)
+        let path = format!("{path}{separator}chain={}", self.chain);
+        let reply: Reply<T> = common::get(&self.pool, &path).await;
+        reply.answer()
     }
 
-    /// The answer to a GET that must succeed.
-    async fn answer<T: DeserializeOwned>(&self, path: &str) -> T {
-        let (status, body) = self.get(path).await;
-        body.unwrap_or_else(|refusal| panic!("{path}: {status}: {refusal}"))
-    }
-
-    /// The raw body of a GET, for scanning.
-    async fn raw(&self, path: &str) -> String {
-        let (_, body) = self.get::<serde_json::Value>(path).await;
-        body.map(|value| value.to_string())
-            .unwrap_or_else(|refusal| refusal)
-    }
-
-    /// The address the gateway signs for `labels` on this chain.
-    async fn ens_addr(&self, labels: &[&str]) -> Option<Address> {
-        let call = resolve_call(
-            &wire_name(labels),
-            &addr_call(labels, CoinType::of_chain(self.chain).raw().to::<u64>()),
-        );
-        let uri = format!("/{RESOLVER}/0x{}.json", hex::encode(&call));
-        let response = self
-            .gateway
-            .clone()
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-            .await
-            .expect("gateway");
-        assert_eq!(response.status(), 200, "the gateway answers");
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let reply: GatewayResponse = serde_json::from_slice(&bytes).expect("an answer");
-        let (result, _, _) =
-            <(Bytes, u64, Bytes)>::abi_decode_params(&reply.data).expect("the blob");
-        let record = Bytes::abi_decode(&result).expect("addr's bytes");
-        (!record.is_empty()).then(|| Address::from_slice(&record))
-    }
-
-    /// Mine one `bind`'s events and wait for the indexer to commit them.
-    async fn bind(&self, bind: Bind) {
-        self.registry
-            .emitBind(bind)
-            .send()
-            .await
-            .unwrap()
-            .watch()
-            .await
-            .unwrap();
-        self.caught_up().await;
-    }
-
-    /// Wait for the indexer to commit through the chain's latest block.
-    async fn caught_up(&self) {
+    /// Mine one transaction and wait for the indexer to commit it.
+    async fn mine(
+        &self,
+        send: impl Future<
+            Output = alloy::contract::Result<PendingTransactionBuilder<Ethereum>>,
+        >,
+    ) {
+        send.await.unwrap().watch().await.unwrap();
         let latest = self.provider.get_block_number().await.expect("latest");
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
@@ -383,7 +243,7 @@ impl Harness {
                 Instant::now() < deadline,
                 "cursor {cursor:?} behind {latest}"
             );
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -399,10 +259,52 @@ impl Harness {
         .await
         .expect("a disclosure read")
     }
+
+    /// Every column holding text, bytes or JSON on this chain where `needle`
+    /// is found: what a privacy scan reads.
+    async fn where_found(&self, needle: &str) -> Vec<String> {
+        let columns: Vec<(String, String, String, bool)> = sqlx::query_as(
+            "SELECT c.table_name, c.column_name, c.data_type,
+                    EXISTS (SELECT 1 FROM information_schema.columns k
+                            WHERE k.table_schema = 'names'
+                              AND k.table_name = c.table_name
+                              AND k.column_name = 'chain_id')
+             FROM information_schema.columns c
+             JOIN information_schema.tables t
+               ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+             WHERE c.table_schema = 'names' AND t.table_type = 'BASE TABLE'
+               AND c.data_type IN ('text', 'bytea', 'jsonb', 'ARRAY')",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .expect("columns");
+        let mut found = Vec::new();
+        for (table, column, kind, chained) in columns {
+            let test = if kind == "bytea" {
+                format!(
+                    "(position(convert_to(lower($1), 'UTF8') in {column}) > 0 \
+                     OR position(convert_to($1, 'UTF8') in {column}) > 0)"
+                )
+            } else {
+                format!("lower({column}::text) LIKE '%' || lower($1) || '%'")
+            };
+            let scope = if chained { " AND chain_id = $2" } else { "" };
+            let statement =
+                format!("SELECT count(*) FROM names.{table} WHERE {test}{scope}");
+            let mut query = sqlx::query_scalar::<_, i64>(&statement).bind(needle);
+            if chained {
+                query = query.bind(self.chain as i64);
+            }
+            if query.fetch_one(&self.pool).await.expect("scan") > 0 {
+                found.push(format!("{table}.{column}"));
+            }
+        }
+        found
+    }
 }
 
 /// A private bind of `id` to `handle` on X with nothing to withdraw or
-/// retire; a scenario sets what its bind finds.
+/// retire.
 fn x_bind(holder: Address, id: &str, handle: &str, observed_at: u64) -> Bind {
     let x = KnownPlatform::X;
     Bind {
@@ -421,69 +323,12 @@ fn x_bind(holder: Address, id: &str, handle: &str, observed_at: u64) -> Bind {
     }
 }
 
-/// An address history as (kind, roles, handle node), newest first.
-fn entries(history: &AddressHistory) -> Vec<(String, Vec<Role>, Option<B256>)> {
-    history
-        .entries
-        .iter()
-        .map(|e| {
-            let kind = serde_json::to_value(&e.event).expect("an event")["kind"]
-                .as_str()
-                .expect("a kind")
-                .to_string();
-            (
-                kind,
-                e.roles.clone(),
-                e.handle.as_ref().map(|h| h.handle_node),
-            )
-        })
-        .collect()
-}
-
-/// Every place the store keeps text, bytes or JSON, and how many rows of it
-/// hold `needle`: what a privacy scan reads.
-async fn where_found(pool: &PgPool, needle: &str) -> Vec<String> {
-    let columns: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT c.table_name, c.column_name, c.data_type
-         FROM information_schema.columns c
-         JOIN information_schema.tables t
-           ON t.table_schema = c.table_schema AND t.table_name = c.table_name
-         WHERE c.table_schema = 'names' AND t.table_type = 'BASE TABLE'
-           AND c.data_type IN ('text', 'bytea', 'jsonb', 'ARRAY')",
-    )
-    .fetch_all(pool)
-    .await
-    .expect("columns");
-    let mut found = Vec::new();
-    for (table, column, kind) in columns {
-        let test = if kind == "bytea" {
-            format!(
-                "position(convert_to(lower($1), 'UTF8') in {column}) > 0 \
-                 OR position(convert_to($1, 'UTF8') in {column}) > 0"
-            )
-        } else {
-            format!("lower({column}::text) LIKE '%' || lower($1) || '%'")
-        };
-        let hits: i64 = sqlx::query_scalar(&format!(
-            "SELECT count(*) FROM names.{table} WHERE {test}"
-        ))
-        .bind(needle)
-        .fetch_one(pool)
-        .await
-        .expect("scan");
-        if hits > 0 {
-            found.push(format!("{table}.{column}"));
-        }
-    }
-    found
-}
-
 #[tokio::test]
 async fn private_binds_stay_private_and_disclosures_show_until_withdrawn() {
     let Some(h) = Harness::open(CHAIN).await else {
         return;
     };
-    let (pool, registry, escrow) = (&h.pool, &h.registry, &h.escrow);
+    let (registry, escrow) = (&h.registry, &h.escrow);
 
     let x = KnownPlatform::X;
     let (alice, bob, dave) = (
@@ -494,90 +339,59 @@ async fn private_binds_stay_private_and_disclosures_show_until_withdrawn() {
     let alice_node = x.handle_node("Alice_1").expect("a handle");
     let alice_id = x.id_node(ALICE_ID).expect("an id");
 
-    // 1. A private bind of @Alice_1: nodes only.
-    registry
-        .emitIdentityBound(alice, alice_id, alice_node, x.id(), 1000, 1)
-        .send()
-        .await
-        .unwrap()
-        .watch()
-        .await
-        .unwrap();
-    h.caught_up().await;
-
-    // 2. Hashed here, resolved by node; the text is nowhere to show.
-    let resolved: HandleResolution = h.answer("/v1/resolve/handle/x/Alice_1").await;
+    // 1. A private bind of @Alice_1: nodes only, resolved by hashing here,
+    //    with no text to show.
+    h.mine(
+        registry
+            .emitBind(x_bind(alice, ALICE_ID, "alice_1", 1000))
+            .send(),
+    )
+    .await;
+    let resolved: HandleResolution = h.get("/v1/resolve/handle/x/Alice_1").await;
     assert_eq!(resolved.handle_node, alice_node);
     assert_eq!(resolved.bindings[0].owner, alice);
     assert_eq!(resolved.bindings[0].id_node, alice_id);
     assert_eq!(resolved.bindings[0].handle, None);
-    let by_id: IdResolution = h.answer(&format!("/v1/resolve/id/x/{ALICE_ID}")).await;
+    let by_id: IdResolution = h.get(&format!("/v1/resolve/id/x/{ALICE_ID}")).await;
     assert_eq!(by_id.bindings[0].owner, alice);
     assert_eq!(by_id.bindings[0].handle, None);
-    let found: SearchResults = h.answer("/v1/search?q=alice").await;
+    let found: SearchResults = h.get("/v1/search?q=alice").await;
     assert!(found.hits.is_empty(), "{found:?}");
-    // The gateway resolves a private binding, as `resolveHandle` does.
-    assert_eq!(h.ens_addr(&["alice-1", "x"]).await, Some(alice));
 
-    // 3. A disclosing bind: shown on the address and found by search.
-    registry
-        .emitDisclosingBind(
-            alice,
-            alice_id,
-            alice_node,
-            x.id(),
-            2000,
-            1,
-            "alice_1".into(),
-        )
-        .send()
-        .await
-        .unwrap()
-        .watch()
-        .await
-        .unwrap();
-    h.caught_up().await;
-    let theirs: AddressResolution =
-        h.answer(&format!("/v1/resolve/address/{alice}")).await;
+    // 2. A disclosing bind: shown on the address and found by search.
+    let disclosing = Bind {
+        handle: "alice_1".into(),
+        ..x_bind(alice, ALICE_ID, "alice_1", 2000)
+    };
+    h.mine(registry.emitBind(disclosing).send()).await;
+    let theirs: AddressResolution = h.get(&format!("/v1/resolve/address/{alice}")).await;
     assert_eq!(theirs.identities.len(), 1, "{theirs:?}");
     assert_eq!(theirs.identities[0].handle.as_deref(), Some("alice_1"));
     assert!(theirs.identities[0].published);
-    let found: SearchResults = h.answer("/v1/search?q=alice").await;
+    let found: SearchResults = h.get("/v1/search?q=alice").await;
     let hits: Vec<&str> = found.hits.iter().map(|hit| hit.handle.as_str()).collect();
     assert_eq!(hits, ["alice_1"]);
     assert_eq!(h.withdrawn(alice_node).await, Some(false));
 
-    // 4. Withdrawn: hidden again, the row kept and marked.
-    registry
-        .emitHandleUnpublished(alice, x.id())
-        .send()
-        .await
-        .unwrap()
-        .watch()
-        .await
-        .unwrap();
-    h.caught_up().await;
-    let theirs: AddressResolution =
-        h.answer(&format!("/v1/resolve/address/{alice}")).await;
+    // 3. Withdrawn: hidden again, the row kept and marked.
+    h.mine(registry.emitHandleUnpublished(alice, x.id()).send())
+        .await;
+    let theirs: AddressResolution = h.get(&format!("/v1/resolve/address/{alice}")).await;
     assert_eq!(theirs.identities[0].handle, None);
     assert!(!theirs.identities[0].published);
-    let found: SearchResults = h.answer("/v1/search?q=alice").await;
+    let found: SearchResults = h.get("/v1/search?q=alice").await;
     assert!(found.hits.is_empty(), "{found:?}");
-    let resolved: HandleResolution = h.answer("/v1/resolve/handle/x/alice_1").await;
+    let resolved: HandleResolution = h.get("/v1/resolve/handle/x/alice_1").await;
     assert_eq!(resolved.bindings[0].handle, None);
     assert_eq!(
         h.withdrawn(alice_node).await,
         Some(true),
         "the disclosure stays, withdrawn"
     );
-    let history = h.raw(&format!("/v1/history/address/{alice}")).await;
-    assert!(!history.contains("alice_1"), "{history}");
+    let history: serde_json::Value = h.get(&format!("/v1/history/address/{alice}")).await;
+    assert!(!history.to_string().contains("alice_1"), "{history}");
 
-    // 5. The gateway still resolves the name, through the SHA node.
-    assert_eq!(h.ens_addr(&["alice-1", "x"]).await, Some(alice));
-    assert_eq!(h.ens_addr(&["nobody", "x"]).await, None);
-
-    // 6. A public deposit to @Bob_2, then Bob binds it privately: the
+    // 4. A public deposit to @Bob_2, then Bob binds it privately: the
     //    disclosed handle maps to his id node. A private deposit names only
     //    a node, and no platform.
     let native = address!("EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
@@ -585,70 +399,36 @@ async fn private_binds_stay_private_and_disclosures_show_until_withdrawn() {
     let bob_node = x.handle_node("bob_2").expect("a handle");
     let bob_id = x.id_node(BOB_ID).expect("an id");
     let carol_node = x.handle_node("carol_3").expect("a handle");
-    escrow
-        .emitDepositedToHandle(
-            bob_node,
-            native,
-            payer,
-            payer,
-            U256::ZERO,
-            U256::from(100u64),
-            x.id(),
-            "Bob_2".into(),
-        )
-        .send()
-        .await
-        .unwrap()
-        .watch()
-        .await
-        .unwrap();
-    escrow
-        .emitDeposited(
-            carol_node,
-            native,
-            payer,
-            payer,
-            U256::ZERO,
-            U256::from(5u64),
-        )
-        .send()
-        .await
-        .unwrap()
-        .watch()
-        .await
-        .unwrap();
-    registry
-        .emitIdentityBound(bob, bob_id, bob_node, x.id(), 3000, 1)
-        .send()
-        .await
-        .unwrap()
-        .watch()
-        .await
-        .unwrap();
+    let (round, hundred, five) = (U256::ZERO, U256::from(100u64), U256::from(5u64));
+    let to_bob = escrow.emitDepositedToHandle(
+        bob_node,
+        native,
+        payer,
+        payer,
+        round,
+        hundred,
+        x.id(),
+        "Bob_2".into(),
+    );
+    h.mine(to_bob.send()).await;
+    let to_carol = escrow.emitDeposited(carol_node, native, payer, payer, round, five);
+    h.mine(to_carol.send()).await;
+    h.mine(registry.emitBind(x_bind(bob, BOB_ID, "bob_2", 3000)).send())
+        .await;
     // Dave binds privately and is never disclosed.
-    registry
-        .emitIdentityBound(
-            dave,
-            x.id_node(DAVE_ID).expect("an id"),
-            x.handle_node("dave_4").expect("a handle"),
-            x.id(),
-            4000,
-            1,
-        )
-        .send()
-        .await
-        .unwrap()
-        .watch()
-        .await
-        .unwrap();
-    h.caught_up().await;
+    h.mine(
+        registry
+            .emitBind(x_bind(dave, DAVE_ID, "dave_4", 4000))
+            .send(),
+    )
+    .await;
 
     let mapping: Vec<(String, B256, Option<B256>, Option<Address>)> = sqlx::query_as(
         "SELECT handle, handle_node, id_node, holder FROM names.handle_identities
          WHERE chain_id = $1 ORDER BY handle",
     )
     .bind(CHAIN as i64)
-    .fetch_all(pool)
+    .fetch_all(&h.pool)
     .await
     .expect("the mapping");
     assert_eq!(
@@ -656,190 +436,46 @@ async fn private_binds_stay_private_and_disclosures_show_until_withdrawn() {
         [("bob_2".to_string(), bob_node, Some(bob_id), Some(bob))],
         "alice_1 is withdrawn, carol and dave were never disclosed"
     );
-    let by_node: HandleResolution = h
-        .answer(&format!("/v1/resolve/handle-node/{bob_node}"))
-        .await;
+    let by_node: HandleResolution =
+        h.get(&format!("/v1/resolve/handle-node/{bob_node}")).await;
     assert_eq!(by_node.bindings[0].handle.as_deref(), Some("bob_2"));
     assert_eq!(by_node.bindings[0].id_node, bob_id);
-    let by_id: IdResolution = h.answer(&format!("/v1/resolve/id-node/{bob_id}")).await;
+    let by_id: IdResolution = h.get(&format!("/v1/resolve/id-node/{bob_id}")).await;
     assert_eq!(by_id.bindings[0].handle.as_deref(), Some("bob_2"));
-    let carols: HandleAmounts = h.answer(&format!("/v1/escrow/node/{carol_node}")).await;
+    let carols: HandleAmounts = h.get(&format!("/v1/escrow/node/{carol_node}")).await;
     assert_eq!(carols.handle.platform_id, None, "{carols:?}");
     assert_eq!(carols.handle.handle, None);
-    assert_eq!(carols.amounts[0].amount, U256::from(5u64));
-    let bobs: HandleAmounts = h.answer("/v1/escrow/handle/x/BOB_2").await;
+    assert_eq!(carols.amounts[0].amount, five);
+    let bobs: HandleAmounts = h.get("/v1/escrow/handle/x/BOB_2").await;
     assert_eq!(bobs.handle.platform_id, Some(x.id()));
     assert_eq!(bobs.handle.handle.as_deref(), Some("bob_2"));
-    let payers: AddressHistory = h.answer(&format!("/v1/history/address/{payer}")).await;
+    let payers: AddressHistory = h.get(&format!("/v1/history/address/{payer}")).await;
     assert_eq!(payers.entries.len(), 2, "{payers:?}");
 
-    // 7. The privacy scan: no id anywhere, no undisclosed handle anywhere,
+    // 5. The privacy scan: no id anywhere, no undisclosed handle anywhere,
     //    and the disclosed ones only in the disclosures table.
     for id in [ALICE_ID, BOB_ID, DAVE_ID] {
-        assert_eq!(where_found(pool, id).await, Vec::<String>::new(), "id {id}");
+        assert_eq!(h.where_found(id).await, Vec::<String>::new(), "id {id}");
     }
     for handle in ["carol_3", "dave_4"] {
         assert_eq!(
-            where_found(pool, handle).await,
+            h.where_found(handle).await,
             Vec::<String>::new(),
             "{handle}"
         );
     }
     for handle in ["alice_1", "bob_2"] {
         assert_eq!(
-            where_found(pool, handle).await,
+            h.where_found(handle).await,
             ["disclosures.handle"],
             "{handle}"
         );
     }
-    let bob_history = h.raw(&format!("/v1/history/address/{bob}")).await;
+    let bob_history: serde_json::Value =
+        h.get(&format!("/v1/history/address/{bob}")).await;
+    let bob_history = bob_history.to_string();
     for secret in [BOB_ID, "alice_1", "carol_3", "dave_4"] {
         assert!(!bob_history.contains(secret), "{secret}: {bob_history}");
     }
-    h.close().await;
-}
-
-/// A retirement is in the history of the address that held the handle, which
-/// the event names, whoever's bind retired it.
-#[tokio::test]
-async fn a_retired_handle_is_in_the_history_of_the_address_that_held_it() {
-    let Some(h) = Harness::open(43119).await else {
-        return;
-    };
-    let x = KnownPlatform::X;
-    let node = |handle: &str| x.handle_node(handle).expect("a handle");
-    let (alice, bob) = (Address::repeat_byte(0xA1), Address::repeat_byte(0xB2));
-
-    // Alice binds @kim1, disclosing it, then renames to @kim2: her bind
-    // retires @kim1 and withdraws her name for it.
-    h.bind(Bind {
-        handle: "kim1".into(),
-        ..x_bind(alice, "777", "kim1", 1_000)
-    })
-    .await;
-    h.bind(Bind {
-        retiredNode: node("kim1"),
-        retiredHolder: alice,
-        retiredNamed: true,
-        handle: "kim2".into(),
-        ..x_bind(alice, "777", "kim2", 2_000)
-    })
-    .await;
-    // The account moves to Bob's address and renames to @kim3, privately:
-    // @kim2 retires from Alice, and her name for it goes.
-    h.bind(Bind {
-        retiredNode: node("kim2"),
-        retiredHolder: alice,
-        retiredNamed: true,
-        ..x_bind(bob, "777", "kim3", 3_000)
-    })
-    .await;
-
-    let history: AddressHistory = h.answer(&format!("/v1/history/address/{alice}")).await;
-    let (holder, held, moved) = (
-        vec![Role::Holder],
-        vec![Role::PreviousHandleHolder],
-        vec![Role::PreviousIdHolder],
-    );
-    let row = |kind: &str, roles: &Vec<Role>, handle: &str| {
-        (kind.to_string(), roles.clone(), Some(node(handle)))
-    };
-    assert_eq!(
-        entries(&history),
-        [
-            row("identity_bound", &moved, "kim3"),
-            row("handle_unpublished", &holder, "kim2"),
-            row("handle_retired", &held, "kim2"),
-            row("ceremony_bound", &holder, "kim2"),
-            row("handle_published", &holder, "kim2"),
-            row("identity_bound", &holder, "kim2"),
-            row("handle_unpublished", &holder, "kim1"),
-            row("handle_retired", &held, "kim1"),
-            row("ceremony_bound", &holder, "kim1"),
-            row("handle_published", &holder, "kim1"),
-            row("identity_bound", &holder, "kim1"),
-        ]
-    );
-    // Bob never held @kim2: his history is his own bind.
-    let history: AddressHistory = h.answer(&format!("/v1/history/address/{bob}")).await;
-    assert_eq!(
-        entries(&history),
-        [
-            row("ceremony_bound", &holder, "kim3"),
-            row("identity_bound", &holder, "kim3"),
-        ]
-    );
-    h.close().await;
-}
-
-/// Another identity proving a handle withdraws its previous holder's name for
-/// it first, as `bind` does: the text hides on a private takeover, and shows
-/// again, under the new holder, on a disclosing one.
-#[tokio::test]
-async fn a_takeover_hides_the_previous_holders_text_until_disclosed_again() {
-    let Some(h) = Harness::open(43120).await else {
-        return;
-    };
-    let x = KnownPlatform::X;
-    let node = |handle: &str| x.handle_node(handle).expect("a handle");
-    let (tom, uma, val) = (
-        Address::repeat_byte(0xC1),
-        Address::repeat_byte(0xC2),
-        Address::repeat_byte(0xC3),
-    );
-    let holder_text = |resolved: &HandleResolution| {
-        let binding = &resolved.bindings[0];
-        (binding.owner, binding.handle.clone())
-    };
-
-    // (a) Tom discloses @lee1; Uma's account takes it privately.
-    h.bind(Bind {
-        handle: "lee1".into(),
-        ..x_bind(tom, "555", "lee1", 1_000)
-    })
-    .await;
-    h.bind(Bind {
-        takenFrom: tom,
-        ..x_bind(uma, "556", "lee1", 2_000)
-    })
-    .await;
-    let resolved: HandleResolution = h.answer("/v1/resolve/handle/x/lee1").await;
-    assert_eq!(holder_text(&resolved), (uma, None));
-    let found: SearchResults = h.answer("/v1/search?q=lee1").await;
-    assert!(found.hits.is_empty(), "{found:?}");
-    let umas: AddressResolution = h.answer(&format!("/v1/resolve/address/{uma}")).await;
-    assert_eq!(umas.identities[0].handle, None);
-    assert!(!umas.identities[0].published);
-    assert_eq!(h.withdrawn(node("lee1")).await, Some(true));
-
-    // (b) Tom discloses @lee2; Val's account takes it, disclosing it.
-    h.bind(Bind {
-        handle: "lee2".into(),
-        ..x_bind(tom, "555", "lee2", 3_000)
-    })
-    .await;
-    h.bind(Bind {
-        takenFrom: tom,
-        handle: "lee2".into(),
-        ..x_bind(val, "557", "lee2", 4_000)
-    })
-    .await;
-    let resolved: HandleResolution = h.answer("/v1/resolve/handle/x/lee2").await;
-    assert_eq!(holder_text(&resolved), (val, Some("lee2".into())));
-    let found: SearchResults = h.answer("/v1/search?q=lee2").await;
-    let hits: Vec<(&str, Address, bool)> = found
-        .hits
-        .iter()
-        .map(|hit| (hit.handle.as_str(), hit.owner, hit.published))
-        .collect();
-    assert_eq!(hits, [("lee2", val, true)]);
-    let toms: AddressResolution = h.answer(&format!("/v1/resolve/address/{tom}")).await;
-    assert!(
-        toms.identities
-            .iter()
-            .all(|i| i.handle.is_none() && !i.published),
-        "{toms:?}"
-    );
-    assert_eq!(h.withdrawn(node("lee2")).await, Some(false));
     h.close().await;
 }

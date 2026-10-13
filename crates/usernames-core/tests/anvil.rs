@@ -16,7 +16,6 @@ use alloy::{
     primitives::{
         address,
         Address,
-        Bytes,
         B256,
         U256,
     },
@@ -91,6 +90,31 @@ const CHAIN: u64 = 43117;
 /// A Google account id as the platform issues it: the OIDC `sub`.
 const GOOGLE_USER_ID: &str = "123456789012345678901";
 
+/// A bind of `id` that discloses `handle`, with nothing to withdraw or retire.
+fn disclosing_bind(
+    holder: Address,
+    platform: KnownPlatform,
+    id: &str,
+    handle: &str,
+    observed_at: u64,
+    digest: B256,
+) -> MockIdentityRegistry::Bind {
+    MockIdentityRegistry::Bind {
+        holder,
+        idNode: platform.id_node(id).unwrap(),
+        handleNode: platform.handle_node(handle).unwrap(),
+        platformId: platform.id(),
+        observedAt: observed_at,
+        ceremonyVersion: 1,
+        takenFrom: Address::ZERO,
+        retiredNode: B256::ZERO,
+        retiredHolder: Address::ZERO,
+        retiredNamed: false,
+        handle: handle.into(),
+        authorizationDigest: digest,
+    }
+}
+
 #[tokio::test]
 async fn indexes_a_real_chain_end_to_end() {
     let Ok(url) = std::env::var("DATABASE_URL") else {
@@ -136,22 +160,7 @@ async fn indexes_a_real_chain_end_to_end() {
         .watch()
         .await
         .unwrap();
-    mock.emitDisclosingBind(
-        alice,
-        x.id_node("111").unwrap(),
-        x.handle_node("alice_1").unwrap(),
-        x.id(),
-        1000,
-        1,
-        "alice_1".into(),
-    )
-    .send()
-    .await
-    .unwrap()
-    .watch()
-    .await
-    .unwrap();
-    mock.emitCeremonyBound(digest, alice, x.id(), Bytes::from_static(b"app-a"))
+    mock.emitBind(disclosing_bind(alice, x, "111", "alice_1", 1000, digest))
         .send()
         .await
         .unwrap()
@@ -172,36 +181,29 @@ async fn indexes_a_real_chain_end_to_end() {
         .watch()
         .await
         .unwrap();
-    mock.emitDisclosingBind(
+    let digest_2 = B256::repeat_byte(0xD2);
+    mock.emitBind(disclosing_bind(alice, x, "111", "alice_2", 2000, digest_2))
+        .send()
+        .await
+        .unwrap()
+        .watch()
+        .await
+        .unwrap();
+    let google_bind = disclosing_bind(
         alice,
-        x.id_node("111").unwrap(),
-        x.handle_node("alice_2").unwrap(),
-        x.id(),
-        2000,
-        1,
-        "alice_2".into(),
-    )
-    .send()
-    .await
-    .unwrap()
-    .watch()
-    .await
-    .unwrap();
-    mock.emitDisclosingBind(
-        alice,
-        google.id_node(GOOGLE_USER_ID).unwrap(),
-        google.handle_node("a.b+tag@example.com").unwrap(),
-        google.id(),
+        google,
+        GOOGLE_USER_ID,
+        "a.b+tag@example.com",
         3000,
-        1,
-        "a.b+tag@example.com".into(),
-    )
-    .send()
-    .await
-    .unwrap()
-    .watch()
-    .await
-    .unwrap();
+        B256::repeat_byte(0xD3),
+    );
+    mock.emitBind(google_bind)
+        .send()
+        .await
+        .unwrap()
+        .watch()
+        .await
+        .unwrap();
     mock.emitHandleUnpublished(alice, google.id())
         .send()
         .await
@@ -294,7 +296,7 @@ async fn indexes_a_real_chain_end_to_end() {
         contract: *mock.address(),
         escrow: Some(*escrow.address()),
         confirmations: 0,
-        poll_interval: Duration::from_secs(1),
+        poll_interval: Duration::from_millis(20),
         max_block_range: 2,
         start_block: None,
         // A report good for two minutes; the loop renews it every cycle.
@@ -315,7 +317,7 @@ async fn indexes_a_real_chain_end_to_end() {
             Instant::now() < deadline,
             "indexer did not catch up to block {latest}; cursor {cursor:?}"
         );
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     cancel.cancel();
     let _ = task.await;
@@ -426,15 +428,15 @@ async fn indexes_a_real_chain_end_to_end() {
     .expect("platform row");
     assert_eq!(platform_key.as_deref(), Some("x"));
 
-    // The journal holds every event the scenario emitted, the ceremony's own
-    // two included.
+    // The journal holds every event the scenario emitted, each bind's
+    // ceremony and the fee included.
     let journal: i64 =
         sqlx::query_scalar("SELECT count(*) FROM names.events WHERE chain_id = $1")
             .bind(CHAIN as i64)
             .fetch_one(&pool)
             .await
             .expect("journal count");
-    assert_eq!(journal, 15);
+    assert_eq!(journal, 17);
     let fee_kinds: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM names.events WHERE chain_id = $1 AND kind = 'bind_fee_paid'",
     )
