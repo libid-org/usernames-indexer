@@ -28,6 +28,7 @@ use alloy::{
     signers::local::PrivateKeySigner,
     sol,
     sol_types::{
+        SolCall,
         SolEvent,
         SolValue,
     },
@@ -838,5 +839,43 @@ async fn a_takeover_hides_the_previous_holders_text_until_disclosed_again() {
         h.disclosure(node("lee2")).await,
         Some(("bind".into(), false))
     );
+    h.close().await;
+}
+
+/// A `publish` after a private bind in the same transaction is a publish:
+/// only the HandlePublished right after its bind's IdentityBound is a bind's.
+#[tokio::test]
+async fn a_publish_beside_a_private_bind_is_recorded_as_a_publish() {
+    let Some(h) = Harness::open(43121).await else {
+        return;
+    };
+    let x = KnownPlatform::X;
+    let wes = Address::repeat_byte(0xE1);
+    let ned = x.handle_node("ned1").expect("a handle");
+    let calls = vec![
+        MockIdentityRegistry::emitBindCall {
+            b: x_bind(wes, "558", "ned1", 1_000),
+        }
+        .abi_encode()
+        .into(),
+        MockIdentityRegistry::emitHandlePublishedCall {
+            holder: wes,
+            platformId: x.id(),
+            handleNode: ned,
+            handle: "ned1".into(),
+        }
+        .abi_encode()
+        .into(),
+    ];
+    h.registry
+        .multicall(calls)
+        .send()
+        .await
+        .unwrap()
+        .watch()
+        .await
+        .unwrap();
+    h.caught_up().await;
+    assert_eq!(h.disclosure(ned).await, Some(("publish".into(), false)));
     h.close().await;
 }
