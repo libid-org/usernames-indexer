@@ -221,9 +221,9 @@ impl Platform {
     }
 }
 
-/// Fold a search query the way normalization would, without refusing partial
-/// input: trim spaces, strip one leading `@`, lowercase A-Z. A partial handle
-/// cannot pass shape checks, so full normalization is not run.
+/// A search query as search matches it: spaces trimmed, one leading `@`
+/// stripped, A-Z folded to a-z. Nothing is refused, so a partial or typed
+/// handle such as ` @Ali` finds `alice`.
 pub fn fold_search_query(raw: &str) -> String {
     let trimmed = raw.trim_matches(' ');
     let stripped = trimmed.strip_prefix('@').unwrap_or(trimmed);
