@@ -1,4 +1,4 @@
--- Hashed identities; INDEXER_VERSION 3 replays, so old rows and cursors go.
+-- Hashed identities; the read model replays, so old rows and cursors go.
 
 TRUNCATE names.events, names.ids, names.handles, names.published,
          names.platforms, names.handle_nodes, names.escrow_held,
