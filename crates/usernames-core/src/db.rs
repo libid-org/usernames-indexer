@@ -1239,7 +1239,7 @@ fn search_lookup(
     scoped(&mut statement, "h.chain_id", chain);
     if let Some(platform_id) = platform_id {
         statement
-            .push(" AND h.platform_id = ")
+            .push(" AND v.platform_id = ")
             .push_bind(platform_id);
     }
     if let Some(owner) = owner {
@@ -1466,7 +1466,13 @@ pub(crate) mod plan_tests {
             ),
             (
                 "search by text on a platform, one chain",
-                None,
+                // By its leading column, not walked whole.
+                Some(
+                    &[
+                        "disclosures_platform_chain_idx",
+                        "Index Cond: ((platform_id = ",
+                    ][..],
+                ),
                 search_lookup(
                     "EXPLAIN ",
                     Some(1),
@@ -1536,9 +1542,10 @@ pub(crate) mod plan_tests {
     /// The plans are taken over [`VOLUME`], inside a transaction that rolls
     /// back with its statistics: on a handful of rows every index costs the
     /// same. Sequential scans stay switched off so none hides behind a small
-    /// table. The text search names no index: the planner filters the text
-    /// off a narrower index rather than reading the trigram one, and only the
-    /// row count decides that.
+    /// table. A text search names an index only when a platform narrows it:
+    /// across platforms the planner filters the text off a narrower index
+    /// rather than reading the trigram one, and only the row count decides
+    /// that.
     #[tokio::test]
     async fn every_read_over_the_big_tables_seeks_its_index() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
