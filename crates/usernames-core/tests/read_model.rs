@@ -788,8 +788,9 @@ async fn unconfigured_platform_and_impossible_text_name_their_codes() {
     apply_tx(&store, 1, bind(addr(0xA1), x, "111", "alice_1", 1000, true)).await;
 
     // A platform nothing was ever bound on is a different fact than an
-    // unclaimed handle — the contract's UnknownPlatform revert versus its
-    // zero-address answer — and the code says which, on both resolve paths.
+    // unclaimed handle — `resolveHandle`'s UnknownPlatform revert versus its
+    // zero-address answer — and the code says which. `resolveId` takes no
+    // platform and never reverts, so an id misses as unbound.
     let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/github/alice")
         .await
         .refusal();
@@ -800,10 +801,7 @@ async fn unconfigured_platform_and_impossible_text_name_their_codes() {
     let refusal = get::<IdResolution>(&pool, "/v1/resolve/id/github/111")
         .await
         .refusal();
-    assert_eq!(
-        refusal,
-        (StatusCode::NOT_FOUND, ErrorCode::PlatformNotConfigured)
-    );
+    assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::IdNotBound));
     // A platform this build has no tags for cannot hash text at all.
     let foreign = B256::repeat_byte(7);
     let refusal =

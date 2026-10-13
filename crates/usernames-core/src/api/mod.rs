@@ -552,7 +552,7 @@ async fn handle_resolution(
 ) -> Result<Json<HandleResolution>, ApiError> {
     let rows = state.store.resolve_handle(chain, handle_node).await?;
     let Some(first) = rows.first() else {
-        return Err(not_bound(state, chain, platform, ErrorCode::HandleNotBound).await);
+        return Err(handle_not_bound(state, chain, platform).await);
     };
     let platform_id = first.platform_id;
     let bindings: Vec<HandleBinding> = rows
@@ -582,14 +582,13 @@ async fn handle_resolution(
     }))
 }
 
-/// The 404 for a node no chain in scope binds: the contract's
+/// The 404 for a handle node no chain in scope binds: `resolveHandle`'s
 /// `UnknownPlatform` when nothing was ever bound on the platform, its zero
 /// address otherwise.
-async fn not_bound(
+async fn handle_not_bound(
     state: &AppState,
     chain: Option<i64>,
     platform: Option<KnownPlatform>,
-    code: ErrorCode,
 ) -> ApiError {
     if let Some(platform) = platform {
         match state.store.platform_wired(chain, platform.id()).await {
@@ -603,7 +602,10 @@ async fn not_bound(
             Err(e) => return e.into(),
         }
     }
-    ApiError::not_found(code, "nothing is bound under this node")
+    ApiError::not_found(
+        ErrorCode::HandleNotBound,
+        "nothing is bound under this node",
+    )
 }
 
 /// `GET /v1/resolve/id/{platform}/{user_id}?chain=` — the wallet an account
@@ -619,7 +621,7 @@ async fn resolve_id(
     let chain = filter.parse()?;
     state.synced(chain).await?;
     let id_node = platform.id_node(&user_id)?;
-    id_resolution(&state, chain, id_node, Some(platform)).await
+    id_resolution(&state, chain, id_node).await
 }
 
 /// `GET /v1/resolve/id-node/{idNode}?chain=` — the same, by node.
@@ -631,18 +633,22 @@ async fn resolve_id_node(
     let id_node = parse_node(&id_node)?;
     let chain = filter.parse()?;
     state.synced(chain).await?;
-    id_resolution(&state, chain, id_node, None).await
+    id_resolution(&state, chain, id_node).await
 }
 
+/// `resolveId` takes no platform and never reverts, so a miss is
+/// `id_not_bound` whatever the platform.
 async fn id_resolution(
     state: &AppState,
     chain: Option<i64>,
     id_node: B256,
-    platform: Option<KnownPlatform>,
 ) -> Result<Json<IdResolution>, ApiError> {
     let rows = state.store.resolve_id(chain, id_node).await?;
     let Some(first) = rows.first() else {
-        return Err(not_bound(state, chain, platform, ErrorCode::IdNotBound).await);
+        return Err(ApiError::not_found(
+            ErrorCode::IdNotBound,
+            "nothing is bound under this node",
+        ));
     };
     let platform_id = first.platform_id;
     Ok(Json(IdResolution {

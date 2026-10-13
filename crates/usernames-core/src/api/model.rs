@@ -50,7 +50,7 @@ pub enum ErrorCode {
     HandleRetired,
     /// No chain in scope binds the account.
     IdNotBound,
-    /// No chain in scope ever bound on the platform.
+    /// No chain in scope ever bound on the platform a handle was asked on.
     PlatformNotConfigured,
     /// Text the platform could never hold as a handle.
     HandleImpossible,

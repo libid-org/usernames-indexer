@@ -123,8 +123,9 @@ OIDC `sub`.
 Errors share one envelope — `{ "error": { "code", "message" } }`. The `code`
 is stable and machine-readable; the prose is for humans and may be reworded.
 Resolution 404s distinguish `handle_not_bound`, `handle_retired`,
-`id_not_bound`, `platform_not_configured` (nothing was ever bound on the
-platform on the chains in scope), `handle_impossible` (text the platform could
+`id_not_bound`, `platform_not_configured` (a handle asked on a platform
+nothing was ever bound on, on the chains in scope; an id route answers
+`id_not_bound`, as `resolveId` never reverts), `handle_impossible` (text the platform could
 never hold) and `id_impossible` (an id the platform never issues); `not_synced` is the 503 before the first window;
 bad input is `invalid_platform`, `invalid_address`, `invalid_node`,
 `invalid_chain`, `invalid_cursor`, `invalid_argument`, or, for a path or query
