@@ -83,24 +83,27 @@ impl KnownPlatform {
 
     /// The node a typed handle is bound under, or why no handle can be.
     pub fn handle_node(self, raw: &str) -> Result<B256, HandleError> {
-        libid_identity::handle_node(self.key(), raw)
-            .unwrap_or_else(|| panic!("libid-identity has no node tags for {self}"))
+        self.tagged(libid_identity::handle_node(self.key(), raw))
             .map(B256::from)
     }
 
     /// `text` with A-Z folded to a-z, and its node: the chain's
     /// `handleNodeOf`, which applies no other rule.
     pub fn folded_handle_node(self, text: &str) -> (String, B256) {
-        let (folded, node) = libid_identity::folded_handle_node(self.key(), text)
-            .unwrap_or_else(|| panic!("libid-identity has no node tags for {self}"));
+        let (folded, node) =
+            self.tagged(libid_identity::folded_handle_node(self.key(), text));
         (folded, B256::from(node))
     }
 
     /// The node a user id is bound under, or why no id can be.
     pub fn id_node(self, id: &str) -> Result<B256, IdError> {
-        libid_identity::id_node(self.key(), id)
-            .unwrap_or_else(|| panic!("libid-identity has no node tags for {self}"))
+        self.tagged(libid_identity::id_node(self.key(), id))
             .map(B256::from)
+    }
+
+    /// A node lookup's result; every known platform has node tags.
+    fn tagged<T>(self, lookup: Option<T>) -> T {
+        lookup.unwrap_or_else(|| panic!("libid-identity has no node tags for {self}"))
     }
 }
 
