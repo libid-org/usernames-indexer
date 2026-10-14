@@ -29,10 +29,6 @@ use serde_with::{
     DeserializeFromStr,
     SerializeDisplay,
 };
-use sha2::{
-    Digest,
-    Sha256,
-};
 
 /// keccak256 of a platform key is its id. [`Platform`] is the one entry
 /// point for naming platforms, so this stays private: a caller cannot
@@ -92,15 +88,12 @@ impl KnownPlatform {
             .map(B256::from)
     }
 
-    /// `text` with A-Z folded to a-z, and `SHA256(handle tag || folded)`:
-    /// the chain's `handleNodeOf`, which applies no other rule.
+    /// `text` with A-Z folded to a-z, and its node: the chain's
+    /// `handleNodeOf`, which applies no other rule.
     pub fn folded_handle_node(self, text: &str) -> (String, B256) {
-        let folded = text.to_ascii_lowercase();
-        let node = Sha256::new()
-            .chain_update(self.spec().handle_tag)
-            .chain_update(&folded)
-            .finalize();
-        (folded, B256::from_slice(&node))
+        let (folded, node) = libid_identity::folded_handle_node(self.key(), text)
+            .unwrap_or_else(|| panic!("libid-identity has no node tags for {self}"));
+        (folded, B256::from(node))
     }
 
     /// The node a user id is bound under, or why no id can be.
@@ -322,24 +315,6 @@ mod tests {
         assert!(DisclosedHandle::verify(x, node, "alice_1!").is_none());
         let github = KnownPlatform::GitHub;
         assert!(DisclosedHandle::verify(github, node, "alice_1").is_none());
-    }
-
-    /// The hand-rolled hash agrees with libid-identity's on every vector it
-    /// accepts.
-    #[test]
-    fn every_accepted_vector_verifies_to_its_node() {
-        for v in handle_vectors::VECTORS.iter().filter(|v| v.accepted) {
-            let platform: KnownPlatform = v.platform.parse().unwrap();
-            let node: B256 = v.handle_node.parse().unwrap();
-            let disclosed = DisclosedHandle::verify(platform, node, v.input);
-            assert_eq!(
-                disclosed.as_ref().map(DisclosedHandle::as_str),
-                Some(v.output),
-                "{} {:?}",
-                v.platform,
-                v.input
-            );
-        }
     }
 
     /// Only A-Z folds. Text the platform's rules refuse is still accepted

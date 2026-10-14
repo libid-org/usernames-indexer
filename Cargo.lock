@@ -3466,7 +3466,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "libid-contracts"
 version = "0.17.0"
-source = "git+https://github.com/libid-org/libID-contracts?rev=534c0e5#534c0e523f378215b7e41eb704494d20beed56f3"
+source = "git+https://github.com/libid-org/libID-contracts?rev=2cb3abc#2cb3abc8b7f2f31473a533ccc4a98d3c329a45e5"
 dependencies = [
  "alloy",
  "include_dir",
@@ -3479,7 +3479,7 @@ dependencies = [
 [[package]]
 name = "libid-identity"
 version = "0.17.0"
-source = "git+https://github.com/libid-org/libID-contracts?rev=534c0e5#534c0e523f378215b7e41eb704494d20beed56f3"
+source = "git+https://github.com/libid-org/libID-contracts?rev=2cb3abc#2cb3abc8b7f2f31473a533ccc4a98d3c329a45e5"
 dependencies = [
  "sha2 0.10.9",
 ]
@@ -3487,7 +3487,7 @@ dependencies = [
 [[package]]
 name = "libid-profiles"
 version = "0.17.0"
-source = "git+https://github.com/libid-org/libID-contracts?rev=534c0e5#534c0e523f378215b7e41eb704494d20beed56f3"
+source = "git+https://github.com/libid-org/libID-contracts?rev=2cb3abc#2cb3abc8b7f2f31473a533ccc4a98d3c329a45e5"
 
 [[package]]
 name = "libid-signer"
@@ -5774,7 +5774,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
- "sha2 0.10.9",
  "sqlx",
  "thiserror",
  "tokio",
