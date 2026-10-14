@@ -24,10 +24,13 @@ use alloy::primitives::{
 };
 use axum::http::StatusCode;
 use common::{
+    apply,
+    apply_tx,
     bind,
     publish,
     retire,
     unpublish,
+    withdrawn,
     Reply,
 };
 use serde::de::DeserializeOwned;
@@ -55,10 +58,7 @@ use usernames_core::{
         ChainStore,
     },
     ens,
-    events::{
-        LogPosition,
-        NamesEvent,
-    },
+    events::NamesEvent,
     nodes::KnownPlatform,
 };
 
@@ -101,34 +101,11 @@ fn addr(byte: u8) -> Address {
     Address::from_slice(&[byte; 20])
 }
 
-/// Apply one transaction's events at a synthetic chain position, committing
-/// like a window: the same [`db::Window`] the loop uses, so the cursor lands
-/// with the write — which is also what lets the sync-gated API answer.
-async fn apply_tx(store: &ChainStore, seq: u64, events: Vec<NamesEvent>) {
-    let mut window = store.begin_window().await.expect("begin");
-    for (log_index, event) in (0u64..).zip(&events) {
-        let pos = LogPosition {
-            block_number: seq,
-            log_index,
-            tx_hash: B256::from_slice(&[seq as u8; 32]),
-            block_time: 1_700_000_000 + seq,
-        };
-        window.apply(event, &pos).await.expect("apply");
-    }
-    window.commit(seq).await.expect("commit");
-}
-
-/// Apply one event alone in its transaction.
-async fn apply(store: &ChainStore, seq: u64, event: NamesEvent) {
-    apply_tx(store, seq, vec![event]).await;
-}
-
 /// A request scoped to this suite's chain: the store is shared with the
 /// anvil suite's chain, and an unscoped read would see both. The reads that
 /// span chains have their own test below.
 async fn get<T: DeserializeOwned>(pool: &PgPool, path: &str) -> Reply<T> {
-    let separator = if path.contains('?') { '&' } else { '?' };
-    common::get(pool, &format!("{path}{separator}chain={CHAIN}")).await
+    common::get_on(pool, CHAIN, path).await
 }
 
 /// The one binding a resolution carries in these single-chain scenarios.
@@ -256,18 +233,6 @@ async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
     drop(guard);
 }
 
-/// Whether the node's disclosure is withdrawn, when it has one.
-async fn withdrawn(pool: &PgPool, handle_node: B256) -> Option<bool> {
-    sqlx::query_scalar(
-        "SELECT withdrawn FROM names.disclosures WHERE chain_id = $1 AND handle_node = $2",
-    )
-    .bind(CHAIN)
-    .bind(handle_node)
-    .fetch_optional(pool)
-    .await
-    .expect("a disclosure read")
-}
-
 /// Another identity proving a handle withdraws its previous holder's name for
 /// it first, as `bind` does: the text hides on a private takeover, and shows
 /// again, under the new holder, on a disclosing one.
@@ -300,7 +265,7 @@ async fn a_takeover_hides_the_previous_holders_text_until_disclosed_again() {
     assert_eq!(only(&umas.identities).handle, None);
     assert!(!only(&umas.identities).published);
     let lee1 = x.handle_node("lee1").unwrap();
-    assert_eq!(withdrawn(&pool, lee1).await, Some(true));
+    assert_eq!(withdrawn(&pool, CHAIN, lee1).await, Some(true));
 
     // (b) Tom discloses @lee2; Val's account takes it, disclosing it.
     apply_tx(&store, 3, bind(tom, x, "555", "lee2", 3_000, true)).await;
@@ -327,7 +292,7 @@ async fn a_takeover_hides_the_previous_holders_text_until_disclosed_again() {
         "{toms:?}"
     );
     let lee2 = x.handle_node("lee2").unwrap();
-    assert_eq!(withdrawn(&pool, lee2).await, Some(false));
+    assert_eq!(withdrawn(&pool, CHAIN, lee2).await, Some(false));
     drop(guard);
 }
 
@@ -346,7 +311,7 @@ async fn publishing_another_name_withdraws_the_one_it_replaces() {
     apply_tx(&store, 2, bind(alice, x, "72", "lee", 2_000, false)).await;
     apply(&store, 3, publish(alice, x, "lee")).await;
     let kim = x.handle_node("kim").unwrap();
-    assert_eq!(withdrawn(&pool, kim).await, Some(true));
+    assert_eq!(withdrawn(&pool, CHAIN, kim).await, Some(true));
 
     // Bob's account takes kim privately: Alice's name is lee, so the bind
     // withdraws nothing on chain.

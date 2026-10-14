@@ -13,7 +13,7 @@
 //! - [`addr_call`] and [`legacy_addr_call`]: the record request, in the
 //!   ENSIP-11 multichain form and in the older form that means coin type 60.
 //! - [`resolve_call`]: the wrapped call the gateway receives.
-//! - [`bind`]: one binding written into the store the gateway answers from,
+//! - [`bind`] and [`bind_private`]: one binding written into the store the gateway answers from,
 //!   with its chain marked synced.
 //!
 //! `gateway.rs` drives the router in process with these; `end_to_end.rs`
@@ -121,10 +121,18 @@ pub fn legacy_addr_call(labels: &[&str]) -> Vec<u8> {
     .abi_encode()
 }
 
-/// Seed one X binding into the read model the gateway answers from: its
-/// `IdentityBound`, and its `HandlePublished` when `disclosed`, in one
-/// transaction, with the chain's SHA nodes.
-pub async fn bind(store: &ChainStore, handle: &str, holder: Address, disclosed: bool) {
+/// Seed one disclosing X binding into the read model the gateway answers
+/// from: its `IdentityBound` and `HandlePublished`, in one transaction.
+pub async fn bind(store: &ChainStore, handle: &str, holder: Address) {
+    seed(store, handle, holder, true).await;
+}
+
+/// [`bind`] without the `HandlePublished`: a private binding.
+pub async fn bind_private(store: &ChainStore, handle: &str, holder: Address) {
+    seed(store, handle, holder, false).await;
+}
+
+async fn seed(store: &ChainStore, handle: &str, holder: Address, disclosed: bool) {
     let x = KnownPlatform::X;
     let handle_node = x.handle_node(handle).expect("an X handle");
     let mut events = vec![NamesEvent::IdentityBound {

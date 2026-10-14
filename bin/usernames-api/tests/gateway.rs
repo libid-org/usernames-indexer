@@ -291,7 +291,7 @@ macro_rules! gateway_or_skip {
 async fn a_bound_handle_resolves_and_the_signature_verifies() {
     let (router, store, _pool, guard) = gateway_or_skip!(32);
     let owner = Address::from([0xbe; 20]);
-    bind(&store, "alice", owner, true).await;
+    bind(&store, "alice", owner).await;
 
     let call = resolve_call(
         &wire_name(&["alice", "x"]),
@@ -308,7 +308,7 @@ async fn a_bound_handle_resolves_and_the_signature_verifies() {
 async fn a_private_binding_resolves() {
     let (router, store, _pool, guard) = gateway_or_skip!(32);
     let owner = Address::from([0xbe; 20]);
-    bind(&store, "alice", owner, false).await;
+    bind_private(&store, "alice", owner).await;
 
     let call = resolve_call(
         &wire_name(&["alice", "x"]),
@@ -346,7 +346,7 @@ async fn a_name_nobody_holds_gets_a_signed_null() {
 #[tokio::test]
 async fn a_chain_this_gateway_does_not_serve_is_refused_not_signed() {
     let (router, store, _pool, guard) = gateway_or_skip!(32);
-    bind(&store, "alice", Address::from([0xbe; 20]), true).await;
+    bind(&store, "alice", Address::from([0xbe; 20])).await;
 
     // Base, while this gateway serves only the test chain.
     let call = resolve_call(
@@ -364,7 +364,7 @@ async fn a_chain_this_gateway_does_not_serve_is_refused_not_signed() {
 #[tokio::test]
 async fn a_non_evm_coin_type_is_answered_null() {
     let (router, store, _pool, guard) = gateway_or_skip!(32);
-    bind(&store, "alice", Address::from([0xbe; 20]), true).await;
+    bind(&store, "alice", Address::from([0xbe; 20])).await;
 
     let call = resolve_call(&wire_name(&["alice", "x"]), &addr_call(&["alice", "x"], 0));
     let (status, body) = ask(&router, RESOLVER, &call).await;
@@ -378,7 +378,7 @@ async fn a_chain_label_narrows_and_never_widens() {
     let Some((router, store, _pool, guard)) = gateway_over(&[EDEN], 32).await else {
         return;
     };
-    bind(&store, "alice", Address::from([0xbe; 20]), true).await;
+    bind(&store, "alice", Address::from([0xbe; 20])).await;
     declare_names(&store, &["eden"]).await;
     let coin = 0x8000_0000 | EDEN as u64;
 
@@ -408,7 +408,7 @@ async fn every_name_a_chain_declares_resolves_it() {
         return;
     };
     let owner = Address::from([0xbe; 20]);
-    bind(&store, "alice", owner, true).await;
+    bind(&store, "alice", owner).await;
     declare_names(&store, &["eden", "eden-testnet"]).await;
     let coin = 0x8000_0000 | EDEN as u64;
 
@@ -430,7 +430,7 @@ async fn a_record_that_is_not_addr_degrades_to_null() {
     // A client asking for `text()` must not see an error on a name that
     // resolves fine for addresses.
     let (router, store, _pool, guard) = gateway_or_skip!(32);
-    bind(&store, "alice", Address::from([0xbe; 20]), true).await;
+    bind(&store, "alice", Address::from([0xbe; 20])).await;
 
     let call = resolve_call(&wire_name(&["alice", "x"]), &[0xaa, 0xbb, 0xcc, 0xdd]);
     let (status, body) = ask(&router, RESOLVER, &call).await;
@@ -521,7 +521,7 @@ async fn a_gateway_under_a_subname_answers_its_names_and_refuses_the_parents() {
     config.domain = "testnet.handles.link".parse().expect("domain");
     let router = usernames_api::ens::router(GatewayState::new(config));
     let owner = Address::from([0xbe; 20]);
-    bind(&store, "alice", owner, true).await;
+    bind(&store, "alice", owner).await;
     let coin = 0x8000_0000 | CHAIN as u64;
 
     // `wire_name` appends `handles.link`, so the subname rides as a label.
@@ -547,7 +547,7 @@ async fn a_stale_index_refuses_rather_than_signing_a_null() {
     // The distinction the lag gate exists for: a signed null asserts that no
     // binding exists, and an index this far behind has not earned that.
     let (router, store, _pool, guard) = gateway_or_skip!(0);
-    bind(&store, "alice", Address::from([0xbe; 20]), true).await;
+    bind(&store, "alice", Address::from([0xbe; 20])).await;
     // Far ahead of the cursor, as the TARGET: that is the quantity the gate
     // compares, and the head alone no longer moves it.
     store
@@ -584,7 +584,7 @@ async fn one_gateway_answers_for_every_chain_it_serves() {
     };
     let here = Address::from([0xbe; 20]);
     let there = Address::from([0xed; 20]);
-    bind(&store, "alice", here, true).await;
+    bind(&store, "alice", here).await;
 
     // The same handle, bound to a different wallet on the other chain.
     let other_store = ChainStore::new(
@@ -593,7 +593,7 @@ async fn one_gateway_answers_for_every_chain_it_serves() {
             .unwrap(),
         OTHER,
     );
-    bind(&other_store, "alice", there, true).await;
+    bind(&other_store, "alice", there).await;
 
     for (chain, expected) in [(CHAIN, here), (OTHER, there)] {
         let call = resolve_call(
@@ -622,7 +622,7 @@ async fn one_gateway_answers_for_every_chain_it_serves() {
 #[tokio::test]
 async fn an_index_that_cannot_report_its_position_refuses() {
     let (router, store, pool, guard) = gateway_or_skip!(32);
-    bind(&store, "alice", Address::from([0xbe; 20]), true).await;
+    bind(&store, "alice", Address::from([0xbe; 20])).await;
 
     // Wipe what the index knows about its own progress, leaving the binding
     // in place: the rows say one thing, the cursor says nothing.
@@ -651,7 +651,7 @@ async fn an_index_that_cannot_report_its_position_refuses() {
 #[tokio::test]
 async fn an_expired_report_is_too_stale_however_small_the_lag() {
     let (router, store, _pool, guard) = gateway_or_skip!(32);
-    bind(&store, "alice", Address::from([0xbe; 20]), true).await;
+    bind(&store, "alice", Address::from([0xbe; 20])).await;
     // Caught up by the block measure, and the report long expired.
     store.set_chain_target_valid_until(1).await;
 
@@ -676,9 +676,9 @@ async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
         return;
     };
     let here = Address::from([0xbe; 20]);
-    bind(&store, "alice", here, true).await;
+    bind(&store, "alice", here).await;
     let other_store = ChainStore::new(pool.clone(), OTHER);
-    bind(&other_store, "alice", Address::from([0xed; 20]), true).await;
+    bind(&other_store, "alice", Address::from([0xed; 20])).await;
     // The other chain's indexer stopped long ago.
     other_store.set_chain_target_valid_until(1).await;
 
@@ -740,7 +740,7 @@ fn row_of(status: &GatewayStatus, chain_id: i64) -> &ChainStatus {
 async fn a_chain_with_no_declared_name_answers_only_the_unlabelled_name() {
     let (router, store, _pool, guard) = gateway_or_skip!(32);
     let here = Address::from([0xbe; 20]);
-    bind(&store, "alice", here, true).await;
+    bind(&store, "alice", here).await;
     let coin = 0x8000_0000 | CHAIN as u64;
 
     let plain = resolve_call(
@@ -791,7 +791,7 @@ async fn a_chain_that_appears_in_the_store_is_served_without_a_restart() {
     other.set_chain_head(1).await;
     other.set_chain_target(1, Duration::from_secs(120)).await;
     let there = Address::from([0xed; 20]);
-    bind(&other, "alice", there, true).await;
+    bind(&other, "alice", there).await;
 
     // The same router, untouched, now answers for it.
     let (status, body) = ask(&router, RESOLVER, &call).await;
@@ -811,7 +811,7 @@ async fn two_indexed_chains_on_one_coin_type_are_refused_unsigned() {
     else {
         return;
     };
-    bind(&store, "alice", Address::from([0xed; 20]), true).await;
+    bind(&store, "alice", Address::from([0xed; 20])).await;
     let call = resolve_call(
         &wire_name(&["alice", "x"]),
         &addr_call(&["alice", "x"], 0x8000_0000u64 | EDEN as u64),
@@ -855,7 +855,7 @@ async fn the_eden_testnet_resolves_despite_its_chain_id() {
         return;
     };
     let owner = Address::from([0xed; 20]);
-    bind(&store, "alice", owner, true).await;
+    bind(&store, "alice", owner).await;
     declare_names(&store, &["eden"]).await;
 
     // Exactly what a wallet on eden sends: `0x80000000 | 3735928814`, which is
@@ -883,7 +883,7 @@ async fn the_eden_testnet_resolves_despite_its_chain_id() {
 #[tokio::test]
 async fn the_legacy_addr_shape_is_refused_unsigned_off_mainnet() {
     let (router, store, _pool, guard) = gateway_or_skip!(32);
-    bind(&store, "alice", Address::from([0xbe; 20]), true).await;
+    bind(&store, "alice", Address::from([0xbe; 20])).await;
 
     let call = resolve_call(
         &wire_name(&["alice", "x"]),
@@ -917,7 +917,7 @@ async fn bare_addr_asks_for_the_chain_of_the_gateways_registry() {
         ..config
     }));
     let owner = Address::from([0xbe; 20]);
-    bind(&store, "alice", owner, true).await;
+    bind(&store, "alice", owner).await;
 
     let call = resolve_call(
         &wire_name(&["alice", "x"]),
@@ -946,7 +946,7 @@ async fn the_merged_router_keeps_both_halves_intact() {
         return;
     };
     let owner = Address::from([0xbe; 20]);
-    bind(&store, "alice", owner, true).await;
+    bind(&store, "alice", owner).await;
 
     let app = usernames_api::build_router(
         AppState::new(Store::new(pool.clone())),
@@ -1029,7 +1029,7 @@ async fn the_merged_router_keeps_both_halves_intact() {
 #[tokio::test]
 async fn a_node_that_is_not_this_name_is_refused() {
     let (router, store, _pool, guard) = gateway_or_skip!(32);
-    bind(&store, "alice", Address::from([0xbe; 20]), true).await;
+    bind(&store, "alice", Address::from([0xbe; 20])).await;
 
     let coin = 0x8000_0000 | CHAIN as u64;
     let call = resolve_call(

@@ -31,10 +31,13 @@ use alloy::{
         Provider,
         ProviderBuilder,
     },
-    sol,
     sol_types::SolEvent,
 };
-use common::Reply;
+use common::{
+    MockHandleEscrow,
+    MockIdentityRegistry,
+    Reply,
+};
 use libid_contracts::bindings::{
     escrow::HandleEscrow,
     identity::IdentityRegistry,
@@ -60,20 +63,6 @@ use usernames_core::{
     indexer,
     nodes::KnownPlatform,
 };
-
-sol!(
-    #[allow(clippy::too_many_arguments)]
-    #[sol(rpc)]
-    MockIdentityRegistry,
-    "../../contracts/MockIdentityRegistry.json"
-);
-
-sol!(
-    #[allow(clippy::too_many_arguments)]
-    #[sol(rpc)]
-    MockHandleEscrow,
-    "../../contracts/MockHandleEscrow.json"
-);
 
 /// This suite's chain, apart from every other suite's.
 const CHAIN: u64 = 43118;
@@ -143,17 +132,7 @@ impl Harness {
             return skip("anvil not on PATH");
         }
         let pool = db::connect_and_migrate(&url).await.expect("database");
-        for statement in [
-            db::CLEAR_CHAIN,
-            db::CLEAR_CHAIN_METADATA,
-            db::CLEAR_CHAIN_NAMES,
-        ] {
-            sqlx::query(statement)
-                .bind(chain as i64)
-                .execute(&pool)
-                .await
-                .expect("cleanup");
-        }
+        common::clear_chain(&pool, chain as i64).await;
         let store = ChainStore::new(pool.clone(), chain as i64);
 
         let provider = ProviderBuilder::new()
@@ -215,9 +194,7 @@ impl Harness {
 
     /// The answer to one GET on the read API, scoped to this chain.
     async fn get<T: DeserializeOwned + Debug>(&self, path: &str) -> T {
-        let separator = if path.contains('?') { '&' } else { '?' };
-        let path = format!("{path}{separator}chain={}", self.chain);
-        let reply: Reply<T> = common::get(&self.pool, &path).await;
+        let reply: Reply<T> = common::get_on(&self.pool, self.chain as i64, path).await;
         reply.answer()
     }
 
@@ -231,19 +208,6 @@ impl Harness {
         send.await.unwrap().watch().await.unwrap();
         let latest = self.provider.get_block_number().await.expect("latest");
         common::wait_for_cursor(&self.store, latest).await;
-    }
-
-    /// Whether the node's disclosure is withdrawn, when it has one.
-    async fn withdrawn(&self, handle_node: B256) -> Option<bool> {
-        sqlx::query_scalar(
-            "SELECT withdrawn FROM names.disclosures
-             WHERE chain_id = $1 AND handle_node = $2",
-        )
-        .bind(self.chain as i64)
-        .bind(handle_node)
-        .fetch_optional(&self.pool)
-        .await
-        .expect("a disclosure read")
     }
 
     /// Every column holding text, bytes or JSON on this chain where `needle`
@@ -292,21 +256,16 @@ impl Harness {
 /// A private bind of `id` to `handle` on X with nothing to withdraw or
 /// retire.
 fn x_bind(holder: Address, id: &str, handle: &str, observed_at: u64) -> Bind {
-    let x = KnownPlatform::X;
-    Bind {
+    let digest = B256::from(U256::from(observed_at));
+    common::mock_bind(
         holder,
-        idNode: x.id_node(id).expect("an id"),
-        handleNode: x.handle_node(handle).expect("a handle"),
-        platformId: x.id(),
-        observedAt: observed_at,
-        ceremonyVersion: 1,
-        takenFrom: Address::ZERO,
-        retiredNode: B256::ZERO,
-        retiredHolder: Address::ZERO,
-        retiredNamed: false,
-        handle: String::new(),
-        authorizationDigest: B256::from(U256::from(observed_at)),
-    }
+        KnownPlatform::X,
+        id,
+        handle,
+        observed_at,
+        false,
+        digest,
+    )
 }
 
 #[tokio::test]
@@ -357,7 +316,10 @@ async fn private_binds_stay_private_and_disclosures_show_until_withdrawn() {
     let found: SearchResults = h.get("/v1/search?q=alice").await;
     let hits: Vec<&str> = found.hits.iter().map(|hit| hit.handle.as_str()).collect();
     assert_eq!(hits, ["alice_1"]);
-    assert_eq!(h.withdrawn(alice_node).await, Some(false));
+    assert_eq!(
+        common::withdrawn(&h.pool, h.chain as i64, alice_node).await,
+        Some(false)
+    );
 
     // 3. Withdrawn: hidden again, the row kept and marked.
     h.mine(registry.emitHandleUnpublished(alice, x.id()).send())
@@ -370,7 +332,7 @@ async fn private_binds_stay_private_and_disclosures_show_until_withdrawn() {
     let resolved: HandleResolution = h.get("/v1/resolve/handle/x/alice_1").await;
     assert_eq!(resolved.bindings[0].handle, None);
     assert_eq!(
-        h.withdrawn(alice_node).await,
+        common::withdrawn(&h.pool, h.chain as i64, alice_node).await,
         Some(true),
         "the disclosure stays, withdrawn"
     );

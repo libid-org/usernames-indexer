@@ -23,7 +23,6 @@ use alloy::{
         Provider,
         ProviderBuilder,
     },
-    sol,
 };
 use axum::http::StatusCode;
 use serde::de::DeserializeOwned;
@@ -54,33 +53,16 @@ use usernames_core::{
 mod common;
 use common::{
     events,
+    MockHandleEscrow,
+    MockIdentityRegistry,
     Reply,
 };
 
 /// A request scoped to this suite's chain: the store is shared with the
 /// read-model suite's chain.
 async fn get<T: DeserializeOwned>(pool: &PgPool, path: &str) -> Reply<T> {
-    let separator = if path.contains('?') { '&' } else { '?' };
-    common::get(pool, &format!("{path}{separator}chain={CHAIN}")).await
+    common::get_on(pool, CHAIN as i64, path).await
 }
-
-sol!(
-    /// The event surface of IdentityRegistry behind bare emit functions,
-    /// compiled from contracts/MockIdentityRegistry.sol.
-    #[allow(clippy::too_many_arguments)]
-    #[sol(rpc)]
-    MockIdentityRegistry,
-    "../../contracts/MockIdentityRegistry.json"
-);
-
-sol!(
-    /// The event surface of HandleEscrow behind bare emit functions, and its
-    /// `registry` view, compiled from contracts/MockHandleEscrow.sol.
-    #[allow(clippy::too_many_arguments)]
-    #[sol(rpc)]
-    MockHandleEscrow,
-    "../../contracts/MockHandleEscrow.json"
-);
 
 /// Not 31337: the read-model tests use anvil's default id against the same
 /// database, and chain_id keying is exactly the isolation this exercises.
@@ -98,20 +80,7 @@ fn disclosing_bind(
     observed_at: u64,
     digest: B256,
 ) -> MockIdentityRegistry::Bind {
-    MockIdentityRegistry::Bind {
-        holder,
-        idNode: platform.id_node(id).unwrap(),
-        handleNode: platform.handle_node(handle).unwrap(),
-        platformId: platform.id(),
-        observedAt: observed_at,
-        ceremonyVersion: 1,
-        takenFrom: Address::ZERO,
-        retiredNode: B256::ZERO,
-        retiredHolder: Address::ZERO,
-        retiredNamed: false,
-        handle: handle.into(),
-        authorizationDigest: digest,
-    }
+    common::mock_bind(holder, platform, id, handle, observed_at, true, digest)
 }
 
 #[tokio::test]

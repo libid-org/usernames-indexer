@@ -200,7 +200,7 @@ async fn walk(who: WhoSigns) -> Option<Result<Address, contract::Error>> {
     }
     let store = ChainStore::new(pool.clone(), CHAIN);
     let owner = Address::from([0xbe; 20]);
-    bind(&store, "alice", owner, true).await;
+    bind(&store, "alice", owner).await;
 
     // ── the chain, and the resolver on it ────────────────────────────
     let anvil = Anvil::new().try_spawn().expect("anvil on PATH");
