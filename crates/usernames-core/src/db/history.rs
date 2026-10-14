@@ -181,11 +181,18 @@ impl Window {
                 ..
             }) => involvement.named(*handle_node, *platform_id),
 
-            // A bind already named the node's platform.
-            NamesEvent::HandlePublished { handle_node, .. }
-            | NamesEvent::HandleRetired { handle_node, .. } => {
-                involvement.handle_node = Some(*handle_node)
+            // Both name the platform too, which matters when the index
+            // starts after the node's bind.
+            NamesEvent::HandlePublished {
+                handle_node,
+                platform_id,
+                ..
             }
+            | NamesEvent::HandleRetired {
+                handle_node,
+                platform_id,
+                ..
+            } => involvement.named(*handle_node, *platform_id),
 
             // A deposit names no platform; the `DepositedToHandle` after it,
             // or a bind, does.

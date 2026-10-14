@@ -517,16 +517,17 @@ impl Name {
 impl KnownPlatform {
     /// Invert the label transform for this platform.
     ///
-    /// The forward direction is specified against what `HandleNormalizer`
-    /// produced, so this returns the handle in exactly the byte form the chain
-    /// keyed — no case, no padding, no leading at-sign to strip.
+    /// The forward direction maps the handles each platform issues, folded as
+    /// the chain keys them, so this returns that byte form — no case, no
+    /// padding, no leading at-sign to strip. A handle outside the platform's
+    /// own format has no name.
     ///
     /// A method on the platform, so the `match` is exhaustive: a platform
     /// added to the type does not compile until its transform is written
     /// here. That guarantee is why the type exists.
     fn handle_from_labels(self, labels: &[String]) -> Option<String> {
         match self {
-            // X's alphabet is `[a-z0-9_]` and contains no hyphen, so `_` ->
+            // X issues handles of `[a-z0-9_]` (folded), with no hyphen, so `_` ->
             // `-` is a bijection onto its image and reverses by replacing
             // every `-`.
             Self::X => {

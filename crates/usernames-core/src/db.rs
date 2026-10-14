@@ -827,8 +827,8 @@ impl Window {
                     .await?;
             }
 
-            // Nothing published is still a withdrawal the contract accepts;
-            // it concerns no handle.
+            // The contract logs this only when it withdrew a name; with no
+            // published row here, the index missed it (a later START_BLOCK).
             NamesEvent::HandleUnpublished {
                 holder,
                 platform_id,

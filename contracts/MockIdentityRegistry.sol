@@ -13,6 +13,11 @@ pragma solidity ^0.8.20;
 ///         the hashed-identities suite checks every topic against the
 ///         crate's bindings.
 contract MockIdentityRegistry {
+    /// Keyed by nodes, as IdentityRegistry answers; the indexer checks it.
+    function nodeKeyed() external pure returns (bool) {
+        return true;
+    }
+
     event IdentityBound(
         address indexed holder,
         bytes32 indexed idNode,

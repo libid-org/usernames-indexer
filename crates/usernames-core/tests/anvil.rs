@@ -189,6 +189,14 @@ async fn indexes_a_real_chain_end_to_end() {
     chain::check_escrow(&provider, *escrow.address(), *mock.address())
         .await
         .expect("the escrow resolves holders through the registry");
+    chain::check_registry(&provider, *mock.address())
+        .await
+        .expect("the registry is keyed by nodes");
+    // The escrow has no `nodeKeyed`: an indexer pointed at it refuses.
+    assert!(matches!(
+        chain::check_registry(&provider, *escrow.address()).await,
+        Err(chain::RegistryRefused::Unread { .. })
+    ));
     let native = address!("EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
     let (payer, bob) = (Address::repeat_byte(0xC0), Address::repeat_byte(0xB0));
     let bob_node = x.handle_node("bob_x").unwrap();

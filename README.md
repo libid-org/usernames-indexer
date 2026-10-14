@@ -369,15 +369,18 @@ migrated database; a newer API started before the migration answers
 002 has migrated: to go back, start it on a fresh database, or run
 `DROP SCHEMA names CASCADE; DROP TABLE _sqlx_migrations;` first, as above.
 
-**Upgrading to hashed identities (`INDEXER_VERSION` 4):** this build indexes
-`IdentityRegistry` and `HandleEscrow` from libID-contracts 0.18, whose events
-carry nodes rather than plaintext. Point `IDENTITY_NAMES_ADDRESS` and
-`HANDLE_ESCROW_ADDRESS` at the 0.18 deployments and roll the indexer first.
+**Upgrading to hashed identities:** this build indexes the node-keyed
+`IdentityRegistry` and `HandleEscrow` of the libID-contracts release
+`Cargo.toml` pins, whose events carry nodes rather than plaintext. Point
+`IDENTITY_NAMES_ADDRESS` and `HANDLE_ESCROW_ADDRESS` at those deployments and
+roll the indexer first; it refuses to start against a registry whose
+`nodeKeyed()` does not answer true.
 It migrates in place (`003_hashed_identities.sql`): the migration deletes
 every row the earlier build wrote — they held plaintext ids and handles — and
 every chain's cursor, then reshapes the tables. Each chain answers
-`not_synced` until its indexer has replayed it from its registry's
-deployment block. An earlier indexer refuses a database 003 has migrated,
+`not_synced` until its first window commits. Until the replay reaches the
+head, its answers miss what it has not reached yet: gate on `/v1/status`'s
+lag, not on `not_synced`. An earlier indexer refuses a database 003 has migrated,
 and an earlier API answers `internal`; to go back, start the earlier build on
 a fresh database, as above.
 

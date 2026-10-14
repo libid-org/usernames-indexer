@@ -148,6 +148,10 @@ pub async fn run() -> anyhow::Result<()> {
     }
     let chain_id = i64::try_from(reported)
         .map_err(|_| anyhow::anyhow!("chain id {reported} does not fit in a BIGINT"))?;
+    // Before `prepare` too: an older registry's events would be misread.
+    chain::check_registry(&provider, contract)
+        .await
+        .context("IDENTITY_NAMES_ADDRESS")?;
     let escrow = config.handle_escrow_address;
     if let Some(escrow) = escrow {
         // Before `prepare`, which clears the chain when the escrow changes: a

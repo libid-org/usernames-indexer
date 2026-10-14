@@ -713,6 +713,24 @@ async fn a_retired_handle_is_in_the_history_of_the_address_that_held_it() {
     suite.done();
 }
 
+/// An index that starts after a node's bind still learns its platform from
+/// a retire, which names it.
+#[tokio::test]
+async fn a_retire_names_the_platform_of_a_node_whose_bind_was_missed() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    suite.apply_tx(1, vec![retire(X, "kim1", addr(0xA1))]).await;
+    let history: HandleHistory = suite
+        .get(&format!("/v1/history/node/{}", node("kim1")))
+        .await
+        .answer();
+    assert_eq!(history.handle.platform, Some(X));
+    assert_eq!(history.handle.platform_id, Some(X.id()));
+    suite.done();
+}
+
 #[tokio::test]
 async fn a_bind_fee_is_in_the_payers_history_under_the_handle_it_bought() {
     let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
