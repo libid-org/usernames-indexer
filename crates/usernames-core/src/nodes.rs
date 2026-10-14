@@ -223,14 +223,14 @@ pub fn fold_search_query(raw: &str) -> String {
     stripped.to_ascii_lowercase()
 }
 
-/// Handle text an event disclosed: normalized by the platform's rules, and
+/// Handle text an event disclosed: a token a circuit hashes, folded, and
 /// checked to hash to the node the event names. [`DisclosedHandle::verify`] is the only way to one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisclosedHandle(String);
 
 impl DisclosedHandle {
-    /// `text` normalized, when the platform's rules accept it and it hashes
-    /// to `handle_node`. Text the rules refuse no account can bind.
+    /// `text` folded, when a circuit would hash it and it hashes to
+    /// `handle_node`. Text no circuit hashes no account can bind.
     pub fn verify(
         platform: KnownPlatform,
         handle_node: B256,
@@ -288,10 +288,10 @@ mod tests {
         let id = KnownPlatform::GitHub.id_node("583231").unwrap();
         assert_eq!(id[..4], [0x47, 0x59, 0x02, 0xb2]);
         assert_eq!(
-            KnownPlatform::X.handle_node(" @alice"),
+            KnownPlatform::X.handle_node("ali\"ce"),
             Err(HandleError::BadCharacter)
         );
-        assert_eq!(KnownPlatform::X.id_node("0123"), Err(IdError::BadShape));
+        assert_eq!(KnownPlatform::X.id_node(" 123"), Err(IdError::BadCharacter));
     }
 
     /// Every known platform has node tags, so the node lookups never panic.
@@ -317,12 +317,12 @@ mod tests {
         assert!(DisclosedHandle::verify(github, node, "alice_1").is_none());
     }
 
-    /// Text the rules refuse is not a handle, even when its fold-only node,
+    /// Text no circuit hashes is not a handle, even when its fold-only node,
     /// as `depositToHandle` keys it, matches.
     #[test]
-    fn text_the_rules_refuse_is_not_disclosed() {
+    fn text_no_circuit_hashes_is_not_disclosed() {
         let x = KnownPlatform::X;
-        for text in [" @Alice", "Bo\0b"] {
+        for text in ["Bo\"b", "Bo\0b"] {
             let (_, node) = x.folded_handle_node(text);
             assert!(DisclosedHandle::verify(x, node, text).is_none(), "{text:?}");
         }

@@ -767,10 +767,10 @@ async fn unconfigured_platform_and_impossible_text_name_their_codes() {
         .refusal();
     assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::IdImpossible));
 
-    // Text X's rules can never hold (an interior space) mirrors the
-    // contract's deliberate zero-address answer: "no such handle can exist",
-    // a 404 with its own code — not "you asked wrong".
-    let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/a%20b")
+    // Text no circuit hashes (a quote) mirrors the contract's deliberate
+    // zero-address answer: "no such handle can exist", a 404 with its own
+    // code — not "you asked wrong".
+    let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/a%22b")
         .await
         .refusal();
     assert_eq!(

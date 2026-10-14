@@ -857,9 +857,9 @@ async fn a_handle_nothing_was_sent_to_holds_nothing() {
     suite.done();
 }
 
-/// The chain folds a deposit's text and applies no other rule, so text the
-/// platform's rules refuse still finds what was sent to it, but no account
-/// can bind it and its text is not stored.
+/// The chain folds a deposit's text and checks nothing else, so text no
+/// circuit hashes still finds what was sent to it, but no account can bind
+/// it and its text is not stored.
 #[tokio::test]
 async fn text_finds_a_deposit_the_way_the_chain_hashed_it() {
     let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
@@ -867,30 +867,30 @@ async fn text_finds_a_deposit_the_way_the_chain_hashed_it() {
         return;
     };
     let carol = addr(0xC0);
-    let (_, at_bob) = X.folded_handle_node("@Bob");
-    assert!(X.handle_node("@Bob").is_err(), "X's rules refuse the @");
+    let (_, quoted) = X.folded_handle_node("Bo\"b");
+    assert!(X.handle_node("Bo\"b").is_err(), "no circuit hashes a quote");
     suite
         .apply_tx(
             1,
             vec![
                 NamesEvent::Escrow(EscrowEvent::Deposited {
-                    handle_node: at_bob,
+                    handle_node: quoted,
                     token: NATIVE,
                     refund_to: carol,
                     depositor: carol,
                     round: U256::ZERO,
                     amount: U256::from(9u64),
                 }),
-                deposited_to_handle(X, "@Bob"),
+                deposited_to_handle(X, "Bo\"b"),
             ],
         )
         .await;
 
-    let held: HandleAmounts = suite.get("/v1/escrow/handle/x/@bob").await.answer();
-    assert_eq!(held.handle.handle_node, at_bob);
+    let held: HandleAmounts = suite.get("/v1/escrow/handle/x/bo%22b").await.answer();
+    assert_eq!(held.handle.handle_node, quoted);
     assert_eq!(held.handle.handle, None);
     assert_eq!(amounts(&held.amounts), [(NATIVE, 9)]);
-    let history: HandleHistory = suite.get("/v1/history/handle/x/@bob").await.answer();
+    let history: HandleHistory = suite.get("/v1/history/handle/x/bo%22b").await.answer();
     assert_eq!(history.entries.len(), 2);
     suite.done();
 }
