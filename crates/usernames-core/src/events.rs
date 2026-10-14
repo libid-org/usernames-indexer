@@ -431,8 +431,8 @@ fn payload_of<E: SolEvent>(log: &Log, event: &'static str) -> Result<E, DecodeEr
         .map_err(|source| DecodeError::Payload { event, source })
 }
 
-/// The text an event disclosed, when it hashes to the node the event names.
-/// Text that does not is dropped and logged without itself.
+/// The text an event disclosed, when it is a handle hashing to the node the
+/// event names. Other text is dropped and logged without itself.
 fn disclosed(
     event: &'static str,
     platform_id: B256,
@@ -453,7 +453,7 @@ fn disclosed(
             event,
             %platform_id,
             %handle_node,
-            "disclosed text does not hash to its node; not stored"
+            "disclosed text is not a handle hashing to its node; not stored"
         );
     }
     verified

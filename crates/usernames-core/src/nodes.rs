@@ -223,25 +223,25 @@ pub fn fold_search_query(raw: &str) -> String {
     stripped.to_ascii_lowercase()
 }
 
-/// Handle text an event disclosed: folded, and checked to hash to the node
-/// the event names. [`DisclosedHandle::verify`] is the only way to one.
+/// Handle text an event disclosed: normalized by the platform's rules, and
+/// checked to hash to the node the event names. [`DisclosedHandle::verify`] is the only way to one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisclosedHandle(String);
 
 impl DisclosedHandle {
-    /// `text` with A-Z folded to a-z, when `SHA256(handle tag || folded)` is
-    /// `handle_node`. The platform's rules are not applied: the circuits own
-    /// them, and text that hashes to the node is the handle the chain keyed.
+    /// `text` normalized, when the platform's rules accept it and it hashes
+    /// to `handle_node`. Text the rules refuse no account can bind.
     pub fn verify(
         platform: KnownPlatform,
         handle_node: B256,
         text: &str,
     ) -> Option<Self> {
-        let (folded, node) = platform.folded_handle_node(text);
-        (node == handle_node).then_some(Self(folded))
+        let normalized = libid_identity::normalize(text, platform.spec().rules).ok()?;
+        let (normalized, node) = platform.folded_handle_node(&normalized);
+        (node == handle_node).then_some(Self(normalized))
     }
 
-    /// The folded text.
+    /// The normalized text.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -317,20 +317,15 @@ mod tests {
         assert!(DisclosedHandle::verify(github, node, "alice_1").is_none());
     }
 
-    /// Only A-Z folds. Text the platform's rules refuse is still accepted
-    /// when it hashes to the node, here `SHA256("libid.x.handle" ||
-    /// " @alice")` from `sha256sum`.
+    /// Text the rules refuse is not a handle, even when its fold-only node,
+    /// as `depositToHandle` keys it, matches.
     #[test]
-    fn disclosed_text_is_checked_by_its_hash_alone() {
-        let node = B256::from(hex!(
-            "91f649a873eea530e1610096d7039221f1178ab2c046a8078f3b1de00d1b86fc"
-        ));
-        assert!(KnownPlatform::X.handle_node(" @alice").is_err());
-        let disclosed = DisclosedHandle::verify(KnownPlatform::X, node, " @Alice");
-        assert_eq!(
-            disclosed.as_ref().map(DisclosedHandle::as_str),
-            Some(" @alice")
-        );
+    fn text_the_rules_refuse_is_not_disclosed() {
+        let x = KnownPlatform::X;
+        for text in [" @Alice", "Bo\0b"] {
+            let (_, node) = x.folded_handle_node(text);
+            assert!(DisclosedHandle::verify(x, node, text).is_none(), "{text:?}");
+        }
     }
 
     /// The registry is the launch profile set, no more and no less: every

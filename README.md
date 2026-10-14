@@ -106,8 +106,9 @@ routes fold the text's A-Z and hash it, the way `depositToHandle` does, so
 **Handle text is shown only while it is visible.** Every response that
 carries handle text (`handle` in resolutions, search hits, histories and
 escrow amounts) takes it from the `names.visible_handles` view; migration
-003 defines the policy there. Text is A-Z folded and stored only when it
-hashes to the node it names; the platform's rules are not applied again.
+003 defines the policy there. Text is stored only when the platform's rules
+accept it and it hashes to the node it names; a public transfer to text no
+account can bind keeps its deposit but not its text.
 Search lists visible handles only, and `names.handle_identities` maps each to
 its id node and holder. A private binding still resolves by text or by node,
 without text in the answer.
@@ -291,8 +292,8 @@ chain; a second deployment can share the database):
   watermark survives it the way the contract keeps it
 - `published` — the display names, as the node each name hashes to; a row
   exists exactly while the contract's stored string is nonempty
-- `disclosures` — handle text the chain disclosed, A-Z folded and checked
-  against its node by hash alone: one row per node, `withdrawn` once its
+- `disclosures` — handle text the chain disclosed, normalized by the
+  platform's rules and checked against its node: one row per node, `withdrawn` once its
   holder's `HandleUnpublished` withdrew it or a `publish` of another name
   replaced it. `visible_handles` is the visibility policy
   over it; `handle_identities` maps each visible handle to its id node

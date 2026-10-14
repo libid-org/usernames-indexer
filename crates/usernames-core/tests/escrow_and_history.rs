@@ -858,7 +858,8 @@ async fn a_handle_nothing_was_sent_to_holds_nothing() {
 }
 
 /// The chain folds a deposit's text and applies no other rule, so text the
-/// platform's rules would change still finds what was sent to it.
+/// platform's rules refuse still finds what was sent to it, but no account
+/// can bind it and its text is not stored.
 #[tokio::test]
 async fn text_finds_a_deposit_the_way_the_chain_hashed_it() {
     let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
@@ -887,7 +888,7 @@ async fn text_finds_a_deposit_the_way_the_chain_hashed_it() {
 
     let held: HandleAmounts = suite.get("/v1/escrow/handle/x/@bob").await.answer();
     assert_eq!(held.handle.handle_node, at_bob);
-    assert_eq!(held.handle.handle.as_deref(), Some("@bob"));
+    assert_eq!(held.handle.handle, None);
     assert_eq!(amounts(&held.amounts), [(NATIVE, 9)]);
     let history: HandleHistory = suite.get("/v1/history/handle/x/@bob").await.answer();
     assert_eq!(history.entries.len(), 2);
