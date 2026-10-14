@@ -54,8 +54,6 @@ pub enum ErrorCode {
     PlatformNotConfigured,
     /// Text the platform could never hold as a handle.
     HandleImpossible,
-    /// Text the platform could never issue as a user id.
-    IdImpossible,
     /// No indexer has committed a first window for the chains in scope.
     NotSynced,
     /// Neither a known platform key nor a 0x-hex platform id.
@@ -191,9 +189,8 @@ pub struct IdBinding {
     pub published: bool,
 }
 
-/// `GET /v1/resolve/id/{platform}/{userId}` and
 /// `GET /v1/resolve/id-node/{idNode}`: the wallet an id node resolves to on
-/// each chain it is bound on. The user id itself is never stored or served.
+/// each chain it is bound on. The user id never reaches the server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdResolution {

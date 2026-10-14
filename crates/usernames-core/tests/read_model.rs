@@ -139,6 +139,11 @@ fn only<T: Debug>(bindings: &[T]) -> &T {
     }
 }
 
+/// The id-node route for an id, hashed here as a client would.
+fn id_route(platform: KnownPlatform, id: &str) -> String {
+    format!("/v1/resolve/id-node/{}", platform.id_node(id).unwrap())
+}
+
 #[tokio::test]
 async fn bind_resolves_all_three_directions() {
     let Some((store, pool, guard)) = test_store().await else {
@@ -164,7 +169,7 @@ async fn bind_resolves_all_three_directions() {
     assert_eq!(resolved.handle_node, x.handle_node("alice_1").unwrap());
     assert_eq!(resolved.platform, Some(KnownPlatform::X));
 
-    let resolved: IdResolution = get(&pool, "/v1/resolve/id/x/111").await.answer();
+    let resolved: IdResolution = get(&pool, &id_route(x, "111")).await.answer();
     let binding = only(&resolved.bindings);
     assert_eq!(binding.owner, alice);
     assert_eq!(binding.handle.as_deref(), Some("alice_1"));
@@ -204,7 +209,7 @@ async fn rename_retires_the_previous_handle() {
         get(&pool, "/v1/resolve/handle/x/alice_2").await.answer();
     assert_eq!(only(&resolved.bindings).owner, alice);
 
-    let resolved: IdResolution = get(&pool, "/v1/resolve/id/x/111").await.answer();
+    let resolved: IdResolution = get(&pool, &id_route(x, "111")).await.answer();
     assert_eq!(only(&resolved.bindings).handle.as_deref(), Some("alice_2"));
 
     // The retired node keeps its watermark, mirroring the contract's
@@ -244,7 +249,7 @@ async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
 
     // Alice's id still resolves to her wallet, but the handle is no longer
     // hers to display: the node points at Bob's id.
-    let resolved: IdResolution = get(&pool, "/v1/resolve/id/x/111").await.answer();
+    let resolved: IdResolution = get(&pool, &id_route(x, "111")).await.answer();
     let binding = only(&resolved.bindings);
     assert_eq!(binding.owner, alice);
     assert_eq!(binding.handle, None);
@@ -567,7 +572,7 @@ async fn unclaimed_names_on_a_configured_platform_are_coded_404s() {
         .refusal();
     assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::HandleNotBound));
 
-    let refusal = get::<IdResolution>(&pool, "/v1/resolve/id/x/999999")
+    let refusal = get::<IdResolution>(&pool, &id_route(x, "999999"))
         .await
         .refusal();
     assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::IdNotBound));
@@ -615,11 +620,7 @@ async fn a_nul_byte_in_a_query_is_refused_not_a_500() {
         bind(addr(9), KnownPlatform::X, "1", "evil", 1000, true),
     )
     .await;
-    // No platform issues an id or a handle holding NUL.
-    let refusal = get::<IdResolution>(&pool, "/v1/resolve/id/x/1%00")
-        .await
-        .refusal();
-    assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::IdImpossible));
+    // No platform issues a handle holding NUL.
     let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/evil%00")
         .await
         .refusal();
@@ -746,7 +747,7 @@ async fn unconfigured_platform_and_impossible_text_name_their_codes() {
         refusal,
         (StatusCode::NOT_FOUND, ErrorCode::PlatformNotConfigured)
     );
-    let refusal = get::<IdResolution>(&pool, "/v1/resolve/id/github/111")
+    let refusal = get::<IdResolution>(&pool, &id_route(KnownPlatform::GitHub, "111"))
         .await
         .refusal();
     assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::IdNotBound));
@@ -760,12 +761,6 @@ async fn unconfigured_platform_and_impossible_text_name_their_codes() {
         refusal,
         (StatusCode::BAD_REQUEST, ErrorCode::InvalidPlatform)
     );
-
-    // An id X never issues: nobody can be bound under it.
-    let refusal = get::<IdResolution>(&pool, "/v1/resolve/id/x/alice")
-        .await
-        .refusal();
-    assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::IdImpossible));
 
     // Text no circuit hashes (a quote) mirrors the contract's deliberate
     // zero-address answer: "no such handle can exist", a 404 with its own

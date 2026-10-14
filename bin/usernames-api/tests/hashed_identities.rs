@@ -338,7 +338,7 @@ async fn private_binds_stay_private_and_disclosures_show_until_withdrawn() {
     assert_eq!(resolved.bindings[0].owner, alice);
     assert_eq!(resolved.bindings[0].id_node, alice_id);
     assert_eq!(resolved.bindings[0].handle, None);
-    let by_id: IdResolution = h.get(&format!("/v1/resolve/id/x/{ALICE_ID}")).await;
+    let by_id: IdResolution = h.get(&format!("/v1/resolve/id-node/{alice_id}")).await;
     assert_eq!(by_id.bindings[0].owner, alice);
     assert_eq!(by_id.bindings[0].handle, None);
     let found: SearchResults = h.get("/v1/search?q=alice").await;

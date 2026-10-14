@@ -106,7 +106,6 @@ pub fn router(state: AppState) -> Router {
             "/v1/resolve/handle-node/{handle_node}",
             get(resolve_handle_node),
         )
-        .route("/v1/resolve/id/{platform}/{user_id}", get(resolve_id))
         .route("/v1/resolve/id-node/{id_node}", get(resolve_id_node))
         .route("/v1/resolve/address/{address}", get(resolve_address))
         .route("/v1/search", get(search))
@@ -192,16 +191,6 @@ impl From<libid_identity::HandleError> for ApiError {
         Self::not_found(
             ErrorCode::HandleImpossible,
             format!("no handle can exist on this platform for this text: {e}"),
-        )
-    }
-}
-
-/// An id the platform could never issue: nobody can be bound under it.
-impl From<libid_identity::IdError> for ApiError {
-    fn from(e: libid_identity::IdError) -> Self {
-        Self::not_found(
-            ErrorCode::IdImpossible,
-            format!("no id can exist on this platform for this text: {e}"),
         )
     }
 }
@@ -608,23 +597,9 @@ async fn handle_not_bound(
     )
 }
 
-/// `GET /v1/resolve/id/{platform}/{user_id}?chain=` — the wallet an account
-/// id resolves to, the way `resolveId` would answer it, on every chain it is
-/// bound on or the one named. The id is hashed here into the node the chain
-/// keys; it is never stored or served.
-async fn resolve_id(
-    State(state): State<AppState>,
-    ApiPath((platform, user_id)): ApiPath<(String, String)>,
-    ApiQuery(filter): ApiQuery<ChainFilter>,
-) -> Result<Json<IdResolution>, ApiError> {
-    let platform = parse_known_platform(&platform)?;
-    let chain = filter.parse()?;
-    state.synced(chain).await?;
-    let id_node = platform.id_node(&user_id)?;
-    id_resolution(&state, chain, id_node).await
-}
-
-/// `GET /v1/resolve/id-node/{idNode}?chain=` — the same, by node.
+/// `GET /v1/resolve/id-node/{idNode}?chain=` — the wallet an id node resolves
+/// to, the way `resolveId` would answer it, on every chain it is bound on or
+/// the one named. The client hashes the id; no plaintext id reaches here.
 async fn resolve_id_node(
     State(state): State<AppState>,
     ApiPath(id_node): ApiPath<String>,

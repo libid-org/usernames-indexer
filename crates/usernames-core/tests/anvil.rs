@@ -327,7 +327,12 @@ async fn indexes_a_real_chain_end_to_end() {
     assert_eq!(binding.owner, alice);
     assert_eq!(binding.ceremony_version, 1);
     assert_eq!(binding.handle.as_deref(), Some("alice_2"));
-    let resolved: IdResolution = get(&pool, "/v1/resolve/id/x/111").await.answer();
+    let resolved: IdResolution = get(
+        &pool,
+        &format!("/v1/resolve/id-node/{}", x.id_node("111").unwrap()),
+    )
+    .await
+    .answer();
     assert_eq!(resolved.bindings[0].handle.as_deref(), Some("alice_2"));
 
     // The Google identity resolves through the URL-encoded raw form; its
@@ -345,10 +350,15 @@ async fn indexes_a_real_chain_end_to_end() {
         resolved.bindings[0].id_node,
         google.id_node(GOOGLE_USER_ID).unwrap()
     );
-    let resolved: IdResolution =
-        get(&pool, &format!("/v1/resolve/id/google/{GOOGLE_USER_ID}"))
-            .await
-            .answer();
+    let resolved: IdResolution = get(
+        &pool,
+        &format!(
+            "/v1/resolve/id-node/{}",
+            google.id_node(GOOGLE_USER_ID).unwrap()
+        ),
+    )
+    .await
+    .answer();
     assert_eq!(resolved.bindings[0].owner, alice);
     assert_eq!(resolved.bindings[0].handle, None);
 

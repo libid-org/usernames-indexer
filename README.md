@@ -68,8 +68,7 @@ indexer's settings.
 |---|---|
 | `GET /v1/resolve/handle/{platform}/{handle}` | The wallet a handle resolves to (`resolveHandle`) on each chain it is bound on, each with the id node it pairs with. The handle is hashed here into its node |
 | `GET /v1/resolve/handle-node/{handleNode}` | The same, by node |
-| `GET /v1/resolve/id/{platform}/{userId}` | The wallet an account id resolves to (`resolveId`) on each chain it is bound on, each with the handle node that account holds now. The id is hashed here and never stored or served |
-| `GET /v1/resolve/id-node/{idNode}` | The same, by node |
+| `GET /v1/resolve/id-node/{idNode}` | The wallet an id node resolves to (`resolveId`) on each chain it is bound on, each with the handle node that account holds now. The client hashes the id (`libid-identity`, or `idNode` in `@libid/contracts`); no plaintext id reaches the server |
 | `GET /v1/resolve/address/{address}` | Every identity a wallet proved on every chain, by id node, with `resolves` and `published` flags (`publishedHandleOf`'s reverse display) |
 | `GET /v1/search?q=gre&platform=x&owner=0x…&limit=10&offset=0` | Live, visible handles matching a partial query (exact, then prefix, then substring, then trigram-fuzzy), linked to a wallet, or both; one of `q` and `owner` is required. `limit` (1..50, default 10) and `offset` (up to 10000) page the ranked list; a page shorter than `limit` is the last |
 | `GET /v1/history/address/{address}?before=&limit=` | Every event the address took part in, newest first, each with its `roles`: `holder`, `previousHandleHolder` and `previousIdHolder` (an event took that handle or account from it), `feeReceiver`, `depositor`, `refundTo` (a claim took its deposit, too), `claimer`, `recipient` |
@@ -119,16 +118,15 @@ platform id. A text route hashes its text with `libid-identity`, so it needs a
 platform this build knows: an unknown id is `invalid_platform`, and the node
 routes answer for any platform. A resolution route folds the handle and checks
 it is a token a circuit hashes; the escrow and history routes only fold it, as
-the chain does. The id is hashed exactly as given. A Google `{userId}` is the
-OIDC `sub`.
+the chain does.
 
 Errors share one envelope — `{ "error": { "code", "message" } }`. The `code`
 is stable and machine-readable; the prose is for humans and may be reworded.
 Resolution 404s distinguish `handle_not_bound`, `handle_retired`,
 `id_not_bound`, `platform_not_configured` (a handle asked on a platform
-nothing was ever bound on, on the chains in scope; an id route answers
-`id_not_bound`, as `resolveId` never reverts), `handle_impossible` (text the platform could
-never hold) and `id_impossible` (an id the platform never issues); `not_synced` is the 503 before the first window;
+nothing was ever bound on, on the chains in scope; the id route answers
+`id_not_bound`, as `resolveId` never reverts) and `handle_impossible` (text no
+circuit hashes); `not_synced` is the 503 before the first window;
 bad input is `invalid_platform`, `invalid_address`, `invalid_node`,
 `invalid_chain`, `invalid_cursor`, `invalid_argument`, or, for a path or query
 string that does not parse at all, `invalid_path` and `invalid_query`;
