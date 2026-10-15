@@ -354,7 +354,7 @@ pub struct HistoryRow {
     pub handle_node: Option<B256>,
     /// That node's platform.
     pub platform_id: Option<B256>,
-    /// That handle's text, while a disclosure of it is visible.
+    /// That handle's text, once the chain disclosed it.
     pub handle: Option<String>,
 }
 

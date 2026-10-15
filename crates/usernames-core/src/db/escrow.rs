@@ -158,7 +158,7 @@ pub struct EscrowSlotRow {
     pub platform_id: Option<B256>,
     /// The handle node the amount is held against.
     pub handle_node: B256,
-    /// The handle's text, while a disclosure of it is visible.
+    /// The handle's text, once the chain disclosed it.
     pub handle: Option<String>,
     /// Who holds the handle now and may claim: `None` while nobody does.
     pub holder: Option<Address>,

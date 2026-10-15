@@ -807,11 +807,13 @@ async fn an_unpublish_concerns_the_handle_it_withdrew() {
             HistoryEvent::IdentityBound { .. },
         ]
     ));
-    // Withdrawn: the history shows the node and no text.
+    // Withdrawn: the history still shows the node and its disclosed text.
     assert!(history.entries.iter().all(|e| e
         .handle
         .as_ref()
-        .is_some_and(|h| h.handle_node == node("ann_1") && h.handle.is_none())));
+        .is_some_and(
+            |h| h.handle_node == node("ann_1") && h.handle.as_deref() == Some("ann_1")
+        )));
     suite.done();
 }
 

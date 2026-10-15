@@ -3,6 +3,6 @@ SELECT e.chain_id, h.platform_id, e.handle_node, v.handle, h.owner AS holder,
 FROM names.handles h
 JOIN names.escrow_held e
   ON e.chain_id = h.chain_id AND e.handle_node = h.handle_node
-LEFT JOIN names.visible_handles v
+LEFT JOIN names.disclosures v
   ON v.chain_id = e.chain_id AND v.handle_node = e.handle_node
 WHERE e.held > 0

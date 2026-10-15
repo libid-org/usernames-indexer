@@ -5,5 +5,5 @@ LEFT JOIN names.handle_nodes n
   ON n.chain_id = r.chain_id AND n.handle_node = r.handle_node
 LEFT JOIN names.handles h
   ON h.chain_id = r.chain_id AND h.handle_node = r.handle_node
-LEFT JOIN names.visible_handles v
+LEFT JOIN names.disclosures v
   ON v.chain_id = r.chain_id AND v.handle_node = r.handle_node

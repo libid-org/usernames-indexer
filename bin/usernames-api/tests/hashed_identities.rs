@@ -269,7 +269,7 @@ fn x_bind(holder: Address, id: &str, handle: &str, observed_at: u64) -> Bind {
 }
 
 #[tokio::test]
-async fn private_binds_stay_private_and_disclosures_show_until_withdrawn() {
+async fn private_binds_stay_private_and_disclosures_stay_shown() {
     let Some(h) = Harness::open(CHAIN).await else {
         return;
     };
@@ -316,28 +316,30 @@ async fn private_binds_stay_private_and_disclosures_show_until_withdrawn() {
     let found: SearchResults = h.get("/v1/search?q=alice").await;
     let hits: Vec<&str> = found.hits.iter().map(|hit| hit.handle.as_str()).collect();
     assert_eq!(hits, ["alice_1"]);
-    assert_eq!(
-        common::withdrawn(&h.pool, h.chain as i64, alice_node).await,
-        Some(false)
-    );
 
-    // 3. Withdrawn: hidden again, the row kept and marked.
+    // 3. Withdrawn: no longer published, the text still shown.
     h.mine(registry.emitHandleUnpublished(alice, x.id()).send())
         .await;
     let theirs: AddressResolution = h.get(&format!("/v1/resolve/address/{alice}")).await;
-    assert_eq!(theirs.identities[0].handle, None);
+    assert_eq!(theirs.identities[0].handle.as_deref(), Some("alice_1"));
     assert!(!theirs.identities[0].published);
     let found: SearchResults = h.get("/v1/search?q=alice").await;
-    assert!(found.hits.is_empty(), "{found:?}");
+    let hits: Vec<(&str, bool)> = found
+        .hits
+        .iter()
+        .map(|hit| (hit.handle.as_str(), hit.published))
+        .collect();
+    assert_eq!(hits, [("alice_1", false)]);
     let resolved: HandleResolution = h.get("/v1/resolve/handle/x/alice_1").await;
-    assert_eq!(resolved.bindings[0].handle, None);
+    assert_eq!(resolved.bindings[0].handle.as_deref(), Some("alice_1"));
     assert_eq!(
-        common::withdrawn(&h.pool, h.chain as i64, alice_node).await,
-        Some(true),
-        "the disclosure stays, withdrawn"
+        common::disclosed(&h.pool, h.chain as i64, alice_node)
+            .await
+            .as_deref(),
+        Some("alice_1")
     );
     let history: serde_json::Value = h.get(&format!("/v1/history/address/{alice}")).await;
-    assert!(!history.to_string().contains("alice_1"), "{history}");
+    assert!(history.to_string().contains("alice_1"), "{history}");
 
     // 4. A public deposit to @Bob_2, then Bob binds it privately: the
     //    disclosed handle maps to his id node. A private deposit names only
@@ -381,8 +383,16 @@ async fn private_binds_stay_private_and_disclosures_show_until_withdrawn() {
     .expect("the mapping");
     assert_eq!(
         mapping,
-        [("bob_2".to_string(), bob_node, Some(bob_id), Some(bob))],
-        "alice_1 is withdrawn, carol and dave were never disclosed"
+        [
+            (
+                "alice_1".to_string(),
+                alice_node,
+                Some(alice_id),
+                Some(alice)
+            ),
+            ("bob_2".to_string(), bob_node, Some(bob_id), Some(bob)),
+        ],
+        "carol and dave were never disclosed"
     );
     let by_node: HandleResolution =
         h.get(&format!("/v1/resolve/handle-node/{bob_node}")).await;

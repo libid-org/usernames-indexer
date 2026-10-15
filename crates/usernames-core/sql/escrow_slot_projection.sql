@@ -5,6 +5,6 @@ LEFT JOIN names.handle_nodes n
   ON n.chain_id = e.chain_id AND n.handle_node = e.handle_node
 LEFT JOIN names.handles h
   ON h.chain_id = e.chain_id AND h.handle_node = e.handle_node
-LEFT JOIN names.visible_handles v
+LEFT JOIN names.disclosures v
   ON v.chain_id = e.chain_id AND v.handle_node = e.handle_node
 WHERE e.held > 0

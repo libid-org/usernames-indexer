@@ -31,7 +31,6 @@ use crate::{
         LogPosition,
         NamesEvent,
     },
-    nodes,
 };
 
 mod escrow;
@@ -790,12 +789,6 @@ impl Window {
                     .bind(log_index)
                     .execute(&mut *self.tx)
                     .await?;
-                sqlx::query(sql::RECORD_PLATFORM)
-                    .bind(chain_id)
-                    .bind(platform_id)
-                    .bind(nodes::Platform::key_of(*platform_id))
-                    .execute(&mut *self.tx)
-                    .await?;
             }
 
             NamesEvent::HandlePublished {
@@ -873,7 +866,7 @@ impl Window {
 // which chain it came from. Handlers translate HTTP to these calls and rows
 // to JSON; they do not own queries.
 
-/// One `names.handles` row and its visible text: everything `resolveHandle`
+/// One `names.handles` row and its disclosed text: everything `resolveHandle`
 /// answers from.
 #[derive(sqlx::FromRow)]
 pub struct HandleRow {
@@ -893,7 +886,7 @@ pub struct HandleRow {
     pub ceremony_version: i64,
     /// The account id node this handle points back at (`idNodeByHandle`).
     pub id_node: B256,
-    /// The handle's text, while a disclosure of it is visible.
+    /// The handle's text, once the chain disclosed it.
     pub handle: Option<String>,
 }
 
@@ -916,7 +909,7 @@ pub struct IdentityRow {
     pub ceremony_version: i64,
     /// The handle node this account last proved (`handleNodeById`).
     pub handle_node: B256,
-    /// That handle's text, while a disclosure of it is visible.
+    /// That handle's text, once the chain disclosed it.
     pub handle: Option<String>,
     /// The holder the handle node currently resolves to.
     pub handle_owner: Option<Address>,
@@ -936,7 +929,7 @@ impl IdentityRow {
         self.handle_owner == Some(self.owner) && self.handle_id_node == Some(self.id_node)
     }
 
-    /// The handle's text to present: visible, and still this account's.
+    /// The handle's text to present: disclosed, and still this account's.
     pub fn presentable_handle(&self) -> Option<&str> {
         if self.handle_still_owned() {
             self.handle.as_deref()
@@ -952,7 +945,7 @@ impl IdentityRow {
     }
 }
 
-/// One search hit: a live, visible handle, its owner, and the id node it
+/// One search hit: a live, disclosed handle, its owner, and the id node it
 /// pairs with.
 #[derive(sqlx::FromRow)]
 pub struct SearchRow {
@@ -1003,26 +996,6 @@ impl Store {
         Ok(found.is_some())
     }
 
-    /// Whether any chain in scope ever bound on this platform: the half of
-    /// the contract's `UnknownPlatform` an index can see.
-    pub async fn platform_wired(
-        &self,
-        chain: Option<i64>,
-        platform_id: B256,
-    ) -> Result<bool, sqlx::Error> {
-        let mut statement = QueryBuilder::new(sql::PLATFORM_WIRED);
-        statement
-            .push(" WHERE platform_id = ")
-            .push_bind(platform_id);
-        scoped(&mut statement, "chain_id", chain);
-        statement.push(" LIMIT 1");
-        let found: Option<bool> = statement
-            .build_query_scalar()
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(found.is_some())
-    }
-
     /// The rows `resolveHandle` answers from, one per chain the handle node
     /// is bound on.
     pub async fn resolve_handle(
@@ -1062,7 +1035,7 @@ impl Store {
             .await
     }
 
-    /// Live, visible handles a search lists, across the chains in scope:
+    /// Live, disclosed handles a search lists, across the chains in scope:
     /// those a wallet holds, those matching a folded partial query — exact
     /// first, then prefix, then substring, then trigram-fuzzy — or both.
     pub async fn search_handles(
@@ -1233,7 +1206,6 @@ mod sql {
     pub const WITHDRAW_NAME: &str = include_str!("../sql/withdraw_name.sql");
     pub const DISCLOSE: &str = include_str!("../sql/disclose.sql");
     pub const RETIRE_HANDLE: &str = include_str!("../sql/retire_handle.sql");
-    pub const RECORD_PLATFORM: &str = include_str!("../sql/record_platform.sql");
     pub const ENS_HOLDER: &str = include_str!("../sql/ens_holder.sql");
     pub const CHAIN_NAMES_TAKEN: &str = include_str!("../sql/chain_names_taken.sql");
     /// The names the chain goes by in an ENS name.
@@ -1242,15 +1214,14 @@ mod sql {
     pub const CHAIN_NAMES: &str = include_str!("../sql/chain_names.sql");
     pub const CHAIN_NAMED: &str = include_str!("../sql/chain_named.sql");
     pub const SYNCED: &str = include_str!("../sql/synced.sql");
-    pub const PLATFORM_WIRED: &str = include_str!("../sql/platform_wired.sql");
     /// The projection every `names.ids` read shares: the row itself, the
     /// handle it points at, and whether that pair is displayed. A caller
     /// appends its own `WHERE`, the only part that differs.
     pub const IDENTITY_PROJECTION: &str = include_str!("../sql/identity_projection.sql");
     /// The projection every `names.handles` read shares: the row and its
-    /// visible text. A caller appends its `WHERE`.
+    /// disclosed text. A caller appends its `WHERE`.
     pub const HANDLE_PROJECTION: &str = include_str!("../sql/handle_projection.sql");
-    /// Live, visible handles with their id node and display flag; the caller
+    /// Live, disclosed handles with their id node and display flag; the caller
     /// narrows, orders and pages.
     pub const SEARCH_PROJECTION: &str = include_str!("../sql/search_projection.sql");
     pub const ESCROW_DEPOSIT: &str = include_str!("../sql/escrow_deposit.sql");
@@ -1419,7 +1390,7 @@ pub(crate) mod plan_tests {
             ),
             (
                 "a withdrawn name",
-                &["published_pkey", "disclosures_pkey"][..],
+                &["published_pkey"][..],
                 sqlx::query_scalar(&explain(sql::WITHDRAW_NAME))
                     .bind(1i64)
                     .bind(owner)
@@ -1429,7 +1400,7 @@ pub(crate) mod plan_tests {
             ),
             (
                 "a name published over another",
-                &["published_pkey", "disclosures_pkey"][..],
+                &["published_pkey"][..],
                 sqlx::query_scalar(&explain(sql::PUBLISH))
                     .bind(1i64)
                     .bind(owner)

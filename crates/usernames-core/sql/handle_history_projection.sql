@@ -8,5 +8,5 @@ JOIN names.events e
      AND e.log_index = he.log_index
 LEFT JOIN names.handle_nodes hn
   ON hn.chain_id = he.chain_id AND hn.handle_node = he.handle_node
-LEFT JOIN names.visible_handles v
+LEFT JOIN names.disclosures v
   ON v.chain_id = he.chain_id AND v.handle_node = he.handle_node

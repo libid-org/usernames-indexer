@@ -70,7 +70,7 @@ indexer's settings.
 | `GET /v1/resolve/handle-node/{handleNode}` | The same, by node |
 | `GET /v1/resolve/id-node/{idNode}` | The wallet an id node resolves to (`resolveId`) on each chain it is bound on, each with the handle node that account holds now. The client hashes the id (`libid-identity`, or `idNode` in `@libid/contracts`); no plaintext id reaches the server |
 | `GET /v1/resolve/address/{address}` | Every identity a wallet proved on every chain, by id node, with `resolves` and `published` flags (`publishedHandleOf`'s reverse display) |
-| `GET /v1/search?q=gre&platform=x&owner=0x…&limit=10&offset=0` | Live, visible handles matching a partial query (exact, then prefix, then substring, then trigram-fuzzy), linked to a wallet, or both; one of `q` and `owner` is required. `limit` (1..50, default 10) and `offset` (up to 10000) page the ranked list; a page shorter than `limit` is the last |
+| `GET /v1/search?q=gre&platform=x&owner=0x…&limit=10&offset=0` | Live handles whose text the chain disclosed, matching a partial query (exact, then prefix, then substring, then trigram-fuzzy), linked to a wallet, or both; one of `q` and `owner` is required. `limit` (1..50, default 10) and `offset` (up to 10000) page the ranked list; a page shorter than `limit` is the last |
 | `GET /v1/history/address/{address}?before=&limit=` | Every event the address took part in, newest first, each with its `roles`: `holder`, `previousHandleHolder` and `previousIdHolder` (an event took that handle or account from it), `feeReceiver`, `depositor`, `refundTo` (a claim took its deposit, too), `claimer`, `recipient` |
 | `GET /v1/history/handle/{platform}/{handle}?before=&limit=` | Every event on the handle: deposits while nobody held it, the binds that gave it a holder, and every claim, refund and payment after |
 | `GET /v1/history/node/{node}?before=&limit=` | The same, by handle node: for a handle nobody has bound, whose text no event carried |
@@ -102,16 +102,19 @@ one. Asking by text works from the first deposit: the escrow and history
 routes fold the text's A-Z and hash it, the way `depositToHandle` does, so
 `/v1/escrow/handle/x/Bo%22b` finds a deposit to `Bo"b`.
 
-**Handle text is shown only while it is visible.** Every response that
+**Handle text shows once the chain disclosed it.** Every response that
 carries handle text (`handle` in resolutions, search hits, histories and
-escrow amounts) takes it from the `names.visible_handles` view; migration
-003 defines the policy there. Text is stored only when it is a token a
-circuit hashes (printable ASCII without `"` or `\`, within the circuit's
-buffer) and it hashes to the node it names; a public transfer to text no
-account can bind keeps its deposit but not its text.
-Search lists visible handles only, and `names.handle_identities` maps each to
-its id node and holder. A private binding still resolves by text or by node,
-without text in the answer.
+escrow amounts) takes it from `names.disclosures`: text a disclosing bind, a
+`publish` or a `depositToHandle` carried. The API explores the chain's
+history, so a name its holder later withdrew or replaced, or a handle that
+passed privately to another account, still shows the text once disclosed;
+`published` says whether it is the holder's displayed name now. Text is stored
+only when it is a token a circuit hashes (printable ASCII without `"` or `\`,
+within the circuit's buffer) and it hashes to the node it names; a public
+transfer to text no account can bind keeps its deposit but not its text.
+Search lists disclosed handles only, and `names.handle_identities` maps each
+to its id node and holder. A binding nothing disclosed still resolves by text
+or by node, without text in the answer.
 
 `{platform}` is a short key (`x`, `github`, `google`) or a 0x-hex 32-byte
 platform id. A text route hashes its text with `libid-identity`, so it needs a
@@ -122,11 +125,9 @@ the chain does.
 
 Errors share one envelope — `{ "error": { "code", "message" } }`. The `code`
 is stable and machine-readable; the prose is for humans and may be reworded.
-Resolution 404s distinguish `handle_not_bound`, `handle_retired`,
-`id_not_bound`, `platform_not_configured` (a handle asked on a platform
-nothing was ever bound on, on the chains in scope; the id route answers
-`id_not_bound`, as `resolveId` never reverts) and `handle_impossible` (text no
-circuit hashes); `not_synced` is the 503 before the first window;
+Resolution 404s distinguish `handle_not_bound` (on a known platform, whether
+or not anything was ever bound on it), `handle_retired`, `id_not_bound` and
+`handle_impossible` (text no circuit hashes); `not_synced` is the 503 before the first window;
 bad input is `invalid_platform`, `invalid_address`, `invalid_node`,
 `invalid_chain`, `invalid_cursor`, `invalid_argument`, or, for a path or query
 string that does not parse at all, `invalid_path` and `invalid_query`;
@@ -292,13 +293,9 @@ chain; a second deployment can share the database):
 - `published` — the display names, as the node each name hashes to; a row
   exists exactly while the contract's stored string is nonempty
 - `disclosures` — handle text the chain disclosed, a token a circuit hashes,
-  folded and checked against its node: one row per node, `withdrawn` once its
-  holder's `HandleUnpublished` withdrew it or a `publish` of another name
-  replaced it. `visible_handles` is the visibility policy
-  over it; `handle_identities` maps each visible handle to its id node
-- `platforms` — one row per platform some bind used: what
-  `platform_not_configured` answers from. The Proof Verifier is chain
-  metadata, reported by `/v1/status`
+  folded and checked against its node: one row per node, kept whatever
+  happens to the name or the handle after. `handle_identities` maps each
+  disclosed handle to its id node
 - `handle_nodes` — the platform of every handle node a bind or a
   `DepositedToHandle` named; a bare deposit names none
 - `escrow_held` — mirrors HandleEscrow's `held` and `round` per handle node
@@ -310,6 +307,8 @@ chain; a second deployment can share the database):
   previous holders, a ceremony's and a fee's handle, and a fee's payer are
   read from the rows the event changes, or from the events its transaction
   emitted just before it
+
+The Proof Verifier is chain metadata, reported by `/v1/status`.
 
 Each poll window commits in one transaction — journal, projections and cursor
 together — and the journal's `(chain, block, log)` conflict gates the
@@ -375,12 +374,13 @@ migrated database; a newer API started before the migration answers
 `IDENTITY_NAMES_ADDRESS` and `HANDLE_ESCROW_ADDRESS` at those deployments and
 roll the indexer first; it refuses to start against a registry whose
 `nodeKeyed()` does not answer true.
-It migrates in place (`003_hashed_identities.sql`): the migration deletes
+It migrates in place (`003_hashed_identities.sql`, then
+`004_disclosures_all_show.sql`): 003 deletes
 every row the earlier build wrote — they held plaintext ids and handles — and
 every chain's cursor, then reshapes the tables. Each chain answers
 `not_synced` until its first window commits. Until the replay reaches the
 head, its answers miss what it has not reached yet: gate on `/v1/status`'s
-lag, not on `not_synced`. An earlier indexer refuses a database 003 has migrated,
+lag, not on `not_synced`. An earlier indexer refuses a database 003 or 004 has migrated,
 and an earlier API answers `internal`; to go back, start the earlier build on
 a fresh database, as above.
 

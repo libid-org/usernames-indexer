@@ -308,7 +308,7 @@ async fn indexes_a_real_chain_end_to_end() {
     assert_eq!(resolved.bindings[0].handle.as_deref(), Some("alice_2"));
 
     // The Google identity resolves through the URL-encoded raw form; its
-    // name was withdrawn, so no text comes back.
+    // name was withdrawn, and the text it disclosed still comes back.
     let resolved: HandleResolution =
         get(&pool, "/v1/resolve/handle/google/A.B%2Btag%40Example.COM")
             .await
@@ -317,7 +317,10 @@ async fn indexes_a_real_chain_end_to_end() {
         resolved.handle_node,
         google.handle_node("a.b+tag@example.com").unwrap()
     );
-    assert_eq!(resolved.bindings[0].handle, None);
+    assert_eq!(
+        resolved.bindings[0].handle.as_deref(),
+        Some("a.b+tag@example.com")
+    );
     assert_eq!(
         resolved.bindings[0].id_node,
         google.id_node(GOOGLE_USER_ID).unwrap()
@@ -332,7 +335,10 @@ async fn indexes_a_real_chain_end_to_end() {
     .await
     .answer();
     assert_eq!(resolved.bindings[0].owner, alice);
-    assert_eq!(resolved.bindings[0].handle, None);
+    assert_eq!(
+        resolved.bindings[0].handle.as_deref(),
+        Some("a.b+tag@example.com")
+    );
 
     // Reverse: both identities; X's name is displayed, Google's was
     // withdrawn.
@@ -388,15 +394,6 @@ async fn indexes_a_real_chain_end_to_end() {
     );
     assert_eq!(chain.proof_verifier, Some(verifier));
     assert_eq!(chain.escrow, Some(*escrow.address()));
-    let platform_key: Option<String> = sqlx::query_scalar(
-        "SELECT platform_key FROM names.platforms WHERE chain_id = $1 AND platform_id = $2",
-    )
-    .bind(CHAIN as i64)
-    .bind(x.id().as_slice())
-    .fetch_one(&pool)
-    .await
-    .expect("platform row");
-    assert_eq!(platform_key.as_deref(), Some("x"));
 
     // The journal holds every event the scenario emitted, each bind's
     // ceremony and the fee included.

@@ -335,7 +335,7 @@ impl HandleKey {
 
 impl HandleQuery {
     /// The handle a request named, completed from `known`: any row about the
-    /// node names its platform, and its text while that is visible.
+    /// node names its platform, and its text once disclosed.
     fn of(key: &HandleKey, known: Option<&HandleRef>) -> Self {
         let (platform, platform_id) = match key {
             HandleKey::Text { platform, .. } => (Some(*platform), Some(platform.id())),
@@ -354,7 +354,7 @@ impl HandleQuery {
 }
 
 impl HandleRef {
-    /// A stored node with its platform, when known, and its visible text.
+    /// A stored node with its platform, when known, and its disclosed text.
     fn of(platform_id: Option<B256>, handle_node: B256, handle: Option<String>) -> Self {
         Self {
             platform: platform_id.and_then(nodes::Platform::known_of),
@@ -518,7 +518,7 @@ async fn resolve_handle(
     let chain = filter.parse()?;
     state.synced(chain).await?;
     let handle_node = platform.handle_node(&handle)?;
-    handle_resolution(&state, chain, handle_node, Some(platform)).await
+    handle_resolution(&state, chain, handle_node).await
 }
 
 /// `GET /v1/resolve/handle-node/{handleNode}?chain=` — the same, by node.
@@ -530,18 +530,20 @@ async fn resolve_handle_node(
     let handle_node = parse_node(&handle_node)?;
     let chain = filter.parse()?;
     state.synced(chain).await?;
-    handle_resolution(&state, chain, handle_node, None).await
+    handle_resolution(&state, chain, handle_node).await
 }
 
 async fn handle_resolution(
     state: &AppState,
     chain: Option<i64>,
     handle_node: B256,
-    platform: Option<KnownPlatform>,
 ) -> Result<Json<HandleResolution>, ApiError> {
     let rows = state.store.resolve_handle(chain, handle_node).await?;
     let Some(first) = rows.first() else {
-        return Err(handle_not_bound(state, chain, platform).await);
+        return Err(ApiError::not_found(
+            ErrorCode::HandleNotBound,
+            "nothing is bound under this node",
+        ));
     };
     let platform_id = first.platform_id;
     let bindings: Vec<HandleBinding> = rows
@@ -569,32 +571,6 @@ async fn handle_resolution(
         handle_node,
         bindings,
     }))
-}
-
-/// The 404 for a handle node no chain in scope binds: `resolveHandle`'s
-/// `UnknownPlatform` when nothing was ever bound on the platform, its zero
-/// address otherwise.
-async fn handle_not_bound(
-    state: &AppState,
-    chain: Option<i64>,
-    platform: Option<KnownPlatform>,
-) -> ApiError {
-    if let Some(platform) = platform {
-        match state.store.platform_wired(chain, platform.id()).await {
-            Ok(true) => {}
-            Ok(false) => {
-                return ApiError::not_found(
-                    ErrorCode::PlatformNotConfigured,
-                    "nothing was ever bound on this platform on any chain in scope",
-                )
-            }
-            Err(e) => return e.into(),
-        }
-    }
-    ApiError::not_found(
-        ErrorCode::HandleNotBound,
-        "nothing is bound under this node",
-    )
 }
 
 /// `GET /v1/resolve/id-node/{idNode}?chain=` — the wallet an id node resolves
@@ -704,7 +680,7 @@ const PAGE_DEFAULT_LIMIT: i64 = 20;
 const PAGE_MAX_LIMIT: i64 = 100;
 
 /// `GET /v1/search?q=gre&platform=x&owner=0x…&chain=8453&limit=10&offset=0`
-/// — live, visible handles matching a partial query (exact first, then prefix,
+/// — live, disclosed handles matching a partial query (exact first, then prefix,
 /// substring and fuzzy), linked to a wallet, or both, across every chain
 /// the store holds or the one named. One of `q` and `owner` is required;
 /// `limit` and `offset` page through the ranked list.

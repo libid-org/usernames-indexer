@@ -210,11 +210,6 @@ impl Platform {
     pub fn known_of(id: B256) -> Option<KnownPlatform> {
         KNOWN_BY_ID.get(&id).copied()
     }
-
-    /// The short key for a bare id, when this build knows it.
-    pub fn key_of(id: B256) -> Option<&'static str> {
-        Self::known_of(id).map(KnownPlatform::key)
-    }
 }
 
 /// A search query as search matches it: spaces trimmed, one leading `@`

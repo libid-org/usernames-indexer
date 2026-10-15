@@ -1,6 +1,6 @@
 SELECT h.chain_id, h.platform_id, h.handle_node, h.id_node, v.handle, h.owner,
        (p.handle_node IS NOT NULL) AS published
-FROM names.visible_handles v
+FROM names.disclosures v
 JOIN names.handles h
   ON h.chain_id = v.chain_id AND h.handle_node = v.handle_node
 LEFT JOIN names.published p

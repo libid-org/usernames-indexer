@@ -169,10 +169,10 @@ pub async fn apply(store: &ChainStore, block: u64, event: NamesEvent) {
     apply_tx(store, block, vec![event]).await;
 }
 
-/// Whether the node's disclosure on `chain` is withdrawn, when it has one.
-pub async fn withdrawn(pool: &PgPool, chain: i64, handle_node: B256) -> Option<bool> {
+/// The text the chain disclosed for the node on `chain`, when it did.
+pub async fn disclosed(pool: &PgPool, chain: i64, handle_node: B256) -> Option<String> {
     sqlx::query_scalar(
-        "SELECT withdrawn FROM names.disclosures WHERE chain_id = $1 AND handle_node = $2",
+        "SELECT handle FROM names.disclosures WHERE chain_id = $1 AND handle_node = $2",
     )
     .bind(chain)
     .bind(handle_node)

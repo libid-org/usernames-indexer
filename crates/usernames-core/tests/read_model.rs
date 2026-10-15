@@ -27,10 +27,10 @@ use common::{
     apply,
     apply_tx,
     bind,
+    disclosed,
     publish,
     retire,
     unpublish,
-    withdrawn,
     Reply,
 };
 use serde::de::DeserializeOwned;
@@ -235,10 +235,10 @@ async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
 }
 
 /// Another identity proving a handle withdraws its previous holder's name for
-/// it first, as `bind` does: the text hides on a private takeover, and shows
-/// again, under the new holder, on a disclosing one.
+/// it first, as `bind` does; the text the chain disclosed shows all the same,
+/// under the new holder, whether that bind disclosed it or not.
 #[tokio::test]
-async fn a_takeover_hides_the_previous_holders_text_until_disclosed_again() {
+async fn a_takeover_keeps_the_disclosed_text() {
     let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
@@ -249,6 +249,13 @@ async fn a_takeover_hides_the_previous_holders_text_until_disclosed_again() {
         let binding = only(&resolved.bindings);
         (binding.owner, binding.handle.clone())
     };
+    let hits_of = |found: &SearchResults| -> Vec<(String, Address, bool)> {
+        found
+            .hits
+            .iter()
+            .map(|hit| (hit.handle.clone(), hit.owner, hit.published))
+            .collect()
+    };
 
     // (a) Tom discloses @lee1; Uma's account takes it privately.
     apply_tx(&store, 1, bind(tom, x, "555", "lee1", 1_000, true)).await;
@@ -257,18 +264,17 @@ async fn a_takeover_hides_the_previous_holders_text_until_disclosed_again() {
     apply_tx(&store, 2, takeover).await;
     let resolved: HandleResolution =
         get(&pool, "/v1/resolve/handle/x/lee1").await.answer();
-    assert_eq!(holder_text(&resolved), (uma, None));
+    assert_eq!(holder_text(&resolved), (uma, Some("lee1".into())));
     let found: SearchResults = get(&pool, "/v1/search?q=lee1").await.answer();
-    assert!(found.hits.is_empty(), "{found:?}");
+    assert_eq!(hits_of(&found), [("lee1".to_string(), uma, false)]);
     let umas: AddressResolution = get(&pool, &format!("/v1/resolve/address/{uma}"))
         .await
         .answer();
-    assert_eq!(only(&umas.identities).handle, None);
+    assert_eq!(only(&umas.identities).handle.as_deref(), Some("lee1"));
     assert!(!only(&umas.identities).published);
-    let lee1 = x.handle_node("lee1").unwrap();
-    assert_eq!(withdrawn(&pool, CHAIN, lee1).await, Some(true));
 
-    // (b) Tom discloses @lee2; Val's account takes it, disclosing it.
+    // (b) Tom discloses @lee2; Val's account takes it, disclosing it again:
+    // still one disclosure.
     apply_tx(&store, 3, bind(tom, x, "555", "lee2", 3_000, true)).await;
     let mut takeover = vec![unpublish(tom, x)];
     takeover.extend(bind(val, x, "557", "lee2", 4_000, true));
@@ -277,12 +283,11 @@ async fn a_takeover_hides_the_previous_holders_text_until_disclosed_again() {
         get(&pool, "/v1/resolve/handle/x/lee2").await.answer();
     assert_eq!(holder_text(&resolved), (val, Some("lee2".into())));
     let found: SearchResults = get(&pool, "/v1/search?q=lee2").await.answer();
-    let hits: Vec<(&str, Address, bool)> = found
-        .hits
-        .iter()
-        .map(|hit| (hit.handle.as_str(), hit.owner, hit.published))
-        .collect();
-    assert_eq!(hits, [("lee2", val, true)]);
+    // The exact match ranks first; lee1 follows as a fuzzy neighbor.
+    assert_eq!(hits_of(&found)[0], ("lee2".to_string(), val, true));
+    let lee2 = x.handle_node("lee2").unwrap();
+    assert_eq!(disclosed(&pool, CHAIN, lee2).await.as_deref(), Some("lee2"));
+    // Tom's account no longer holds either handle, so it shows neither.
     let toms: AddressResolution = get(&pool, &format!("/v1/resolve/address/{tom}"))
         .await
         .answer();
@@ -292,16 +297,14 @@ async fn a_takeover_hides_the_previous_holders_text_until_disclosed_again() {
             .all(|i| i.handle.is_none() && !i.published),
         "{toms:?}"
     );
-    let lee2 = x.handle_node("lee2").unwrap();
-    assert_eq!(withdrawn(&pool, CHAIN, lee2).await, Some(false));
     drop(guard);
 }
 
 /// `publish` over a name overwrites it and logs no `HandleUnpublished`; the
-/// old name's text hides all the same, and stays hidden once its handle
-/// passes, privately, to someone else.
+/// old name's text still shows, after its handle passes, privately, to
+/// someone else too.
 #[tokio::test]
-async fn publishing_another_name_withdraws_the_one_it_replaces() {
+async fn publishing_another_name_keeps_the_one_it_replaces_disclosed() {
     let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
@@ -312,7 +315,7 @@ async fn publishing_another_name_withdraws_the_one_it_replaces() {
     apply_tx(&store, 2, bind(alice, x, "72", "lee", 2_000, false)).await;
     apply(&store, 3, publish(alice, x, "lee")).await;
     let kim = x.handle_node("kim").unwrap();
-    assert_eq!(withdrawn(&pool, CHAIN, kim).await, Some(true));
+    assert_eq!(disclosed(&pool, CHAIN, kim).await.as_deref(), Some("kim"));
 
     // Bob's account takes kim privately: Alice's name is lee, so the bind
     // withdraws nothing on chain.
@@ -320,20 +323,26 @@ async fn publishing_another_name_withdraws_the_one_it_replaces() {
     let resolved: HandleResolution =
         get(&pool, "/v1/resolve/handle/x/kim").await.answer();
     let binding = only(&resolved.bindings);
-    assert_eq!((binding.owner, binding.handle.as_deref()), (bob, None));
+    assert_eq!(
+        (binding.owner, binding.handle.as_deref()),
+        (bob, Some("kim"))
+    );
     let found: SearchResults = get(&pool, "/v1/search?q=kim").await.answer();
-    assert!(found.hits.is_empty(), "{found:?}");
+    assert_eq!(handles_of(&found), ["kim"]);
+    assert_eq!(only(&found.hits).owner, bob);
     let bobs: AddressResolution = get(&pool, &format!("/v1/resolve/address/{bob}"))
         .await
         .answer();
-    assert_eq!(only(&bobs.identities).handle, None);
+    assert_eq!(only(&bobs.identities).handle.as_deref(), Some("kim"));
     let found: SearchResults = get(&pool, "/v1/search?q=lee").await.answer();
     assert_eq!(handles_of(&found), ["lee"]);
     drop(guard);
 }
 
+/// `HandleUnpublished` clears the displayed name; the text it disclosed
+/// still shows everywhere, histories included.
 #[tokio::test]
-async fn a_name_shows_while_published_and_hides_once_withdrawn() {
+async fn a_withdrawn_name_is_no_longer_published_but_still_shows() {
     let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
@@ -360,23 +369,28 @@ async fn a_name_shows_while_published_and_hides_once_withdrawn() {
     assert!(identity.published);
     assert_eq!(identity.handle.as_deref(), Some("alice_2"));
 
-    // HandleUnpublished hides it again, and a history shows no text either.
+    // HandleUnpublished takes the name down; the text stays.
     apply(&store, 4, unpublish(alice, x)).await;
     let resolved: AddressResolution = get(&pool, &address).await.answer();
     let identity = only(&resolved.identities);
     assert!(!identity.published);
-    assert_eq!(identity.handle, None);
+    assert_eq!(identity.handle.as_deref(), Some("alice_2"));
+    let resolved: HandleResolution =
+        get(&pool, "/v1/resolve/handle/x/alice_2").await.answer();
+    assert_eq!(only(&resolved.bindings).handle.as_deref(), Some("alice_2"));
+    let found: SearchResults = get(&pool, "/v1/search?q=alice_2").await.answer();
+    assert_eq!(handles_of(&found), ["alice_2"]);
+    assert!(!only(&found.hits).published);
     let history: AddressHistory = get(&pool, &format!("/v1/history/address/{alice}"))
         .await
         .answer();
-    assert!(
-        history
-            .entries
-            .iter()
-            .filter_map(|entry| entry.handle.as_ref())
-            .all(|handle| handle.handle.is_none()),
-        "{history:?}"
-    );
+    let texts: Vec<&str> = history
+        .entries
+        .iter()
+        .filter_map(|entry| entry.handle.as_ref()?.handle.as_deref())
+        .collect();
+    assert!(texts.contains(&"alice_1"), "{history:?}");
+    assert!(texts.contains(&"alice_2"), "{history:?}");
     drop(guard);
 }
 
@@ -400,12 +414,16 @@ async fn search_ranks_exact_prefix_substring() {
     apply_tx(&store, 5, bind(addr(5), github, "5", "alicorn", 1000, true)).await;
     // A private bind is never a hit, whatever it would match.
     apply_tx(&store, 6, bind(addr(6), x, "6", "alina", 1000, false)).await;
-    // A name its holder withdrew is not either.
+    // A name its holder withdrew still is, no longer published.
     apply(&store, 7, unpublish(addr(3), x)).await;
 
     let results: SearchResults = get(&pool, "/v1/search?q=ali").await.answer();
     // Exact first, then prefix alphabetically, then substring.
-    assert_eq!(handles_of(&results), ["ali", "alice_1", "alicorn"]);
+    assert_eq!(
+        handles_of(&results),
+        ["ali", "alice_1", "alicorn", "malice"]
+    );
+    assert!(!results.hits[3].published);
     // And the hit carries the right binding, not just the right string.
     let exact = &results.hits[0];
     assert_eq!(exact.owner, addr(1));
@@ -420,7 +438,7 @@ async fn search_ranks_exact_prefix_substring() {
         .answer();
     assert_eq!((page.limit, page.offset), (2, 1));
     assert_eq!(handles_of(&page), ["alice_1", "alicorn"]);
-    let page: SearchResults = get(&pool, "/v1/search?q=ali&limit=2&offset=2")
+    let page: SearchResults = get(&pool, "/v1/search?q=ali&limit=2&offset=3")
         .await
         .answer();
     assert_eq!(page.hits.len(), 1, "{page:?}");
@@ -434,7 +452,7 @@ async fn search_ranks_exact_prefix_substring() {
 
     // Search folds the way normalization does: case and a leading @ vanish.
     let results: SearchResults = get(&pool, "/v1/search?q=%40ALI").await.answer();
-    assert_eq!(results.hits.len(), 3);
+    assert_eq!(results.hits.len(), 4);
 
     // A wallet's handles, alone or narrowed by text; the two intersect.
     let results: SearchResults = get(&pool, &format!("/v1/search?owner={}", addr(2)))
@@ -699,7 +717,7 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
 }
 
 #[tokio::test]
-async fn unconfigured_platform_and_impossible_text_name_their_codes() {
+async fn unbound_handle_and_impossible_text_name_their_codes() {
     let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
@@ -707,17 +725,16 @@ async fn unconfigured_platform_and_impossible_text_name_their_codes() {
     let x = KnownPlatform::X;
     apply_tx(&store, 1, bind(addr(0xA1), x, "111", "alice_1", 1000, true)).await;
 
-    // A platform nothing was ever bound on is a different fact than an
-    // unclaimed handle — `resolveHandle`'s UnknownPlatform revert versus its
-    // zero-address answer — and the code says which. `resolveId` takes no
-    // platform and never reverts, so an id misses as unbound.
+    // A known platform's unbound handle is `handle_not_bound`, whether or
+    // not anything was ever bound on it; an id misses as unbound the same way.
+    let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/alice")
+        .await
+        .refusal();
+    assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::HandleNotBound));
     let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/github/alice")
         .await
         .refusal();
-    assert_eq!(
-        refusal,
-        (StatusCode::NOT_FOUND, ErrorCode::PlatformNotConfigured)
-    );
+    assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::HandleNotBound));
     let refusal = get::<IdResolution>(&pool, &id_route(KnownPlatform::GitHub, "111"))
         .await
         .refusal();

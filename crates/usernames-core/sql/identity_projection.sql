@@ -5,7 +5,7 @@ SELECT i.chain_id, i.platform_id, i.id_node, i.owner,
 FROM names.ids i
 LEFT JOIN names.handles h
   ON h.chain_id = i.chain_id AND h.handle_node = i.handle_node
-LEFT JOIN names.visible_handles v
+LEFT JOIN names.disclosures v
   ON v.chain_id = i.chain_id AND v.handle_node = i.handle_node
 LEFT JOIN names.published p
   ON p.chain_id = i.chain_id AND p.owner = i.owner

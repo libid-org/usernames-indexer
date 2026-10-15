@@ -50,8 +50,6 @@ pub enum ErrorCode {
     HandleRetired,
     /// No chain in scope binds the account.
     IdNotBound,
-    /// No chain in scope ever bound on the platform a handle was asked on.
-    PlatformNotConfigured,
     /// Text the platform could never hold as a handle.
     HandleImpossible,
     /// No indexer has committed a first window for the chains in scope.
@@ -148,7 +146,7 @@ pub struct HandleBinding {
     pub ceremony_version: i64,
     /// The account id node the handle points back at (`idNodeByHandle`).
     pub id_node: B256,
-    /// The handle's text, while a disclosure of it on this chain is visible.
+    /// The handle's text, once this chain disclosed it.
     pub handle: Option<String>,
 }
 
@@ -180,7 +178,7 @@ pub struct IdBinding {
     pub observed_at: i64,
     /// The ceremony version that proved the binding.
     pub ceremony_version: i64,
-    /// The handle's text, while it is visible and still the account's — the
+    /// The handle's text, once disclosed and while still the account's — the
     /// `handleNodeById`/`idNodeByHandle` round trip.
     pub handle: Option<String>,
     /// The handle node this account last proved (`handleNodeById`).
@@ -217,7 +215,7 @@ pub struct AddressIdentity {
     pub platform_id: B256,
     /// The node the chain filed the account under.
     pub id_node: B256,
-    /// The handle's text, while it is visible and still the account's.
+    /// The handle's text, once disclosed and while still the account's.
     pub handle: Option<String>,
     /// The handle node the account last proved.
     pub handle_node: B256,
@@ -241,7 +239,7 @@ pub struct AddressResolution {
     pub identities: Vec<AddressIdentity>,
 }
 
-/// One search hit: a live, visible handle, its owner, and the id node it
+/// One search hit: a live, disclosed handle, its owner, and the id node it
 /// pairs with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -291,7 +289,7 @@ pub struct HandleRef {
     pub platform_id: Option<B256>,
     /// The node the chain filed the handle under.
     pub handle_node: B256,
-    /// The handle's text, while a disclosure of it is visible.
+    /// The handle's text, once the chain disclosed it.
     pub handle: Option<String>,
 }
 
@@ -603,7 +601,7 @@ pub struct HandleQuery {
     pub platform_id: Option<B256>,
     /// The node the chain files the handle under.
     pub handle_node: B256,
-    /// The handle's text, while a disclosure of it is visible.
+    /// The handle's text, once the chain disclosed it.
     pub handle: Option<String>,
 }
 
