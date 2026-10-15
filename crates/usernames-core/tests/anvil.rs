@@ -6,10 +6,7 @@
 //! Skips silently in exactly two cases: `DATABASE_URL` unset, or no `anvil`
 //! binary on PATH. Everything past those checks panics on failure.
 
-use std::{
-    process::Command,
-    time::Duration,
-};
+use std::time::Duration;
 
 use alloy::{
     primitives::{
@@ -85,11 +82,11 @@ fn disclosing_bind(
 
 #[tokio::test]
 async fn indexes_a_real_chain_end_to_end() {
-    let Ok(url) = std::env::var("DATABASE_URL") else {
+    let Some(url) = common::database_url() else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    if Command::new("anvil").arg("--version").output().is_err() {
+    if !common::anvil_available() {
         eprintln!("skipping: anvil not on PATH");
         return;
     }
@@ -142,15 +139,13 @@ async fn indexes_a_real_chain_end_to_end() {
         .watch()
         .await
         .unwrap();
-    mock.emitHandleRetired(x.id(), x.handle_node("alice_1").unwrap(), alice)
-        .send()
-        .await
-        .unwrap()
-        .watch()
-        .await
-        .unwrap();
+    // The rename retires alice_1 and withdraws its name in the same bind.
     let digest_2 = B256::repeat_byte(0xD2);
-    mock.emitBind(disclosing_bind(alice, x, "111", "alice_2", 2000, digest_2))
+    let mut rename = disclosing_bind(alice, x, "111", "alice_2", 2000, digest_2);
+    rename.retiredNode = x.handle_node("alice_1").unwrap();
+    rename.retiredHolder = alice;
+    rename.retiredNamed = true;
+    mock.emitBind(rename)
         .send()
         .await
         .unwrap()
@@ -411,7 +406,7 @@ async fn indexes_a_real_chain_end_to_end() {
             .fetch_one(&pool)
             .await
             .expect("journal count");
-    assert_eq!(journal, 17);
+    assert_eq!(journal, 18);
     let fee_kinds: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM names.events WHERE chain_id = $1 AND kind = 'bind_fee_paid'",
     )
@@ -476,7 +471,7 @@ async fn indexes_a_real_chain_end_to_end() {
 
 #[tokio::test]
 async fn an_escrow_of_another_registry_is_refused() {
-    if Command::new("anvil").arg("--version").output().is_err() {
+    if !common::anvil_available() {
         eprintln!("skipping: anvil not on PATH");
         return;
     }

@@ -82,7 +82,7 @@ async fn test_store_with(
     max_connections: u32,
 ) -> Option<(ChainStore, PgPool, MutexGuard<'static, ()>)> {
     let guard = DB_LOCK.lock().await;
-    let url = std::env::var("DATABASE_URL").ok()?;
+    let url = common::database_url()?;
     let pool = PgPoolOptions::new()
         .max_connections(max_connections)
         .connect(&url)
@@ -171,9 +171,10 @@ async fn rename_retires_the_previous_handle() {
     let x = KnownPlatform::X;
     let alice = addr(0xA1);
     apply_tx(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
-    // The contract emits the retirement before the new bind in the same tx.
-    apply(&store, 2, retire(x, "alice_1", alice)).await;
-    apply_tx(&store, 3, bind(alice, x, "111", "alice_2", 2000, true)).await;
+    // The rename's bind retires alice_1 and withdraws its name first.
+    let mut rename = vec![retire(x, "alice_1", alice), unpublish(alice, x)];
+    rename.extend(bind(alice, x, "111", "alice_2", 2000, true));
+    apply_tx(&store, 2, rename).await;
 
     // The code is the machine-readable half: a UI renders "retired"
     // differently from "never claimed" without parsing prose.
@@ -470,7 +471,12 @@ async fn search_ranks_exact_prefix_substring() {
     // A retired handle stops matching. Its fuzzy neighbors still do — that
     // is what the trigram branch is for — but the retired name itself is
     // gone from the results.
-    apply(&store, 8, retire(x, "alice_1", addr(2))).await;
+    apply_tx(
+        &store,
+        8,
+        vec![retire(x, "alice_1", addr(2)), unpublish(addr(2), x)],
+    )
+    .await;
     let results: SearchResults = get(&pool, "/v1/search?q=alice_1").await.answer();
     let handles = handles_of(&results);
     assert!(!handles.contains(&"alice_1"), "{handles:?}");

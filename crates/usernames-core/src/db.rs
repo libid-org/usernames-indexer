@@ -1462,6 +1462,10 @@ pub(crate) mod plan_tests {
     #[tokio::test]
     async fn every_read_over_the_big_tables_seeks_its_index() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "DATABASE_URL not set under CI"
+            );
             eprintln!("skipping: DATABASE_URL not set");
             return;
         };

@@ -61,6 +61,31 @@ use usernames_core::{
     },
 };
 
+/// `DATABASE_URL`, or `None` to skip the test; under CI, where the job
+/// provides Postgres, its absence fails the test instead.
+pub fn database_url() -> Option<String> {
+    let url = std::env::var("DATABASE_URL").ok();
+    assert!(
+        url.is_some() || std::env::var_os("CI").is_none(),
+        "DATABASE_URL not set: CI runs this suite against Postgres"
+    );
+    url
+}
+
+/// Whether `anvil` runs; under CI, where the job installs it, a missing
+/// anvil fails the test instead.
+pub fn anvil_available() -> bool {
+    let found = std::process::Command::new("anvil")
+        .arg("--version")
+        .output()
+        .is_ok();
+    assert!(
+        found || std::env::var_os("CI").is_none(),
+        "anvil not on PATH: CI runs this suite against anvil"
+    );
+    found
+}
+
 /// One suite's chain in the database the suites share: emptied of whatever
 /// an earlier run left there, and held under the suite's lock until
 /// [`Suite::done`].
@@ -74,7 +99,7 @@ impl Suite {
     /// The suite's `chain`, emptied; `None` when `DATABASE_URL` is unset.
     pub async fn open(lock: &'static Mutex<()>, chain: i64) -> Option<Self> {
         let lock = lock.lock().await;
-        let url = std::env::var("DATABASE_URL").ok()?;
+        let url = database_url()?;
         let pool = PgPool::connect(&url)
             .await
             .expect("DATABASE_URL is set but connecting failed");
