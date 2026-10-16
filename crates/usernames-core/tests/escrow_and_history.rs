@@ -643,15 +643,31 @@ fn entries(history: &AddressHistory) -> Vec<(String, Vec<Role>, Option<B256>)> {
         .entries
         .iter()
         .map(|e| {
-            let event = serde_json::to_value(&e.event).expect("an event");
-            let kind = event["kind"].as_str().expect("a kind").to_string();
             (
-                kind,
+                kind(&e.event).to_string(),
                 e.roles.clone(),
                 e.handle.as_ref().map(|h| h.handle_node),
             )
         })
         .collect()
+}
+
+/// The journal kind an event is served under.
+fn kind(event: &HistoryEvent) -> &'static str {
+    match event {
+        HistoryEvent::IdentityBound { .. } => "identity_bound",
+        HistoryEvent::HandlePublished { .. } => "handle_published",
+        HistoryEvent::HandleRetired { .. } => "handle_retired",
+        HistoryEvent::HandleUnpublished { .. } => "handle_unpublished",
+        HistoryEvent::ProofVerifierConfigured { .. } => "proof_verifier_configured",
+        HistoryEvent::CeremonyBound { .. } => "ceremony_bound",
+        HistoryEvent::BindFeePaid { .. } => "bind_fee_paid",
+        HistoryEvent::Deposited { .. } => "deposited",
+        HistoryEvent::DepositedToHandle { .. } => "deposited_to_handle",
+        HistoryEvent::Forwarded { .. } => "forwarded",
+        HistoryEvent::Claimed { .. } => "claimed",
+        HistoryEvent::Refunded { .. } => "refunded",
+    }
 }
 
 /// A retirement is in the history of the address that held the handle, which
