@@ -296,8 +296,9 @@ chain; a second deployment can share the database):
   folded and checked against its node: one row per node, kept whatever
   happens to the name or the handle after. `handle_identities` maps each
   disclosed handle to its id node
-- `handle_nodes` — the platform of every handle node a bind or a
-  `DepositedToHandle` named; a bare deposit names none
+- `handle_nodes` — the platform of every handle node a bind,
+  `HandlePublished`, `HandleRetired` or `DepositedToHandle` named; a bare
+  deposit names none
 - `escrow_held` — mirrors HandleEscrow's `held` and `round` per handle node
   and token
 - `escrow_refundable` — mirrors `refundable`: each `refundTo`'s contribution
