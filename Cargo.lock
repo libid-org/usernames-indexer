@@ -3465,9 +3465,8 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libid-contracts"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8bf494b4de8e40f51503d89e35c5b36375e54dd98a6e3003080fa7593ccd8ca7"
+version = "0.17.0"
+source = "git+https://github.com/libid-org/libID-contracts?rev=0ab6d48#0ab6d48026e7ca3b0be9509ee78af54f98aa2029"
 dependencies = [
  "alloy",
  "include_dir",
@@ -3479,15 +3478,16 @@ dependencies = [
 
 [[package]]
 name = "libid-identity"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "210a23a9c6f36772c817eff46a97a8a5b63f02cffb7f262c9a98fa5fbe927574"
+version = "0.17.0"
+source = "git+https://github.com/libid-org/libID-contracts?rev=0ab6d48#0ab6d48026e7ca3b0be9509ee78af54f98aa2029"
+dependencies = [
+ "sha2 0.10.9",
+]
 
 [[package]]
 name = "libid-profiles"
-version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f04bb5813f63d697e314b0c47f384b30839569c9592340f513f30805f8533aa"
+version = "0.17.0"
+source = "git+https://github.com/libid-org/libID-contracts?rev=0ab6d48#0ab6d48026e7ca3b0be9509ee78af54f98aa2029"
 
 [[package]]
 name = "libid-signer"
@@ -6025,7 +6025,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

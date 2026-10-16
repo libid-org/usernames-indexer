@@ -6,7 +6,13 @@
 // Every suite compiles its own copy of this module and uses part of it.
 #![allow(dead_code)]
 
-use alloy::primitives::B256;
+use alloy::{
+    primitives::{
+        Address,
+        B256,
+    },
+    sol,
+};
 use axum::{
     body::Body,
     http::{
@@ -17,10 +23,16 @@ use axum::{
 use http_body_util::BodyExt;
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
-use std::fmt::Debug;
-use tokio::sync::{
-    Mutex,
-    MutexGuard,
+use std::{
+    fmt::Debug,
+    time::Duration,
+};
+use tokio::{
+    sync::{
+        Mutex,
+        MutexGuard,
+    },
+    time::Instant,
 };
 use tower::ServiceExt;
 use usernames_core::{
@@ -39,10 +51,40 @@ use usernames_core::{
         Store,
     },
     events::{
+        EscrowEvent,
         LogPosition,
         NamesEvent,
     },
+    nodes::{
+        DisclosedHandle,
+        KnownPlatform,
+    },
 };
+
+/// `DATABASE_URL`, or `None` to skip the test; under CI, where the job
+/// provides Postgres, its absence fails the test instead.
+pub fn database_url() -> Option<String> {
+    let url = std::env::var("DATABASE_URL").ok();
+    assert!(
+        url.is_some() || std::env::var_os("CI").is_none(),
+        "DATABASE_URL not set: CI runs this suite against Postgres"
+    );
+    url
+}
+
+/// Whether `anvil` runs; under CI, where the job installs it, a missing
+/// anvil fails the test instead.
+pub fn anvil_available() -> bool {
+    let found = std::process::Command::new("anvil")
+        .arg("--version")
+        .output()
+        .is_ok();
+    assert!(
+        found || std::env::var_os("CI").is_none(),
+        "anvil not on PATH: CI runs this suite against anvil"
+    );
+    found
+}
 
 /// One suite's chain in the database the suites share: emptied of whatever
 /// an earlier run left there, and held under the suite's lock until
@@ -57,7 +99,7 @@ impl Suite {
     /// The suite's `chain`, emptied; `None` when `DATABASE_URL` is unset.
     pub async fn open(lock: &'static Mutex<()>, chain: i64) -> Option<Self> {
         let lock = lock.lock().await;
-        let url = std::env::var("DATABASE_URL").ok()?;
+        let url = database_url()?;
         let pool = PgPool::connect(&url)
             .await
             .expect("DATABASE_URL is set but connecting failed");
@@ -70,33 +112,19 @@ impl Suite {
         })
     }
 
-    /// Apply one transaction's events at `block`, in log order, and commit
-    /// like a window. A block's time is its number past a constant, so a
-    /// later block is later in time too.
+    /// [`apply_tx`] on the suite's chain.
     pub async fn apply_tx(&self, block: u64, events: Vec<NamesEvent>) {
-        let mut window = self.store.begin_window().await.expect("begin");
-        for (log_index, event) in (0u64..).zip(events) {
-            let pos = LogPosition {
-                block_number: block,
-                log_index,
-                tx_hash: B256::left_padding_from(&block.to_be_bytes()),
-                block_time: 1_700_000_000 + block,
-            };
-            window.apply(&event, &pos).await.expect("apply");
-        }
-        window.commit(block).await.expect("commit");
+        apply_tx(&self.store, block, events).await;
     }
 
-    /// Apply one event alone in its block.
+    /// [`apply`] on the suite's chain.
     pub async fn apply(&self, block: u64, event: NamesEvent) {
-        self.apply_tx(block, vec![event]).await;
+        apply(&self.store, block, event).await;
     }
 
     /// One GET on the suite's chain.
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Reply<T> {
-        let separator = if path.contains('?') { '&' } else { '?' };
-        let chain = self.store.chain_id();
-        get(&self.pool, &format!("{path}{separator}chain={chain}")).await
+        get_on(&self.pool, self.store.chain_id(), path).await
     }
 
     /// The test is done with the database; the suite's next test may take it.
@@ -116,6 +144,167 @@ pub async fn clear_chain(pool: &PgPool, chain: i64) {
             .execute(pool)
             .await
             .expect("cleanup");
+    }
+}
+
+/// Apply one transaction's events at `block`, in log order, and commit
+/// like a window. A block's time is its number past a constant, so a later
+/// block is later in time too.
+pub async fn apply_tx(store: &ChainStore, block: u64, events: Vec<NamesEvent>) {
+    let mut window = store.begin_window().await.expect("begin");
+    for (log_index, event) in (0u64..).zip(events) {
+        let pos = LogPosition {
+            block_number: block,
+            log_index,
+            tx_hash: B256::left_padding_from(&block.to_be_bytes()),
+            block_time: 1_700_000_000 + block,
+        };
+        window.apply(&event, &pos).await.expect("apply");
+    }
+    window.commit(block).await.expect("commit");
+}
+
+/// Apply one event alone in its block.
+pub async fn apply(store: &ChainStore, block: u64, event: NamesEvent) {
+    apply_tx(store, block, vec![event]).await;
+}
+
+/// The text the chain disclosed for the node on `chain`, when it did.
+pub async fn disclosed(pool: &PgPool, chain: i64, handle_node: B256) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT handle FROM names.disclosures WHERE chain_id = $1 AND handle_node = $2",
+    )
+    .bind(chain)
+    .bind(handle_node)
+    .fetch_optional(pool)
+    .await
+    .expect("a disclosure read")
+}
+
+sol!(
+    /// The event surface of IdentityRegistry behind bare emit functions,
+    /// compiled from contracts/MockIdentityRegistry.sol.
+    #[allow(clippy::too_many_arguments)]
+    #[sol(rpc)]
+    MockIdentityRegistry,
+    "../../contracts/MockIdentityRegistry.json"
+);
+
+sol!(
+    /// The event surface of HandleEscrow behind bare emit functions, and its
+    /// `registry` view, compiled from contracts/MockHandleEscrow.sol.
+    #[allow(clippy::too_many_arguments)]
+    #[sol(rpc)]
+    MockHandleEscrow,
+    "../../contracts/MockHandleEscrow.json"
+);
+
+/// The mock's bind of `id` to `handle`, disclosing it when `disclosed`, with
+/// nothing to withdraw or retire.
+pub fn mock_bind(
+    holder: Address,
+    platform: KnownPlatform,
+    id: &str,
+    handle: &str,
+    observed_at: u64,
+    disclosed: bool,
+    digest: B256,
+) -> MockIdentityRegistry::Bind {
+    MockIdentityRegistry::Bind {
+        holder,
+        idNode: platform.id_node(id).expect("an id"),
+        handleNode: platform.handle_node(handle).expect("a handle"),
+        platformId: platform.id(),
+        observedAt: observed_at,
+        ceremonyVersion: 1,
+        takenFrom: Address::ZERO,
+        retiredNode: B256::ZERO,
+        retiredHolder: Address::ZERO,
+        retiredNamed: false,
+        handle: if disclosed {
+            handle.into()
+        } else {
+            String::new()
+        },
+        authorizationDigest: digest,
+    }
+}
+
+/// A bind's events, as the contract emits them: `IdentityBound`, and
+/// `HandlePublished` when the ceremony disclosed the handle.
+pub fn bind(
+    holder: Address,
+    platform: KnownPlatform,
+    id: &str,
+    handle: &str,
+    observed_at: u64,
+    disclosed: bool,
+) -> Vec<NamesEvent> {
+    let mut events = vec![NamesEvent::IdentityBound {
+        holder,
+        id_node: platform.id_node(id).expect("an id"),
+        handle_node: platform.handle_node(handle).expect("a handle"),
+        platform_id: platform.id(),
+        observed_at,
+        ceremony_version: 1,
+    }];
+    if disclosed {
+        events.push(publish(holder, platform, handle));
+    }
+    events
+}
+
+/// `publish(handle)`'s event.
+pub fn publish(holder: Address, platform: KnownPlatform, handle: &str) -> NamesEvent {
+    let handle_node = platform.handle_node(handle).expect("a handle");
+    NamesEvent::HandlePublished {
+        holder,
+        platform_id: platform.id(),
+        handle_node,
+        handle: DisclosedHandle::verify(platform, handle_node, handle),
+    }
+}
+
+/// A bind's retirement of the handle `holder` held.
+pub fn retire(platform: KnownPlatform, handle: &str, holder: Address) -> NamesEvent {
+    NamesEvent::HandleRetired {
+        platform_id: platform.id(),
+        handle_node: platform.handle_node(handle).expect("a handle"),
+        holder,
+    }
+}
+
+/// A withdrawal of `holder`'s name on the platform.
+pub fn unpublish(holder: Address, platform: KnownPlatform) -> NamesEvent {
+    NamesEvent::HandleUnpublished {
+        holder,
+        platform_id: platform.id(),
+    }
+}
+
+/// A `depositToHandle`'s disclosure of the handle as typed.
+pub fn deposited_to_handle(platform: KnownPlatform, typed: &str) -> NamesEvent {
+    let (_, handle_node) = platform.folded_handle_node(typed);
+    NamesEvent::Escrow(EscrowEvent::DepositedToHandle {
+        handle_node,
+        platform_id: platform.id(),
+        handle: DisclosedHandle::verify(platform, handle_node, typed),
+    })
+}
+
+/// Wait until the indexer has committed through `block`; fail after 30s.
+pub async fn wait_for_cursor(store: &ChainStore, block: u64) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let cursor = store.cursor().await.expect("cursor");
+        if cursor.is_some_and(|c| c >= block) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the indexer did not reach block {block}; cursor {cursor:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -149,6 +338,16 @@ impl<T: Debug> Reply<T> {
             Ok(answer) => panic!("answered {}: {answer:?}", self.status),
         }
     }
+}
+
+/// One GET scoped to `chain`.
+pub async fn get_on<T: DeserializeOwned>(
+    pool: &PgPool,
+    chain: i64,
+    path: &str,
+) -> Reply<T> {
+    let separator = if path.contains('?') { '&' } else { '?' };
+    get(pool, &format!("{path}{separator}chain={chain}")).await
 }
 
 /// One GET against the same axum router a caller would hit, decoded into the

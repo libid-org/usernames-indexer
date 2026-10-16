@@ -12,7 +12,10 @@ use alloy::{
     },
     transports::TransportError,
 };
-use libid_contracts::bindings::escrow::HandleEscrow;
+use libid_contracts::bindings::{
+    escrow::HandleEscrow,
+    identity::IdentityRegistry,
+};
 
 /// Binary search for the block at which a contract was deployed: the first
 /// block where `eth_getCode` returns non-empty bytecode. `Ok(None)` means the
@@ -73,6 +76,46 @@ pub async fn fetch_logs(
         .from_block(BlockNumberOrTag::Number(from))
         .to_block(BlockNumberOrTag::Number(to));
     provider.get_logs(&f).await
+}
+
+/// Why a registry is refused.
+#[derive(Debug, thiserror::Error)]
+pub enum RegistryRefused {
+    /// `nodeKeyed()` could not be read: not a node-keyed registry.
+    #[error(
+        "registry {registry}: nodeKeyed(): {source}; point it at a libID-contracts 0.18 IdentityRegistry"
+    )]
+    Unread {
+        /// The registry asked.
+        registry: Address,
+        /// The call's failure.
+        #[source]
+        source: contract::Error,
+    },
+    /// The registry says it is not keyed by nodes.
+    #[error("registry {registry} is not keyed by nodes")]
+    NotNodeKeyed {
+        /// The registry asked.
+        registry: Address,
+    },
+}
+
+/// Refuse a registry whose events this build would misread: one not keyed
+/// by circuit nodes. Checked once, at startup, before a row is touched.
+pub async fn check_registry(
+    provider: &impl Provider,
+    registry: Address,
+) -> Result<(), RegistryRefused> {
+    let keyed = IdentityRegistry::new(registry, provider)
+        .nodeKeyed()
+        .call()
+        .await
+        .map_err(|source| RegistryRefused::Unread { registry, source })?;
+    if keyed {
+        Ok(())
+    } else {
+        Err(RegistryRefused::NotNodeKeyed { registry })
+    }
 }
 
 /// Why an escrow is refused beside the registry an indexer follows.

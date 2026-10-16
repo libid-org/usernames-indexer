@@ -19,9 +19,10 @@ axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 dotenvy = "0.15"
 humantime = "2"
-libid-contracts = "0.15"
-libid-identity = "0.15"
-libid-profiles = "0.15"
+# libID-contracts #87 (0.17.0 there); switch to crates.io 0.18.0 at its release.
+libid-contracts = { git = "https://github.com/libid-org/libID-contracts", rev = "0ab6d48" }
+libid-identity = { git = "https://github.com/libid-org/libID-contracts", rev = "0ab6d48", features = ["node"] }
+libid-profiles = { git = "https://github.com/libid-org/libID-contracts", rev = "0ab6d48" }
 libid-signer = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

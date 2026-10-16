@@ -1,9 +1,9 @@
-SELECT h.chain_id, h.platform_id, h.handle, h.owner, i.user_id,
-       (p.handle IS NOT NULL) AS published
-FROM names.handles h
-LEFT JOIN names.ids i
-  ON i.chain_id = h.chain_id AND i.id_node = h.id_node
+SELECT h.chain_id, h.platform_id, h.handle_node, h.id_node, v.handle, h.owner,
+       (p.handle_node IS NOT NULL) AS published
+FROM names.disclosures v
+JOIN names.handles h
+  ON h.chain_id = v.chain_id AND h.handle_node = v.handle_node
 LEFT JOIN names.published p
   ON p.chain_id = h.chain_id AND p.owner = h.owner
-     AND p.platform_id = h.platform_id AND p.handle = h.handle
+     AND p.platform_id = h.platform_id AND p.handle_node = h.handle_node
 WHERE h.owner IS NOT NULL

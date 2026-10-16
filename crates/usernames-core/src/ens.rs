@@ -52,10 +52,7 @@ use alloy::{
     sol_types::SolValue,
 };
 
-use crate::nodes::{
-    KnownPlatform,
-    Platform,
-};
+use crate::nodes::KnownPlatform;
 
 /// The domain a gateway answers under when its deployment names none.
 pub const DEFAULT_DOMAIN: &str = "handles.link";
@@ -262,7 +259,7 @@ pub enum Subject {
     /// A handle on a platform, already in the byte form the chain keyed.
     Handle {
         /// The platform the labels named.
-        platform: Platform,
+        platform: KnownPlatform,
         /// The handle the labels invert to.
         handle: String,
     },
@@ -511,10 +508,7 @@ impl Name {
             .ok_or_else(|| EnsError::UnnormalizedLabel(head.join(".")))?;
 
         Ok(Query {
-            subject: Subject::Handle {
-                platform: platform.into(),
-                handle,
-            },
+            subject: Subject::Handle { platform, handle },
             chain_label,
         })
     }
@@ -523,16 +517,17 @@ impl Name {
 impl KnownPlatform {
     /// Invert the label transform for this platform.
     ///
-    /// The forward direction is specified against what `HandleNormalizer`
-    /// produced, so this returns the handle in exactly the byte form the chain
-    /// keyed — no case, no padding, no leading at-sign to strip.
+    /// The forward direction maps the handles each platform issues, folded as
+    /// the chain keys them, so this returns that byte form — no case, no
+    /// padding, no leading at-sign to strip. A handle outside the platform's
+    /// own format has no name.
     ///
     /// A method on the platform, so the `match` is exhaustive: a platform
     /// added to the type does not compile until its transform is written
     /// here. That guarantee is why the type exists.
     fn handle_from_labels(self, labels: &[String]) -> Option<String> {
         match self {
-            // X's alphabet is `[a-z0-9_]` and contains no hyphen, so `_` ->
+            // X issues handles of `[a-z0-9_]` (folded), with no hyphen, so `_` ->
             // `-` is a bijection onto its image and reverses by replacing
             // every `-`.
             Self::X => {
@@ -1133,9 +1128,7 @@ mod chain_names {
             );
         }
         for platform in KnownPlatform::ALL {
-            let key = Platform::from(*platform)
-                .key()
-                .expect("a known platform has a key");
+            let key = platform.key();
             assert_eq!(
                 key.parse::<ChainName>(),
                 Err(ChainNameError::Platform(key.to_string()))

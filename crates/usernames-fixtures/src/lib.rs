@@ -13,7 +13,7 @@
 //! - [`addr_call`] and [`legacy_addr_call`]: the record request, in the
 //!   ENSIP-11 multichain form and in the older form that means coin type 60.
 //! - [`resolve_call`]: the wrapped call the gateway receives.
-//! - [`bind`]: one binding written into the store the gateway answers from,
+//! - [`bind`] and [`bind_private`]: one binding written into the store the gateway answers from,
 //!   with its chain marked synced.
 //!
 //! `gateway.rs` drives the router in process with these; `end_to_end.rs`
@@ -51,7 +51,7 @@ use usernames_core::{
         NamesEvent,
     },
     nodes::{
-        self,
+        DisclosedHandle,
         KnownPlatform,
     },
 };
@@ -121,36 +121,51 @@ pub fn legacy_addr_call(labels: &[&str]) -> Vec<u8> {
     .abi_encode()
 }
 
-/// Seed one binding into the read model the gateway answers from.
+/// Seed one disclosing X binding into the read model the gateway answers
+/// from: its `IdentityBound` and `HandlePublished`, in one transaction.
 pub async fn bind(store: &ChainStore, handle: &str, holder: Address) {
-    let platform = KnownPlatform::X.id();
-    let event = NamesEvent::IdentityBound {
+    seed(store, handle, holder, true).await;
+}
+
+/// [`bind`] without the `HandlePublished`: a private binding.
+pub async fn bind_private(store: &ChainStore, handle: &str, holder: Address) {
+    seed(store, handle, holder, false).await;
+}
+
+async fn seed(store: &ChainStore, handle: &str, holder: Address, disclosed: bool) {
+    let x = KnownPlatform::X;
+    let handle_node = x.handle_node(handle).expect("an X handle");
+    let mut events = vec![NamesEvent::IdentityBound {
         holder,
-        id_node: nodes::id_node(platform, "42"),
-        handle_node: nodes::handle_node(
-            platform,
-            &nodes::NormalizedHandle::from_chain(handle),
-        ),
-        platform_id: platform,
-        id: "42".into(),
-        handle: handle.into(),
+        id_node: x.id_node("42").expect("an X id"),
+        handle_node,
+        platform_id: x.id(),
         observed_at: 1_700_000_000,
         ceremony_version: 1,
-        published: true,
-    };
+    }];
+    if disclosed {
+        events.push(NamesEvent::HandlePublished {
+            holder,
+            platform_id: x.id(),
+            handle_node,
+            handle: DisclosedHandle::verify(x, handle_node, handle),
+        });
+    }
     let mut window = store.begin_window().await.expect("begin");
-    window
-        .apply(
-            &event,
-            &LogPosition {
-                block_number: 1,
-                log_index: 0,
-                tx_hash: B256::from([1u8; 32]),
-                block_time: 1_700_000_000,
-            },
-        )
-        .await
-        .expect("apply");
+    for (log_index, event) in (0u64..).zip(&events) {
+        window
+            .apply(
+                event,
+                &LogPosition {
+                    block_number: 1,
+                    log_index,
+                    tx_hash: B256::from([1u8; 32]),
+                    block_time: 1_700_000_000,
+                },
+            )
+            .await
+            .expect("apply");
+    }
     window.commit(1).await.expect("commit");
     // The indexer records both every cycle, and the gateway refuses to answer
     // from an index that cannot say how far behind it is. Staleness is measured

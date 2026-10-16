@@ -303,6 +303,23 @@ async fn a_bound_handle_resolves_and_the_signature_verifies() {
     drop(guard);
 }
 
+/// A private binding resolves too, as `resolveHandle` does on chain.
+#[tokio::test]
+async fn a_private_binding_resolves() {
+    let (router, store, _pool, guard) = gateway_or_skip!(32);
+    let owner = Address::from([0xbe; 20]);
+    bind_private(&store, "alice", owner).await;
+
+    let call = resolve_call(
+        &wire_name(&["alice", "x"]),
+        &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
+    );
+    let (status, body) = ask(&router, RESOLVER, &call).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(verify(&body, &call), Some(owner));
+    drop(guard);
+}
+
 #[tokio::test]
 async fn a_name_nobody_holds_gets_a_signed_null() {
     // The point of signing a null: a wallet must be able to trust "nobody

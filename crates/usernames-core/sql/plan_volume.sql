@@ -5,23 +5,26 @@
 -- little and its address or node select almost nothing, the way they do in
 -- production. The test loads it in a transaction that rolls back.
 INSERT INTO names.handles
-    (chain_id, handle_node, platform_id, handle, owner,
+    (chain_id, handle_node, platform_id, owner,
      observed_at, ceremony_version, id_node, block_number, log_index)
 SELECT 1, sha256(('node' || i)::bytea),
        CASE i % 3 WHEN 0 THEN decode(repeat('01', 32), 'hex')
                   ELSE sha256(('platform' || i % 3)::bytea) END,
-       'handle' || i,
        substring(sha256(('address' || i % 1000)::bytea) FROM 1 FOR 20),
        1, 1, sha256(('id' || i)::bytea), i, 0
 FROM generate_series(1, 5000) i;
 INSERT INTO names.ids
-    (chain_id, id_node, platform_id, user_id, owner,
+    (chain_id, id_node, platform_id, owner,
      observed_at, ceremony_version, handle_node, block_number, log_index)
-SELECT 1, id_node, platform_id, 'user' || block_number, owner,
+SELECT 1, id_node, platform_id, owner,
        1, 1, handle_node, block_number, 0
 FROM names.handles WHERE chain_id = 1;
-INSERT INTO names.published (chain_id, owner, platform_id, handle)
-SELECT DISTINCT ON (owner, platform_id) 1, owner, platform_id, handle
+INSERT INTO names.published (chain_id, owner, platform_id, handle_node)
+SELECT DISTINCT ON (owner, platform_id) 1, owner, platform_id, handle_node
+FROM names.handles WHERE chain_id = 1;
+INSERT INTO names.disclosures
+    (chain_id, handle_node, platform_id, handle)
+SELECT 1, handle_node, platform_id, md5(block_number::text)
 FROM names.handles WHERE chain_id = 1;
 INSERT INTO names.events
     (chain_id, block_number, log_index, tx_hash, kind, payload)
@@ -51,6 +54,8 @@ SELECT substring(sha256(('address' || i % 1000)::bytea) FROM 1 FOR 20), 1,
        sha256(('node' || i)::bytea),
        substring(sha256(('token' || i % 5)::bytea) FROM 1 FOR 20), 0, i
 FROM generate_series(1, 5000) i;
-ANALYZE names.handles, names.ids, names.published, names.events,
+-- Vacuum moves a GIN index's pending entries into it; the rows above wait there.
+SELECT gin_clean_pending_list('names.disclosures_handle_trgm_idx');
+ANALYZE names.handles, names.ids, names.published, names.disclosures, names.events,
         names.address_events, names.handle_events, names.handle_nodes,
         names.escrow_held, names.escrow_refundable;

@@ -21,7 +21,11 @@ use alloy::primitives::{
 };
 use axum::http::StatusCode;
 use common::{
+    bind,
+    deposited_to_handle,
     events,
+    retire,
+    unpublish,
     Suite,
 };
 use serde::de::DeserializeOwned;
@@ -44,10 +48,7 @@ use usernames_core::{
         EscrowEvent,
         NamesEvent,
     },
-    nodes::{
-        self,
-        KnownPlatform,
-    },
+    nodes::KnownPlatform,
 };
 
 const CHAIN: i64 = 31401;
@@ -59,31 +60,17 @@ const DAI: Address = Address::repeat_byte(0x0D);
 
 static SUITE: Mutex<()> = Mutex::const_new(());
 
+const X: KnownPlatform = KnownPlatform::X;
+
 fn addr(byte: u8) -> Address {
     Address::repeat_byte(byte)
 }
 
 fn node(handle: &str) -> B256 {
-    nodes::handle_node(
-        KnownPlatform::X.id(),
-        &nodes::NormalizedHandle::from_chain(handle),
-    )
+    X.handle_node(handle).expect("an X handle")
 }
 
-fn bind(holder: Address, id: &str, handle: &str, observed_at: u64) -> NamesEvent {
-    NamesEvent::IdentityBound {
-        holder,
-        id_node: nodes::id_node(KnownPlatform::X.id(), id),
-        handle_node: node(handle),
-        platform_id: KnownPlatform::X.id(),
-        id: id.into(),
-        handle: handle.into(),
-        observed_at,
-        published: false,
-        ceremony_version: 1,
-    }
-}
-
+/// A `deposit` by node: no platform, no text.
 fn deposited(
     handle: &str,
     token: Address,
@@ -96,7 +83,6 @@ fn deposited(
         token,
         refund_to,
         depositor,
-        platform_id: KnownPlatform::X.id(),
         round: U256::ZERO,
         amount: U256::from(amount),
     })
@@ -152,10 +138,16 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
         (addr(0xB0), addr(0xC0), addr(0xD0), addr(0xE0), addr(0xD1));
     let bob_node = node("bob_1");
 
-    // Nobody holds @bob_1: three deposits escrow. Erin pays for Dave, whose
-    // address is the one that may refund.
+    // Nobody holds @bob_1: three deposits escrow, the first to the handle as
+    // typed. Erin pays for Dave, whose address is the one that may refund.
     suite
-        .apply(1, deposited("bob_1", NATIVE, carol, carol, 100))
+        .apply_tx(
+            1,
+            vec![
+                deposited("Bob_1", NATIVE, carol, carol, 100),
+                deposited_to_handle(X, "Bob_1"),
+            ],
+        )
         .await;
     suite
         .apply(2, deposited("bob_1", NATIVE, erin, dave, 50))
@@ -164,20 +156,44 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
         .apply(3, deposited("bob_1", USDC, carol, carol, 7))
         .await;
 
-    // Known by its node alone: no bind has carried the text. Token by token,
-    // descending: the native coin's address sorts above USDC's.
+    // The deposit to the handle disclosed its platform and, folded, its
+    // text. Token by token, descending: the native coin's address sorts
+    // above USDC's.
     let held: HandleAmounts = suite
         .get(&format!("/v1/escrow/node/{bob_node}"))
         .await
         .answer();
     assert_eq!(amounts(&held.amounts), [(NATIVE, 150), (USDC, 7)]);
     assert_eq!(held.handle.platform, Some(KnownPlatform::X));
-    assert_eq!(held.handle.handle, None);
+    assert_eq!(held.handle.handle.as_deref(), Some("bob_1"));
     assert!(held.amounts.iter().all(|a| a.holder.is_none()));
-    // By text, the request names the handle; the node is the same.
-    let held: HandleAmounts = suite.get("/v1/escrow/handle/x/@Bob_1").await.answer();
+    // By text, hashed here; the node is the same.
+    let held: HandleAmounts = suite.get("/v1/escrow/handle/x/BOB_1").await.answer();
     assert_eq!(held.handle.handle_node, bob_node);
     assert_eq!(held.handle.handle.as_deref(), Some("bob_1"));
+    // A deposit by node alone names no platform and no text.
+    suite
+        .apply(20, deposited("anon_1", DAI, carol, carol, 1))
+        .await;
+    let anon: HandleAmounts = suite
+        .get(&format!("/v1/escrow/node/{}", node("anon_1")))
+        .await
+        .answer();
+    assert_eq!((anon.handle.platform_id, anon.handle.handle), (None, None));
+    suite
+        .apply(
+            21,
+            NamesEvent::Escrow(EscrowEvent::Refunded {
+                handle_node: node("anon_1"),
+                token: DAI,
+                refund_to: carol,
+                recipient: carol,
+                round: U256::ZERO,
+                released: U256::from(1u64),
+                received: U256::from(1u64),
+            }),
+        )
+        .await;
 
     // The payers see what they may take back; a payer that named somebody
     // else's refund address sees nothing.
@@ -219,8 +235,11 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
         .answer();
     assert!(daves.amounts.is_empty());
 
-    // Bob binds @bob_1: what is held is his to claim, under the handle's text.
-    suite.apply(5, bind(bob, "222", "bob_1", 5_000)).await;
+    // Bob binds @bob_1 privately: what is held is his to claim, under the
+    // text the deposit disclosed.
+    suite
+        .apply_tx(5, bind(bob, X, "222", "bob_1", 5_000, false))
+        .await;
     let bobs: AddressAmounts = suite
         .get(&format!("/v1/escrow/claimable/{bob}"))
         .await
@@ -277,7 +296,6 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
                 token: NATIVE,
                 depositor: carol,
                 holder: bob,
-                platform_id: KnownPlatform::X.id(),
                 amount: U256::from(5u64),
                 received: U256::from(5u64),
             }),
@@ -303,6 +321,7 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
                 HistoryEvent::Refunded { .. },
                 HistoryEvent::Deposited { .. },
                 HistoryEvent::Deposited { .. },
+                HistoryEvent::DepositedToHandle { .. },
                 HistoryEvent::Deposited { .. },
             ]
         ),
@@ -341,15 +360,17 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
     assert!(matches!(
         events(&history.entries)[..],
         [
+            HistoryEvent::Refunded { .. },
+            HistoryEvent::Deposited { .. },
             HistoryEvent::Forwarded { .. },
             HistoryEvent::Claimed { .. },
             HistoryEvent::Deposited { .. },
             HistoryEvent::Deposited { .. },
         ]
     ));
-    assert_eq!(history.entries[0].roles, [Role::Depositor]);
-    assert_eq!(history.entries[1].roles, [Role::RefundTo]);
-    assert_eq!(history.entries[2].roles, [Role::Depositor, Role::RefundTo]);
+    assert_eq!(history.entries[2].roles, [Role::Depositor]);
+    assert_eq!(history.entries[3].roles, [Role::RefundTo]);
+    assert_eq!(history.entries[4].roles, [Role::Depositor, Role::RefundTo]);
     let history: AddressHistory = suite
         .get(&format!("/v1/history/address/{dave}"))
         .await
@@ -490,8 +511,12 @@ async fn every_escrow_list_pages_by_cursor_without_gaps_or_repeats() {
                 .await;
         }
     }
-    suite.apply(20, bind(bob, "1", "p1", 1_000)).await;
-    suite.apply(21, bind(bob, "2", "p2", 1_000)).await;
+    suite
+        .apply_tx(20, bind(bob, X, "1", "p1", 1_000, false))
+        .await;
+    suite
+        .apply_tx(21, bind(bob, X, "2", "p2", 1_000, false))
+        .await;
 
     let path = format!("/v1/escrow/claimable/{bob}");
     let whole: AddressAmounts = suite.get(&path).await.answer();
@@ -568,11 +593,19 @@ async fn a_bind_names_what_it_took_and_from_whom() {
     let (alice, bob, carol, dave) = (addr(0xA1), addr(0xB2), addr(0xC3), addr(0xD4));
 
     // The platform recycled @kim to another account, which Bob proves.
-    suite.apply(1, bind(alice, "111", "kim", 1_000)).await;
-    suite.apply(2, bind(bob, "222", "kim", 2_000)).await;
+    suite
+        .apply_tx(1, bind(alice, X, "111", "kim", 1_000, false))
+        .await;
+    suite
+        .apply_tx(2, bind(bob, X, "222", "kim", 2_000, false))
+        .await;
     // Carol's account moves to Dave's address, handle and all.
-    suite.apply(3, bind(carol, "333", "carol", 3_000)).await;
-    suite.apply(4, bind(dave, "333", "carol", 4_000)).await;
+    suite
+        .apply_tx(3, bind(carol, X, "333", "carol", 3_000, false))
+        .await;
+    suite
+        .apply_tx(4, bind(dave, X, "333", "carol", 4_000, false))
+        .await;
 
     let history: AddressHistory = suite
         .get(&format!("/v1/history/address/{alice}"))
@@ -604,6 +637,41 @@ async fn a_bind_names_what_it_took_and_from_whom() {
     suite.done();
 }
 
+/// An address history as (kind, roles, handle node), newest first.
+fn entries(history: &AddressHistory) -> Vec<(String, Vec<Role>, Option<B256>)> {
+    history
+        .entries
+        .iter()
+        .map(|e| {
+            (
+                kind(&e.event).to_string(),
+                e.roles.clone(),
+                e.handle.as_ref().map(|h| h.handle_node),
+            )
+        })
+        .collect()
+}
+
+/// The journal kind an event is served under.
+fn kind(event: &HistoryEvent) -> &'static str {
+    match event {
+        HistoryEvent::IdentityBound { .. } => "identity_bound",
+        HistoryEvent::HandlePublished { .. } => "handle_published",
+        HistoryEvent::HandleRetired { .. } => "handle_retired",
+        HistoryEvent::HandleUnpublished { .. } => "handle_unpublished",
+        HistoryEvent::ProofVerifierConfigured { .. } => "proof_verifier_configured",
+        HistoryEvent::CeremonyBound { .. } => "ceremony_bound",
+        HistoryEvent::BindFeePaid { .. } => "bind_fee_paid",
+        HistoryEvent::Deposited { .. } => "deposited",
+        HistoryEvent::DepositedToHandle { .. } => "deposited_to_handle",
+        HistoryEvent::Forwarded { .. } => "forwarded",
+        HistoryEvent::Claimed { .. } => "claimed",
+        HistoryEvent::Refunded { .. } => "refunded",
+    }
+}
+
+/// A retirement is in the history of the address that held the handle, which
+/// the event names, whoever's bind retired it.
 #[tokio::test]
 async fn a_retired_handle_is_in_the_history_of_the_address_that_held_it() {
     let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
@@ -611,60 +679,45 @@ async fn a_retired_handle_is_in_the_history_of_the_address_that_held_it() {
         return;
     };
     let (alice, bob) = (addr(0xA1), addr(0xB2));
-    let retire = |handle: &str, holder: Address| NamesEvent::HandleRetired {
-        platform_id: KnownPlatform::X.id(),
-        handle_node: node(handle),
-        holder,
-    };
-    // Alice renames @kim1 to @kim2: her own bind retires her own handle.
-    suite.apply(1, bind(alice, "777", "kim1", 1_000)).await;
-    suite
-        .apply_tx(
-            2,
-            vec![retire("kim1", alice), bind(alice, "777", "kim2", 2_000)],
-        )
-        .await;
-    // The account moves to Bob's address and renames to @kim3 in one bind:
-    // the retirement names Bob, but @kim2 was Alice's.
-    suite
-        .apply_tx(
-            3,
-            vec![retire("kim2", bob), bind(bob, "777", "kim3", 3_000)],
-        )
-        .await;
 
+    // Alice binds @kim1, disclosing it, then renames to @kim2: her bind
+    // retires @kim1 and withdraws her name for it.
+    suite
+        .apply_tx(1, bind(alice, X, "777", "kim1", 1_000, true))
+        .await;
+    let mut rename = vec![retire(X, "kim1", alice), unpublish(alice, X)];
+    rename.extend(bind(alice, X, "777", "kim2", 2_000, true));
+    suite.apply_tx(2, rename).await;
+    // The account moves to Bob's address and renames to @kim3, privately:
+    // @kim2 retires from Alice, and her name for it goes.
+    let mut to_bob = vec![retire(X, "kim2", alice), unpublish(alice, X)];
+    to_bob.extend(bind(bob, X, "777", "kim3", 3_000, false));
+    suite.apply_tx(3, to_bob).await;
+
+    let (holder, held, moved) = (
+        vec![Role::Holder],
+        vec![Role::PreviousHandleHolder],
+        vec![Role::PreviousIdHolder],
+    );
+    let row = |kind: &str, roles: &Vec<Role>, handle: &str| {
+        (kind.to_string(), roles.clone(), Some(node(handle)))
+    };
     let history: AddressHistory = suite
         .get(&format!("/v1/history/address/{alice}"))
         .await
         .answer();
-    let entries: Vec<(&[Role], Option<&str>)> = history
-        .entries
-        .iter()
-        .map(|e| {
-            (
-                e.roles.as_slice(),
-                e.handle.as_ref().and_then(|h| h.handle.as_deref()),
-            )
-        })
-        .collect();
-    assert!(matches!(
-        events(&history.entries)[..],
-        [
-            HistoryEvent::IdentityBound { .. },
-            HistoryEvent::HandleRetired { .. },
-            HistoryEvent::IdentityBound { .. },
-            HistoryEvent::HandleRetired { .. },
-            HistoryEvent::IdentityBound { .. },
-        ]
-    ));
     assert_eq!(
-        entries,
+        entries(&history),
         [
-            (&[Role::PreviousIdHolder][..], Some("kim3")),
-            (&[Role::PreviousHandleHolder][..], Some("kim2")),
-            (&[Role::Holder][..], Some("kim2")),
-            (&[Role::Holder][..], Some("kim1")),
-            (&[Role::Holder][..], Some("kim1")),
+            row("identity_bound", &moved, "kim3"),
+            row("handle_unpublished", &holder, "kim2"),
+            row("handle_retired", &held, "kim2"),
+            row("handle_published", &holder, "kim2"),
+            row("identity_bound", &holder, "kim2"),
+            row("handle_unpublished", &holder, "kim1"),
+            row("handle_retired", &held, "kim1"),
+            row("handle_published", &holder, "kim1"),
+            row("identity_bound", &holder, "kim1"),
         ]
     );
     // Bob never held @kim2: his history is his own bind.
@@ -672,10 +725,25 @@ async fn a_retired_handle_is_in_the_history_of_the_address_that_held_it() {
         .get(&format!("/v1/history/address/{bob}"))
         .await
         .answer();
-    assert!(matches!(
-        events(&history.entries)[..],
-        [HistoryEvent::IdentityBound { .. }]
-    ));
+    assert_eq!(entries(&history), [row("identity_bound", &holder, "kim3")]);
+    suite.done();
+}
+
+/// An index that starts after a node's bind still learns its platform from
+/// a retire, which names it.
+#[tokio::test]
+async fn a_retire_names_the_platform_of_a_node_whose_bind_was_missed() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    suite.apply_tx(1, vec![retire(X, "kim1", addr(0xA1))]).await;
+    let history: HandleHistory = suite
+        .get(&format!("/v1/history/node/{}", node("kim1")))
+        .await
+        .answer();
+    assert_eq!(history.handle.platform, Some(X));
+    assert_eq!(history.handle.platform_id, Some(X.id()));
     suite.done();
 }
 
@@ -688,25 +756,21 @@ async fn a_bind_fee_is_in_the_payers_history_under_the_handle_it_bought() {
     let (alice, app) = (addr(0xA1), addr(0xFE));
     let digest = B256::repeat_byte(0xD1);
     // One bind's transaction: the binding, its ceremony, its fee.
-    suite
-        .apply_tx(
-            1,
-            vec![
-                bind(alice, "111", "ann_1", 1_000),
-                NamesEvent::CeremonyBound {
-                    authorization_digest: digest,
-                    holder: alice,
-                    platform_id: KnownPlatform::X.id(),
-                    client_identifier: Bytes::from_static(b"app"),
-                },
-                NamesEvent::BindFeePaid {
-                    authorization_digest: digest,
-                    receiver: app,
-                    amount: U256::from(1_000u64),
-                },
-            ],
-        )
-        .await;
+    let mut tx = bind(alice, X, "111", "ann_1", 1_000, false);
+    tx.extend([
+        NamesEvent::CeremonyBound {
+            authorization_digest: digest,
+            holder: alice,
+            platform_id: X.id(),
+            client_identifier: Bytes::from_static(b"app"),
+        },
+        NamesEvent::BindFeePaid {
+            authorization_digest: digest,
+            receiver: app,
+            amount: U256::from(1_000u64),
+        },
+    ]);
+    suite.apply_tx(1, tx).await;
 
     let history: AddressHistory = suite
         .get(&format!("/v1/history/address/{alice}"))
@@ -721,7 +785,7 @@ async fn a_bind_fee_is_in_the_payers_history_under_the_handle_it_bought() {
         ] if *amount == U256::from(1_000u64)
     ));
     assert!(history.entries.iter().all(|e| e.roles == [Role::Holder]
-        && e.handle.as_ref().and_then(|h| h.handle.as_deref()) == Some("ann_1")));
+        && e.handle.as_ref().map(|h| h.handle_node) == Some(node("ann_1"))));
 
     let history: AddressHistory = suite
         .get(&format!("/v1/history/address/{app}"))
@@ -745,29 +809,27 @@ async fn an_unpublish_concerns_the_handle_it_withdrew() {
         return;
     };
     let alice = addr(0xA1);
-    let mut published = bind(alice, "111", "ann_1", 1_000);
-    if let NamesEvent::IdentityBound { published, .. } = &mut published {
-        *published = true;
-    }
-    suite.apply(1, published).await;
     suite
-        .apply(
-            2,
-            NamesEvent::HandleUnpublished {
-                holder: alice,
-                platform_id: KnownPlatform::X.id(),
-            },
-        )
+        .apply_tx(1, bind(alice, X, "111", "ann_1", 1_000, true))
         .await;
+    suite.apply(2, unpublish(alice, X)).await;
 
     let history: HandleHistory = suite.get("/v1/history/handle/x/ann_1").await.answer();
     assert!(matches!(
         events(&history.entries)[..],
         [
             HistoryEvent::HandleUnpublished { .. },
+            HistoryEvent::HandlePublished { .. },
             HistoryEvent::IdentityBound { .. },
         ]
     ));
+    // Withdrawn: the history still shows the node and its disclosed text.
+    assert!(history.entries.iter().all(|e| e
+        .handle
+        .as_ref()
+        .is_some_and(
+            |h| h.handle_node == node("ann_1") && h.handle.as_deref() == Some("ann_1")
+        )));
     suite.done();
 }
 
@@ -778,16 +840,10 @@ async fn an_unpublish_with_nothing_published_concerns_no_handle() {
         return;
     };
     let alice = addr(0xA1);
-    suite.apply(1, bind(alice, "111", "ann_1", 1_000)).await;
     suite
-        .apply(
-            2,
-            NamesEvent::HandleUnpublished {
-                holder: alice,
-                platform_id: KnownPlatform::X.id(),
-            },
-        )
+        .apply_tx(1, bind(alice, X, "111", "ann_1", 1_000, false))
         .await;
+    suite.apply(2, unpublish(alice, X)).await;
 
     let history: AddressHistory = suite
         .get(&format!("/v1/history/address/{alice}"))
@@ -828,17 +884,50 @@ async fn a_handle_nothing_was_sent_to_holds_nothing() {
         return;
     };
     suite
-        .apply(
-            1,
-            NamesEvent::PlatformConfigured {
-                platform_id: KnownPlatform::X.id(),
-            },
-        )
+        .apply_tx(1, bind(addr(1), X, "1", "somebody", 1_000, false))
         .await;
     let held: HandleAmounts = suite.get("/v1/escrow/handle/x/nobody").await.answer();
     assert!(held.amounts.is_empty() && held.next.is_none());
     let history: HandleHistory = suite.get("/v1/history/handle/x/nobody").await.answer();
     assert!(history.entries.is_empty() && history.next.is_none());
+    suite.done();
+}
+
+/// The chain folds a deposit's text and checks nothing else, so text no
+/// circuit hashes still finds what was sent to it, but no account can bind
+/// it and its text is not stored.
+#[tokio::test]
+async fn text_finds_a_deposit_the_way_the_chain_hashed_it() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let carol = addr(0xC0);
+    let (_, quoted) = X.folded_handle_node("Bo\"b");
+    assert!(X.handle_node("Bo\"b").is_err(), "no circuit hashes a quote");
+    suite
+        .apply_tx(
+            1,
+            vec![
+                NamesEvent::Escrow(EscrowEvent::Deposited {
+                    handle_node: quoted,
+                    token: NATIVE,
+                    refund_to: carol,
+                    depositor: carol,
+                    round: U256::ZERO,
+                    amount: U256::from(9u64),
+                }),
+                deposited_to_handle(X, "Bo\"b"),
+            ],
+        )
+        .await;
+
+    let held: HandleAmounts = suite.get("/v1/escrow/handle/x/bo%22b").await.answer();
+    assert_eq!(held.handle.handle_node, quoted);
+    assert_eq!(held.handle.handle, None);
+    assert_eq!(amounts(&held.amounts), [(NATIVE, 9)]);
+    let history: HandleHistory = suite.get("/v1/history/handle/x/bo%22b").await.answer();
+    assert_eq!(history.entries.len(), 2);
     suite.done();
 }
 

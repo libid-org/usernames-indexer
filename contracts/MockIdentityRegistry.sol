@@ -2,25 +2,28 @@
 pragma solidity ^0.8.20;
 
 /// @notice Test double for the indexer: the exact event surface of
-///         IdentityRegistry, each behind a function that just emits it. The
+///         IdentityRegistry, each behind a function that just emits it or,
+///         for HandlePublished, among a bind's events in `bind`'s order. The
 ///         integration test deploys this on anvil and replays scenarios, so
 ///         the indexer decodes real ABI-encoded logs rather than values a
 ///         Rust test constructed for itself.
 ///
 ///         Event signatures are copied verbatim from
-///         libid-contracts/solidity/contracts/identity/IdentityRegistry.sol —
-///         a drifted copy here fails the integration test against the
-///         bindings, which come from the published crate.
+///         libid-contracts/solidity/contracts/identity/IdentityRegistry.sol;
+///         the hashed-identities suite checks every topic against the
+///         crate's bindings.
 contract MockIdentityRegistry {
+    /// Keyed by nodes, as IdentityRegistry answers; the indexer checks it.
+    function nodeKeyed() external pure returns (bool) {
+        return true;
+    }
+
     event IdentityBound(
         address indexed holder,
         bytes32 indexed idNode,
         bytes32 indexed handleNode,
         bytes32 platformId,
-        string id,
-        string handle,
         uint64 observedAt,
-        bool published,
         uint16 ceremonyVersion
     );
     event CeremonyBound(
@@ -28,24 +31,57 @@ contract MockIdentityRegistry {
     );
     event BindFeePaid(bytes32 indexed authorizationDigest, address indexed receiver, uint256 amount);
     event HandleRetired(bytes32 indexed platformId, bytes32 indexed handleNode, address indexed holder);
-    event PlatformConfigured(bytes32 indexed platformId);
     event ProofVerifierConfigured(address verifier);
+    event HandlePublished(
+        address indexed holder, bytes32 indexed platformId, bytes32 indexed handleNode, string handle
+    );
     event HandleUnpublished(address indexed holder, bytes32 indexed platformId);
+
+    /// @notice One `bind`, and what it finds before it writes.
+    struct Bind {
+        address holder;
+        bytes32 idNode;
+        bytes32 handleNode;
+        bytes32 platformId;
+        uint64 observedAt;
+        uint16 ceremonyVersion;
+        /// The address whose name for `handleNode` the bind withdraws; zero for none.
+        address takenFrom;
+        /// The handle node the identity held before; zero for none.
+        bytes32 retiredNode;
+        /// Who held `retiredNode`.
+        address retiredHolder;
+        /// Whether `retiredHolder`'s name was `retiredNode`.
+        bool retiredNamed;
+        /// The disclosed handle; empty for a private bind.
+        string handle;
+        bytes32 authorizationDigest;
+    }
 
     function emitIdentityBound(
         address holder,
         bytes32 idNode,
         bytes32 handleNode,
         bytes32 platformId,
-        string calldata id,
-        string calldata handle,
         uint64 observedAt,
-        bool published,
         uint16 ceremonyVersion
     ) external {
-        emit IdentityBound(
-            holder, idNode, handleNode, platformId, id, handle, observedAt, published, ceremonyVersion
-        );
+        emit IdentityBound(holder, idNode, handleNode, platformId, observedAt, ceremonyVersion);
+    }
+
+    /// @notice `bind`'s events, in its order: `_write`'s withdrawal of the
+    ///         taken handle's name, the previous handle's retirement and its
+    ///         name's withdrawal, the binding; then the disclosure and the
+    ///         ceremony.
+    function emitBind(Bind calldata b) external {
+        if (b.takenFrom != address(0)) emit HandleUnpublished(b.takenFrom, b.platformId);
+        if (b.retiredNode != bytes32(0)) {
+            emit HandleRetired(b.platformId, b.retiredNode, b.retiredHolder);
+            if (b.retiredNamed) emit HandleUnpublished(b.retiredHolder, b.platformId);
+        }
+        emit IdentityBound(b.holder, b.idNode, b.handleNode, b.platformId, b.observedAt, b.ceremonyVersion);
+        if (bytes(b.handle).length != 0) emit HandlePublished(b.holder, b.platformId, b.handleNode, b.handle);
+        emit CeremonyBound(b.authorizationDigest, b.holder, b.platformId, "");
     }
 
     function emitCeremonyBound(
@@ -63,10 +99,6 @@ contract MockIdentityRegistry {
 
     function emitHandleRetired(bytes32 platformId, bytes32 handleNode, address holder) external {
         emit HandleRetired(platformId, handleNode, holder);
-    }
-
-    function emitPlatformConfigured(bytes32 platformId) external {
-        emit PlatformConfigured(platformId);
     }
 
     function emitProofVerifierConfigured(address verifier) external {

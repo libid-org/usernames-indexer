@@ -23,7 +23,16 @@ use alloy::primitives::{
     U256,
 };
 use axum::http::StatusCode;
-use common::Reply;
+use common::{
+    apply,
+    apply_tx,
+    bind,
+    disclosed,
+    publish,
+    retire,
+    unpublish,
+    Reply,
+};
 use serde::de::DeserializeOwned;
 use sqlx::{
     postgres::PgPoolOptions,
@@ -49,14 +58,8 @@ use usernames_core::{
         ChainStore,
     },
     ens,
-    events::{
-        LogPosition,
-        NamesEvent,
-    },
-    nodes::{
-        self,
-        KnownPlatform,
-    },
+    events::NamesEvent,
+    nodes::KnownPlatform,
 };
 
 /// One chain id for every test; arbitrary, only consistency matters.
@@ -79,7 +82,7 @@ async fn test_store_with(
     max_connections: u32,
 ) -> Option<(ChainStore, PgPool, MutexGuard<'static, ()>)> {
     let guard = DB_LOCK.lock().await;
-    let url = std::env::var("DATABASE_URL").ok()?;
+    let url = common::database_url()?;
     let pool = PgPoolOptions::new()
         .max_connections(max_connections)
         .connect(&url)
@@ -98,62 +101,11 @@ fn addr(byte: u8) -> Address {
     Address::from_slice(&[byte; 20])
 }
 
-/// Apply one event at a synthetic chain position, committing like a window:
-/// the same [`db::Window`] the loop uses, so the cursor lands with the write —
-/// which is also what lets the sync-gated API answer.
-async fn apply(store: &ChainStore, seq: u64, event: NamesEvent) {
-    let pos = LogPosition {
-        block_number: seq,
-        log_index: 0,
-        tx_hash: B256::from_slice(&[seq as u8; 32]),
-        block_time: 1_700_000_000 + seq,
-    };
-    let mut window = store.begin_window().await.expect("begin");
-    window.apply(&event, &pos).await.expect("apply");
-    window.commit(seq).await.expect("commit");
-}
-
-fn bind(
-    holder: Address,
-    platform: B256,
-    id: &str,
-    handle: &str,
-    observed_at: u64,
-    published: bool,
-) -> NamesEvent {
-    NamesEvent::IdentityBound {
-        holder,
-        id_node: nodes::id_node(platform, id),
-        handle_node: nodes::handle_node(
-            platform,
-            &nodes::NormalizedHandle::from_chain(handle),
-        ),
-        platform_id: platform,
-        id: id.into(),
-        handle: handle.into(),
-        observed_at,
-        published,
-        ceremony_version: 1,
-    }
-}
-
-fn retire(platform: B256, handle: &str, holder: Address) -> NamesEvent {
-    NamesEvent::HandleRetired {
-        platform_id: platform,
-        handle_node: nodes::handle_node(
-            platform,
-            &nodes::NormalizedHandle::from_chain(handle),
-        ),
-        holder,
-    }
-}
-
 /// A request scoped to this suite's chain: the store is shared with the
 /// anvil suite's chain, and an unscoped read would see both. The reads that
 /// span chains have their own test below.
 async fn get<T: DeserializeOwned>(pool: &PgPool, path: &str) -> Reply<T> {
-    let separator = if path.contains('?') { '&' } else { '?' };
-    common::get(pool, &format!("{path}{separator}chain={CHAIN}")).await
+    common::get_on(pool, CHAIN, path).await
 }
 
 /// The one binding a resolution carries in these single-chain scenarios.
@@ -164,31 +116,37 @@ fn only<T: Debug>(bindings: &[T]) -> &T {
     }
 }
 
+/// The id-node route for an id, hashed here as a client would.
+fn id_route(platform: KnownPlatform, id: &str) -> String {
+    format!("/v1/resolve/id-node/{}", platform.id_node(id).unwrap())
+}
+
 #[tokio::test]
 async fn bind_resolves_all_three_directions() {
     let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = KnownPlatform::X.id();
+    let x = KnownPlatform::X;
     let alice = addr(0xA1);
-    apply(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
+    apply_tx(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
 
     let resolved: HandleResolution =
         get(&pool, "/v1/resolve/handle/x/alice_1").await.answer();
     let binding = only(&resolved.bindings);
     assert_eq!(binding.chain_id, CHAIN);
     assert_eq!(binding.owner, alice);
-    assert_eq!(binding.user_id.as_deref(), Some("111"));
+    assert_eq!(binding.id_node, x.id_node("111").unwrap());
+    assert_eq!(binding.handle.as_deref(), Some("alice_1"));
     assert_eq!(binding.ceremony_version, 1);
 
-    // The path normalizes the way the chain did: raw form finds the same row.
+    // The path is hashed the way the circuit hashed it: case folds.
     let resolved: HandleResolution =
-        get(&pool, "/v1/resolve/handle/x/@Alice_1").await.answer();
-    assert_eq!(resolved.handle, "alice_1");
+        get(&pool, "/v1/resolve/handle/x/Alice_1").await.answer();
+    assert_eq!(resolved.handle_node, x.handle_node("alice_1").unwrap());
     assert_eq!(resolved.platform, Some(KnownPlatform::X));
 
-    let resolved: IdResolution = get(&pool, "/v1/resolve/id/x/111").await.answer();
+    let resolved: IdResolution = get(&pool, &id_route(x, "111")).await.answer();
     let binding = only(&resolved.bindings);
     assert_eq!(binding.owner, alice);
     assert_eq!(binding.handle.as_deref(), Some("alice_1"));
@@ -210,12 +168,13 @@ async fn rename_retires_the_previous_handle() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = KnownPlatform::X.id();
+    let x = KnownPlatform::X;
     let alice = addr(0xA1);
-    apply(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
-    // The contract emits the retirement before the new bind in the same tx.
-    apply(&store, 2, retire(x, "alice_1", alice)).await;
-    apply(&store, 3, bind(alice, x, "111", "alice_2", 2000, true)).await;
+    apply_tx(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
+    // The rename's bind retires alice_1 and withdraws its name first.
+    let mut rename = vec![retire(x, "alice_1", alice), unpublish(alice, x)];
+    rename.extend(bind(alice, x, "111", "alice_2", 2000, true));
+    apply_tx(&store, 2, rename).await;
 
     // The code is the machine-readable half: a UI renders "retired"
     // differently from "never claimed" without parsing prose.
@@ -228,15 +187,16 @@ async fn rename_retires_the_previous_handle() {
         get(&pool, "/v1/resolve/handle/x/alice_2").await.answer();
     assert_eq!(only(&resolved.bindings).owner, alice);
 
-    let resolved: IdResolution = get(&pool, "/v1/resolve/id/x/111").await.answer();
+    let resolved: IdResolution = get(&pool, &id_route(x, "111")).await.answer();
     assert_eq!(only(&resolved.bindings).handle.as_deref(), Some("alice_2"));
 
     // The retired node keeps its watermark, mirroring the contract's
     // stale-proof gate.
     let watermark: i64 = sqlx::query_scalar(
-        "SELECT observed_at FROM names.handles WHERE chain_id = $1 AND handle = 'alice_1'",
+        "SELECT observed_at FROM names.handles WHERE chain_id = $1 AND handle_node = $2",
     )
     .bind(CHAIN)
+    .bind(x.handle_node("alice_1").unwrap())
     .fetch_one(&pool)
     .await
     .expect("watermark row");
@@ -250,64 +210,187 @@ async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = KnownPlatform::X.id();
+    let x = KnownPlatform::X;
     let (alice, bob) = (addr(0xA1), addr(0xB2));
     // Alice holds the handle, renames her platform account, re-proves under
     // the same handle... then the platform recycles the name to Bob's
     // account, and Bob proves it with a fresher observation.
-    apply(&store, 1, bind(alice, x, "111", "popular", 1000, false)).await;
-    apply(&store, 2, bind(bob, x, "222", "popular", 2000, false)).await;
+    apply_tx(&store, 1, bind(alice, x, "111", "popular", 1000, false)).await;
+    apply_tx(&store, 2, bind(bob, x, "222", "popular", 2000, false)).await;
 
     // The handle resolves to Bob now, paired with Bob's id.
     let resolved: HandleResolution =
         get(&pool, "/v1/resolve/handle/x/popular").await.answer();
     let binding = only(&resolved.bindings);
     assert_eq!(binding.owner, bob);
-    assert_eq!(binding.user_id.as_deref(), Some("222"));
+    assert_eq!(binding.id_node, x.id_node("222").unwrap());
 
     // Alice's id still resolves to her wallet, but the handle is no longer
     // hers to display: the node points at Bob's id.
-    let resolved: IdResolution = get(&pool, "/v1/resolve/id/x/111").await.answer();
+    let resolved: IdResolution = get(&pool, &id_route(x, "111")).await.answer();
     let binding = only(&resolved.bindings);
     assert_eq!(binding.owner, alice);
     assert_eq!(binding.handle, None);
     drop(guard);
 }
 
+/// Another identity proving a handle withdraws its previous holder's name for
+/// it first, as `bind` does; the text the chain disclosed shows all the same,
+/// under the new holder, whether that bind disclosed it or not.
 #[tokio::test]
-async fn publish_flag_is_the_post_state() {
+async fn a_takeover_keeps_the_disclosed_text() {
     let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = KnownPlatform::X.id();
+    let x = KnownPlatform::X;
+    let (tom, uma, val) = (addr(0xC1), addr(0xC2), addr(0xC3));
+    let holder_text = |resolved: &HandleResolution| {
+        let binding = only(&resolved.bindings);
+        (binding.owner, binding.handle.clone())
+    };
+    let hits_of = |found: &SearchResults| -> Vec<(String, Address, bool)> {
+        found
+            .hits
+            .iter()
+            .map(|hit| (hit.handle.clone(), hit.owner, hit.published))
+            .collect()
+    };
+
+    // (a) Tom discloses @lee1; Uma's account takes it privately.
+    apply_tx(&store, 1, bind(tom, x, "555", "lee1", 1_000, true)).await;
+    let mut takeover = vec![unpublish(tom, x)];
+    takeover.extend(bind(uma, x, "556", "lee1", 2_000, false));
+    apply_tx(&store, 2, takeover).await;
+    let resolved: HandleResolution =
+        get(&pool, "/v1/resolve/handle/x/lee1").await.answer();
+    assert_eq!(holder_text(&resolved), (uma, Some("lee1".into())));
+    let found: SearchResults = get(&pool, "/v1/search?q=lee1").await.answer();
+    assert_eq!(hits_of(&found), [("lee1".to_string(), uma, false)]);
+    let umas: AddressResolution = get(&pool, &format!("/v1/resolve/address/{uma}"))
+        .await
+        .answer();
+    assert_eq!(only(&umas.identities).handle.as_deref(), Some("lee1"));
+    assert!(!only(&umas.identities).published);
+
+    // (b) Tom discloses @lee2; Val's account takes it, disclosing it again:
+    // still one disclosure.
+    apply_tx(&store, 3, bind(tom, x, "555", "lee2", 3_000, true)).await;
+    let mut takeover = vec![unpublish(tom, x)];
+    takeover.extend(bind(val, x, "557", "lee2", 4_000, true));
+    apply_tx(&store, 4, takeover).await;
+    let resolved: HandleResolution =
+        get(&pool, "/v1/resolve/handle/x/lee2").await.answer();
+    assert_eq!(holder_text(&resolved), (val, Some("lee2".into())));
+    let found: SearchResults = get(&pool, "/v1/search?q=lee2").await.answer();
+    // The exact match ranks first; lee1 follows as a fuzzy neighbor.
+    assert_eq!(hits_of(&found)[0], ("lee2".to_string(), val, true));
+    let lee2 = x.handle_node("lee2").unwrap();
+    assert_eq!(disclosed(&pool, CHAIN, lee2).await.as_deref(), Some("lee2"));
+    // Tom's account no longer holds either handle, so it shows neither.
+    let toms: AddressResolution = get(&pool, &format!("/v1/resolve/address/{tom}"))
+        .await
+        .answer();
+    assert!(
+        toms.identities
+            .iter()
+            .all(|i| i.handle.is_none() && !i.published),
+        "{toms:?}"
+    );
+    drop(guard);
+}
+
+/// `publish` over a name overwrites it and logs no `HandleUnpublished`; the
+/// old name's text still shows, after its handle passes, privately, to
+/// someone else too.
+#[tokio::test]
+async fn publishing_another_name_keeps_the_one_it_replaces_disclosed() {
+    let Some((store, pool, guard)) = test_store().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let x = KnownPlatform::X;
+    let (alice, bob) = (addr(0xD1), addr(0xD2));
+    apply_tx(&store, 1, bind(alice, x, "71", "kim", 1_000, true)).await;
+    apply_tx(&store, 2, bind(alice, x, "72", "lee", 2_000, false)).await;
+    apply(&store, 3, publish(alice, x, "lee")).await;
+    let kim = x.handle_node("kim").unwrap();
+    assert_eq!(disclosed(&pool, CHAIN, kim).await.as_deref(), Some("kim"));
+
+    // Bob's account takes kim privately: Alice's name is lee, so the bind
+    // withdraws nothing on chain.
+    apply_tx(&store, 4, bind(bob, x, "71", "kim", 3_000, false)).await;
+    let resolved: HandleResolution =
+        get(&pool, "/v1/resolve/handle/x/kim").await.answer();
+    let binding = only(&resolved.bindings);
+    assert_eq!(
+        (binding.owner, binding.handle.as_deref()),
+        (bob, Some("kim"))
+    );
+    let found: SearchResults = get(&pool, "/v1/search?q=kim").await.answer();
+    assert_eq!(handles_of(&found), ["kim"]);
+    assert_eq!(only(&found.hits).owner, bob);
+    let bobs: AddressResolution = get(&pool, &format!("/v1/resolve/address/{bob}"))
+        .await
+        .answer();
+    assert_eq!(only(&bobs.identities).handle.as_deref(), Some("kim"));
+    let found: SearchResults = get(&pool, "/v1/search?q=lee").await.answer();
+    assert_eq!(handles_of(&found), ["lee"]);
+    drop(guard);
+}
+
+/// `HandleUnpublished` clears the displayed name; the text it disclosed
+/// still shows everywhere, histories included.
+#[tokio::test]
+async fn a_withdrawn_name_is_no_longer_published_but_still_shows() {
+    let Some((store, pool, guard)) = test_store().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let x = KnownPlatform::X;
     let alice = addr(0xA1);
-    apply(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
-    // A later bind that reports published=false clears the display name.
-    apply(&store, 2, retire(x, "alice_1", alice)).await;
-    apply(&store, 3, bind(alice, x, "111", "alice_2", 2000, false)).await;
+    apply_tx(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
+    // A rename retires the old handle and withdraws the name it published,
+    // before the new, private bind.
+    let mut rename = vec![retire(x, "alice_1", alice), unpublish(alice, x)];
+    rename.extend(bind(alice, x, "111", "alice_2", 2000, false));
+    apply_tx(&store, 2, rename).await;
 
-    let resolved: AddressResolution = get(&pool, &format!("/v1/resolve/address/{alice}"))
+    let address = format!("/v1/resolve/address/{alice}");
+    let resolved: AddressResolution = get(&pool, &address).await.answer();
+    let identity = only(&resolved.identities);
+    assert!(!identity.published);
+    assert_eq!(identity.handle, None, "a private bind shows no text");
+
+    // A later `publish` discloses it.
+    apply(&store, 3, publish(alice, x, "alice_2")).await;
+    let resolved: AddressResolution = get(&pool, &address).await.answer();
+    let identity = only(&resolved.identities);
+    assert!(identity.published);
+    assert_eq!(identity.handle.as_deref(), Some("alice_2"));
+
+    // HandleUnpublished takes the name down; the text stays.
+    apply(&store, 4, unpublish(alice, x)).await;
+    let resolved: AddressResolution = get(&pool, &address).await.answer();
+    let identity = only(&resolved.identities);
+    assert!(!identity.published);
+    assert_eq!(identity.handle.as_deref(), Some("alice_2"));
+    let resolved: HandleResolution =
+        get(&pool, "/v1/resolve/handle/x/alice_2").await.answer();
+    assert_eq!(only(&resolved.bindings).handle.as_deref(), Some("alice_2"));
+    let found: SearchResults = get(&pool, "/v1/search?q=alice_2").await.answer();
+    assert_eq!(handles_of(&found), ["alice_2"]);
+    assert!(!only(&found.hits).published);
+    let history: AddressHistory = get(&pool, &format!("/v1/history/address/{alice}"))
         .await
         .answer();
-    assert!(!only(&resolved.identities).published);
-
-    // And HandleUnpublished after a published bind does the same.
-    apply(&store, 4, retire(x, "alice_2", alice)).await;
-    apply(&store, 5, bind(alice, x, "111", "alice_3", 3000, true)).await;
-    apply(
-        &store,
-        6,
-        NamesEvent::HandleUnpublished {
-            holder: alice,
-            platform_id: x,
-        },
-    )
-    .await;
-    let resolved: AddressResolution = get(&pool, &format!("/v1/resolve/address/{alice}"))
-        .await
-        .answer();
-    assert!(!only(&resolved.identities).published);
+    let texts: Vec<&str> = history
+        .entries
+        .iter()
+        .filter_map(|entry| entry.handle.as_ref()?.handle.as_deref())
+        .collect();
+    assert!(texts.contains(&"alice_1"), "{history:?}");
+    assert!(texts.contains(&"alice_2"), "{history:?}");
     drop(guard);
 }
 
@@ -322,18 +405,17 @@ async fn search_ranks_exact_prefix_substring() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = KnownPlatform::X.id();
-    let github = KnownPlatform::GitHub.id();
-    apply(&store, 1, bind(addr(1), x, "1", "ali", 1000, false)).await;
-    apply(&store, 2, bind(addr(2), x, "2", "alice_1", 1000, true)).await;
-    apply(&store, 3, bind(addr(3), x, "3", "malice", 1000, false)).await;
-    apply(&store, 4, bind(addr(4), x, "4", "bob", 1000, false)).await;
-    apply(
-        &store,
-        5,
-        bind(addr(5), github, "5", "alicorn", 1000, false),
-    )
-    .await;
+    let x = KnownPlatform::X;
+    let github = KnownPlatform::GitHub;
+    apply_tx(&store, 1, bind(addr(1), x, "1", "ali", 1000, true)).await;
+    apply_tx(&store, 2, bind(addr(2), x, "2", "alice_1", 1000, true)).await;
+    apply_tx(&store, 3, bind(addr(3), x, "3", "malice", 1000, true)).await;
+    apply_tx(&store, 4, bind(addr(4), x, "4", "bob", 1000, true)).await;
+    apply_tx(&store, 5, bind(addr(5), github, "5", "alicorn", 1000, true)).await;
+    // A private bind is never a hit, whatever it would match.
+    apply_tx(&store, 6, bind(addr(6), x, "6", "alina", 1000, false)).await;
+    // A name its holder withdrew still is, no longer published.
+    apply(&store, 7, unpublish(addr(3), x)).await;
 
     let results: SearchResults = get(&pool, "/v1/search?q=ali").await.answer();
     // Exact first, then prefix alphabetically, then substring.
@@ -341,12 +423,13 @@ async fn search_ranks_exact_prefix_substring() {
         handles_of(&results),
         ["ali", "alice_1", "alicorn", "malice"]
     );
+    assert!(!results.hits[3].published);
     // And the hit carries the right binding, not just the right string.
     let exact = &results.hits[0];
     assert_eq!(exact.owner, addr(1));
-    assert_eq!(exact.user_id.as_deref(), Some("1"));
-    assert!(!exact.published);
-    assert!(results.hits[1].published);
+    assert_eq!(exact.id_node, x.id_node("1").unwrap());
+    assert_eq!(exact.handle_node, x.handle_node("ali").unwrap());
+    assert!(exact.published);
     assert_eq!(results.query.as_deref(), Some("ali"));
 
     // Pages walk the same ranked list; a short page is the last one.
@@ -406,7 +489,12 @@ async fn search_ranks_exact_prefix_substring() {
     // A retired handle stops matching. Its fuzzy neighbors still do — that
     // is what the trigram branch is for — but the retired name itself is
     // gone from the results.
-    apply(&store, 6, retire(x, "alice_1", addr(2))).await;
+    apply_tx(
+        &store,
+        8,
+        vec![retire(x, "alice_1", addr(2)), unpublish(addr(2), x)],
+    )
+    .await;
     let results: SearchResults = get(&pool, "/v1/search?q=alice_1").await.answer();
     let handles = handles_of(&results);
     assert!(!handles.contains(&"alice_1"), "{handles:?}");
@@ -425,11 +513,11 @@ async fn replay_converges_instead_of_duplicating() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = KnownPlatform::X.id();
+    let x = KnownPlatform::X;
     let alice = addr(0xA1);
-    let event = bind(alice, x, "111", "alice_1", 1000, true);
-    apply(&store, 1, event.clone()).await;
-    apply(&store, 1, event).await;
+    let events = bind(alice, x, "111", "alice_1", 1000, true);
+    apply_tx(&store, 1, events.clone()).await;
+    apply_tx(&store, 1, events).await;
 
     let journal: i64 =
         sqlx::query_scalar("SELECT count(*) FROM names.events WHERE chain_id = $1")
@@ -437,28 +525,18 @@ async fn replay_converges_instead_of_duplicating() {
             .fetch_one(&pool)
             .await
             .expect("count");
-    assert_eq!(journal, 1);
+    assert_eq!(journal, 2);
     let resolved: HandleResolution =
         get(&pool, "/v1/resolve/handle/x/alice_1").await.answer();
     assert_eq!(only(&resolved.bindings).owner, alice);
 
-    // The journal conflict gates every projection write, so the one counter
-    // that is not naturally convergent cannot drift on a replay either.
-    apply(&store, 2, NamesEvent::PlatformConfigured { platform_id: x }).await;
-    apply(&store, 2, NamesEvent::PlatformConfigured { platform_id: x }).await;
-    let count: i64 = sqlx::query_scalar(
-        "SELECT configured_count FROM names.platforms
-         WHERE chain_id = $1 AND platform_id = $2",
-    )
-    .bind(CHAIN)
-    .bind(x.as_slice())
-    .fetch_one(&pool)
-    .await
-    .expect("platform row");
-    assert_eq!(
-        count, 1,
-        "replayed PlatformConfigured must not double-count"
-    );
+    let disclosures: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM names.disclosures WHERE chain_id = $1")
+            .bind(CHAIN)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(disclosures, 1);
     drop(guard);
 }
 
@@ -468,17 +546,22 @@ async fn unclaimed_names_on_a_configured_platform_are_coded_404s() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = KnownPlatform::X.id();
-    // The platform row EXISTS — the branch the absent-platform test cannot
-    // reach, and the one that once shipped a decode 500.
-    apply(&store, 1, NamesEvent::PlatformConfigured { platform_id: x }).await;
+    let x = KnownPlatform::X;
+    // Something was bound on the platform — the branch the absent-platform
+    // test cannot reach, and the one that once shipped a decode 500.
+    apply_tx(
+        &store,
+        1,
+        bind(addr(0xA1), x, "111", "alice_1", 1000, false),
+    )
+    .await;
 
     let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/zzz")
         .await
         .refusal();
     assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::HandleNotBound));
 
-    let refusal = get::<IdResolution>(&pool, "/v1/resolve/id/x/999999")
+    let refusal = get::<IdResolution>(&pool, &id_route(x, "999999"))
         .await
         .refusal();
     assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::IdNotBound));
@@ -515,38 +598,24 @@ async fn api_refuses_to_answer_before_the_first_window() {
 }
 
 #[tokio::test]
-async fn nul_bytes_neither_stall_the_indexer_nor_crash_the_api() {
+async fn a_nul_byte_in_a_query_is_refused_not_a_500() {
     let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = KnownPlatform::X.id();
-    // An adversarial platform emits an id with a NUL byte. The window must
-    // apply — lossily, loudly — rather than stall the chain forever behind a
-    // value Postgres cannot store.
-    apply(
+    apply_tx(
         &store,
         1,
-        bind(addr(9), x, "evil\0id", "evilhandle", 1000, false),
+        bind(addr(9), KnownPlatform::X, "1", "evil", 1000, true),
     )
     .await;
-    let stored: String = sqlx::query_scalar(
-        "SELECT user_id FROM names.ids WHERE chain_id = $1 AND platform_id = $2",
-    )
-    .bind(CHAIN)
-    .bind(x.as_slice())
-    .fetch_one(&pool)
-    .await
-    .expect("row applied despite the NUL");
-    assert_eq!(stored, "evil\u{fffd}id");
-
-    // And a NUL in a query is a 400, not a 500.
-    let refusal = get::<IdResolution>(&pool, "/v1/resolve/id/x/evil%00id")
+    // No platform issues a handle holding NUL.
+    let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/evil%00")
         .await
         .refusal();
     assert_eq!(
         refusal,
-        (StatusCode::BAD_REQUEST, ErrorCode::InvalidArgument)
+        (StatusCode::NOT_FOUND, ErrorCode::HandleImpossible)
     );
     let (status, _) = get::<SearchResults>(&pool, "/v1/search?q=evil%00")
         .await
@@ -561,9 +630,8 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = KnownPlatform::X.id();
+    let x = KnownPlatform::X;
     let digest = B256::repeat_byte(0xD1);
-    apply(&store, 1, NamesEvent::PlatformConfigured { platform_id: x }).await;
     apply(
         &store,
         2,
@@ -578,7 +646,7 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
         NamesEvent::CeremonyBound {
             authorization_digest: digest,
             holder: addr(0xA1),
-            platform_id: x,
+            platform_id: x.id(),
             client_identifier: Bytes::from_static(b"client-a"),
         },
     )
@@ -593,17 +661,6 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
         },
     )
     .await;
-
-    let key: Option<String> = sqlx::query_scalar(
-        "SELECT platform_key FROM names.platforms
-         WHERE chain_id = $1 AND platform_id = $2",
-    )
-    .bind(CHAIN)
-    .bind(x.as_slice())
-    .fetch_one(&pool)
-    .await
-    .expect("platform row");
-    assert_eq!(key.as_deref(), Some("x"));
 
     // The Proof Verifier is the chain's one verification component; the
     // status reports it so an operator need not ask the RPC.
@@ -630,7 +687,7 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
         HistoryEvent::CeremonyBound {
             authorization_digest: digest,
             holder: addr(0xA1),
-            platform_id: x,
+            platform_id: x.id(),
             client_identifier: Bytes::from_static(b"client-a"),
         }
     );
@@ -660,17 +717,29 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
 }
 
 #[tokio::test]
-async fn unconfigured_platform_and_impossible_text_name_their_codes() {
+async fn unbound_handle_and_impossible_text_name_their_codes() {
     let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = KnownPlatform::X.id();
-    apply(&store, 1, bind(addr(0xA1), x, "111", "alice_1", 1000, true)).await;
+    let x = KnownPlatform::X;
+    apply_tx(&store, 1, bind(addr(0xA1), x, "111", "alice_1", 1000, true)).await;
 
-    // A platform id the chain never configured is a different fact than an
-    // unclaimed handle — the contract's UnknownPlatform revert versus its
-    // zero-address answer — and the code says which, on both resolve paths.
+    // A known platform's unbound handle is `handle_not_bound`, whether or
+    // not anything was ever bound on it; an id misses as unbound the same way.
+    let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/alice")
+        .await
+        .refusal();
+    assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::HandleNotBound));
+    let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/github/alice")
+        .await
+        .refusal();
+    assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::HandleNotBound));
+    let refusal = get::<IdResolution>(&pool, &id_route(KnownPlatform::GitHub, "111"))
+        .await
+        .refusal();
+    assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::IdNotBound));
+    // A platform this build has no tags for cannot hash text at all.
     let foreign = B256::repeat_byte(7);
     let refusal =
         get::<HandleResolution>(&pool, &format!("/v1/resolve/handle/{foreign}/alice_1"))
@@ -678,20 +747,13 @@ async fn unconfigured_platform_and_impossible_text_name_their_codes() {
             .refusal();
     assert_eq!(
         refusal,
-        (StatusCode::NOT_FOUND, ErrorCode::PlatformNotConfigured)
-    );
-    let refusal = get::<IdResolution>(&pool, &format!("/v1/resolve/id/{foreign}/111"))
-        .await
-        .refusal();
-    assert_eq!(
-        refusal,
-        (StatusCode::NOT_FOUND, ErrorCode::PlatformNotConfigured)
+        (StatusCode::BAD_REQUEST, ErrorCode::InvalidPlatform)
     );
 
-    // Text X's rules can never hold (an interior space) mirrors the
-    // contract's deliberate zero-address answer: "no such handle can exist",
-    // a 404 with its own code — not "you asked wrong".
-    let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/a%20b")
+    // Text no circuit hashes (a quote) mirrors the contract's deliberate
+    // zero-address answer: "no such handle can exist", a 404 with its own
+    // code — not "you asked wrong".
+    let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/a%22b")
         .await
         .refusal();
     assert_eq!(
@@ -711,11 +773,11 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
         return;
     };
     let other = ChainStore::new(pool.clone(), OTHER_CHAIN);
-    let x = KnownPlatform::X.id();
+    let x = KnownPlatform::X;
     let (alice, bob) = (addr(0xA1), addr(0xB2));
     // The same handle, held by different wallets on the two chains.
-    apply(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
-    apply(&other, 1, bind(bob, x, "999", "alice_1", 1000, false)).await;
+    apply_tx(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
+    apply_tx(&other, 1, bind(bob, x, "999", "alice_1", 1000, true)).await;
 
     // Other suites share the store, so only this suite's chains are read.
     let resolved: HandleResolution = common::get(&pool, "/v1/resolve/handle/x/alice_1")
@@ -804,10 +866,10 @@ fn a_contract() -> Address {
 /// Bind one handle and note a deployment block, so a wipe has something to
 /// take and something to leave.
 async fn seed(store: &ChainStore) {
-    apply(
+    apply_tx(
         store,
         1,
-        bind(addr(1), KnownPlatform::X.id(), "1", "alice", 1, true),
+        bind(addr(1), KnownPlatform::X, "1", "alice", 1, true),
     )
     .await;
     store
@@ -839,10 +901,7 @@ async fn preparing_an_unchanged_chain_keeps_everything() {
     );
     assert!(
         store
-            .resolve_handle(
-                KnownPlatform::X.id(),
-                &nodes::NormalizedHandle::from_chain("alice"),
-            )
+            .ens_holder(KnownPlatform::X.handle_node("alice").unwrap())
             .await
             .unwrap()
             .is_some(),
@@ -877,10 +936,7 @@ async fn watching_another_contract_clears_the_chain() {
     );
     assert!(
         store
-            .resolve_handle(
-                KnownPlatform::X.id(),
-                &nodes::NormalizedHandle::from_chain("alice"),
-            )
+            .ens_holder(KnownPlatform::X.handle_node("alice").unwrap())
             .await
             .unwrap()
             .is_none(),

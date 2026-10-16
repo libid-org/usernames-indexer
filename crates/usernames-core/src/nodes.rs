@@ -1,14 +1,8 @@
-//! The platform registry and node derivation, mirroring `IdentityNodes.sol`.
+//! The platform registry and node derivation.
 //!
-//! Every node the contract stores under is a keccak of three 32-byte words:
-//! a version tag, the platform id, and the keccak of the string. `abi.encode`
-//! of three static `bytes32` values is their plain concatenation, so no ABI
-//! machinery is needed here.
-//!
-//! The indexer recomputes both nodes for every `IdentityBound` it applies and
-//! compares them against the emitted topics. A mismatch means this build's
-//! constants or normalizer drifted from the chain — it is reported loudly and
-//! the emitted topics win, because the chain already keyed its storage.
+//! A platform id is keccak256 of its key. Handle and id nodes are
+//! libid-identity's `SHA256(tag || value)`, the nodes the circuits output and
+//! the contracts key by; this module only names the platform for it.
 
 use std::{
     collections::HashMap,
@@ -21,10 +15,15 @@ use alloy::primitives::{
     keccak256,
     B256,
 };
-use libid_identity::handle_vectors::{
-    PLATFORM_GITHUB_KEY,
-    PLATFORM_GOOGLE_KEY,
-    PLATFORM_X_KEY,
+use libid_identity::{
+    handle_vectors::{
+        self,
+        PLATFORM_GITHUB,
+        PLATFORM_GOOGLE,
+        PLATFORM_X,
+    },
+    HandleError,
+    IdError,
 };
 use serde_with::{
     DeserializeFromStr,
@@ -62,14 +61,19 @@ impl KnownPlatform {
     /// an array so adding one is a single line and not also an arity.
     pub const ALL: &'static [Self] = &[Self::X, Self::GitHub, Self::Google];
 
+    /// The platform as libid-identity's table states it: key, tags, rules.
+    const fn spec(self) -> &'static handle_vectors::Platform {
+        match self {
+            Self::X => &PLATFORM_X,
+            Self::GitHub => &PLATFORM_GITHUB,
+            Self::Google => &PLATFORM_GOOGLE,
+        }
+    }
+
     /// The short key: the platform key, whose keccak is the platform id, and
     /// what a name, a URL path and the API's JSON all call the platform.
     pub const fn key(self) -> &'static str {
-        match self {
-            Self::X => PLATFORM_X_KEY,
-            Self::GitHub => PLATFORM_GITHUB_KEY,
-            Self::Google => PLATFORM_GOOGLE_KEY,
-        }
+        self.spec().key
     }
 
     /// The 32-byte id the chain keys this platform by.
@@ -77,13 +81,21 @@ impl KnownPlatform {
         platform_id(self.key())
     }
 
-    /// The normalization rules the chain applied before it keyed a handle.
-    ///
-    /// Looked up by the short key because `rules_for` lives in
-    /// `libid-identity` and takes one. The string hop stops at that crate
-    /// boundary rather than spreading from here.
-    pub fn rules(self) -> Option<libid_identity::Rules> {
-        libid_identity::rules_for(self.key())
+    /// The node a typed handle is bound under, or why no handle can be.
+    pub fn handle_node(self, raw: &str) -> Result<B256, HandleError> {
+        self.spec().handle_node(raw).map(B256::from)
+    }
+
+    /// `text` with A-Z folded to a-z, and its node: the chain's
+    /// `handleNodeOf`, which applies no other rule.
+    pub fn folded_handle_node(self, text: &str) -> (String, B256) {
+        let (folded, node) = self.spec().folded_handle_node(text);
+        (folded, B256::from(node))
+    }
+
+    /// The node a user id is bound under, or why no id can be.
+    pub fn id_node(self, id: &str) -> Result<B256, IdError> {
+        self.spec().id_node(id).map(B256::from)
     }
 }
 
@@ -124,9 +136,8 @@ pub struct UnknownPlatform {
     raw: String,
 }
 
-/// A platform named by its short key ('x') or its 0x-hex 32-byte id. The key
-/// form also carries this build's normalization rules; the hex form indexes
-/// fine but string queries run un-normalized.
+/// A platform named by its short key ('x') or its 0x-hex 32-byte id. Only a
+/// platform this build knows hashes text into nodes.
 #[derive(Debug, Clone, Copy)]
 pub struct Platform {
     id: B256,
@@ -185,102 +196,45 @@ impl Platform {
         self.known
     }
 
-    /// The short key, when this build knows the id. The API serializes this,
-    /// so the wire form stays a string even though the type behind it is not.
-    pub fn key(&self) -> Option<&'static str> {
-        self.known.map(KnownPlatform::key)
-    }
-
     /// The platform for a bare id — for rows read back from the database,
     /// where only the id survives. An id this build does not know still
-    /// indexes; it just has no normalization rules or name on this side.
+    /// indexes; it just has no rules or name on this side.
     pub fn known_of(id: B256) -> Option<KnownPlatform> {
         KNOWN_BY_ID.get(&id).copied()
     }
-
-    /// The short key for a bare id, for the same callers as [`Self::key`].
-    pub fn key_of(id: B256) -> Option<&'static str> {
-        Self::known_of(id).map(KnownPlatform::key)
-    }
-
-    /// Normalize a full handle exactly the way the chain did before it keyed
-    /// the handle. A platform this build has no rules for passes the text
-    /// through verbatim — its handles were still stored normalized, the
-    /// caller just has to supply that form. An error means the platform could
-    /// never hold this text at all.
-    pub fn normalize_query(
-        &self,
-        raw: &str,
-    ) -> Result<NormalizedHandle, libid_identity::HandleError> {
-        match self.known.and_then(KnownPlatform::rules) {
-            Some(rules) => libid_identity::normalize(raw, rules).map(NormalizedHandle),
-            None => Ok(NormalizedHandle(raw.to_string())),
-        }
-    }
 }
 
-/// A handle in the exact byte form the chain keyed. The only ways to get one
-/// are [`Platform::normalize_query`] — this side running the chain's rules —
-/// and [`NormalizedHandle::from_chain`] for text the chain itself emitted,
-/// which is normalized by definition. What cannot happen is hashing raw user
-/// input by accident: [`handle_node`] refuses plain strings, because a raw
-/// handle writes a node no reader will find.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NormalizedHandle(String);
-
-impl NormalizedHandle {
-    /// Text the chain already keyed: an event field, or a column derived
-    /// from one. The chain is the authority on normalization; this side does
-    /// not second-guess what it emitted.
-    pub fn from_chain(handle: &str) -> Self {
-        Self(handle.to_string())
-    }
-
-    /// The normalized text.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// Fold a search query the way normalization would, without refusing partial
-/// input: trim spaces, strip one leading `@`, lowercase A-Z. A partial handle
-/// cannot pass shape checks, so full normalization is not run —
-/// which is also why this returns a plain `String` and not a
-/// [`NormalizedHandle`]: folded text is not chain-keyed text.
+/// A search query as search matches it: spaces trimmed, one leading `@`
+/// stripped, A-Z folded to a-z. Nothing is refused, so a partial or typed
+/// handle such as ` @Ali` finds `alice`.
 pub fn fold_search_query(raw: &str) -> String {
     let trimmed = raw.trim_matches(' ');
     let stripped = trimmed.strip_prefix('@').unwrap_or(trimmed);
     stripped.to_ascii_lowercase()
 }
 
-static ID_NODE_V1: LazyLock<B256> =
-    LazyLock::new(|| keccak256(b"libid.identity.id-node.v1"));
-static HANDLE_NODE_V1: LazyLock<B256> =
-    LazyLock::new(|| keccak256(b"libid.identity.handle-node.v1"));
+/// Handle text an event disclosed: a token a circuit hashes, folded, and
+/// checked to hash to the node the event names. [`DisclosedHandle::verify`] is the only way to one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisclosedHandle(String);
 
-fn node(tag: B256, platform: B256, inner: B256) -> B256 {
-    let mut buf = [0u8; 96];
-    buf[..32].copy_from_slice(tag.as_slice());
-    buf[32..64].copy_from_slice(platform.as_slice());
-    buf[64..].copy_from_slice(inner.as_slice());
-    keccak256(buf)
-}
+impl DisclosedHandle {
+    /// `text` folded, when a circuit would hash it and it hashes to
+    /// `handle_node`. Text no circuit hashes no account can bind.
+    pub fn verify(
+        platform: KnownPlatform,
+        handle_node: B256,
+        text: &str,
+    ) -> Option<Self> {
+        let normalized = libid_identity::normalize(text, platform.spec().rules).ok()?;
+        let (normalized, node) = platform.folded_handle_node(&normalized);
+        (node == handle_node).then_some(Self(normalized))
+    }
 
-/// The node an id is stored under. The id is hashed byte-verbatim: the
-/// contract never normalizes it, so neither does this.
-pub fn id_node(platform: B256, id: &str) -> B256 {
-    node(*ID_NODE_V1, platform, keccak256(id.as_bytes()))
-}
-
-/// The node a handle is stored under. Demanding [`NormalizedHandle`]
-/// instead of a plain string is what keeps "hashed a raw handle" a compile
-/// error rather than a node no reader will ever find.
-pub fn handle_node(platform: B256, handle: &NormalizedHandle) -> B256 {
-    node(
-        *HANDLE_NODE_V1,
-        platform,
-        keccak256(handle.as_str().as_bytes()),
-    )
+    /// The normalized text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[cfg(test)]
@@ -315,25 +269,42 @@ mod tests {
         }
     }
 
+    /// libid-identity's README vectors, from `hashlib.sha256` over tag and
+    /// text: numbers this crate never produced.
     #[test]
-    fn nodes_match_the_chain() {
-        let x = KnownPlatform::X.id();
-        let google = KnownPlatform::Google.id();
+    fn nodes_match_the_circuits() {
+        let node = KnownPlatform::GitHub.handle_node("OctoCat").unwrap();
+        assert_eq!(node[..4], [0x38, 0x1f, 0xb9, 0xd7]);
+        let id = KnownPlatform::GitHub.id_node("583231").unwrap();
+        assert_eq!(id[..4], [0x47, 0x59, 0x02, 0xb2]);
         assert_eq!(
-            hex::encode(handle_node(x, &NormalizedHandle::from_chain("alice_1"))),
-            "1c43d5d3cf3d99e9d5b6e8c74c23d14bcbb6a743712cf7fa7c15750c4fc2150d"
+            KnownPlatform::X.handle_node("ali\"ce"),
+            Err(HandleError::BadCharacter)
         );
-        assert_eq!(
-            hex::encode(id_node(x, "12345")),
-            "c3a98b9fbd2be3063e652d3d506b3de70b8952e60901fc25bdec89cde86b2214"
-        );
-        assert_eq!(
-            hex::encode(handle_node(
-                google,
-                &NormalizedHandle::from_chain("a.b+tag@example.com")
-            )),
-            "71618d5985c306d64050b15d17f41078c448fc30a93982df14ffd6bbcb4db534"
-        );
+        assert_eq!(KnownPlatform::X.id_node(" 123"), Err(IdError::BadCharacter));
+    }
+
+    #[test]
+    fn disclosed_text_folds_and_must_hash_to_its_node() {
+        let x = KnownPlatform::X;
+        let node = x.handle_node("alice_1").unwrap();
+        let disclosed = DisclosedHandle::verify(x, node, "Alice_1").unwrap();
+        assert_eq!(disclosed.as_str(), "alice_1");
+        assert!(DisclosedHandle::verify(x, node, "alice_2").is_none());
+        assert!(DisclosedHandle::verify(x, node, "alice_1!").is_none());
+        let github = KnownPlatform::GitHub;
+        assert!(DisclosedHandle::verify(github, node, "alice_1").is_none());
+    }
+
+    /// Text no circuit hashes is not a handle, even when its fold-only node,
+    /// as `depositToHandle` keys it, matches.
+    #[test]
+    fn text_no_circuit_hashes_is_not_disclosed() {
+        let x = KnownPlatform::X;
+        for text in ["Bo\"b", "Bo\0b"] {
+            let (_, node) = x.folded_handle_node(text);
+            assert!(DisclosedHandle::verify(x, node, text).is_none(), "{text:?}");
+        }
     }
 
     /// The registry is the launch profile set, no more and no less: every
@@ -350,12 +321,12 @@ mod tests {
     #[test]
     fn parse_accepts_keys_and_hex_and_names_the_keys_it_knows() {
         let by_key = "x".parse::<Platform>().unwrap();
-        assert_eq!(by_key.key(), Some("x"));
+        assert_eq!(by_key.known(), Some(KnownPlatform::X));
 
         // The hex form of a registered platform picks its key back up.
         let by_id = by_key.id().to_string().parse::<Platform>().unwrap();
         assert_eq!(by_id.id(), by_key.id());
-        assert_eq!(by_id.key(), Some("x"));
+        assert_eq!(by_id.known(), Some(KnownPlatform::X));
 
         // An unregistered id still parses — events are self-describing —
         // it just has no key, and so no rules, on this side.
@@ -363,7 +334,7 @@ mod tests {
             .to_string()
             .parse::<Platform>()
             .unwrap();
-        assert_eq!(foreign.key(), None);
+        assert_eq!(foreign.known(), None);
 
         // The refusal names every registered key, derived from the registry.
         let err = "myspace".parse::<Platform>().unwrap_err().to_string();

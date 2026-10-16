@@ -14,11 +14,13 @@ stalled indexer must not hide behind a healthy-looking endpoint.
 Neither binary contains logic: both stand on the `usernames-core` library,
 where the read model, the event decoding and the loop itself live.
 
-The contract was designed for exactly this: `IdentityBound` carries the
-plaintext `id` and the normalized `handle` next to their storage nodes,
-so the read model needs no on-chain strings, and the `published` flag plus
-`HandleUnpublished` are emitted precisely so an off-chain index can reproduce
-reverse display without guessing.
+The chain keys every binding by node: `SHA256(tag || id)` and
+`SHA256(tag || folded handle)`, the nodes the circuits output. No plaintext
+id ever reaches the chain, and handle text reaches it only where somebody
+disclosed it: a disclosing bind or `publish` (`HandlePublished`), or a
+`depositToHandle` (`DepositedToHandle`). The read model holds exactly that
+much. It keys bindings by node, keeps disclosed text in one table, and checks
+that each text hashes to its node before it stores it.
 
 ## Running
 
@@ -64,10 +66,11 @@ indexer's settings.
 
 | Endpoint | Answers |
 |---|---|
-| `GET /v1/resolve/handle/{platform}/{handle}` | The wallet a handle resolves to (`resolveHandle`) on each chain it is bound on, each with the account id it pairs with |
-| `GET /v1/resolve/id/{platform}/{userId}` | The wallet an account id resolves to (`resolveId`) on each chain it is bound on, each with the handle that account currently holds |
-| `GET /v1/resolve/address/{address}` | Every identity a wallet proved on every chain, with `resolves` and `published` flags (`publishedHandleOf`'s reverse display) |
-| `GET /v1/search?q=gre&platform=x&owner=0x…&limit=10&offset=0` | Live handles matching a partial query (exact, then prefix, then substring, then trigram-fuzzy), linked to a wallet, or both; one of `q` and `owner` is required. `limit` (1..50, default 10) and `offset` (up to 10000) page the ranked list; a page shorter than `limit` is the last |
+| `GET /v1/resolve/handle/{platform}/{handle}` | The wallet a handle resolves to (`resolveHandle`) on each chain it is bound on, each with the id node it pairs with. The handle is hashed here into its node |
+| `GET /v1/resolve/handle-node/{handleNode}` | The same, by node |
+| `GET /v1/resolve/id-node/{idNode}` | The wallet an id node resolves to (`resolveId`) on each chain it is bound on, each with the handle node that account holds now. The client hashes the id (`libid-identity`, or `idNode` in `@libid/contracts`); no plaintext id reaches the server |
+| `GET /v1/resolve/address/{address}` | Every identity a wallet proved on every chain, by id node, with `resolves` and `published` flags (`publishedHandleOf`'s reverse display) |
+| `GET /v1/search?q=gre&platform=x&owner=0x…&limit=10&offset=0` | Live handles whose text the chain disclosed, matching a partial query (exact, then prefix, then substring, then trigram-fuzzy), linked to a wallet, or both; one of `q` and `owner` is required. `limit` (1..50, default 10) and `offset` (up to 10000) page the ranked list; a page shorter than `limit` is the last |
 | `GET /v1/history/address/{address}?before=&limit=` | Every event the address took part in, newest first, each with its `roles`: `holder`, `previousHandleHolder` and `previousIdHolder` (an event took that handle or account from it), `feeReceiver`, `depositor`, `refundTo` (a claim took its deposit, too), `claimer`, `recipient` |
 | `GET /v1/history/handle/{platform}/{handle}?before=&limit=` | Every event on the handle: deposits while nobody held it, the binds that gave it a holder, and every claim, refund and payment after |
 | `GET /v1/history/node/{node}?before=&limit=` | The same, by handle node: for a handle nobody has bound, whose text no event carried |
@@ -93,23 +96,38 @@ handle it concerns. Amounts and rounds are `uint256` decimal strings; the
 chain's own coin is the EIP-7528 token `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`.
 Anybody can deposit a token they wrote, so show the tokens you recognize.
 
-A deposit names a handle by its node, never its text. Until somebody binds
-the handle, the store knows it by node and platform alone: `handle` is absent
-on those amounts and entries. Asking by text works from the first deposit,
-because the API hashes the text the way the chain does.
+A `deposit` names a handle by its node alone: the store knows no platform
+for it (`platformId` is absent) until a `DepositedToHandle` or a bind names
+one. Asking by text works from the first deposit: the escrow and history
+routes fold the text's A-Z and hash it, the way `depositToHandle` does, so
+`/v1/escrow/handle/x/Bo%22b` finds a deposit to `Bo"b`.
+
+**Handle text shows once the chain disclosed it.** Every response that
+carries handle text (`handle` in resolutions, search hits, histories and
+escrow amounts) takes it from `names.disclosures`: text a disclosing bind, a
+`publish` or a `depositToHandle` carried. The API explores the chain's
+history, so a name its holder later withdrew or replaced, or a handle that
+passed privately to another account, still shows the text once disclosed;
+`published` says whether it is the holder's displayed name now. Text is stored
+only when it is a token a circuit hashes (printable ASCII without `"` or `\`,
+within the circuit's buffer) and it hashes to the node it names; a public
+transfer to text no account can bind keeps its deposit but not its text.
+Search lists disclosed handles only, and `names.handle_identities` maps each
+to its id node and holder. A binding nothing disclosed still resolves by text
+or by node, without text in the answer.
 
 `{platform}` is a short key (`x`, `github`, `google`) or a 0x-hex 32-byte
-platform id. With a known key, the handle in the path is normalized exactly
-the way the chain normalized it before keying (`libid-identity`); `{userId}`
-is always matched byte-verbatim, because the contract never normalizes ids.
-A Google `{userId}` is the id the chain binds: `0x` and 64 lowercase hex
-digits of SHA-256(`"libid.google-user-id" || sub`), not the `sub`.
+platform id. A text route hashes its text with `libid-identity`, so it needs a
+platform this build knows: an unknown id is `invalid_platform`, and the node
+routes answer for any platform. A resolution route folds the handle and checks
+it is a token a circuit hashes; the escrow and history routes only fold it, as
+the chain does.
 
 Errors share one envelope — `{ "error": { "code", "message" } }`. The `code`
 is stable and machine-readable; the prose is for humans and may be reworded.
-Resolution 404s distinguish `handle_not_bound`, `handle_retired`,
-`id_not_bound`, `platform_not_configured`, and `handle_impossible` (text the
-platform could never hold); `not_synced` is the 503 before the first window;
+Resolution 404s distinguish `handle_not_bound` (on a known platform, whether
+or not anything was ever bound on it), `handle_retired`, `id_not_bound` and
+`handle_impossible` (text no circuit hashes); `not_synced` is the 503 before the first window;
 bad input is `invalid_platform`, `invalid_address`, `invalid_node`,
 `invalid_chain`, `invalid_cursor`, `invalid_argument`, or, for a path or query
 string that does not parse at all, `invalid_path` and `invalid_query`;
@@ -225,6 +243,11 @@ no coin type — and it sends what it is given on that network. The gateway
 is told its registry's chain as `ENS_CHAIN_ID`; a deployment that does not
 index that chain refuses the bare query.
 
+**A name resolves through its node.** The gateway inverts the label to a
+handle, hashes it with `libid-identity` into the SHA-256 handle node, and
+answers that node's holder; `sql/ens_holder.sql` says which bindings it
+answers for.
+
 **Where answers come from.** The indexed model, and nothing else: the gateway
 opens no RPC and takes no per-chain configuration. Answers are as of the
 indexer's last committed window, kept `CONFIRMATIONS` blocks deep, which is
@@ -258,19 +281,24 @@ Schema `names`, all tables keyed by `chain_id` (one process follows one
 chain; a second deployment can share the database):
 
 - `events` — append-only journal of every decoded log, the audit trail and
-  what the histories list. `CeremonyBound` and `BindFeePaid` have no
-  projection of their own: nothing resolves by which client authenticated a
-  binding or what fee it paid
-- `ids` — mirrors `idBindings` + `handleNodeById`: id → holder, current handle
+  what the histories list. It holds no handle text: a disclosure's text is in
+  `disclosures` alone. `CeremonyBound` and `BindFeePaid` have no projection of
+  their own: nothing resolves by which client authenticated a binding or what
+  fee it paid
+- `ids` — mirrors `idBindings` + `handleNodeById`: id node → holder, current
+  handle node
 - `handles` — mirrors `handleBindings` + `idNodeByHandle`: handle node → holder;
   `owner NULL` mirrors the contract's retirement, and the `observed_at`
   watermark survives it the way the contract keeps it
-- `published` — the display names; a row exists exactly while the contract's
-  stored string is nonempty
-- `platforms` — one row per platform the contract configured; the Proof
-  Verifier it is wired to is chain metadata, reported by `/v1/status`
-- `handle_nodes` — the platform of every handle node an event named one for:
-  binds, retirements, deposits and forwards
+- `published` — the display names, as the node each name hashes to; a row
+  exists exactly while the contract's stored string is nonempty
+- `disclosures` — handle text the chain disclosed, a token a circuit hashes,
+  folded and checked against its node: one row per node, kept whatever
+  happens to the name or the handle after. `handle_identities` maps each
+  disclosed handle to its id node
+- `handle_nodes` — the platform of every handle node a bind,
+  `HandlePublished`, `HandleRetired` or `DepositedToHandle` named; a bare
+  deposit names none
 - `escrow_held` — mirrors HandleEscrow's `held` and `round` per handle node
   and token
 - `escrow_refundable` — mirrors `refundable`: each `refundTo`'s contribution
@@ -280,6 +308,8 @@ chain; a second deployment can share the database):
   previous holders, a ceremony's and a fee's handle, and a fee's payer are
   read from the rows the event changes, or from the events its transaction
   emitted just before it
+
+The Proof Verifier is chain metadata, reported by `/v1/status`.
 
 Each poll window commits in one transaction — journal, projections and cursor
 together — and the journal's `(chain, block, log)` conflict gates the
@@ -339,6 +369,22 @@ migrated database; a newer API started before the migration answers
 002 has migrated: to go back, start it on a fresh database, or run
 `DROP SCHEMA names CASCADE; DROP TABLE _sqlx_migrations;` first, as above.
 
+**Upgrading to hashed identities:** this build indexes the node-keyed
+`IdentityRegistry` and `HandleEscrow` of the libID-contracts release
+`Cargo.toml` pins, whose events carry nodes rather than plaintext. Point
+`IDENTITY_NAMES_ADDRESS` and `HANDLE_ESCROW_ADDRESS` at those deployments and
+roll the indexer first; it refuses to start against a registry whose
+`nodeKeyed()` does not answer true.
+It migrates in place (`003_hashed_identities.sql`, then
+`004_disclosures_all_show.sql`): 003 deletes
+every row the earlier build wrote — they held plaintext ids and handles — and
+every chain's cursor, then reshapes the tables. Each chain answers
+`not_synced` until its first window commits. Until the replay reaches the
+head, its answers miss what it has not reached yet: gate on `/v1/status`'s
+lag, not on `not_synced`. An earlier indexer refuses a database 003 or 004 has migrated,
+and an earlier API answers `internal`; to go back, start the earlier build on
+a fresh database, as above.
+
 Probes belong to the API: `GET /health` for liveness; for readiness gate on
 the status code of `GET /v1/status`, which is 200 whenever the database
 answers — the resolve endpoints answer 503 until the first window lands. It sends permissive CORS for GET, so a browser UI (handle.link) can
@@ -355,16 +401,14 @@ compose Postgres — set `RPC_URL` and `IDENTITY_NAMES_ADDRESS` in
 
 ## Caveats worth knowing
 
-- **`PlatformConfigured` re-keying**: reconfiguring a platform's rules on
-  chain re-keys every handle already written, and the event carries no rules
-  payload. This build compiles its rules in from `handles.json` (via
-  `libid-identity`). A reconfiguration is recorded and warned about; if the
-  rules actually changed, string lookups need this build's rules updated and
-  a re-index. Node-keyed lookups stay exact throughout.
+- **Node tags are compiled in**: text routes hash with the tags and rules
+  `libid-identity` carries. A platform this build does not know is reachable
+  by node only.
 - **Reorgs**: the loop stays `CONFIRMATIONS` blocks behind the head; there is
   no rollback. On a chain with deeper reorgs, raise the setting.
-- **Unknown platforms** index fine (events are self-describing) but cannot be
-  normalized or named by key on this side until `handles.json` learns them.
+- **Unknown platforms** index fine (events are self-describing), but their
+  disclosed text cannot be checked, so it is not stored, and they cannot be
+  asked by text, until `handles.json` learns them.
 - **Sync state is a caller's concern**: until the first window commits, the
   resolution endpoints answer 503 rather than an authoritative-looking 404.
   After that, a replaying or lagging indexer serves what it has; watch

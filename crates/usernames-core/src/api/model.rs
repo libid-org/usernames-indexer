@@ -50,8 +50,6 @@ pub enum ErrorCode {
     HandleRetired,
     /// No chain in scope binds the account.
     IdNotBound,
-    /// No chain in scope configured the platform.
-    PlatformNotConfigured,
     /// Text the platform could never hold as a handle.
     HandleImpossible,
     /// No indexer has committed a first window for the chains in scope.
@@ -140,21 +138,20 @@ pub struct Status {
 pub struct HandleBinding {
     /// The chain the handle is bound on.
     pub chain_id: i64,
-    /// The storage key the chain filed the handle under.
-    pub handle_node: B256,
     /// The wallet the handle resolves to.
     pub owner: Address,
     /// The proof-freshness watermark.
     pub observed_at: i64,
     /// The ceremony version that proved the binding.
     pub ceremony_version: i64,
-    /// The plaintext account id the handle points back at, when ever bound.
-    pub user_id: Option<String>,
     /// The account id node the handle points back at (`idNodeByHandle`).
     pub id_node: B256,
+    /// The handle's text, once this chain disclosed it.
+    pub handle: Option<String>,
 }
 
-/// `GET /v1/resolve/handle/{platform}/{handle}`: the handle and the wallet it
+/// `GET /v1/resolve/handle/{platform}/{handle}` and
+/// `GET /v1/resolve/handle-node/{handleNode}`: the wallet a handle node
 /// resolves to on each chain it is bound on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -163,8 +160,8 @@ pub struct HandleResolution {
     pub platform: Option<KnownPlatform>,
     /// The platform id the chain keys by.
     pub platform_id: B256,
-    /// The handle as the chain keyed it: normalized.
-    pub handle: String,
+    /// The node the chain filed the handle under.
+    pub handle_node: B256,
     /// One per chain, in chain order; never empty.
     pub bindings: Vec<HandleBinding>,
 }
@@ -175,17 +172,14 @@ pub struct HandleResolution {
 pub struct IdBinding {
     /// The chain the account is bound on.
     pub chain_id: i64,
-    /// The storage key the chain filed the account under.
-    pub id_node: B256,
     /// The wallet that proved the account.
     pub owner: Address,
     /// The proof-freshness watermark.
     pub observed_at: i64,
     /// The ceremony version that proved the binding.
     pub ceremony_version: i64,
-    /// The handle this account last proved, when the node it points at is
-    /// still the account's — the `handleNodeById`/`idNodeByHandle` round
-    /// trip.
+    /// The handle's text, once disclosed and while still the account's — the
+    /// `handleNodeById`/`idNodeByHandle` round trip.
     pub handle: Option<String>,
     /// The handle node this account last proved (`handleNodeById`).
     pub handle_node: B256,
@@ -193,8 +187,8 @@ pub struct IdBinding {
     pub published: bool,
 }
 
-/// `GET /v1/resolve/id/{platform}/{userId}`: an account id and the wallet it
-/// resolves to on each chain it is bound on.
+/// `GET /v1/resolve/id-node/{idNode}`: the wallet an id node resolves to on
+/// each chain it is bound on. The user id never reaches the server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdResolution {
@@ -202,8 +196,8 @@ pub struct IdResolution {
     pub platform: Option<KnownPlatform>,
     /// The platform id the chain keys by.
     pub platform_id: B256,
-    /// The account id, byte-verbatim as the chain keys it.
-    pub user_id: String,
+    /// The node the chain filed the account under.
+    pub id_node: B256,
     /// One per chain, in chain order; never empty.
     pub bindings: Vec<IdBinding>,
 }
@@ -219,9 +213,9 @@ pub struct AddressIdentity {
     pub platform: Option<KnownPlatform>,
     /// The platform id the chain keys by.
     pub platform_id: B256,
-    /// The account id, byte-verbatim.
-    pub user_id: String,
-    /// The handle the account holds, while it is still the account's.
+    /// The node the chain filed the account under.
+    pub id_node: B256,
+    /// The handle's text, once disclosed and while still the account's.
     pub handle: Option<String>,
     /// The handle node the account last proved.
     pub handle_node: B256,
@@ -241,11 +235,12 @@ pub struct AddressIdentity {
 pub struct AddressResolution {
     /// The wallet asked about.
     pub address: Address,
-    /// In chain, platform, account-id order.
+    /// In chain, platform, id-node order.
     pub identities: Vec<AddressIdentity>,
 }
 
-/// One search hit: a live handle, its owner, and the id it pairs with.
+/// One search hit: a live, disclosed handle, its owner, and the id node it
+/// pairs with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchHit {
@@ -255,12 +250,14 @@ pub struct SearchHit {
     pub platform: Option<KnownPlatform>,
     /// The platform id the chain keys by.
     pub platform_id: B256,
-    /// The normalized handle.
+    /// The handle's text.
     pub handle: String,
+    /// The node the chain filed the handle under.
+    pub handle_node: B256,
     /// The wallet it resolves to.
     pub owner: Address,
-    /// The account id behind it, when bound.
-    pub user_id: Option<String>,
+    /// The account id node behind it.
+    pub id_node: B256,
     /// Whether the owner displays this handle.
     pub published: bool,
 }
@@ -285,14 +282,14 @@ pub struct SearchResults {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HandleRef {
-    /// The platform's short key, when this build knows the id.
+    /// The platform's short key, when known.
     pub platform: Option<KnownPlatform>,
-    /// The platform id the chain keys by.
-    pub platform_id: B256,
+    /// The platform id, once a bind or a `DepositedToHandle` named it: a
+    /// deposit names only the node.
+    pub platform_id: Option<B256>,
     /// The node the chain filed the handle under.
     pub handle_node: B256,
-    /// The normalized handle, once a bind has carried its text. A deposit
-    /// carries only the node, so a handle nobody has bound has none here.
+    /// The handle's text, once the chain disclosed it.
     pub handle: Option<String>,
 }
 
@@ -313,11 +310,13 @@ pub enum HistoryEvent {
         id_node: B256,
         handle_node: B256,
         platform_id: B256,
-        id: String,
-        handle: String,
         observed_at: u64,
-        published: bool,
         ceremony_version: u16,
+    },
+    HandlePublished {
+        holder: Address,
+        platform_id: B256,
+        handle_node: B256,
     },
     HandleRetired {
         platform_id: B256,
@@ -326,9 +325,6 @@ pub enum HistoryEvent {
     },
     HandleUnpublished {
         holder: Address,
-        platform_id: B256,
-    },
-    PlatformConfigured {
         platform_id: B256,
     },
     ProofVerifierConfigured {
@@ -351,18 +347,20 @@ pub enum HistoryEvent {
         token: Address,
         refund_to: Address,
         depositor: Address,
-        platform_id: B256,
         #[serde_as(as = "DisplayFromStr")]
         round: U256,
         #[serde_as(as = "DisplayFromStr")]
         amount: U256,
+    },
+    DepositedToHandle {
+        handle_node: B256,
+        platform_id: B256,
     },
     Forwarded {
         handle_node: B256,
         token: Address,
         depositor: Address,
         holder: Address,
-        platform_id: B256,
         #[serde_as(as = "DisplayFromStr")]
         amount: U256,
         #[serde_as(as = "DisplayFromStr")]
@@ -396,6 +394,8 @@ pub enum HistoryEvent {
 
 /// The wire's copy of a journaled event: the same fields, so a client reads
 /// what the chain emitted, in a type the journal's format does not bind.
+/// Disclosed text is the entry's [`HandleRef`], shown under the visibility
+/// policy.
 impl From<NamesEvent> for HistoryEvent {
     fn from(event: NamesEvent) -> Self {
         match event {
@@ -404,21 +404,25 @@ impl From<NamesEvent> for HistoryEvent {
                 id_node,
                 handle_node,
                 platform_id,
-                id,
-                handle,
                 observed_at,
-                published,
                 ceremony_version,
             } => Self::IdentityBound {
                 holder,
                 id_node,
                 handle_node,
                 platform_id,
-                id,
-                handle,
                 observed_at,
-                published,
                 ceremony_version,
+            },
+            NamesEvent::HandlePublished {
+                holder,
+                platform_id,
+                handle_node,
+                handle: _,
+            } => Self::HandlePublished {
+                holder,
+                platform_id,
+                handle_node,
             },
             NamesEvent::HandleRetired {
                 platform_id,
@@ -436,9 +440,6 @@ impl From<NamesEvent> for HistoryEvent {
                 holder,
                 platform_id,
             },
-            NamesEvent::PlatformConfigured { platform_id } => {
-                Self::PlatformConfigured { platform_id }
-            }
             NamesEvent::ProofVerifierConfigured { verifier } => {
                 Self::ProofVerifierConfigured { verifier }
             }
@@ -467,7 +468,6 @@ impl From<NamesEvent> for HistoryEvent {
                 token,
                 refund_to,
                 depositor,
-                platform_id,
                 round,
                 amount,
             }) => Self::Deposited {
@@ -475,16 +475,22 @@ impl From<NamesEvent> for HistoryEvent {
                 token,
                 refund_to,
                 depositor,
-                platform_id,
                 round,
                 amount,
+            },
+            NamesEvent::Escrow(EscrowEvent::DepositedToHandle {
+                handle_node,
+                platform_id,
+                handle: _,
+            }) => Self::DepositedToHandle {
+                handle_node,
+                platform_id,
             },
             NamesEvent::Escrow(EscrowEvent::Forwarded {
                 handle_node,
                 token,
                 depositor,
                 holder,
-                platform_id,
                 amount,
                 received,
             }) => Self::Forwarded {
@@ -492,7 +498,6 @@ impl From<NamesEvent> for HistoryEvent {
                 token,
                 depositor,
                 holder,
-                platform_id,
                 amount,
                 received,
             },
@@ -596,7 +601,7 @@ pub struct HandleQuery {
     pub platform_id: Option<B256>,
     /// The node the chain files the handle under.
     pub handle_node: B256,
-    /// The normalized handle, when the request or a bind carried its text.
+    /// The handle's text, once the chain disclosed it.
     pub handle: Option<String>,
 }
 

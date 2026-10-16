@@ -6,17 +6,12 @@
 //! Skips silently in exactly two cases: `DATABASE_URL` unset, or no `anvil`
 //! binary on PATH. Everything past those checks panics on failure.
 
-use std::{
-    process::Command,
-    time::Duration,
-};
-use tokio::time::Instant;
+use std::time::Duration;
 
 use alloy::{
     primitives::{
         address,
         Address,
-        Bytes,
         B256,
         U256,
     },
@@ -25,7 +20,6 @@ use alloy::{
         Provider,
         ProviderBuilder,
     },
-    sol,
 };
 use axum::http::StatusCode;
 use serde::de::DeserializeOwned;
@@ -50,60 +44,49 @@ use usernames_core::{
         ChainStore,
     },
     indexer,
-    nodes::{
-        self,
-        KnownPlatform,
-    },
+    nodes::KnownPlatform,
 };
 
 mod common;
 use common::{
     events,
+    MockHandleEscrow,
+    MockIdentityRegistry,
     Reply,
 };
 
 /// A request scoped to this suite's chain: the store is shared with the
 /// read-model suite's chain.
 async fn get<T: DeserializeOwned>(pool: &PgPool, path: &str) -> Reply<T> {
-    let separator = if path.contains('?') { '&' } else { '?' };
-    common::get(pool, &format!("{path}{separator}chain={CHAIN}")).await
+    common::get_on(pool, CHAIN as i64, path).await
 }
-
-sol!(
-    /// The event surface of IdentityRegistry behind bare emit functions,
-    /// compiled from contracts/MockIdentityRegistry.sol.
-    #[allow(clippy::too_many_arguments)]
-    #[sol(rpc)]
-    MockIdentityRegistry,
-    "../../contracts/MockIdentityRegistry.json"
-);
-
-sol!(
-    /// The event surface of HandleEscrow behind bare emit functions, and its
-    /// `registry` view, compiled from contracts/MockHandleEscrow.sol.
-    #[allow(clippy::too_many_arguments)]
-    #[sol(rpc)]
-    MockHandleEscrow,
-    "../../contracts/MockHandleEscrow.json"
-);
 
 /// Not 31337: the read-model tests use anvil's default id against the same
 /// database, and chain_id keying is exactly the isolation this exercises.
 const CHAIN: u64 = 43117;
 
-/// A Google account id as the chain binds it: `0x` and the hex SHA-256 of
-/// `"libid.google-user-id" || sub`. This is libid-contracts'
-/// `GooglePlatformVerifier` test vector for the sub `123456789012345678901`.
-const GOOGLE_USER_ID: &str =
-    "0x20078023c9d4bf6bffc2580ec36446075d10c8453cecbe4f1cb3d326b2b35560";
+/// A Google account id as the platform issues it: the OIDC `sub`.
+const GOOGLE_USER_ID: &str = "123456789012345678901";
+
+/// A bind of `id` that discloses `handle`, with nothing to withdraw or retire.
+fn disclosing_bind(
+    holder: Address,
+    platform: KnownPlatform,
+    id: &str,
+    handle: &str,
+    observed_at: u64,
+    digest: B256,
+) -> MockIdentityRegistry::Bind {
+    common::mock_bind(holder, platform, id, handle, observed_at, true, digest)
+}
 
 #[tokio::test]
 async fn indexes_a_real_chain_end_to_end() {
-    let Ok(url) = std::env::var("DATABASE_URL") else {
+    let Some(url) = common::database_url() else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    if Command::new("anvil").arg("--version").output().is_err() {
+    if !common::anvil_available() {
         eprintln!("skipping: anvil not on PATH");
         return;
     }
@@ -126,24 +109,15 @@ async fn indexes_a_real_chain_end_to_end() {
         .expect("deploy");
     let deploy_block = provider.get_block_number().await.expect("block");
 
-    let x = KnownPlatform::X.id();
-    let google = KnownPlatform::Google.id();
+    let (x, google) = (KnownPlatform::X, KnownPlatform::Google);
     let alice = Address::repeat_byte(0xA1);
     let verifier = Address::repeat_byte(0xEE);
     let fee_receiver = Address::repeat_byte(0xFE);
     let digest = B256::repeat_byte(0xD1);
 
     // The scenario, one tx per step (anvil automines a block each): wire the
-    // platform and the Proof Verifier, bind published — the ceremony's own
-    // events beside it — rename, add a Google identity, withdraw the
-    // published handle.
-    mock.emitPlatformConfigured(x)
-        .send()
-        .await
-        .unwrap()
-        .watch()
-        .await
-        .unwrap();
+    // Proof Verifier, bind disclosing the handle — the ceremony's own events
+    // beside it — rename, add a disclosed Google identity, withdraw its name.
     mock.emitProofVerifierConfigured(verifier)
         .send()
         .await
@@ -151,24 +125,7 @@ async fn indexes_a_real_chain_end_to_end() {
         .watch()
         .await
         .unwrap();
-    mock.emitIdentityBound(
-        alice,
-        nodes::id_node(x, "111"),
-        nodes::handle_node(x, &nodes::NormalizedHandle::from_chain("alice_1")),
-        x,
-        "111".into(),
-        "alice_1".into(),
-        1000,
-        true,
-        1,
-    )
-    .send()
-    .await
-    .unwrap()
-    .watch()
-    .await
-    .unwrap();
-    mock.emitCeremonyBound(digest, alice, x, Bytes::from_static(b"app-a"))
+    mock.emitBind(disclosing_bind(alice, x, "111", "alice_1", 1000, digest))
         .send()
         .await
         .unwrap()
@@ -182,55 +139,35 @@ async fn indexes_a_real_chain_end_to_end() {
         .watch()
         .await
         .unwrap();
-    mock.emitHandleRetired(
-        x,
-        nodes::handle_node(x, &nodes::NormalizedHandle::from_chain("alice_1")),
+    // The rename retires alice_1 and withdraws its name in the same bind.
+    let digest_2 = B256::repeat_byte(0xD2);
+    let mut rename = disclosing_bind(alice, x, "111", "alice_2", 2000, digest_2);
+    rename.retiredNode = x.handle_node("alice_1").unwrap();
+    rename.retiredHolder = alice;
+    rename.retiredNamed = true;
+    mock.emitBind(rename)
+        .send()
+        .await
+        .unwrap()
+        .watch()
+        .await
+        .unwrap();
+    let google_bind = disclosing_bind(
         alice,
-    )
-    .send()
-    .await
-    .unwrap()
-    .watch()
-    .await
-    .unwrap();
-    mock.emitIdentityBound(
-        alice,
-        nodes::id_node(x, "111"),
-        nodes::handle_node(x, &nodes::NormalizedHandle::from_chain("alice_2")),
-        x,
-        "111".into(),
-        "alice_2".into(),
-        2000,
-        true,
-        1,
-    )
-    .send()
-    .await
-    .unwrap()
-    .watch()
-    .await
-    .unwrap();
-    mock.emitIdentityBound(
-        alice,
-        nodes::id_node(google, GOOGLE_USER_ID),
-        nodes::handle_node(
-            google,
-            &nodes::NormalizedHandle::from_chain("a.b+tag@example.com"),
-        ),
         google,
-        GOOGLE_USER_ID.into(),
-        "a.b+tag@example.com".into(),
+        GOOGLE_USER_ID,
+        "a.b+tag@example.com",
         3000,
-        false,
-        1,
-    )
-    .send()
-    .await
-    .unwrap()
-    .watch()
-    .await
-    .unwrap();
-    mock.emitHandleUnpublished(alice, x)
+        B256::repeat_byte(0xD3),
+    );
+    mock.emitBind(google_bind)
+        .send()
+        .await
+        .unwrap()
+        .watch()
+        .await
+        .unwrap();
+    mock.emitHandleUnpublished(alice, google.id())
         .send()
         .await
         .unwrap()
@@ -247,16 +184,23 @@ async fn indexes_a_real_chain_end_to_end() {
     chain::check_escrow(&provider, *escrow.address(), *mock.address())
         .await
         .expect("the escrow resolves holders through the registry");
+    chain::check_registry(&provider, *mock.address())
+        .await
+        .expect("the registry is keyed by nodes");
+    // The escrow has no `nodeKeyed`: an indexer pointed at it refuses.
+    assert!(matches!(
+        chain::check_registry(&provider, *escrow.address()).await,
+        Err(chain::RegistryRefused::Unread { .. })
+    ));
     let native = address!("EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
     let (payer, bob) = (Address::repeat_byte(0xC0), Address::repeat_byte(0xB0));
-    let bob_node = nodes::handle_node(x, &nodes::NormalizedHandle::from_chain("bob_x"));
+    let bob_node = x.handle_node("bob_x").unwrap();
     escrow
         .emitDeposited(
             bob_node,
             native,
             payer,
             payer,
-            x,
             U256::ZERO,
             U256::from(100u64),
         )
@@ -268,11 +212,10 @@ async fn indexes_a_real_chain_end_to_end() {
         .unwrap();
     escrow
         .emitForwarded(
-            nodes::handle_node(x, &nodes::NormalizedHandle::from_chain("alice_2")),
+            x.handle_node("alice_2").unwrap(),
             native,
             payer,
             alice,
-            x,
             U256::from(7u64),
             U256::from(7u64),
         )
@@ -282,23 +225,13 @@ async fn indexes_a_real_chain_end_to_end() {
         .watch()
         .await
         .unwrap();
-    mock.emitIdentityBound(
-        bob,
-        nodes::id_node(x, "222"),
-        bob_node,
-        x,
-        "222".into(),
-        "bob_x".into(),
-        4000,
-        false,
-        1,
-    )
-    .send()
-    .await
-    .unwrap()
-    .watch()
-    .await
-    .unwrap();
+    mock.emitIdentityBound(bob, x.id_node("222").unwrap(), bob_node, x.id(), 4000, 1)
+        .send()
+        .await
+        .unwrap()
+        .watch()
+        .await
+        .unwrap();
     escrow
         .emitClaimed(
             bob_node,
@@ -334,7 +267,7 @@ async fn indexes_a_real_chain_end_to_end() {
         contract: *mock.address(),
         escrow: Some(*escrow.address()),
         confirmations: 0,
-        poll_interval: Duration::from_secs(1),
+        poll_interval: Duration::from_millis(20),
         max_block_range: 2,
         start_block: None,
         // A report good for two minutes; the loop renews it every cycle.
@@ -345,18 +278,7 @@ async fn indexes_a_real_chain_end_to_end() {
             .run(cancel.clone()),
     );
 
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let cursor = store.cursor().await.expect("cursor");
-        if cursor.is_some_and(|c| c >= latest) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "indexer did not catch up to block {latest}; cursor {cursor:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    common::wait_for_cursor(&store, latest).await;
     cancel.cancel();
     let _ = task.await;
     writer.release().await.expect("the lease releases");
@@ -376,37 +298,63 @@ async fn indexes_a_real_chain_end_to_end() {
     assert_eq!(binding.chain_id, CHAIN as i64);
     assert_eq!(binding.owner, alice);
     assert_eq!(binding.ceremony_version, 1);
-    let resolved: IdResolution = get(&pool, "/v1/resolve/id/x/111").await.answer();
+    assert_eq!(binding.handle.as_deref(), Some("alice_2"));
+    let resolved: IdResolution = get(
+        &pool,
+        &format!("/v1/resolve/id-node/{}", x.id_node("111").unwrap()),
+    )
+    .await
+    .answer();
     assert_eq!(resolved.bindings[0].handle.as_deref(), Some("alice_2"));
 
-    // The Google identity resolves through the URL-encoded raw form.
+    // The Google identity resolves through the URL-encoded raw form; its
+    // name was withdrawn, and the text it disclosed still comes back.
     let resolved: HandleResolution =
         get(&pool, "/v1/resolve/handle/google/A.B%2Btag%40Example.COM")
             .await
             .answer();
-    assert_eq!(resolved.handle, "a.b+tag@example.com");
     assert_eq!(
-        resolved.bindings[0].user_id.as_deref(),
-        Some(GOOGLE_USER_ID)
+        resolved.handle_node,
+        google.handle_node("a.b+tag@example.com").unwrap()
     );
-    let resolved: IdResolution =
-        get(&pool, &format!("/v1/resolve/id/google/{GOOGLE_USER_ID}"))
-            .await
-            .answer();
+    assert_eq!(
+        resolved.bindings[0].handle.as_deref(),
+        Some("a.b+tag@example.com")
+    );
+    assert_eq!(
+        resolved.bindings[0].id_node,
+        google.id_node(GOOGLE_USER_ID).unwrap()
+    );
+    let resolved: IdResolution = get(
+        &pool,
+        &format!(
+            "/v1/resolve/id-node/{}",
+            google.id_node(GOOGLE_USER_ID).unwrap()
+        ),
+    )
+    .await
+    .answer();
     assert_eq!(resolved.bindings[0].owner, alice);
     assert_eq!(
         resolved.bindings[0].handle.as_deref(),
         Some("a.b+tag@example.com")
     );
 
-    // Reverse: both identities, neither displayed (x was unpublished, google
-    // never was).
+    // Reverse: both identities; X's name is displayed, Google's was
+    // withdrawn.
     let resolved: AddressResolution = get(&pool, &format!("/v1/resolve/address/{alice}"))
         .await
         .answer();
     assert_eq!(resolved.identities.len(), 2, "{resolved:?}");
-    assert!(
-        resolved.identities.iter().all(|i| !i.published),
+    // Platform ids order the identities: X's sorts before Google's.
+    let displayed: Vec<_> = resolved
+        .identities
+        .iter()
+        .map(|i| (i.platform, i.published))
+        .collect();
+    assert_eq!(
+        displayed,
+        [(Some(x), true), (Some(google), false)],
         "{resolved:?}"
     );
     assert!(
@@ -446,25 +394,16 @@ async fn indexes_a_real_chain_end_to_end() {
     );
     assert_eq!(chain.proof_verifier, Some(verifier));
     assert_eq!(chain.escrow, Some(*escrow.address()));
-    let platform_key: Option<String> = sqlx::query_scalar(
-        "SELECT platform_key FROM names.platforms WHERE chain_id = $1 AND platform_id = $2",
-    )
-    .bind(CHAIN as i64)
-    .bind(x.as_slice())
-    .fetch_one(&pool)
-    .await
-    .expect("platform row");
-    assert_eq!(platform_key.as_deref(), Some("x"));
 
-    // The journal holds every event the scenario emitted, the ceremony's own
-    // two included.
+    // The journal holds every event the scenario emitted, each bind's
+    // ceremony and the fee included.
     let journal: i64 =
         sqlx::query_scalar("SELECT count(*) FROM names.events WHERE chain_id = $1")
             .bind(CHAIN as i64)
             .fetch_one(&pool)
             .await
             .expect("journal count");
-    assert_eq!(journal, 13);
+    assert_eq!(journal, 18);
     let fee_kinds: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM names.events WHERE chain_id = $1 AND kind = 'bind_fee_paid'",
     )
@@ -529,7 +468,7 @@ async fn indexes_a_real_chain_end_to_end() {
 
 #[tokio::test]
 async fn an_escrow_of_another_registry_is_refused() {
-    if Command::new("anvil").arg("--version").output().is_err() {
+    if !common::anvil_available() {
         eprintln!("skipping: anvil not on PATH");
         return;
     }

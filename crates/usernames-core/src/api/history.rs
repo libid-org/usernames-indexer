@@ -50,12 +50,9 @@ impl HistoryEntry {
                     .map_err(|e| ApiError::internal(format_args!("{at}: {e}")))
             })
             .collect::<Result<_, _>>()?;
-        let handle = match (row.handle_node, row.platform_id) {
-            (Some(handle_node), Some(platform_id)) => {
-                Some(HandleRef::of(platform_id, handle_node, row.handle))
-            }
-            _ => None,
-        };
+        let handle = row
+            .handle_node
+            .map(|handle_node| HandleRef::of(row.platform_id, handle_node, row.handle));
         Ok(Self {
             chain_id: row.chain_id,
             block_number: row.block_number,

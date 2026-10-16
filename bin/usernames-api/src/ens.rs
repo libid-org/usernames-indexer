@@ -94,7 +94,6 @@ use usernames_core::{
         ResolveCall,
         Subject,
     },
-    nodes::NormalizedHandle,
 };
 
 /// What the gateway needs: the store it reads, and the identity it signs with.
@@ -236,15 +235,12 @@ impl Config {
 
         let owner = match query.subject {
             Subject::Handle { platform, handle } => {
-                // The inverse transform yields what `HandleNormalizer`
-                // produced, so running the chain's rules over it again is
-                // idempotent — and it is the only way to a `NormalizedHandle`,
-                // which is what keeps a raw string from ever being hashed into
-                // a key nobody finds.
-                let Ok(normalized) = platform.normalize_query(&handle) else {
+                // The chain's node for the handle: what `resolveHandle`
+                // keys by.
+                let Ok(handle_node) = platform.handle_node(&handle) else {
                     return Ok(null);
                 };
-                indexed.owner_of(platform.id(), &normalized).await?
+                indexed.owner_of(handle_node).await?
             }
         };
 
@@ -420,16 +416,8 @@ impl IndexedChain {
     /// The owner a name resolves to, as of whatever block this chain's
     /// indexer last committed. `None` is the null answer — a name nobody
     /// holds.
-    async fn owner_of(
-        &self,
-        platform: B256,
-        handle: &NormalizedHandle,
-    ) -> Result<Option<Address>, GatewayError> {
-        Ok(self
-            .0
-            .resolve_handle(platform, handle)
-            .await?
-            .and_then(|row| row.owner))
+    async fn owner_of(&self, handle_node: B256) -> Result<Option<Address>, GatewayError> {
+        Ok(self.0.ens_holder(handle_node).await?)
     }
 
     /// Where this index stands, or nothing if the store cannot say.

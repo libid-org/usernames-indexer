@@ -3,8 +3,8 @@
 //!
 //! What an event does not name is read from the rows it is about to change,
 //! or from the rows its own transaction recorded just before it: a bind's
-//! previous holders, a retirement's holder, the handle of a ceremony, a fee
-//! or an unpublish, a fee's payer, and the refundTos a claim takes from.
+//! previous holders, the handle of a ceremony or a fee, a fee's payer, and the
+//! refundTos a claim takes from. An unpublish's handle is the row it deletes.
 
 use std::{
     fmt,
@@ -44,7 +44,7 @@ use crate::events::{
 /// names one.
 pub(crate) struct Involvement {
     parties: Vec<(Address, Vec<Role>)>,
-    handle_node: Option<B256>,
+    pub(crate) handle_node: Option<B256>,
     platform_id: Option<B256>,
 }
 
@@ -119,43 +119,8 @@ impl Window {
                 involvement.named(*handle_node, *platform_id);
             }
 
-            // The event names the address whose bind retired the handle. When
-            // the account moved to another address in that bind, the handle
-            // was held by the one it left, and that is whose history it
-            // belongs in.
-            NamesEvent::HandleRetired {
-                platform_id,
-                handle_node,
-                holder,
-            } => {
-                let held_by: Option<Option<Address>> =
-                    sqlx::query_scalar(sql::HANDLE_HOLDER)
-                        .bind(chain_id)
-                        .bind(handle_node)
-                        .fetch_optional(&mut *self.tx)
-                        .await?;
-                match held_by.flatten() {
-                    Some(held_by) if held_by != *holder => {
-                        involvement.add(held_by, Role::PreviousHandleHolder)
-                    }
-                    _ => involvement.add(*holder, Role::Holder),
-                }
-                involvement.named(*handle_node, *platform_id);
-            }
-
-            // Nothing published is still a withdrawal the contract accepts;
-            // it concerns no handle.
-            NamesEvent::HandleUnpublished {
-                holder,
-                platform_id,
-            } => {
-                involvement.handle_node = sqlx::query_scalar(sql::PUBLISHED_HANDLE_NODE)
-                    .bind(chain_id)
-                    .bind(holder)
-                    .bind(platform_id)
-                    .fetch_optional(&mut *self.tx)
-                    .await?;
-            }
+            // The withdrawal itself reads which handle it concerns.
+            NamesEvent::HandleUnpublished { .. } => {}
 
             NamesEvent::CeremonyBound {
                 holder,
@@ -209,18 +174,32 @@ impl Window {
                 involvement.handle_node = ceremony.handle_node;
             }
 
+            // A deposit can come before any bind names the node's platform.
+            NamesEvent::Escrow(EscrowEvent::DepositedToHandle {
+                handle_node,
+                platform_id,
+                ..
+            }) => involvement.named(*handle_node, *platform_id),
+
+            // Both name the platform too, which matters when the index
+            // starts after the node's bind.
+            NamesEvent::HandlePublished {
+                handle_node,
+                platform_id,
+                ..
+            }
+            | NamesEvent::HandleRetired {
+                handle_node,
+                platform_id,
+                ..
+            } => involvement.named(*handle_node, *platform_id),
+
+            // A deposit names no platform; the `DepositedToHandle` after it,
+            // or a bind, does.
             NamesEvent::Escrow(
-                EscrowEvent::Deposited {
-                    handle_node,
-                    platform_id,
-                    ..
-                }
-                | EscrowEvent::Forwarded {
-                    handle_node,
-                    platform_id,
-                    ..
-                },
-            ) => involvement.named(*handle_node, *platform_id),
+                EscrowEvent::Deposited { handle_node, .. }
+                | EscrowEvent::Forwarded { handle_node, .. },
+            ) => involvement.handle_node = Some(*handle_node),
 
             // A claim ends the refunds of everybody whose deposit it took:
             // the round's refundable rows, read before the claim deletes them.
@@ -248,8 +227,7 @@ impl Window {
                 involvement.handle_node = Some(*handle_node);
             }
 
-            NamesEvent::PlatformConfigured { .. }
-            | NamesEvent::ProofVerifierConfigured { .. } => {}
+            NamesEvent::ProofVerifierConfigured { .. } => {}
         }
 
         Ok(involvement)
@@ -376,7 +354,7 @@ pub struct HistoryRow {
     pub handle_node: Option<B256>,
     /// That node's platform.
     pub platform_id: Option<B256>,
-    /// That handle's text, when a bind ever carried it.
+    /// That handle's text, once the chain disclosed it.
     pub handle: Option<String>,
 }
 
@@ -566,29 +544,13 @@ pub(crate) mod plans {
         let reads = [
             (
                 "previous holders",
-                &["handles_pkey", "ids_pkey"][..],
+                &[
+                    "handles_pkey|handles_node_chain_idx",
+                    "ids_pkey|ids_node_chain_idx",
+                ][..],
                 sqlx::query_scalar::<_, String>(&explain(sql::PREVIOUS_HOLDERS))
                     .bind(1i64)
                     .bind(node)
-                    .bind(node)
-                    .fetch_all(&mut *conn)
-                    .await,
-            ),
-            (
-                "a retired handle's holder",
-                &["handles_pkey"][..],
-                sqlx::query_scalar(&explain(sql::HANDLE_HOLDER))
-                    .bind(1i64)
-                    .bind(node)
-                    .fetch_all(&mut *conn)
-                    .await,
-            ),
-            (
-                "an unpublished handle",
-                &["published_pkey", "handles_platform_handle_chain_idx"][..],
-                sqlx::query_scalar(&explain(sql::PUBLISHED_HANDLE_NODE))
-                    .bind(1i64)
-                    .bind(address)
                     .bind(node)
                     .fetch_all(&mut *conn)
                     .await,
