@@ -83,27 +83,19 @@ impl KnownPlatform {
 
     /// The node a typed handle is bound under, or why no handle can be.
     pub fn handle_node(self, raw: &str) -> Result<B256, HandleError> {
-        self.tagged(libid_identity::handle_node(self.key(), raw))
-            .map(B256::from)
+        self.spec().handle_node(raw).map(B256::from)
     }
 
     /// `text` with A-Z folded to a-z, and its node: the chain's
     /// `handleNodeOf`, which applies no other rule.
     pub fn folded_handle_node(self, text: &str) -> (String, B256) {
-        let (folded, node) =
-            self.tagged(libid_identity::folded_handle_node(self.key(), text));
+        let (folded, node) = self.spec().folded_handle_node(text);
         (folded, B256::from(node))
     }
 
     /// The node a user id is bound under, or why no id can be.
     pub fn id_node(self, id: &str) -> Result<B256, IdError> {
-        self.tagged(libid_identity::id_node(self.key(), id))
-            .map(B256::from)
-    }
-
-    /// A node lookup's result; every known platform has node tags.
-    fn tagged<T>(self, lookup: Option<T>) -> T {
-        lookup.unwrap_or_else(|| panic!("libid-identity has no node tags for {self}"))
+        self.spec().id_node(id).map(B256::from)
     }
 }
 
@@ -290,17 +282,6 @@ mod tests {
             Err(HandleError::BadCharacter)
         );
         assert_eq!(KnownPlatform::X.id_node(" 123"), Err(IdError::BadCharacter));
-    }
-
-    /// Every known platform has node tags, so the node lookups never panic.
-    #[test]
-    fn every_known_platform_is_tagged() {
-        for platform in KnownPlatform::ALL {
-            assert!(
-                libid_identity::tags_for(platform.key()).is_some(),
-                "{platform}"
-            );
-        }
     }
 
     #[test]

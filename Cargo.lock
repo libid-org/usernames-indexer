@@ -3466,7 +3466,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "libid-contracts"
 version = "0.17.0"
-source = "git+https://github.com/libid-org/libID-contracts?rev=1ed61e2#1ed61e267ef4e1a439ec0499ef490fe481cfbcc7"
+source = "git+https://github.com/libid-org/libID-contracts?rev=0ab6d48#0ab6d48026e7ca3b0be9509ee78af54f98aa2029"
 dependencies = [
  "alloy",
  "include_dir",
@@ -3479,7 +3479,7 @@ dependencies = [
 [[package]]
 name = "libid-identity"
 version = "0.17.0"
-source = "git+https://github.com/libid-org/libID-contracts?rev=1ed61e2#1ed61e267ef4e1a439ec0499ef490fe481cfbcc7"
+source = "git+https://github.com/libid-org/libID-contracts?rev=0ab6d48#0ab6d48026e7ca3b0be9509ee78af54f98aa2029"
 dependencies = [
  "sha2 0.10.9",
 ]
@@ -3487,7 +3487,7 @@ dependencies = [
 [[package]]
 name = "libid-profiles"
 version = "0.17.0"
-source = "git+https://github.com/libid-org/libID-contracts?rev=1ed61e2#1ed61e267ef4e1a439ec0499ef490fe481cfbcc7"
+source = "git+https://github.com/libid-org/libID-contracts?rev=0ab6d48#0ab6d48026e7ca3b0be9509ee78af54f98aa2029"
 
 [[package]]
 name = "libid-signer"
