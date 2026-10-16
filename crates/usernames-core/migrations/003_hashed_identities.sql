@@ -3,7 +3,7 @@
 TRUNCATE names.events, names.ids, names.handles, names.published,
          names.platforms, names.handle_nodes, names.escrow_held,
          names.escrow_refundable, names.address_events, names.handle_events;
-DELETE FROM names.chain_metadata WHERE key = 'cursor';
+DELETE FROM names.chain_metadata WHERE key = 'cursor' OR key = 'window_error';
 
 ALTER TABLE names.events DROP CONSTRAINT IF EXISTS events_kind_check;
 ALTER TABLE names.events ADD CONSTRAINT events_kind_check CHECK (kind IN (
