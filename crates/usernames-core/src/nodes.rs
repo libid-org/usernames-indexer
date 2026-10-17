@@ -16,7 +16,7 @@ use alloy::primitives::{
     B256,
 };
 use libid_identity::{
-    handle_vectors::{
+    platforms::{
         self,
         PLATFORM_GITHUB,
         PLATFORM_GOOGLE,
@@ -62,7 +62,7 @@ impl KnownPlatform {
     pub const ALL: &'static [Self] = &[Self::X, Self::GitHub, Self::Google];
 
     /// The platform as libid-identity's table states it: key, tags, rules.
-    const fn spec(self) -> &'static handle_vectors::Platform {
+    const fn spec(self) -> &'static platforms::Platform {
         match self {
             Self::X => &PLATFORM_X,
             Self::GitHub => &PLATFORM_GITHUB,
