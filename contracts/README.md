@@ -1,22 +1,18 @@
-# Contract sources used by the tests
+# Contracts the tests deploy
 
-`MockIdentityRegistry.sol` and `MockHandleEscrow.sol` are the indexer's test
-doubles: the exact event surfaces of `IdentityRegistry` and `HandleEscrow`,
-each event behind a function that emits it, so the anvil suite decodes real
-ABI-encoded logs from two emitters. The escrow double also answers `registry`,
-which the indexer reads at startup. Each is compiled once, and the ABI and
-creation bytecode of each are committed beside its source as the JSON the
-anvil suite's `sol!` reads.
+The anvil suite deploys the `libid-contracts` crate's embedded artifacts:
+`IdentityRegistry`, `CeremonyProofVerifier` and `HandleEscrow`, each behind an
+`ERC1967Proxy`. The API's end-to-end test deploys the crate's `HandleResolver`.
 
-To regenerate them, in a foundry project holding only these sources:
+`StubPlatformVerifier.json` is libid-contracts' test stand-in for a Platform
+Verifier: it answers any payload with the account and handle it was last set
+to, so a bind needs no proof. Its ABI and creation bytecode are compiled from
+`solidity/contracts/identity/test/StubPlatformVerifier.sol` at the
+libid-contracts tag the crate pins, v0.15.0:
 
 ```sh
-forge build --use 0.8.33
+git checkout v0.15.0 && git submodule update --init && cd solidity
+forge build contracts/identity/test/StubPlatformVerifier.sol
 jq '{abi, bytecode: {object: .bytecode.object}}' \
-  out/MockIdentityRegistry.sol/MockIdentityRegistry.json > MockIdentityRegistry.json
-jq '{abi, bytecode: {object: .bytecode.object}}' \
-  out/MockHandleEscrow.sol/MockHandleEscrow.json > MockHandleEscrow.json
+  out/StubPlatformVerifier.sol/StubPlatformVerifier.json > StubPlatformVerifier.json
 ```
-
-The ENS resolver the API's end-to-end test deploys is the `libid-contracts`
-crate's embedded `HandleResolver` artifact.
