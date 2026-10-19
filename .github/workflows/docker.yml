@@ -1,13 +1,15 @@
 name: Docker
 
-# Build on every PR (packaging must not rot); publish to GHCR from main and
-# from release tags. GHCR only, GITHUB_TOKEN only: no external credentials to
-# leak, and the deployment side pulls by digest or semver tag.
+# Build on every PR (packaging must not rot); publish to GHCR from main, from
+# release tags, and from any branch on a manual run, tagged
+# `branch-<name>` and `sha-<commit>`. GHCR only, GITHUB_TOKEN only: no external
+# credentials to leak, and the deployment side pulls by digest or semver tag.
 on:
   pull_request:
   push:
     branches: [main]
     tags: ["v*.*.*"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -53,6 +55,11 @@ jobs:
           case "$GITHUB_REF" in
             refs/tags/v*) tags="$tags,$image:${GITHUB_REF#refs/tags/v},$image:latest" ;;
             refs/heads/main) tags="$tags,$image:main" ;;
+            refs/heads/*)
+              branch="${GITHUB_REF#refs/heads/}"
+              branch="$(printf '%s' "${branch,,}" | tr -c 'a-z0-9._-' '-')"
+              tags="$tags,$image:branch-${branch:0:100}"
+              ;;
           esac
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
 
