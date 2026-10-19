@@ -40,6 +40,7 @@ use axum::{
     Json,
     Router,
 };
+use futures_util::future::try_join_all;
 use serde::{
     de::DeserializeOwned,
     Deserialize,
@@ -89,7 +90,7 @@ impl AppState {
 
 /// The routes, without middleware.
 ///
-/// No CORS layer here on purpose: a `layer` wraps only the routes already on
+/// No CORS layer here: a `layer` wraps only the routes already on
 /// the router it is called on, so one applied inside this function cannot
 /// cover anything a caller merges afterwards. The binary mounts every route
 /// first and applies CORS once over the whole thing.
@@ -124,7 +125,7 @@ pub fn router(state: AppState) -> Router {
 /// sentences that may be reworded.
 struct ApiError {
     status: StatusCode,
-    code: &'static str,
+    code: ErrorCode,
     message: String,
     /// The operator-facing cause, logged when the response renders and never
     /// serialized to the client.
@@ -132,7 +133,7 @@ struct ApiError {
 }
 
 impl ApiError {
-    fn not_found(code: &'static str, message: impl Into<String>) -> Self {
+    fn not_found(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
             code,
@@ -141,7 +142,7 @@ impl ApiError {
         }
     }
 
-    fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
+    fn bad_request(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             code,
@@ -156,7 +157,7 @@ impl ApiError {
         tracing::error!(%what, "unreadable stored value");
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: "internal",
+            code: ErrorCode::Internal,
             message: "internal error".into(),
             source: None,
         }
@@ -171,7 +172,7 @@ impl ApiError {
         };
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "not_synced",
+            code: ErrorCode::NotSynced,
             message,
             source: None,
         }
@@ -184,7 +185,7 @@ impl ApiError {
 impl From<libid_identity::HandleError> for ApiError {
     fn from(e: libid_identity::HandleError) -> Self {
         Self::not_found(
-            "handle_impossible",
+            ErrorCode::HandleImpossible,
             format!("no handle can exist on this platform for this text: {e}"),
         )
     }
@@ -197,7 +198,7 @@ impl From<PathRejection> for ApiError {
         if rejection.status().is_server_error() {
             Self::internal(rejection.body_text())
         } else {
-            Self::bad_request("invalid_path", rejection.body_text())
+            Self::bad_request(ErrorCode::InvalidPath, rejection.body_text())
         }
     }
 }
@@ -205,13 +206,13 @@ impl From<PathRejection> for ApiError {
 /// A query string axum could not take apart, such as a repeated key.
 impl From<QueryRejection> for ApiError {
     fn from(rejection: QueryRejection) -> Self {
-        Self::bad_request("invalid_query", rejection.body_text())
+        Self::bad_request(ErrorCode::InvalidQuery, rejection.body_text())
     }
 }
 
 impl From<InvalidCursor> for ApiError {
     fn from(e: InvalidCursor) -> Self {
-        Self::bad_request("invalid_cursor", e.to_string())
+        Self::bad_request(ErrorCode::InvalidCursor, e.to_string())
     }
 }
 
@@ -221,7 +222,7 @@ impl From<sqlx::Error> for ApiError {
     fn from(e: sqlx::Error) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: "internal",
+            code: ErrorCode::Internal,
             message: "internal error".into(),
             source: Some(e),
         }
@@ -235,7 +236,7 @@ impl IntoResponse for ApiError {
         }
         let body = ErrorBody {
             error: ErrorDetail {
-                code: self.code.to_string(),
+                code: self.code,
                 message: self.message,
             },
         };
@@ -361,8 +362,8 @@ impl HandleRef {
 }
 
 fn parse_platform(raw: &str) -> Result<nodes::Platform, ApiError> {
-    nodes::Platform::parse(raw)
-        .map_err(|e| ApiError::bad_request("invalid_platform", e.to_string()))
+    raw.parse::<nodes::Platform>()
+        .map_err(|e| ApiError::bad_request(ErrorCode::InvalidPlatform, e.to_string()))
 }
 
 /// Postgres cannot compare TEXT holding a NUL byte, and no stored value ever
@@ -370,7 +371,7 @@ fn parse_platform(raw: &str) -> Result<nodes::Platform, ApiError> {
 fn reject_nul(raw: &str, what: &str) -> Result<(), ApiError> {
     if raw.contains('\0') {
         return Err(ApiError::bad_request(
-            "invalid_argument",
+            ErrorCode::InvalidArgument,
             format!("{what} must not contain a NUL byte"),
         ));
     }
@@ -391,7 +392,7 @@ impl ChainFilter {
             .map(|raw| {
                 raw.parse().map_err(|_| {
                     ApiError::bad_request(
-                        "invalid_chain",
+                        ErrorCode::InvalidChain,
                         format!("{raw:?} is not a chain id"),
                     )
                 })
@@ -402,7 +403,10 @@ impl ChainFilter {
 
 fn parse_address(raw: &str) -> Result<Address, ApiError> {
     Address::from_str(raw).map_err(|_| {
-        ApiError::bad_request("invalid_address", format!("{raw:?} is not an address"))
+        ApiError::bad_request(
+            ErrorCode::InvalidAddress,
+            format!("{raw:?} is not an address"),
+        )
     })
 }
 
@@ -412,7 +416,7 @@ fn parse_count(raw: Option<&str>, name: &str) -> Result<Option<i64>, ApiError> {
     raw.map(|raw| {
         raw.parse::<i64>().map_err(|_| {
             ApiError::bad_request(
-                "invalid_argument",
+                ErrorCode::InvalidArgument,
                 format!("{name} must be an integer, not {raw:?}"),
             )
         })
@@ -423,7 +427,7 @@ fn parse_count(raw: Option<&str>, name: &str) -> Result<Option<i64>, ApiError> {
 fn parse_node(raw: &str) -> Result<B256, ApiError> {
     B256::from_str(raw).map_err(|_| {
         ApiError::bad_request(
-            "invalid_node",
+            ErrorCode::InvalidNode,
             format!("{raw:?} is not a 0x-hex 32-byte handle node"),
         )
     })
@@ -434,32 +438,53 @@ async fn health() -> &'static str {
 }
 
 impl ChainStatus {
-    async fn of(store: &ChainStore) -> Result<Self, ApiError> {
-        let last = store.cursor().await?;
-        let head = store.chain_head().await?;
-        let position = store.index_position().await?;
+    async fn of(store: ChainStore) -> Result<Self, ApiError> {
+        let (
+            last,
+            head,
+            position,
+            names,
+            contract,
+            escrow,
+            last_window_error,
+            proof_verifier,
+        ) = tokio::try_join!(
+            store.cursor(),
+            store.chain_head(),
+            store.index_position(),
+            store.chain_names(),
+            store.contract(),
+            store.escrow(),
+            store.window_error(),
+            store.proof_verifier(),
+        )?;
         Ok(Self {
             chain_id: store.chain_id(),
-            names: store.chain_names().await?,
-            contract: store.contract().await?,
-            escrow: store.escrow().await?,
+            names,
+            contract,
+            escrow,
             last_indexed_block: last,
             chain_head_block: head,
             lag_blocks: head.map(|h| h.saturating_sub(last.unwrap_or(0))),
             indexer_reported_at: position.reported_at,
-            report_valid_for: position.valid_for,
-            last_window_error: store.window_error().await?,
-            proof_verifier: store.proof_verifier().await?,
+            report_valid_for: position.valid_for.map(|valid_for| valid_for.num_seconds()),
+            last_window_error,
+            proof_verifier,
         })
     }
 }
 
 /// `GET /v1/status` — every chain in the store, as its indexer last left it.
 async fn status(State(state): State<AppState>) -> Result<Json<Status>, ApiError> {
-    let mut chains = Vec::new();
-    for chain_id in state.store.known_chains().await? {
-        chains.push(ChainStatus::of(&state.store.chain(chain_id)).await?);
-    }
+    let chains = try_join_all(
+        state
+            .store
+            .known_chains()
+            .await?
+            .into_iter()
+            .map(|chain_id| ChainStatus::of(state.store.chain(chain_id))),
+    )
+    .await?;
     Ok(Json(Status {
         chains,
         indexer_version: db::INDEXER_VERSION.to_string(),
@@ -471,8 +496,8 @@ async fn status(State(state): State<AppState>) -> Result<Json<Status>, ApiError>
 /// is bound on or the one named.
 async fn resolve_handle(
     State(state): State<AppState>,
-    Path((platform, handle)): Path<(String, String)>,
-    Query(filter): Query<ChainFilter>,
+    ApiPath((platform, handle)): ApiPath<(String, String)>,
+    ApiQuery(filter): ApiQuery<ChainFilter>,
 ) -> Result<Json<HandleResolution>, ApiError> {
     let platform = parse_platform(&platform)?;
     reject_nul(&handle, "handle")?;
@@ -492,33 +517,32 @@ async fn resolve_handle(
         // an unclaimed handle.
         if !state.store.platform_wired(chain, platform.id()).await? {
             return Err(ApiError::not_found(
-                "platform_not_configured",
+                ErrorCode::PlatformNotConfigured,
                 "this platform is not configured on any chain in scope",
             ));
         }
         return Err(ApiError::not_found(
-            "handle_not_bound",
+            ErrorCode::HandleNotBound,
             format!("{:?} is not bound", normalized.as_str()),
         ));
     }
     let bindings: Vec<HandleBinding> = rows
         .iter()
         .filter_map(|row| {
-            let owner = row.owner.as_deref()?;
             Some(HandleBinding {
                 chain_id: row.chain_id,
-                handle_node: B256::from_slice(&row.handle_node),
-                owner: Address::from_slice(owner),
+                handle_node: row.handle_node,
+                owner: row.owner?,
                 observed_at: row.observed_at,
                 ceremony_version: row.ceremony_version,
                 user_id: row.user_id.clone(),
-                id_node: B256::from_slice(&row.id_node),
+                id_node: row.id_node,
             })
         })
         .collect();
     if bindings.is_empty() {
         return Err(ApiError::not_found(
-            "handle_retired",
+            ErrorCode::HandleRetired,
             format!(
                 "{:?} was retired: its account proved a different handle",
                 normalized.as_str()
@@ -540,8 +564,8 @@ async fn resolve_handle(
 /// the chain keys it.
 async fn resolve_id(
     State(state): State<AppState>,
-    Path((platform, user_id)): Path<(String, String)>,
-    Query(filter): Query<ChainFilter>,
+    ApiPath((platform, user_id)): ApiPath<(String, String)>,
+    ApiQuery(filter): ApiQuery<ChainFilter>,
 ) -> Result<Json<IdResolution>, ApiError> {
     let platform = parse_platform(&platform)?;
     reject_nul(&user_id, "userId")?;
@@ -555,12 +579,12 @@ async fn resolve_id(
     if rows.is_empty() {
         if !state.store.platform_wired(chain, platform.id()).await? {
             return Err(ApiError::not_found(
-                "platform_not_configured",
+                ErrorCode::PlatformNotConfigured,
                 "this platform is not configured on any chain in scope",
             ));
         }
         return Err(ApiError::not_found(
-            "id_not_bound",
+            ErrorCode::IdNotBound,
             format!("{user_id:?} is not bound"),
         ));
     }
@@ -573,12 +597,12 @@ async fn resolve_id(
             .iter()
             .map(|row| IdBinding {
                 chain_id: row.chain_id,
-                id_node: B256::from_slice(&row.id_node),
-                owner: Address::from_slice(&row.owner),
+                id_node: row.id_node,
+                owner: row.owner,
                 observed_at: row.observed_at,
                 ceremony_version: row.ceremony_version,
                 handle: row.presentable_handle().map(str::to_string),
-                handle_node: B256::from_slice(&row.handle_node),
+                handle_node: row.handle_node,
                 published: row.displayed(),
             })
             .collect(),
@@ -590,8 +614,8 @@ async fn resolve_id(
 /// published flag that mirrors `publishedHandleOf`'s reverse display.
 async fn resolve_address(
     State(state): State<AppState>,
-    Path(address): Path<String>,
-    Query(filter): Query<ChainFilter>,
+    ApiPath(address): ApiPath<String>,
+    ApiQuery(filter): ApiQuery<ChainFilter>,
 ) -> Result<Json<AddressResolution>, ApiError> {
     let address = parse_address(&address)?;
     let chain = filter.parse()?;
@@ -600,20 +624,17 @@ async fn resolve_address(
     let rows = state.store.identities_of(chain, address).await?;
     let identities = rows
         .iter()
-        .map(|row| {
-            let platform_id = B256::from_slice(&row.platform_id);
-            AddressIdentity {
-                chain_id: row.chain_id,
-                platform: nodes::Platform::known_of(platform_id),
-                platform_id,
-                user_id: row.user_id.clone(),
-                handle: row.presentable_handle().map(str::to_string),
-                handle_node: B256::from_slice(&row.handle_node),
-                observed_at: row.observed_at,
-                ceremony_version: row.ceremony_version,
-                resolves: row.handle_still_owned(),
-                published: row.displayed(),
-            }
+        .map(|row| AddressIdentity {
+            chain_id: row.chain_id,
+            platform: nodes::Platform::known_of(row.platform_id),
+            platform_id: row.platform_id,
+            user_id: row.user_id.clone(),
+            handle: row.presentable_handle().map(str::to_string),
+            handle_node: row.handle_node,
+            observed_at: row.observed_at,
+            ceremony_version: row.ceremony_version,
+            resolves: row.handle_still_owned(),
+            published: row.displayed(),
         })
         .collect();
 
@@ -629,12 +650,14 @@ struct SearchParams {
     platform: Option<String>,
     owner: Option<String>,
     chain: Option<String>,
-    limit: Option<i64>,
-    offset: Option<i64>,
+    limit: Option<String>,
+    offset: Option<String>,
 }
 
 /// The page size a search may ask for: at most this many hits per request.
 const SEARCH_MAX_LIMIT: i64 = 50;
+/// A search page holds this many hits when the request names no `limit`.
+const SEARCH_DEFAULT_LIMIT: i64 = 10;
 /// How far into a ranked list a search may page. Deeper pages are a scan the
 /// database repeats per request; a client that far in wants a narrower
 /// query.
@@ -651,20 +674,19 @@ const PAGE_MAX_LIMIT: i64 = 100;
 /// `limit` and `offset` page through the ranked list.
 async fn search(
     State(state): State<AppState>,
-    Query(params): Query<SearchParams>,
+    ApiQuery(params): ApiQuery<SearchParams>,
 ) -> Result<Json<SearchResults>, ApiError> {
     let chain = ChainFilter {
         chain: params.chain,
     }
     .parse()?;
-    state.synced(chain).await?;
     let query = match params.q.as_deref() {
         Some(raw) => {
             reject_nul(raw, "q")?;
             let folded = nodes::fold_search_query(raw);
             if folded.is_empty() {
                 return Err(ApiError::bad_request(
-                    "invalid_argument",
+                    ErrorCode::InvalidArgument,
                     "q must be nonempty",
                 ));
             }
@@ -675,18 +697,23 @@ async fn search(
     let owner = params.owner.as_deref().map(parse_address).transpose()?;
     if query.is_none() && owner.is_none() {
         return Err(ApiError::bad_request(
-            "invalid_argument",
+            ErrorCode::InvalidArgument,
             "q or owner is required",
         ));
     }
-    let limit = params.limit.unwrap_or(10).clamp(1, SEARCH_MAX_LIMIT);
-    let offset = params.offset.unwrap_or(0).clamp(0, SEARCH_MAX_OFFSET);
+    let limit = parse_count(params.limit.as_deref(), "limit")?
+        .unwrap_or(SEARCH_DEFAULT_LIMIT)
+        .clamp(1, SEARCH_MAX_LIMIT);
+    let offset = parse_count(params.offset.as_deref(), "offset")?
+        .unwrap_or(0)
+        .clamp(0, SEARCH_MAX_OFFSET);
     let platform_id = params
         .platform
         .as_deref()
         .map(parse_platform)
         .transpose()?
         .map(|p| p.id());
+    state.synced(chain).await?;
 
     let rows = state
         .store
@@ -694,17 +721,14 @@ async fn search(
         .await?;
     let hits = rows
         .iter()
-        .map(|row| {
-            let platform_id = B256::from_slice(&row.platform_id);
-            SearchHit {
-                chain_id: row.chain_id,
-                platform: nodes::Platform::known_of(platform_id),
-                platform_id,
-                handle: row.handle.clone(),
-                owner: Address::from_slice(&row.owner),
-                user_id: row.user_id.clone(),
-                published: row.published,
-            }
+        .map(|row| SearchHit {
+            chain_id: row.chain_id,
+            platform: nodes::Platform::known_of(row.platform_id),
+            platform_id: row.platform_id,
+            handle: row.handle.clone(),
+            owner: row.owner,
+            user_id: row.user_id.clone(),
+            published: row.published,
         })
         .collect();
 
@@ -731,7 +755,7 @@ mod tests {
 
     /// The status and code a route refuses `path` with. Every refusal here
     /// comes before the store is read, so the pool never connects.
-    async fn refusal(path: &str) -> (StatusCode, String) {
+    async fn refusal(path: &str) -> (StatusCode, ErrorCode) {
         let pool =
             PgPool::connect_lazy("postgres://localhost/unread").expect("lazy pool");
         let response = router(AppState::new(Store::new(pool)))
@@ -758,54 +782,83 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_list_request_is_refused_in_the_envelope() {
         let address = Address::repeat_byte(0xA1);
-        let bad = |code: &str| (StatusCode::BAD_REQUEST, code.to_string());
+        let bad = |code: ErrorCode| (StatusCode::BAD_REQUEST, code);
         let cases = [
-            ("/v1/escrow/node/0x1234".to_string(), bad("invalid_node")),
-            ("/v1/history/node/alice".to_string(), bad("invalid_node")),
+            (
+                "/v1/escrow/node/0x1234".to_string(),
+                bad(ErrorCode::InvalidNode),
+            ),
+            (
+                "/v1/history/node/alice".to_string(),
+                bad(ErrorCode::InvalidNode),
+            ),
             (
                 "/v1/escrow/claimable/0xnope".to_string(),
-                bad("invalid_address"),
+                bad(ErrorCode::InvalidAddress),
             ),
             (
                 "/v1/escrow/unclaimed?token=usdc".to_string(),
-                bad("invalid_address"),
+                bad(ErrorCode::InvalidAddress),
             ),
             (
                 "/v1/escrow/handle/myspace/tom".to_string(),
-                bad("invalid_platform"),
+                bad(ErrorCode::InvalidPlatform),
             ),
             (
                 "/v1/history/handle/x/no%20spaces".to_string(),
-                (StatusCode::NOT_FOUND, "handle_impossible".to_string()),
+                (StatusCode::NOT_FOUND, ErrorCode::HandleImpossible),
             ),
             (
                 "/v1/escrow/unclaimed?limit=ten".to_string(),
-                bad("invalid_argument"),
+                bad(ErrorCode::InvalidArgument),
             ),
             (
                 "/v1/history/handle/x/nobody?limit=1.5".to_string(),
-                bad("invalid_argument"),
+                bad(ErrorCode::InvalidArgument),
             ),
             (
                 "/v1/escrow/unclaimed?chain=base".to_string(),
-                bad("invalid_chain"),
+                bad(ErrorCode::InvalidChain),
             ),
             (
                 "/v1/escrow/unclaimed?before=nope".to_string(),
-                bad("invalid_cursor"),
+                bad(ErrorCode::InvalidCursor),
             ),
             (
                 format!("/v1/history/address/{address}?before=yesterday"),
-                bad("invalid_cursor"),
+                bad(ErrorCode::InvalidCursor),
             ),
             (
                 format!("/v1/escrow/refundable/{address}?before=1-2"),
-                bad("invalid_cursor"),
+                bad(ErrorCode::InvalidCursor),
             ),
-            ("/v1/history/address/%FF".to_string(), bad("invalid_path")),
+            (
+                "/v1/history/address/%FF".to_string(),
+                bad(ErrorCode::InvalidPath),
+            ),
+            (
+                "/v1/resolve/address/%FF".to_string(),
+                bad(ErrorCode::InvalidPath),
+            ),
+            (
+                "/v1/search?q=al&q=bo".to_string(),
+                bad(ErrorCode::InvalidQuery),
+            ),
+            (
+                "/v1/search?q=ali&limit=ten".to_string(),
+                bad(ErrorCode::InvalidArgument),
+            ),
+            (
+                "/v1/search?q=ali&offset=1.5".to_string(),
+                bad(ErrorCode::InvalidArgument),
+            ),
+            (
+                "/v1/resolve/handle/x/alice?chain=1&chain=2".to_string(),
+                bad(ErrorCode::InvalidQuery),
+            ),
             (
                 format!("/v1/escrow/claimable/{address}?chain=1&chain=2"),
-                bad("invalid_query"),
+                bad(ErrorCode::InvalidQuery),
             ),
         ];
         for (path, expected) in cases {

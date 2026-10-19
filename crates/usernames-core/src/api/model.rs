@@ -39,11 +39,48 @@ pub struct ErrorBody {
     pub error: ErrorDetail,
 }
 
+/// Why a request was refused, stable and machine-readable: a UI branches on
+/// it, never on the prose beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    /// No chain in scope binds the handle.
+    HandleNotBound,
+    /// The handle was bound and retired: it no longer resolves.
+    HandleRetired,
+    /// No chain in scope binds the account.
+    IdNotBound,
+    /// No chain in scope configured the platform.
+    PlatformNotConfigured,
+    /// Text the platform could never hold as a handle.
+    HandleImpossible,
+    /// No indexer has committed a first window for the chains in scope.
+    NotSynced,
+    /// Neither a known platform key nor a 0x-hex platform id.
+    InvalidPlatform,
+    /// Not an address.
+    InvalidAddress,
+    /// Not a 0x-hex 32-byte handle node.
+    InvalidNode,
+    /// Not a chain id.
+    InvalidChain,
+    /// Not a cursor the list handed out.
+    InvalidCursor,
+    /// A query value the route refuses.
+    InvalidArgument,
+    /// A path that does not parse.
+    InvalidPath,
+    /// A query string that does not parse.
+    InvalidQuery,
+    /// A failure of the service, whatever the request.
+    Internal,
+}
+
 /// The two halves of an error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorDetail {
     /// Stable and machine-readable.
-    pub code: String,
+    pub code: ErrorCode,
     /// For humans; may be reworded.
     pub message: String,
 }

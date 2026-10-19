@@ -16,18 +16,20 @@
 //! signature turns an answer into an assertion, and neither of these has
 //! earned one.
 //!
-//! * **A chain the store does not hold** — mainnet included, and that is
-//!   the case worth stating plainly, because `addr(node)` with no coin type
-//!   IS a mainnet query and it is what `getAddress()` sends by default. The
-//!   resolver carries ONE `urls` list for every query it ever answers — it
-//!   cannot route by coin type — so ERC-3668 has the client walk that list
-//!   until something succeeds. A signed null is a success, and it ends the
-//!   walk. A gateway that signed null for every chain but its own would
-//!   therefore answer, authoritatively and wrongly, for chains its neighbours
-//!   in the list were there to serve. Refusing steps aside and lets the walk
-//!   continue — which also means a deployment must index every chain it
-//!   wants resolvable, mainnet among them, or the default query shape gets an
-//!   error rather than an address.
+//! * **A chain the store does not hold** — the registry's own included, and
+//!   that is the case worth stating plainly, because `addr(node)` with no
+//!   coin type asks for the chain of the registry it went through — Ethereum
+//!   mainnet from the mainnet registry, Sepolia from Sepolia's — and it is
+//!   what `getAddress()` sends by default. The resolver carries ONE `urls`
+//!   list for every query it ever answers — it cannot route by coin type —
+//!   so ERC-3668 has the client walk that list until something succeeds. A
+//!   signed null is a success, and it ends the walk. A gateway that signed
+//!   null for every chain but its own would therefore answer, authoritatively
+//!   and wrongly, for chains its neighbours in the list were there to serve.
+//!   Refusing steps aside and lets the walk continue — which also means a
+//!   deployment must index every chain it wants resolvable, its registry's
+//!   own among them, or the default query shape gets an error rather than an
+//!   address.
 //! * **An index too far behind.** Same shape: a signed null from a stale
 //!   index denies a binding that may already exist.
 //!
@@ -39,14 +41,24 @@
 //! that indexer last committed — which is what [`Config::max_lag_blocks`] and
 //! the indexer's own report guard.
 
-use std::sync::Arc;
+use std::{
+    fmt,
+    sync::Arc,
+    time::{
+        Duration,
+        SystemTime,
+        UNIX_EPOCH,
+    },
+};
 
 use alloy::primitives::{
     Address,
+    Bytes,
     B256,
 };
 use axum::{
     extract::{
+        rejection::PathRejection,
         Path,
         State,
     },
@@ -59,11 +71,11 @@ use axum::{
     Json,
     Router,
 };
+use chrono::TimeDelta;
 use libid_signer::ManagedSigner;
-use serde::Serialize;
-use tracing::{
-    error,
-    warn,
+use serde::{
+    Deserialize,
+    Serialize,
 };
 use usernames_core::{
     db::{
@@ -74,6 +86,7 @@ use usernames_core::{
     ens::{
         AddrShape,
         CoinType,
+        Domain,
         EnsError,
         Name,
         Record,
@@ -87,13 +100,23 @@ use usernames_core::{
 /// What the gateway needs: the store it reads, and the identity it signs with.
 #[derive(Clone)]
 pub struct Config {
-    /// The resolver this gateway answers for. Every answer is signed for this
-    /// address, whatever `{sender}` the path carries: the target is
-    /// configuration, never the request. A request naming another resolver is
-    /// refused rather than answered, so a value that fell behind a
-    /// `setResolver` is a visible 400 instead of a signature the resolver
-    /// rejects.
+    /// The domain this gateway's names sit under. A name outside it is
+    /// refused: a signed null is an assertion, and this gateway has standing
+    /// only over its own names.
+    pub domain: Domain,
+    /// The resolver this gateway answers for: the `HandleResolver` of its
+    /// domain. Every answer is signed for this address, whatever `{sender}`
+    /// the path carries: the target is configuration, never the request. A
+    /// request naming another resolver is refused rather than answered, so a
+    /// value that fell behind a `setResolver` is a visible 400 instead of a
+    /// signature the resolver rejects.
     pub resolver: Address,
+    /// The chain whose ENS registry the resolver is set in. It is what gives
+    /// bare `addr(node)` its meaning: coin type 60 asks for the registry's
+    /// own chain, so the query is a Sepolia question through Sepolia's
+    /// registry and an Ethereum one through the mainnet registry. Nothing in
+    /// a request names the registry, so the deployment does.
+    pub ens_chain: u64,
     /// The store every answer comes from. Which chains it holds is read per
     /// request, never configured: a coin type naming a chain no indexer has
     /// written gets an unsigned refusal, not a signed null — the resolver has
@@ -101,7 +124,7 @@ pub struct Config {
     /// another endpoint was there to finish.
     pub store: Store,
     /// How long an answer stays good. The resolver enforces it on chain.
-    pub ttl_secs: u64,
+    pub ttl: Duration,
     /// How far behind the chain an index may be and still assert anything.
     pub max_lag_blocks: u64,
     /// What signs an answer, pinned by the resolver's signer set; rotating it
@@ -119,14 +142,15 @@ impl Config {
         // — so the name has to be one this resolver has standing to speak
         // about, whatever record was asked of it.
         let name = Name::parse(&call.name).map_err(GatewayError::bad_request)?;
-        let query = name.query();
+        let query = name.query(&self.domain);
         // Not a name under this resolver's domain. Refused rather than
         // answered: a signed null is an authoritative "nobody holds this", and
         // this gateway has no standing to say that about someone else's name.
         if matches!(query, Err(EnsError::ForeignDomain)) {
-            return Err(GatewayError::bad_request(
-                "this resolver answers only for names under handles.link",
-            ));
+            return Err(GatewayError::bad_request(format!(
+                "this resolver answers only for names under {}",
+                self.domain
+            )));
         }
 
         // Only `addr` has a shape this gateway can fill. Anything else —
@@ -198,11 +222,7 @@ impl Config {
         // chain, or no chain any indexer declared, is simply not this chain's
         // name.
         if let Some(label) = &query.chain_label {
-            let named = self
-                .store
-                .chain_named(label)
-                .await
-                .map_err(GatewayError::internal)?;
+            let named = self.store.chain_named(label).await?;
             if named != Some(indexed.chain_id()) {
                 return Ok(null);
             }
@@ -234,7 +254,8 @@ impl Config {
         })
     }
 
-    /// The one chain in the store a coin type names, if there is exactly one.
+    /// The one chain in the store a coin type names when asked through this
+    /// gateway's registry, if there is exactly one.
     ///
     /// Matched against the chains the STORE holds — whatever indexers have
     /// written — never decoded back into a chain id. `0x80000000 | chainId`
@@ -249,18 +270,19 @@ impl Config {
         &self,
         coin_type: CoinType,
     ) -> Result<ChainMatch, GatewayError> {
-        let candidates: Vec<u64> = self
+        let mut candidates: Vec<(u64, IndexedChain)> = self
             .indexed_chains()
             .await?
             .into_iter()
-            .filter(|id| coin_type.names_chain(*id))
+            .filter(|(id, _)| coin_type.names_chain(*id, self.ens_chain))
             .collect();
-        Ok(match candidates.as_slice() {
-            [chain_id] => ChainMatch::One(self.indexed_chain(*chain_id)),
-            [] => ChainMatch::None,
-            both => {
-                warn!(
-                    chains = ?both,
+        let ids: Vec<u64> = candidates.iter().map(|(id, _)| *id).collect();
+        Ok(match candidates.pop() {
+            Some((_, chain)) if candidates.is_empty() => ChainMatch::One(chain),
+            None => ChainMatch::None,
+            Some(_) => {
+                tracing::warn!(
+                    chains = ?ids,
                     %coin_type,
                     "two indexed chains share one coin type"
                 );
@@ -269,24 +291,18 @@ impl Config {
         })
     }
 
-    /// Every chain an indexer has written into the store.
-    async fn indexed_chains(&self) -> Result<Vec<u64>, GatewayError> {
+    /// Every chain an indexer has written into the store, by the id a coin
+    /// type names it with, beside its index.
+    async fn indexed_chains(&self) -> Result<Vec<(u64, IndexedChain)>, GatewayError> {
         Ok(self
             .store
             .indexed_chains()
-            .await
-            .map_err(GatewayError::internal)?
+            .await?
             .into_iter()
-            .filter_map(|id| u64::try_from(id).ok())
+            .filter_map(|id| {
+                Some((u64::try_from(id).ok()?, IndexedChain(self.store.chain(id))))
+            })
             .collect())
-    }
-
-    /// One chain's index.
-    fn indexed_chain(&self, chain_id: u64) -> IndexedChain {
-        IndexedChain(
-            self.store
-                .chain(i64::try_from(chain_id).expect("came from an i64")),
-        )
     }
 
     /// Sign a result for one request, and encode what the resolver's callback
@@ -298,7 +314,7 @@ impl Config {
     ) -> Result<GatewayResponse, GatewayError> {
         let reply = Reply {
             result,
-            expires: Self::now().saturating_add(self.ttl_secs),
+            expires: Self::now().saturating_add(self.ttl.as_secs()),
         };
         // The digest is already the resolver's `makeSignatureHash`; no
         // EIP-191 prefix goes on top of it.
@@ -311,7 +327,7 @@ impl Config {
             // line — exactly inverted.
             .map_err(GatewayError::internal)?;
         Ok(GatewayResponse {
-            data: format!("0x{}", hex::encode(reply.encode(&signature))),
+            data: Bytes::from(reply.encode(&signature)),
         })
     }
 
@@ -319,15 +335,15 @@ impl Config {
     /// stays pure. Saturating, so an absurd TTL cannot wrap it — the startup
     /// ceiling rules one out anyway.
     fn now() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or_default()
     }
 
     /// Refuse a request that names another resolver.
     ///
-    /// Bound to one resolver on purpose. The digest names the configured
+    /// Bound to one resolver. The digest names the configured
     /// target, never `sender`, so this check adds no authority — what it adds
     /// is a visible error. Logged, because a 4xx is terminal for an ERC-3668
     /// client (it ends the walk of the resolver's `urls`) and a line here is
@@ -338,7 +354,7 @@ impl Config {
             .parse()
             .map_err(|_| GatewayError::bad_request("sender is not an address"))?;
         if sender != self.resolver {
-            warn!(
+            tracing::warn!(
                 %sender,
                 resolver = %self.resolver,
                 "refusing a request that names another resolver"
@@ -353,20 +369,16 @@ impl Config {
     /// One row per chain the store holds, as supervision should see it.
     async fn status(&self) -> Result<GatewayStatus, GatewayError> {
         let indexed = self.indexed_chains().await?;
+        let ids: Vec<u64> = indexed.iter().map(|(id, _)| *id).collect();
         let mut chains = Vec::with_capacity(indexed.len());
-        for &chain_id in &indexed {
-            let chain = self.indexed_chain(chain_id);
+        for (chain_id, chain) in indexed {
             let position = chain.position().await;
-            let names = chain
-                .0
-                .chain_names()
-                .await
-                .map_err(GatewayError::internal)?;
+            let names = chain.0.chain_names().await?;
             let lag = Lag::of(position);
             // What the gate sees: a chain sharing its coin type with another
             // in the store is refused for that coin type however fresh either
             // is.
-            let ambiguous = indexed
+            let ambiguous = ids
                 .iter()
                 .any(|other| CoinType::shared_by(chain_id, *other));
             chains.push(ChainStatus {
@@ -374,7 +386,9 @@ impl Config {
                 names,
                 lag_blocks: lag.blocks(),
                 indexer_reported_at: position.and_then(|p| p.reported_at),
-                report_valid_for: position.and_then(|p| p.valid_for),
+                report_valid_for: position
+                    .and_then(|p| p.valid_for)
+                    .map(|valid_for| valid_for.num_seconds()),
                 ambiguous,
                 stale: ambiguous || lag.staleness(self.max_lag_blocks).is_some(),
             });
@@ -414,9 +428,8 @@ impl IndexedChain {
         Ok(self
             .0
             .resolve_handle(platform, handle)
-            .await
-            .map_err(GatewayError::internal)?
-            .and_then(|row| row.owner_address()))
+            .await?
+            .and_then(|row| row.owner))
     }
 
     /// Where this index stands, or nothing if the store cannot say.
@@ -447,9 +460,9 @@ impl IndexedChain {
 /// How far behind the chain an answer would be.
 enum Lag {
     /// Read from an index: this many blocks behind the target its indexer
-    /// last set, and this many seconds before that indexer's report expires
-    /// — negative once it has.
-    Indexed { blocks: u64, valid_for: i64 },
+    /// last set, and this long before that indexer's report expires —
+    /// negative once it has.
+    Indexed { blocks: u64, valid_for: TimeDelta },
     /// An index that cannot say. Treated as too stale, because a source that
     /// does not know its own position has not earned the right to deny a
     /// binding.
@@ -491,9 +504,9 @@ impl Lag {
     /// sees.
     fn staleness(&self, max_lag_blocks: u64) -> Option<Staleness> {
         match *self {
-            Self::Indexed { valid_for, .. } if valid_for < 0 => {
-                Some(Staleness::Expired(valid_for.unsigned_abs()))
-            }
+            Self::Indexed { valid_for, .. } if valid_for < TimeDelta::zero() => Some(
+                Staleness::Expired(valid_for.abs().to_std().unwrap_or_default()),
+            ),
             Self::Indexed { blocks, .. } if blocks > max_lag_blocks => {
                 Some(Staleness::Behind(blocks))
             }
@@ -508,8 +521,8 @@ impl Lag {
 enum Staleness {
     /// The cursor trails the target by this many blocks.
     Behind(u64),
-    /// The indexer's last report expired this many seconds ago.
-    Expired(u64),
+    /// The indexer's last report expired this long ago.
+    Expired(Duration),
     /// The index cannot report its position at all.
     Unknown,
 }
@@ -521,8 +534,11 @@ impl Staleness {
             Self::Behind(lag) => {
                 format!("read model is {lag} blocks behind; not answering")
             }
-            Self::Expired(secs) => {
-                format!("the indexer's last report expired {secs}s ago; not answering")
+            Self::Expired(ago) => {
+                format!(
+                    "the indexer's last report expired {}s ago; not answering",
+                    ago.as_secs()
+                )
             }
             Self::Unknown => {
                 "read model cannot report its position; not answering".into()
@@ -557,7 +573,7 @@ enum Answer {
 impl Answer {
     /// The bytes to sign, or the refusal to send instead.
     ///
-    /// The refusals are unsigned on purpose: a signature would make the answer
+    /// The refusals are unsigned: a signature would make the answer
     /// an assertion, and none of them has earned one. Unsigned lets the client
     /// fall through to the next endpoint in `urls`.
     fn into_result(self) -> Result<Vec<u8>, GatewayError> {
@@ -576,7 +592,7 @@ impl Answer {
                 "two indexed chains share coin type {coin_type}; not answering"
             ))),
             Self::TooStale(why) => {
-                warn!(?why, "refusing to answer from a stale index");
+                tracing::warn!(?why, "refusing to answer from a stale index");
                 Err(GatewayError::unavailable(why.message()))
             }
         }
@@ -620,30 +636,33 @@ pub fn router(state: GatewayState) -> Router {
 }
 
 /// One served chain, as supervision should see it.
-#[derive(Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ChainStatus {
-    chain_id: u64,
+pub struct ChainStatus {
+    /// The chain.
+    pub chain_id: u64,
     /// The names the chain goes by in a name, as its indexer declared them.
-    names: Vec<String>,
+    pub names: Vec<String>,
     /// Blocks between the indexer's target and its cursor.
-    lag_blocks: Option<u64>,
+    pub lag_blocks: Option<u64>,
     /// Unix seconds at which the indexer last reported.
-    indexer_reported_at: Option<u64>,
+    pub indexer_reported_at: Option<u64>,
     /// Seconds until the indexer's last report expires, negative once it has.
-    report_valid_for: Option<i64>,
+    pub report_valid_for: Option<i64>,
     /// Whether another chain in the store shares this chain's coin type, in
     /// which case queries for that coin type are refused however fresh either
     /// is: the store cannot say which was meant.
-    ambiguous: bool,
+    pub ambiguous: bool,
     /// Whether a query for this chain would be refused right now, for any of
     /// the reasons above.
-    stale: bool,
+    pub stale: bool,
 }
 
-#[derive(Serialize)]
-struct GatewayStatus {
-    chains: Vec<ChainStatus>,
+/// `GET /ens/status`: every chain the gateway serves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayStatus {
+    /// One row per chain the store holds.
+    pub chains: Vec<ChainStatus>,
 }
 
 /// `GET /status`: one row per chain the store holds. For alerting, never for
@@ -656,10 +675,12 @@ async fn status(
     Ok(Json(state.config.status().await?))
 }
 
-/// What ERC-3668 hands back: one hex blob the resolver's callback decodes.
-#[derive(Serialize)]
-struct GatewayResponse {
-    data: String,
+/// What ERC-3668 hands back: one blob the resolver's callback decodes,
+/// 0x-hex on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayResponse {
+    /// `abi.encode(result, expires, signature)`.
+    pub data: Bytes,
 }
 
 /// Why an answer could not be given at all — as opposed to given as null.
@@ -687,16 +708,11 @@ impl GatewayError {
         }
     }
 
-    /// A failure of ours. The cause is LOGGED, never serialized — the same
-    /// split `api.rs` makes.
-    ///
-    /// A `sqlx` error carries schema names and connection strings, and this
-    /// route is unauthenticated. Returning it would tell a caller things the
-    /// REST half of the same process deliberately withholds, and returning it
-    /// INSTEAD of logging it — which is what this used to do — leaves the
-    /// operator with nothing while the caller has everything.
-    fn internal(e: impl std::fmt::Display) -> Self {
-        error!(cause = %e, "gateway lookup failed");
+    /// A failure of ours: the cause is logged, never served, since a `sqlx`
+    /// error carries schema names and connection strings and this route is
+    /// unauthenticated.
+    fn internal(e: impl fmt::Display) -> Self {
+        tracing::error!(cause = %e, "gateway lookup failed");
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: "lookup failed".into(),
@@ -704,14 +720,37 @@ impl GatewayError {
     }
 }
 
+impl From<sqlx::Error> for GatewayError {
+    fn from(e: sqlx::Error) -> Self {
+        Self::internal(e)
+    }
+}
+
+/// A path axum could not take apart, such as invalid UTF-8.
+impl From<PathRejection> for GatewayError {
+    fn from(rejection: PathRejection) -> Self {
+        if rejection.status().is_server_error() {
+            Self::internal(rejection.body_text())
+        } else {
+            Self::bad_request(rejection.body_text())
+        }
+    }
+}
+
 impl IntoResponse for GatewayError {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(serde_json::json!({ "message": self.message })),
-        )
-            .into_response()
+        let refusal = GatewayRefusal {
+            message: self.message,
+        };
+        (self.status, Json(refusal)).into_response()
     }
+}
+
+/// The body of a refusal, the shape ERC-3668 clients read an error in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayRefusal {
+    /// Why, for humans.
+    pub message: String,
 }
 
 /// One request's calldata, as the path carried it and as it decodes.
@@ -741,8 +780,9 @@ impl Request {
 /// The ERC-3668 route: accept the sender, decode the call, answer, sign.
 async fn resolve(
     State(state): State<GatewayState>,
-    Path((sender, data)): Path<(String, String)>,
+    path: Result<Path<(String, String)>, PathRejection>,
 ) -> Result<Json<GatewayResponse>, GatewayError> {
+    let Path((sender, data)) = path?;
     let config = &state.config;
     config.accept(&sender)?;
     let request = Request::from_path(&data)?;

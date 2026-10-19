@@ -9,24 +9,24 @@
 //! [`Window::apply`], so replaying a window — after a crash, or after a
 //! version-bump re-index — converges instead of counting an event twice.
 
+use std::time::Duration;
+
 use alloy::primitives::{
     Address,
     B256,
 };
+use chrono::TimeDelta;
 use sqlx::{
+    migrate::Migrator,
     Connection,
     PgPool,
     Postgres,
     QueryBuilder,
     Transaction,
 };
-use tracing::{
-    error,
-    info,
-    warn,
-};
 
 use crate::{
+    ens::ChainName,
     events::{
         LogPosition,
         NamesEvent,
@@ -65,22 +65,11 @@ pub use self::{
 /// from the deployment block — the re-index IS the migration.
 pub const INDEXER_VERSION: &str = "2";
 
-/// Every projection table, in one place. [`ChainStore::prepare`] clears them
-/// for a replay and the tests clean them between scenarios; a single list
-/// means a new table cannot be wiped in one place and silently survive in
-/// another.
-pub const PROJECTION_TABLES: &[&str] = &[
-    "events",
-    "ids",
-    "handles",
-    "published",
-    "platforms",
-    "escrow_held",
-    "escrow_refundable",
-    "address_events",
-    "handle_events",
-    "handle_nodes",
-];
+pub use self::sql::{
+    CLEAR_CHAIN,
+    CLEAR_CHAIN_METADATA,
+    CLEAR_CHAIN_NAMES,
+};
 
 // The chain_metadata keys. Chain scoping is the table's chain_id column;
 // only the deployment-block cache still carries anything in its key.
@@ -105,14 +94,15 @@ pub struct IndexPosition {
     pub cursor: Option<u64>,
     /// Unix seconds at which the indexer last reported.
     pub reported_at: Option<u64>,
-    /// Seconds until the indexer's last report expires; negative once it has.
-    pub valid_for: Option<i64>,
+    /// How long until the indexer's last report expires; negative once it
+    /// has.
+    pub valid_for: Option<TimeDelta>,
 }
 
-/// The longest validity the store will write: ten years. Anything larger is
-/// a mistake, and a value near `i64::MAX` would overflow the `bigint` addition
-/// in Postgres and fail the whole statement, target included.
-const MAX_VALID_FOR_SECS: u64 = 10 * 366 * 24 * 60 * 60;
+/// The longest a report may be trusted: a year. A longer setting is a
+/// mistake, and the store clamps what it writes to this, so the `bigint`
+/// addition in Postgres never overflows and fails the statement.
+pub const MAX_VALID_FOR: Duration = Duration::from_secs(366 * 24 * 60 * 60);
 
 /// The whole store: every chain any indexer has written into one database.
 ///
@@ -158,7 +148,7 @@ impl Store {
 /// invokes it, so anything outside this crate — a test in either binary —
 /// would have to spell a relative path back to here and would break the day
 /// the layout moves.
-pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 /// Connect and bring the schema current.
 pub async fn connect_and_migrate(database_url: &str) -> anyhow::Result<PgPool> {
@@ -182,47 +172,22 @@ pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
 /// every failure is the database's: a chain value that does not fit a BIGINT
 /// is this indexer's limit, and blaming the driver for it would send an
 /// operator debugging the wrong layer.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
     /// The database refused or the connection failed.
-    Db(sqlx::Error),
+    #[error("database: {0}")]
+    Db(#[from] sqlx::Error),
     /// A chain value does not fit the column that stores it.
+    #[error("{what} {value} does not fit in a BIGINT")]
     OutOfRange {
         /// Which value, named the way the event names it.
         what: &'static str,
         /// The value itself.
         value: u64,
     },
-    /// The event did not serialize into its journal payload.
-    Journal(serde_json::Error),
-}
-
-impl std::fmt::Display for ApplyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Db(e) => write!(f, "database: {e}"),
-            Self::OutOfRange { what, value } => {
-                write!(f, "{what} {value} does not fit in a BIGINT")
-            }
-            Self::Journal(e) => write!(f, "journal payload: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for ApplyError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Db(e) => Some(e),
-            Self::OutOfRange { .. } => None,
-            Self::Journal(e) => Some(e),
-        }
-    }
-}
-
-impl From<sqlx::Error> for ApplyError {
-    fn from(e: sqlx::Error) -> Self {
-        Self::Db(e)
-    }
+    /// The event did not serialize into, or read back from, its journal row.
+    #[error("journal payload: {0}")]
+    Journal(#[from] serde_json::Error),
 }
 
 /// Why a chain's names could not be declared.
@@ -253,13 +218,9 @@ pub enum ChainNamesError {
 /// makes it safe. The lease remembers which chain it locks, and `prepare`
 /// verifies the match, so a lease from one store cannot vouch for another.
 pub struct WriterLease {
-    /// A connection of its OWN, deliberately not one from the pool. An advisory
-    /// lock taken with `pg_try_advisory_lock` is held for the SESSION, and a
-    /// pooled connection outlives the lease: dropping it returned a live
-    /// session, still holding the lock, to the idle pool, where it sat for the
-    /// idle timeout. A second indexer — or the next test — then blocked on a
-    /// lock nobody was using. Here the session is the lease's own, so dropping
-    /// it closes the socket and Postgres releases the lock.
+    /// The lease's own session, not a pooled one: the advisory lock belongs to
+    /// the session, so a pooled connection would carry the lock back into the
+    /// pool. Dropping this one closes the socket, and Postgres releases it.
     conn: sqlx::PgConnection,
     /// The chain whose advisory lock this connection holds.
     chain_id: i64,
@@ -274,7 +235,7 @@ impl WriterLease {
     /// every test that takes a second lease on the same chain.
     pub async fn release(mut self) -> Result<(), sqlx::Error> {
         let key = format!("usernames-indexer:{}", self.chain_id);
-        sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+        sqlx::query(sql::WRITER_UNLOCK)
             .bind(&key)
             .execute(&mut self.conn)
             .await?;
@@ -299,12 +260,6 @@ impl ChainStore {
     /// The chain this store is scoped to.
     pub fn chain_id(&self) -> i64 {
         self.chain_id
-    }
-
-    /// The pool behind this store, for a caller that needs a query this type
-    /// does not offer — a test arranging a state the writer would produce.
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
     }
 
     async fn get_metadata(&self, key: &str) -> Result<Option<String>, sqlx::Error> {
@@ -332,17 +287,16 @@ impl ChainStore {
         let mut conn =
             sqlx::PgConnection::connect_with(&self.pool.connect_options()).await?;
         let key = format!("usernames-indexer:{}", self.chain_id);
-        let taken: bool =
-            sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, 0))")
-                .bind(&key)
-                .fetch_one(&mut conn)
-                .await?;
+        let taken: bool = sqlx::query_scalar(sql::WRITER_TRY_LOCK)
+            .bind(&key)
+            .fetch_one(&mut conn)
+            .await?;
         if !taken {
-            warn!(
+            tracing::warn!(
                 chain_id = self.chain_id,
                 "another indexer holds this chain's writer lock; waiting"
             );
-            sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+            sqlx::query(sql::WRITER_LOCK)
                 .bind(&key)
                 .execute(&mut conn)
                 .await?;
@@ -382,9 +336,11 @@ impl ChainStore {
             "writer lease locks chain {}, but this store prepares chain {}",
             writer.chain_id, self.chain_id
         );
-        let version = self.get_metadata(SCHEMA_VERSION_KEY).await?;
-        let known_contract = self.get_metadata(CONTRACT_KEY).await?;
-        let known_escrow = self.get_metadata(ESCROW_KEY).await?;
+        let (version, known_contract, known_escrow) = tokio::try_join!(
+            self.get_metadata(SCHEMA_VERSION_KEY),
+            self.get_metadata(CONTRACT_KEY),
+            self.get_metadata(ESCROW_KEY),
+        )?;
         let contract_now = contract.to_string().to_lowercase();
         let escrow_now = escrow.map(|escrow| escrow.to_string().to_lowercase());
         let version_ok = version.as_deref() == Some(INDEXER_VERSION);
@@ -393,7 +349,7 @@ impl ChainStore {
         if version_ok && contract_ok && escrow_ok {
             return Ok(());
         }
-        warn!(
+        tracing::warn!(
             chain_id = self.chain_id,
             version_from = version.as_deref().unwrap_or("<none>"),
             version_to = INDEXER_VERSION,
@@ -404,12 +360,10 @@ impl ChainStore {
             "read-model shape or a watched contract changed; clearing this chain for a full replay"
         );
         let mut tx = self.pool.begin().await?;
-        for table in PROJECTION_TABLES {
-            sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
-                .bind(self.chain_id)
-                .execute(&mut *tx)
-                .await?;
-        }
+        sqlx::query(sql::CLEAR_CHAIN)
+            .bind(self.chain_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(sql::CLEAR_CHAIN_METADATA)
             .bind(self.chain_id)
             .execute(&mut *tx)
@@ -431,7 +385,7 @@ impl ChainStore {
                 .await?;
         }
         tx.commit().await?;
-        info!(
+        tracing::info!(
             chain_id = self.chain_id,
             version = INDEXER_VERSION,
             "replay armed; starts next cycle"
@@ -444,7 +398,7 @@ impl ChainStore {
     /// window.
     pub async fn set_chain_head(&self, head: u64) {
         if let Err(e) = self.set_metadata(HEAD_KEY, &head.to_string()).await {
-            warn!(%e, "failed to record the chain head");
+            tracing::warn!(%e, "failed to record the chain head");
         }
     }
 
@@ -467,28 +421,27 @@ impl ChainStore {
     /// confirmation depth.
     ///
     /// Record the target, when it was reported, and how long readers may
-    /// trust that report — `valid_for_secs` from now, by the database's
-    /// clock. One statement, so the three cannot disagree: a report must
+    /// trust that report — `valid_for` from now, by the database's clock. One statement, so the three cannot disagree: a report must
     /// never vouch for a target write that failed, and no host's clock
     /// enters into it.
     ///
     /// Returns whether the write landed, so a caller renewing the report
     /// later in the same cycle can decline to vouch for a target that never
     /// made it.
-    pub async fn set_chain_target(&self, target: u64, valid_for_secs: u64) -> bool {
+    pub async fn set_chain_target(&self, target: u64, valid_for: Duration) -> bool {
         let written = sqlx::query(sql::SET_CHAIN_TARGET)
             .bind(self.chain_id)
             .bind(TARGET_KEY)
             .bind(target.to_string())
             .bind(TARGET_REPORTED_AT_KEY)
             .bind(TARGET_VALID_UNTIL_KEY)
-            .bind(Self::valid_for_bind(valid_for_secs))
+            .bind(Self::valid_for_bind(valid_for))
             .execute(&self.pool)
             .await;
         match written {
             Ok(_) => true,
             Err(e) => {
-                warn!(%e, "failed to record the chain target");
+                tracing::warn!(%e, "failed to record the chain target");
                 false
             }
         }
@@ -498,16 +451,16 @@ impl ChainStore {
     /// chunk by chunk under one target, and every committed chunk is proof
     /// that the loop is alive and the chain reachable; without this a healthy
     /// backfill would expire.
-    pub async fn touch_chain_target(&self, valid_for_secs: u64) {
+    pub async fn touch_chain_target(&self, valid_for: Duration) {
         let touched = sqlx::query(sql::TOUCH_CHAIN_TARGET)
             .bind(self.chain_id)
             .bind(TARGET_REPORTED_AT_KEY)
             .bind(TARGET_VALID_UNTIL_KEY)
-            .bind(Self::valid_for_bind(valid_for_secs))
+            .bind(Self::valid_for_bind(valid_for))
             .execute(&self.pool)
             .await;
         if let Err(e) = touched {
-            warn!(%e, "failed to renew the chain target's report");
+            tracing::warn!(%e, "failed to renew the chain target's report");
         }
     }
 
@@ -518,11 +471,10 @@ impl ChainStore {
         format!("deploy_block:{contract}")
     }
 
-    /// The validity the store will write for a report: at most ten years,
-    /// so the `bigint` addition in Postgres can never overflow and fail the
-    /// whole statement, target included.
-    fn valid_for_bind(valid_for_secs: u64) -> i64 {
-        i64::try_from(valid_for_secs.min(MAX_VALID_FOR_SECS)).unwrap_or(i64::MAX)
+    /// The validity the store will write for a report, in the whole seconds
+    /// the SQL adds to its clock, at most [`MAX_VALID_FOR`].
+    fn valid_for_bind(valid_for: Duration) -> i64 {
+        i64::try_from(valid_for.min(MAX_VALID_FOR).as_secs()).unwrap_or(i64::MAX)
     }
 
     /// Declare the names this chain goes by in an ENS name, replacing whatever
@@ -533,7 +485,7 @@ impl ChainStore {
     pub async fn set_chain_names(
         &self,
         lease: &WriterLease,
-        names: &[crate::ens::ChainName],
+        names: &[ChainName],
     ) -> Result<(), ChainNamesError> {
         assert_eq!(
             lease.chain_id, self.chain_id,
@@ -577,18 +529,17 @@ impl ChainStore {
             .await
     }
 
-    /// Set when the report expires, as absolute Unix seconds.
-    ///
-    /// A test seam, and nothing else: production writes validity only through
-    /// [`Self::set_chain_target`] and [`Self::touch_chain_target`], relative
-    /// to the database's clock. Nothing in the binaries may call this.
-    #[doc(hidden)]
+    /// Set when the report expires, as absolute Unix seconds: how a suite
+    /// stands up an indexer that stopped reporting. Production writes
+    /// validity through [`Self::set_chain_target`] and
+    /// [`Self::touch_chain_target`], relative to the database's clock.
+    #[cfg(feature = "test-seams")]
     pub async fn set_chain_target_valid_until(&self, secs: u64) {
         if let Err(e) = self
             .set_metadata(TARGET_VALID_UNTIL_KEY, &secs.to_string())
             .await
         {
-            warn!(%e, "failed to record when the chain target's report expires");
+            tracing::warn!(%e, "failed to record when the chain target's report expires");
         }
     }
 
@@ -618,7 +569,7 @@ impl ChainStore {
                 position.valid_for = value
                     .parse::<i64>()
                     .ok()
-                    .map(|until| until.saturating_sub(now));
+                    .map(|until| TimeDelta::seconds(until.saturating_sub(now)));
             }
         }
         Ok(position)
@@ -648,7 +599,7 @@ impl ChainStore {
                 .map(|_| ()),
         };
         if let Err(e) = result {
-            warn!(%e, "failed to record the window error state");
+            tracing::warn!(%e, "failed to record the window error state");
         }
     }
 
@@ -723,7 +674,7 @@ impl ChainStore {
 /// chain actually keys — stay exact.
 fn sanitize(value: &str, what: &str) -> String {
     if value.contains('\0') {
-        error!(
+        tracing::error!(
             what,
             "string contains a NUL byte; storing with U+FFFD in its place"
         );
@@ -743,8 +694,8 @@ fn sanitize_json(value: &mut serde_json::Value) -> bool {
             true
         }
         serde_json::Value::String(_) => false,
-        // Deliberately exhaustive: every element must be scrubbed, so no
-        // short-circuiting combinator fits here.
+        // Every element must be scrubbed, so no short-circuiting combinator
+        // fits here.
         serde_json::Value::Array(items) => {
             let mut lossy = false;
             for item in items {
@@ -824,9 +775,9 @@ impl Window {
         let at = Position::of(pos)?;
         let (block, log_index) = (at.block, at.log_index);
 
-        let mut payload = event.payload().map_err(ApplyError::Journal)?;
+        let mut payload = event.payload()?;
         if sanitize_json(&mut payload) {
-            error!(
+            tracing::error!(
                 kind = event.kind(),
                 "journal payload contained a NUL byte; stored with U+FFFD in its place"
             );
@@ -835,7 +786,7 @@ impl Window {
             .bind(chain_id)
             .bind(block)
             .bind(log_index)
-            .bind(pos.tx_hash.as_slice())
+            .bind(pos.tx_hash)
             .bind(event.kind())
             .bind(payload)
             .execute(&mut *self.tx)
@@ -871,14 +822,14 @@ impl Window {
                 // platform ids or hashing drifted and resolution-by-string is
                 // broken until fixed.
                 if nodes::id_node(*platform_id, id) != *id_node {
-                    error!(%id_node, id, "recomputed idNode disagrees with the emitted topic");
+                    tracing::error!(%id_node, id, "recomputed idNode disagrees with the emitted topic");
                 }
                 if nodes::handle_node(
                     *platform_id,
                     &nodes::NormalizedHandle::from_chain(handle),
                 ) != *handle_node
                 {
-                    error!(%handle_node, handle, "recomputed handleNode disagrees with the emitted topic");
+                    tracing::error!(%handle_node, handle, "recomputed handleNode disagrees with the emitted topic");
                 }
 
                 let observed = as_i64(*observed_at, "observedAt")?;
@@ -886,13 +837,13 @@ impl Window {
                 let handle = sanitize(handle, "handle");
                 sqlx::query(sql::UPSERT_ID)
                     .bind(chain_id)
-                    .bind(id_node.as_slice())
-                    .bind(platform_id.as_slice())
+                    .bind(id_node)
+                    .bind(platform_id)
                     .bind(&id)
-                    .bind(holder.as_slice())
+                    .bind(holder)
                     .bind(observed)
                     .bind(i64::from(*ceremony_version))
-                    .bind(handle_node.as_slice())
+                    .bind(handle_node)
                     .bind(block)
                     .bind(log_index)
                     .execute(&mut *self.tx)
@@ -900,13 +851,13 @@ impl Window {
 
                 sqlx::query(sql::UPSERT_HANDLE)
                     .bind(chain_id)
-                    .bind(handle_node.as_slice())
-                    .bind(platform_id.as_slice())
+                    .bind(handle_node)
+                    .bind(platform_id)
                     .bind(&handle)
-                    .bind(holder.as_slice())
+                    .bind(holder)
                     .bind(observed)
                     .bind(i64::from(*ceremony_version))
-                    .bind(id_node.as_slice())
+                    .bind(id_node)
                     .bind(block)
                     .bind(log_index)
                     .execute(&mut *self.tx)
@@ -921,16 +872,16 @@ impl Window {
                 if *published {
                     sqlx::query(sql::PUBLISH)
                         .bind(chain_id)
-                        .bind(holder.as_slice())
-                        .bind(platform_id.as_slice())
+                        .bind(holder)
+                        .bind(platform_id)
                         .bind(&handle)
                         .execute(&mut *self.tx)
                         .await?;
                 } else {
                     sqlx::query(sql::UNPUBLISH)
                         .bind(chain_id)
-                        .bind(holder.as_slice())
-                        .bind(platform_id.as_slice())
+                        .bind(holder)
+                        .bind(platform_id)
                         .execute(&mut *self.tx)
                         .await?;
                 }
@@ -943,7 +894,7 @@ impl Window {
             } => {
                 sqlx::query(sql::RETIRE_HANDLE)
                     .bind(chain_id)
-                    .bind(handle_node.as_slice())
+                    .bind(handle_node)
                     .bind(block)
                     .bind(log_index)
                     .execute(&mut *self.tx)
@@ -956,8 +907,8 @@ impl Window {
             } => {
                 sqlx::query(sql::UNPUBLISH)
                     .bind(chain_id)
-                    .bind(holder.as_slice())
-                    .bind(platform_id.as_slice())
+                    .bind(holder)
+                    .bind(platform_id)
                     .execute(&mut *self.tx)
                     .await?;
             }
@@ -966,7 +917,7 @@ impl Window {
                 let key = nodes::Platform::key_of(*platform_id);
                 let reconfigured: bool = sqlx::query_scalar(sql::CONFIGURE_PLATFORM)
                     .bind(chain_id)
-                    .bind(platform_id.as_slice())
+                    .bind(platform_id)
                     .bind(key)
                     .bind(block)
                     .fetch_one(&mut *self.tx)
@@ -979,7 +930,7 @@ impl Window {
                     // rules payload, so the honest move is to say so loudly
                     // and keep indexing by node — node lookups stay exact
                     // either way.
-                    warn!(
+                    tracing::warn!(
                         %platform_id,
                         block,
                         "platform reconfigured on chain; if its rules changed, \
@@ -1029,9 +980,9 @@ pub struct HandleRow {
     /// The normalized handle, as the chain emitted it.
     pub handle: String,
     /// The storage key the chain filed this handle under.
-    pub handle_node: Vec<u8>,
-    /// The wallet, or `None` after retirement — the contract's `address(0)`.
-    pub owner: Option<Vec<u8>>,
+    pub handle_node: B256,
+    /// The holder, or `None` after retirement — the contract's `address(0)`.
+    pub owner: Option<Address>,
     /// The proof-freshness watermark, kept even through retirement.
     pub observed_at: i64,
     /// The ceremony version that proved the last binding at this node. Kept
@@ -1039,20 +990,9 @@ pub struct HandleRow {
     /// only record.
     pub ceremony_version: i64,
     /// The account id node this handle points back at (`idNodeByHandle`).
-    pub id_node: Vec<u8>,
+    pub id_node: B256,
     /// The plaintext account id behind that node, when it was ever bound.
     pub user_id: Option<String>,
-}
-
-impl HandleRow {
-    /// The owner as an address, or `None` after retirement or for a row whose
-    /// bytes are not an address.
-    pub fn owner_address(&self) -> Option<Address> {
-        self.owner
-            .as_deref()
-            .and_then(|bytes| <[u8; 20]>::try_from(bytes).ok())
-            .map(Address::from)
-    }
 }
 
 /// One `names.ids` row joined with the handle node it points at and the
@@ -1063,25 +1003,25 @@ pub struct IdentityRow {
     /// The chain the account is bound on.
     pub chain_id: i64,
     /// The platform the account lives on.
-    pub platform_id: Vec<u8>,
+    pub platform_id: B256,
     /// The plaintext account id, byte-verbatim as the chain keys it.
     pub user_id: String,
     /// The storage key the chain filed this account under.
-    pub id_node: Vec<u8>,
-    /// The wallet that proved the account.
-    pub owner: Vec<u8>,
+    pub id_node: B256,
+    /// The holder that proved the account.
+    pub owner: Address,
     /// The proof-freshness watermark.
     pub observed_at: i64,
     /// The ceremony version that proved the binding.
     pub ceremony_version: i64,
     /// The handle node this account last proved (`handleNodeById`).
-    pub handle_node: Vec<u8>,
+    pub handle_node: B256,
     /// The handle string at that node, when the node was ever bound.
     pub handle: Option<String>,
-    /// The wallet the handle node currently resolves to.
-    pub handle_owner: Option<Vec<u8>>,
+    /// The holder the handle node currently resolves to.
+    pub handle_owner: Option<Address>,
     /// The id node the handle currently points back at.
-    pub handle_id_node: Option<Vec<u8>>,
+    pub handle_id_node: Option<B256>,
     /// Whether a published row exists for (owner, platform, handle).
     pub published: bool,
 }
@@ -1093,8 +1033,7 @@ impl IdentityRow {
     /// account renamed or was overtaken, and showing the stale string would
     /// mis-route a payment.
     pub fn handle_still_owned(&self) -> bool {
-        self.handle_owner.as_deref() == Some(self.owner.as_slice())
-            && self.handle_id_node.as_deref() == Some(self.id_node.as_slice())
+        self.handle_owner == Some(self.owner) && self.handle_id_node == Some(self.id_node)
     }
 
     /// The handle to present, when it is still this account's.
@@ -1119,11 +1058,11 @@ pub struct SearchRow {
     /// The chain the handle is bound on.
     pub chain_id: i64,
     /// The platform the handle lives on.
-    pub platform_id: Vec<u8>,
+    pub platform_id: B256,
     /// The normalized handle.
     pub handle: String,
-    /// The wallet it resolves to (retired handles never match).
-    pub owner: Vec<u8>,
+    /// The holder it resolves to (retired handles never match).
+    pub owner: Address,
     /// The account id behind it, when bound.
     pub user_id: Option<String>,
     /// Whether the owner displays this handle.
@@ -1150,11 +1089,15 @@ impl Store {
     /// or on any chain when none is. Before that there is nothing to answer
     /// from, and a 404 would claim more than the store knows.
     pub async fn synced(&self, chain: Option<i64>) -> Result<bool, sqlx::Error> {
-        sqlx::query_scalar(sql::SYNCED)
-            .bind(CURSOR_KEY)
-            .bind(chain)
-            .fetch_one(&self.pool)
-            .await
+        let mut statement = QueryBuilder::new(sql::SYNCED);
+        statement.push(" WHERE key = ").push_bind(CURSOR_KEY);
+        scoped(&mut statement, "chain_id", chain);
+        statement.push(" LIMIT 1");
+        let found: Option<bool> = statement
+            .build_query_scalar()
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(found.is_some())
     }
 
     /// Whether any chain in scope ever configured this platform — the
@@ -1165,11 +1108,17 @@ impl Store {
         chain: Option<i64>,
         platform_id: B256,
     ) -> Result<bool, sqlx::Error> {
-        sqlx::query_scalar(sql::PLATFORM_WIRED)
-            .bind(platform_id.as_slice())
-            .bind(chain)
-            .fetch_one(&self.pool)
-            .await
+        let mut statement = QueryBuilder::new(sql::PLATFORM_WIRED);
+        statement
+            .push(" WHERE platform_id = ")
+            .push_bind(platform_id);
+        scoped(&mut statement, "chain_id", chain);
+        statement.push(" LIMIT 1");
+        let found: Option<bool> = statement
+            .build_query_scalar()
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(found.is_some())
     }
 
     /// The rows `resolveHandle` answers from, one per chain the handle is
@@ -1282,7 +1231,7 @@ fn handle_lookup(
         sql::HANDLE_PROJECTION
     ));
     statement
-        .push_bind(platform_id.as_slice().to_vec())
+        .push_bind(platform_id)
         .push(" AND h.handle = ")
         .push_bind(handle.as_str().to_string());
     scoped(&mut statement, "h.chain_id", chain);
@@ -1301,7 +1250,7 @@ fn id_lookup(
         sql::IDENTITY_PROJECTION
     ));
     statement
-        .push_bind(platform_id.as_slice().to_vec())
+        .push_bind(platform_id)
         .push(" AND i.user_id = ")
         .push_bind(user_id.to_string());
     scoped(&mut statement, "i.chain_id", chain);
@@ -1314,7 +1263,7 @@ fn identities_lookup(prefix: &str, chain: Option<i64>, owner: Address) -> Statem
         "{prefix}{} WHERE i.owner = ",
         sql::IDENTITY_PROJECTION
     ));
-    statement.push_bind(owner.as_slice().to_vec());
+    statement.push_bind(owner);
     scoped(&mut statement, "i.chain_id", chain);
     statement.push(" ORDER BY i.chain_id, i.platform_id, i.user_id");
     statement
@@ -1338,12 +1287,10 @@ fn search_lookup(
     if let Some(platform_id) = platform_id {
         statement
             .push(" AND h.platform_id = ")
-            .push_bind(platform_id.as_slice().to_vec());
+            .push_bind(platform_id);
     }
     if let Some(owner) = owner {
-        statement
-            .push(" AND h.owner = ")
-            .push_bind(owner.as_slice().to_vec());
+        statement.push(" AND h.owner = ").push_bind(owner);
     }
     match folded_query {
         Some(query) => {
@@ -1385,8 +1332,15 @@ mod sql {
     pub const GET_METADATA: &str = include_str!("../sql/get_metadata.sql");
     pub const UPSERT_METADATA: &str = include_str!("../sql/upsert_metadata.sql");
     pub const DELETE_METADATA: &str = include_str!("../sql/delete_metadata.sql");
+    /// Every row an indexer wrote for one chain into the read model: what a
+    /// replay clears, and what a suite clears before it writes the chain.
+    pub const CLEAR_CHAIN: &str = include_str!("../sql/clear_chain.sql");
+    /// The chain's metadata but its deployment-block cache.
     pub const CLEAR_CHAIN_METADATA: &str =
         include_str!("../sql/clear_chain_metadata.sql");
+    pub const WRITER_TRY_LOCK: &str = include_str!("../sql/writer_try_lock.sql");
+    pub const WRITER_LOCK: &str = include_str!("../sql/writer_lock.sql");
+    pub const WRITER_UNLOCK: &str = include_str!("../sql/writer_unlock.sql");
     pub const SET_CHAIN_TARGET: &str = include_str!("../sql/set_chain_target.sql");
     pub const TOUCH_CHAIN_TARGET: &str = include_str!("../sql/touch_chain_target.sql");
     pub const INDEX_POSITION: &str = include_str!("../sql/index_position.sql");
@@ -1398,6 +1352,7 @@ mod sql {
     pub const RETIRE_HANDLE: &str = include_str!("../sql/retire_handle.sql");
     pub const CONFIGURE_PLATFORM: &str = include_str!("../sql/configure_platform.sql");
     pub const CHAIN_NAMES_TAKEN: &str = include_str!("../sql/chain_names_taken.sql");
+    /// The names the chain goes by in an ENS name.
     pub const CLEAR_CHAIN_NAMES: &str = include_str!("../sql/clear_chain_names.sql");
     pub const INSERT_CHAIN_NAME: &str = include_str!("../sql/insert_chain_name.sql");
     pub const CHAIN_NAMES: &str = include_str!("../sql/chain_names.sql");

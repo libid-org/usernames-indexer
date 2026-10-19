@@ -1,4 +1,4 @@
-//! The ENS half: turning a name under `handles.link` back into a question the
+//! ENS: turning a name under `handles.link` back into a question the
 //! read model can answer.
 //!
 //! Everything here is pure. It parses, it inverts, it encodes; it reads no
@@ -20,11 +20,12 @@
 //!
 //! # Which chain
 //!
-//! A coin type names one chain, and mainnet is one of them rather than a
-//! default: bare `addr(node)` is coin type 60, which is Ethereum mainnet
-//! specifically. Whether an answer is owed for it is the gateway's decision
-//! rather than this module's — see `usernames-api`'s `ens` module, where a
-//! chain the store does not hold is refused rather than denied.
+//! A coin type names one chain, and none of them is a default. Bare
+//! `addr(node)` is coin type 60: the coin of the chain whose ENS registry was
+//! asked, so Ethereum mainnet through the mainnet registry and Sepolia
+//! through Sepolia's. Whether an answer is owed for it is the gateway's
+//! decision rather than this module's — see `usernames-api`'s `ens` module,
+//! where a chain the store does not hold is refused rather than denied.
 //!
 //! Note what the range limit does and does not cost. `0x80000000 | chainId`
 //! stops being injective at 2^31, so a coin type cannot be decoded back to one
@@ -35,7 +36,10 @@
 //! rather than decoding. [`CoinType::shared_by`] names the pair that cannot
 //! be served together.
 
-use std::fmt;
+use std::{
+    fmt,
+    str::FromStr,
+};
 
 use alloy::{
     primitives::{
@@ -53,8 +57,44 @@ use crate::nodes::{
     Platform,
 };
 
-/// The domain every name sits under, as labels.
-pub const DOMAIN: [&str; 2] = ["handles", "link"];
+/// The domain a gateway answers under when its deployment names none.
+pub const DEFAULT_DOMAIN: &str = "handles.link";
+
+/// The domain a gateway's names sit under: `handles.link`, or
+/// `testnet.handles.link` for a deployment that answers under a subname.
+///
+/// A deployment declares it; a name outside it is foreign, whatever its
+/// labels look like.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Domain {
+    labels: Vec<String>,
+}
+
+impl Domain {
+    /// The labels, leftmost first: `["testnet", "handles", "link"]`.
+    pub fn labels(&self) -> &[String] {
+        &self.labels
+    }
+}
+
+impl FromStr for Domain {
+    type Err = EnsError;
+
+    /// Dotted labels, each one a wallet could send after ENS normalization.
+    fn from_str(dotted: &str) -> Result<Self, Self::Err> {
+        let labels: Vec<String> = dotted.split('.').map(String::from).collect();
+        match labels.iter().find(|l| !Name::label_is_wellformed(l)) {
+            Some(label) => Err(EnsError::UnnormalizedLabel(label.clone())),
+            None => Ok(Self { labels }),
+        }
+    }
+}
+
+impl fmt::Display for Domain {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.labels.join("."))
+    }
+}
 
 /// A name a chain goes by in a name: the `base` in `alice.x.base.handles.link`.
 ///
@@ -76,18 +116,28 @@ pub enum ChainNameError {
     Platform(String),
 }
 
-impl ChainName {
-    /// Accept a name a chain may go by.
-    pub fn parse(name: &str) -> Result<Self, ChainNameError> {
+/// A name a chain may go by.
+impl FromStr for ChainName {
+    type Err = ChainNameError;
+
+    fn from_str(name: &str) -> Result<Self, ChainNameError> {
         if !Name::label_is_wellformed(name) {
             return Err(ChainNameError::Malformed(name.to_string()));
         }
-        if KnownPlatform::from_key(name).is_some() {
+        if name.parse::<KnownPlatform>().is_ok() {
             return Err(ChainNameError::Platform(name.to_string()));
         }
         Ok(Self(name.to_string()))
     }
+}
 
+impl fmt::Display for ChainName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl ChainName {
     /// The name, as the label it appears as.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -97,7 +147,8 @@ impl ChainName {
 /// ENSIP-11: an EVM chain's coin type is `0x80000000 | chainId`.
 const EVM_COIN_TYPE_BIT: u64 = 0x8000_0000;
 
-/// Coin type 60 is Ethereum mainnet — a specific chain, not an unknown one.
+/// Coin type 60 is ether: the coin of the chain whose ENS registry was asked —
+/// a specific chain, not an unknown one.
 const COIN_TYPE_ETH: u64 = 60;
 
 /// A coin type, exactly as a wallet asked with it: undecoded, and matched
@@ -137,15 +188,16 @@ impl CoinType {
         raw == COIN_TYPE_ETH || raw & EVM_COIN_TYPE_BIT != 0
     }
 
-    /// Whether this coin type names Ethereum mainnet, which answers to two:
-    /// the legacy 60, and ENSIP-11's `0x80000001`.
-    pub fn is_mainnet(self) -> bool {
-        self.0 == U256::from(COIN_TYPE_ETH) || self == Self::of_chain(1)
-    }
-
-    /// Whether this coin type names the given chain — forward, never decoded.
-    pub fn names_chain(self, chain_id: u64) -> bool {
-        Self::of_chain(chain_id) == self || (chain_id == 1 && self.is_mainnet())
+    /// Whether this coin type, asked through the ENS registry on `ens_chain`,
+    /// names the given chain — forward, never decoded.
+    ///
+    /// The registry's own chain answers to two: its ENSIP-11 coin type, and
+    /// the legacy 60. A wallet on Sepolia asks Sepolia's registry with bare
+    /// `addr(node)` and sends what it is given on Sepolia, so 60 there is
+    /// Sepolia and never Ethereum mainnet.
+    pub fn names_chain(self, chain_id: u64, ens_chain: u64) -> bool {
+        Self::of_chain(chain_id) == self
+            || (chain_id == ens_chain && self.0 == U256::from(COIN_TYPE_ETH))
     }
 
     /// Whether two chains cannot be told apart by their coin type.
@@ -191,7 +243,7 @@ pub enum EnsError {
     #[error("label {0:?} is not valid ENS-normalized text")]
     UnnormalizedLabel(String),
     /// The name does not sit under this gateway's domain.
-    #[error("name is not under handles.link")]
+    #[error("name is not under this gateway's domain")]
     ForeignDomain,
     /// Nothing left after the domain, or a platform label with no handle.
     #[error("name has no subject beneath the domain")]
@@ -280,7 +332,7 @@ impl Record {
         };
         match selector {
             // addr(bytes32) — the node and nothing else, which is coin type 60
-            // by definition: Ethereum mainnet.
+            // by definition: the coin of the chain whose registry was asked.
             s if s == ADDR_SELECTOR => match <(B256,)>::abi_decode_params(args) {
                 Ok((node,)) => Self::Addr {
                     node,
@@ -398,7 +450,7 @@ impl Name {
 
     /// The alphabet a handle-derived label may use: what X and GitHub reduce
     /// to after the substitution, and what Gmail's local part already is. A
-    /// chain name must satisfy it too, which [`ChainName::parse`] enforces.
+    /// chain name must satisfy it too, which parsing a [`ChainName`] enforces.
     pub fn label_is_wellformed(label: &str) -> bool {
         !label.is_empty()
             && label
@@ -406,8 +458,8 @@ impl Name {
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     }
 
-    /// The question this name asks.
-    pub fn query(&self) -> Result<Query, EnsError> {
+    /// The question this name asks of a gateway that answers under `domain`.
+    pub fn query(&self, domain: &Domain) -> Result<Query, EnsError> {
         // The domain before anything else, so a name that is not ours is
         // refused as foreign whatever its labels look like. Label hygiene is
         // a statement about OUR names; a name under someone else's domain is
@@ -415,7 +467,7 @@ impl Name {
         // "unreadable" — which is answered — by miscasing a label.
         let rest = self
             .labels
-            .strip_suffix(&DOMAIN.map(String::from))
+            .strip_suffix(domain.labels())
             .ok_or(EnsError::ForeignDomain)?;
         for label in rest {
             // ENS normalization never produces uppercase or whitespace.
@@ -434,9 +486,7 @@ impl Name {
         // Right to left. The rightmost label is either the platform, or a
         // chain label with the platform one further in.
         let (chain_label, marker_at) = match rest.last().map(String::as_str) {
-            Some(last) if KnownPlatform::from_key(last).is_some() => {
-                (None, rest.len() - 1)
-            }
+            Some(last) if last.parse::<KnownPlatform>().is_ok() => (None, rest.len() - 1),
             Some(chain) => {
                 if rest.len() < 2 {
                     return Err(EnsError::EmptyName);
@@ -455,7 +505,7 @@ impl Name {
         // A platform label this build does not know is not a parse failure —
         // it is a name nobody can hold, which the caller learns as a null
         // answer.
-        let platform = KnownPlatform::from_key(marker).ok_or(EnsError::EmptyName)?;
+        let platform: KnownPlatform = marker.parse().map_err(|_| EnsError::EmptyName)?;
         let handle = platform
             .handle_from_labels(head)
             .ok_or_else(|| EnsError::UnnormalizedLabel(head.join(".")))?;
@@ -597,6 +647,16 @@ mod tests {
         Name::parse(name).unwrap().labels().to_vec()
     }
 
+    /// The domain the mainnet deployment answers under.
+    fn handles_link() -> Domain {
+        DEFAULT_DOMAIN.parse().unwrap()
+    }
+
+    /// The domain the testnet deployment answers under.
+    fn testnet_handles_link() -> Domain {
+        "testnet.handles.link".parse().unwrap()
+    }
+
     fn handle_of(q: &Query) -> String {
         match &q.subject {
             Subject::Handle { handle, .. } => handle.clone(),
@@ -627,7 +687,9 @@ mod tests {
 
     #[test]
     fn the_short_form_names_a_platform_and_no_chain() {
-        let q = Name::from_labels(labels(ALICE_X)).query().unwrap();
+        let q = Name::from_labels(labels(ALICE_X))
+            .query(&handles_link())
+            .unwrap();
         assert_eq!(handle_of(&q), "alice");
         assert_eq!(q.chain_label, None);
     }
@@ -636,7 +698,7 @@ mod tests {
     fn a_chain_label_is_carried_and_never_guessed() {
         let q =
             Name::from_labels(labels(b"\x05alice\x01x\x04base\x07handles\x04link\x00"))
-                .query()
+                .query(&handles_link())
                 .unwrap();
         assert_eq!(handle_of(&q), "alice");
         assert_eq!(q.chain_label.as_deref(), Some("base"));
@@ -645,15 +707,55 @@ mod tests {
     #[test]
     fn a_name_outside_the_domain_is_refused() {
         assert!(matches!(
-            Name::from_labels(labels(b"\x05alice\x01x\x03eth\x00")).query(),
+            Name::from_labels(labels(b"\x05alice\x01x\x03eth\x00"))
+                .query(&handles_link()),
             Err(EnsError::ForeignDomain)
         ));
     }
 
     #[test]
+    fn a_subname_domain_takes_its_names_and_leaves_the_parents() {
+        let alice = b"\x05alice\x01x\x07testnet\x07handles\x04link\x00";
+        let q = Name::from_labels(labels(alice))
+            .query(&testnet_handles_link())
+            .unwrap();
+        assert_eq!(handle_of(&q), "alice");
+        assert_eq!(q.chain_label, None);
+
+        // The parent's own names are not this gateway's to speak about.
+        assert!(matches!(
+            Name::from_labels(labels(ALICE_X)).query(&testnet_handles_link()),
+            Err(EnsError::ForeignDomain)
+        ));
+    }
+
+    #[test]
+    fn a_chain_label_sits_before_a_subname_domain_too() {
+        let alice = b"\x05alice\x01x\x07sepolia\x07testnet\x07handles\x04link\x00";
+        let q = Name::from_labels(labels(alice))
+            .query(&testnet_handles_link())
+            .unwrap();
+        assert_eq!(handle_of(&q), "alice");
+        assert_eq!(q.chain_label.as_deref(), Some("sepolia"));
+    }
+
+    #[test]
+    fn a_domain_reads_and_writes_as_dotted_labels() {
+        let domain = testnet_handles_link();
+        assert_eq!(domain.labels(), ["testnet", "handles", "link"]);
+        assert_eq!(domain.to_string(), "testnet.handles.link");
+        for bad in ["Handles.link", "handles..link", ""] {
+            assert!(
+                matches!(bad.parse::<Domain>(), Err(EnsError::UnnormalizedLabel(_))),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
     fn the_domain_alone_names_nobody() {
         assert!(matches!(
-            Name::from_labels(labels(b"\x07handles\x04link\x00")).query(),
+            Name::from_labels(labels(b"\x07handles\x04link\x00")).query(&handles_link()),
             Err(EnsError::EmptyName)
         ));
     }
@@ -669,7 +771,7 @@ mod tests {
                 "handles".into(),
                 "link".into()
             ])
-            .query(),
+            .query(&handles_link()),
             Err(EnsError::UnnormalizedLabel(_))
         ));
     }
@@ -681,7 +783,7 @@ mod tests {
         // `_` -> `-` is a bijection onto its image because X's alphabet holds
         // no hyphen, so this reverses exactly.
         let q = Name::from_labels(labels(b"\x04a--b\x01x\x07handles\x04link\x00"))
-            .query()
+            .query(&handles_link())
             .unwrap();
         assert_eq!(handle_of(&q), "a__b");
     }
@@ -689,7 +791,7 @@ mod tests {
     #[test]
     fn github_labels_are_the_handle_unchanged() {
         let q = Name::from_labels(labels(b"\x05alice\x06github\x07handles\x04link\x00"))
-            .query()
+            .query(&handles_link())
             .unwrap();
         assert_eq!(handle_of(&q), "alice");
     }
@@ -698,7 +800,7 @@ mod tests {
     fn gmail_joins_its_labels_and_appends_the_domain_the_platform_implies() {
         let q =
             Name::from_labels(labels(b"\x05alice\x01b\x06google\x07handles\x04link\x00"))
-                .query()
+                .query(&handles_link())
                 .unwrap();
         assert_eq!(handle_of(&q), "alice.b@gmail.com");
     }
@@ -710,7 +812,7 @@ mod tests {
         // untested code on a payment path.
         assert!(matches!(
             Name::from_labels(labels(b"\x06al-ice\x06google\x07handles\x04link\x00"))
-                .query(),
+                .query(&handles_link()),
             Err(EnsError::UnnormalizedLabel(_))
         ));
     }
@@ -827,10 +929,28 @@ mod tests {
     fn a_chain_gets_the_coin_type_ensip11_gives_it() {
         assert_eq!(CoinType::of_chain(1).raw(), U256::from(0x8000_0001u64));
         assert_eq!(CoinType::of_chain(8453).raw(), U256::from(0x8000_2105u64)); // Base
-                                                                                // Mainnet answers to the legacy 60 as well.
-        assert!(CoinType::from(U256::from(60u64)).is_mainnet());
-        assert!(CoinType::of_chain(1).is_mainnet());
-        assert!(!CoinType::of_chain(8453).is_mainnet());
+    }
+
+    /// Bare `addr(node)` asks for the chain of the registry it went through.
+    ///
+    /// MetaMask on Sepolia asks Sepolia's registry with coin type 60 and sends
+    /// on Sepolia. Read as Ethereum mainnet, that query has no answer in a
+    /// deployment that indexes Sepolia, and a bound name shows no resolution.
+    #[test]
+    fn the_legacy_coin_type_names_the_chain_of_the_registry_asked() {
+        const MAINNET: u64 = 1;
+        const SEPOLIA: u64 = 11_155_111;
+        let legacy = CoinType::from(U256::from(60u64));
+
+        assert!(legacy.names_chain(MAINNET, MAINNET));
+        assert!(legacy.names_chain(SEPOLIA, SEPOLIA));
+        assert!(!legacy.names_chain(MAINNET, SEPOLIA));
+        assert!(!legacy.names_chain(SEPOLIA, MAINNET));
+
+        // An ENSIP-11 coin type names its chain through either registry.
+        assert!(CoinType::of_chain(MAINNET).names_chain(MAINNET, SEPOLIA));
+        assert!(CoinType::of_chain(SEPOLIA).names_chain(SEPOLIA, MAINNET));
+        assert!(!CoinType::of_chain(8453).names_chain(MAINNET, MAINNET));
     }
 
     /// The eden testnet, and why matching forwards is what makes it work.
@@ -1008,7 +1128,7 @@ mod chain_names {
     fn a_chain_name_is_a_label_apart_from_the_platforms() {
         for ok in ["eden", "base", "op-mainnet", "l2"] {
             assert_eq!(
-                ChainName::parse(ok).map(|n| n.as_str().to_string()),
+                ok.parse::<ChainName>().map(|n| n.to_string()),
                 Ok(ok.to_string())
             );
         }
@@ -1017,13 +1137,13 @@ mod chain_names {
                 .key()
                 .expect("a known platform has a key");
             assert_eq!(
-                ChainName::parse(key),
+                key.parse::<ChainName>(),
                 Err(ChainNameError::Platform(key.to_string()))
             );
         }
         for bad in ["", "Base", "eth main", "eth_main", "bäse", "x.y"] {
             assert!(
-                matches!(ChainName::parse(bad), Err(ChainNameError::Malformed(_))),
+                matches!(bad.parse::<ChainName>(), Err(ChainNameError::Malformed(_))),
                 "{bad:?}"
             );
         }

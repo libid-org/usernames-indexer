@@ -8,6 +8,8 @@
 #![deny(missing_docs)]
 #![deny(dead_code)]
 
+use std::time::Duration;
+
 use alloy::{
     primitives::Address,
     providers::{
@@ -18,7 +20,6 @@ use alloy::{
 use anyhow::Context;
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
 use url::Url;
 use usernames_core::{
     chain,
@@ -64,15 +65,16 @@ pub struct Config {
     /// store at every start for the gateway to read, replacing what this
     /// chain declared before; a name belongs to one chain across the store.
     #[arg(long, env = "CHAIN_NAMES", value_delimiter = ',', required = true)]
-    pub chain_names: Vec<String>,
+    pub chain_names: Vec<ChainName>,
 
     /// Blocks behind the head to stay; shallow-reorg protection.
     #[arg(long, env = "CONFIRMATIONS", default_value_t = 5)]
     pub confirmations: u64,
 
-    /// Seconds between poll cycles, and the retry delay after a failure.
-    #[arg(long, env = "POLL_INTERVAL_SECS", default_value_t = 5)]
-    pub poll_interval_secs: u64,
+    /// Time between poll cycles, and the retry delay after a failure:
+    /// `5s`, `1500ms`.
+    #[arg(long, env = "POLL_INTERVAL", default_value = "5s", value_parser = humantime::parse_duration)]
+    pub poll_interval: Duration,
 
     /// Largest eth_getLogs window, sized to the RPC provider's limits.
     #[arg(long, env = "MAX_BLOCK_RANGE", default_value_t = 10_000)]
@@ -82,18 +84,42 @@ pub struct Config {
     #[arg(long, env = "START_BLOCK")]
     pub start_block: Option<u64>,
 
-    /// How long readers may trust this indexer's last report, in seconds. The
-    /// API refuses a chain whose report has expired, so this decides how soon
-    /// a stopped indexer is noticed — and how long a slow chunk or a missed
-    /// cycle may take without a healthy loop reading as stopped. Unset means
-    /// four poll intervals plus a minute.
-    #[arg(long, env = "STALE_AFTER_SECS")]
-    pub stale_after_secs: Option<u64>,
+    /// How long readers may trust this indexer's last report: `80s`, `2m`.
+    /// The API refuses a chain whose report has expired, so this decides how
+    /// soon a stopped indexer is noticed — and how long a slow chunk or a
+    /// missed cycle may take without a healthy loop reading as stopped. Unset
+    /// means four poll intervals plus a minute.
+    #[arg(long, env = "STALE_AFTER", value_parser = humantime::parse_duration)]
+    pub stale_after: Option<Duration>,
 }
 
-/// The longest a report may be trusted: a year. Past that the setting is a
-/// mistake, and the store would clamp it anyway.
-const MAX_STALE_AFTER_SECS: u64 = 366 * 24 * 60 * 60;
+impl Config {
+    /// How long readers may trust a report: `STALE_AFTER`, or four poll
+    /// intervals plus a minute. Refused unless it outlasts a poll interval,
+    /// or every idle cycle would expire the report before the next one
+    /// renews it, and unless it stays within a year.
+    fn report_validity(&self) -> anyhow::Result<Duration> {
+        let validity = self.stale_after.unwrap_or(
+            self.poll_interval
+                .saturating_mul(4)
+                .saturating_add(Duration::from_secs(60)),
+        );
+        anyhow::ensure!(
+            validity > self.poll_interval,
+            "STALE_AFTER ({}) must exceed POLL_INTERVAL ({}), or every idle cycle \
+             expires the report before the next one renews it",
+            humantime::format_duration(validity),
+            humantime::format_duration(self.poll_interval)
+        );
+        anyhow::ensure!(
+            validity <= db::MAX_VALID_FOR,
+            "STALE_AFTER ({}) is more than a year; a report nobody expects to \
+             expire is not a report",
+            humantime::format_duration(validity)
+        );
+        Ok(validity)
+    }
+}
 
 /// Parse the environment, connect everything, and index until ctrl-c.
 pub async fn run() -> anyhow::Result<()> {
@@ -110,29 +136,7 @@ pub async fn run() -> anyhow::Result<()> {
     // Pure configuration, checked before anything is touched: `prepare`
     // below may wipe the chain's rows on a version bump, and a refusal has
     // to come before that, not after.
-    let stale_after_secs = config.stale_after_secs.unwrap_or(
-        config
-            .poll_interval_secs
-            .saturating_mul(4)
-            .saturating_add(60),
-    );
-    anyhow::ensure!(
-        stale_after_secs > config.poll_interval_secs,
-        "STALE_AFTER_SECS ({stale_after_secs}) must exceed POLL_INTERVAL_SECS ({}), or \
-         every idle cycle expires the report before the next one renews it",
-        config.poll_interval_secs
-    );
-    anyhow::ensure!(
-        stale_after_secs <= MAX_STALE_AFTER_SECS,
-        "STALE_AFTER_SECS ({stale_after_secs}) is more than a year; a report nobody \
-         expects to expire is not a report"
-    );
-    let chain_names = config
-        .chain_names
-        .iter()
-        .map(|name| ChainName::parse(name.trim()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| anyhow::anyhow!("CHAIN_NAMES: {e}"))?;
+    let stale_after = config.report_validity()?;
 
     let provider: RootProvider = RootProvider::new_http(config.rpc_url.clone());
     let reported = provider.get_chain_id().await?;
@@ -163,7 +167,7 @@ pub async fn run() -> anyhow::Result<()> {
     // still-running older pod.
     let writer = store.acquire_writer().await?;
     store.prepare(&writer, contract, escrow).await?;
-    store.set_chain_names(&writer, &chain_names).await?;
+    store.set_chain_names(&writer, &config.chain_names).await?;
 
     let cancel = CancellationToken::new();
     let indexer = indexer::Indexer::new(
@@ -173,33 +177,38 @@ pub async fn run() -> anyhow::Result<()> {
             contract,
             escrow,
             confirmations: config.confirmations,
-            poll_interval_secs: config.poll_interval_secs,
+            poll_interval: config.poll_interval,
             max_block_range: config.max_block_range,
             start_block: config.start_block,
-            stale_after_secs,
+            stale_after,
         },
     );
-    info!(chain_id, %contract, ?escrow, "indexing");
+    tracing::info!(chain_id, %contract, ?escrow, "indexing");
     let mut task = tokio::spawn(indexer.run(cancel.clone()));
 
-    tokio::select! {
+    let stopped = tokio::select! {
         r = tokio::signal::ctrl_c() => {
-            info!("shutting down");
+            tracing::info!("shutting down");
             cancel.cancel();
             let _ = task.await;
-            r?;
-            Ok(())
+            r.map_err(anyhow::Error::from)
         }
         r = &mut task => match r {
             Ok(()) => Err(anyhow::anyhow!("indexer task exited unexpectedly")),
             Err(e) => Err(anyhow::anyhow!("indexer task died: {e}")),
         },
-    }
+    };
+    // The loop no longer writes: the chain is the next instance's.
+    writer.release().await?;
+    stopped
 }
 
 #[cfg(test)]
 mod help_tests {
-    use clap::CommandFactory;
+    use clap::{
+        CommandFactory,
+        Parser,
+    };
 
     use super::Config;
 
@@ -218,6 +227,35 @@ mod help_tests {
                 arg.is_hide_env_values_set(),
                 "{secret} shows its value in --help"
             );
+        }
+    }
+
+    /// The chain names are parsed by clap into their type, so a platform key
+    /// or a malformed label stops the process before anything connects.
+    #[test]
+    fn chain_names_are_refused_at_parse() {
+        let args = |names: &str| {
+            Config::try_parse_from([
+                "usernames-indexer",
+                "--database-url",
+                "postgres://localhost/usernames",
+                "--rpc-url",
+                "http://127.0.0.1:8545",
+                "--identity-names-address",
+                "0x0000000000000000000000000000000000000001",
+                "--chain-names",
+                names,
+            ])
+        };
+        let names: Vec<String> = args("eden,base")
+            .expect("two labels")
+            .chain_names
+            .iter()
+            .map(|name| name.as_str().to_string())
+            .collect();
+        assert_eq!(names, ["eden", "base"]);
+        for bad in ["eden,x", "Eden", "eden,"] {
+            assert!(args(bad).is_err(), "{bad:?}");
         }
     }
 }

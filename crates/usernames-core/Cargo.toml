@@ -1,6 +1,6 @@
 [package]
 name = "usernames-core"
-version = "0.4.0"
+version = "0.5.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -8,11 +8,18 @@ repository.workspace = true
 description = "The read model, event decoding and indexing loop behind the usernames indexer and its read API."
 publish = false
 
+[features]
+# What the suites outside this crate use to stand up states the indexer
+# would reach only over time, such as a report that has expired.
+test-seams = []
+
 [dependencies]
 alloy.workspace = true
 alloy-primitives.workspace = true
 anyhow.workspace = true
 axum.workspace = true
+chrono = "0.4"
+futures-util = "0.3"
 libid-contracts.workspace = true
 libid-identity.workspace = true
 serde.workspace = true

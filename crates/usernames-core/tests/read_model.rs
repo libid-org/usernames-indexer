@@ -8,6 +8,14 @@
 
 mod common;
 
+use std::{
+    fmt::Debug,
+    time::Duration,
+};
+
+use chrono::TimeDelta;
+use tokio::time::Instant;
+
 use alloy::primitives::{
     Address,
     Bytes,
@@ -17,15 +25,21 @@ use alloy::primitives::{
 use axum::http::StatusCode;
 use common::Reply;
 use serde::de::DeserializeOwned;
-use sqlx::PgPool;
+use sqlx::{
+    postgres::PgPoolOptions,
+    PgPool,
+};
 use tokio::sync::{
     Mutex,
     MutexGuard,
 };
 use usernames_core::{
     api::model::{
+        AddressHistory,
         AddressResolution,
+        ErrorCode,
         HandleResolution,
+        HistoryEvent,
         IdResolution,
         SearchResults,
         Status,
@@ -66,7 +80,7 @@ async fn test_store_with(
 ) -> Option<(ChainStore, PgPool, MutexGuard<'static, ()>)> {
     let guard = DB_LOCK.lock().await;
     let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = sqlx::postgres::PgPoolOptions::new()
+    let pool = PgPoolOptions::new()
         .max_connections(max_connections)
         .connect(&url)
         .await
@@ -75,23 +89,7 @@ async fn test_store_with(
     // Scoped to this suite's chain, like the anvil suite scopes to its own:
     // neither depends on cargo happening to run test binaries sequentially.
     for chain in [CHAIN, OTHER_CHAIN] {
-        for table in db::PROJECTION_TABLES {
-            sqlx::query(&format!("DELETE FROM names.{table} WHERE chain_id = $1"))
-                .bind(chain)
-                .execute(&pool)
-                .await
-                .expect("cleanup failed");
-        }
-        sqlx::query("DELETE FROM names.chain_metadata WHERE chain_id = $1")
-            .bind(chain)
-            .execute(&pool)
-            .await
-            .expect("metadata cleanup failed");
-        sqlx::query("DELETE FROM names.chain_names WHERE chain_id = $1")
-            .bind(chain)
-            .execute(&pool)
-            .await
-            .expect("names cleanup failed");
+        common::clear_chain(&pool, chain).await;
     }
     Some((ChainStore::new(pool.clone(), CHAIN), pool, guard))
 }
@@ -153,13 +151,13 @@ fn retire(platform: B256, handle: &str, holder: Address) -> NamesEvent {
 /// A request scoped to this suite's chain: the store is shared with the
 /// anvil suite's chain, and an unscoped read would see both. The reads that
 /// span chains have their own test below.
-async fn get<T: DeserializeOwned>(store: &ChainStore, path: &str) -> Reply<T> {
+async fn get<T: DeserializeOwned>(pool: &PgPool, path: &str) -> Reply<T> {
     let separator = if path.contains('?') { '&' } else { '?' };
-    common::get(store, &format!("{path}{separator}chain={CHAIN}")).await
+    common::get(pool, &format!("{path}{separator}chain={CHAIN}")).await
 }
 
 /// The one binding a resolution carries in these single-chain scenarios.
-fn only<T: std::fmt::Debug>(bindings: &[T]) -> &T {
+fn only<T: Debug>(bindings: &[T]) -> &T {
     match bindings {
         [one] => one,
         many => panic!("one binding expected: {many:?}"),
@@ -168,16 +166,16 @@ fn only<T: std::fmt::Debug>(bindings: &[T]) -> &T {
 
 #[tokio::test]
 async fn bind_resolves_all_three_directions() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::Platform::from_key("x").unwrap().id();
+    let x = KnownPlatform::X.id();
     let alice = addr(0xA1);
     apply(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
 
     let resolved: HandleResolution =
-        get(&store, "/v1/resolve/handle/x/alice_1").await.answer();
+        get(&pool, "/v1/resolve/handle/x/alice_1").await.answer();
     let binding = only(&resolved.bindings);
     assert_eq!(binding.chain_id, CHAIN);
     assert_eq!(binding.owner, alice);
@@ -186,33 +184,33 @@ async fn bind_resolves_all_three_directions() {
 
     // The path normalizes the way the chain did: raw form finds the same row.
     let resolved: HandleResolution =
-        get(&store, "/v1/resolve/handle/x/@Alice_1").await.answer();
+        get(&pool, "/v1/resolve/handle/x/@Alice_1").await.answer();
     assert_eq!(resolved.handle, "alice_1");
     assert_eq!(resolved.platform, Some(KnownPlatform::X));
 
-    let resolved: IdResolution = get(&store, "/v1/resolve/id/x/111").await.answer();
+    let resolved: IdResolution = get(&pool, "/v1/resolve/id/x/111").await.answer();
     let binding = only(&resolved.bindings);
     assert_eq!(binding.owner, alice);
     assert_eq!(binding.handle.as_deref(), Some("alice_1"));
     assert!(binding.published);
 
-    let resolved: AddressResolution =
-        get(&store, &format!("/v1/resolve/address/{alice}"))
-            .await
-            .answer();
+    let resolved: AddressResolution = get(&pool, &format!("/v1/resolve/address/{alice}"))
+        .await
+        .answer();
     let identity = only(&resolved.identities);
     assert_eq!(identity.handle.as_deref(), Some("alice_1"));
     assert!(identity.published);
     assert!(identity.resolves);
+    drop(guard);
 }
 
 #[tokio::test]
 async fn rename_retires_the_previous_handle() {
-    let Some((store, pool, _guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::Platform::from_key("x").unwrap().id();
+    let x = KnownPlatform::X.id();
     let alice = addr(0xA1);
     apply(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
     // The contract emits the retirement before the new bind in the same tx.
@@ -221,19 +219,16 @@ async fn rename_retires_the_previous_handle() {
 
     // The code is the machine-readable half: a UI renders "retired"
     // differently from "never claimed" without parsing prose.
-    let refusal = get::<HandleResolution>(&store, "/v1/resolve/handle/x/alice_1")
+    let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/alice_1")
         .await
         .refusal();
-    assert_eq!(
-        refusal,
-        (StatusCode::NOT_FOUND, "handle_retired".to_string())
-    );
+    assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::HandleRetired));
 
     let resolved: HandleResolution =
-        get(&store, "/v1/resolve/handle/x/alice_2").await.answer();
+        get(&pool, "/v1/resolve/handle/x/alice_2").await.answer();
     assert_eq!(only(&resolved.bindings).owner, alice);
 
-    let resolved: IdResolution = get(&store, "/v1/resolve/id/x/111").await.answer();
+    let resolved: IdResolution = get(&pool, "/v1/resolve/id/x/111").await.answer();
     assert_eq!(only(&resolved.bindings).handle.as_deref(), Some("alice_2"));
 
     // The retired node keeps its watermark, mirroring the contract's
@@ -246,15 +241,16 @@ async fn rename_retires_the_previous_handle() {
     .await
     .expect("watermark row");
     assert_eq!(watermark, 1000);
+    drop(guard);
 }
 
 #[tokio::test]
 async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::Platform::from_key("x").unwrap().id();
+    let x = KnownPlatform::X.id();
     let (alice, bob) = (addr(0xA1), addr(0xB2));
     // Alice holds the handle, renames her platform account, re-proves under
     // the same handle... then the platform recycles the name to Bob's
@@ -264,36 +260,36 @@ async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
 
     // The handle resolves to Bob now, paired with Bob's id.
     let resolved: HandleResolution =
-        get(&store, "/v1/resolve/handle/x/popular").await.answer();
+        get(&pool, "/v1/resolve/handle/x/popular").await.answer();
     let binding = only(&resolved.bindings);
     assert_eq!(binding.owner, bob);
     assert_eq!(binding.user_id.as_deref(), Some("222"));
 
     // Alice's id still resolves to her wallet, but the handle is no longer
     // hers to display: the node points at Bob's id.
-    let resolved: IdResolution = get(&store, "/v1/resolve/id/x/111").await.answer();
+    let resolved: IdResolution = get(&pool, "/v1/resolve/id/x/111").await.answer();
     let binding = only(&resolved.bindings);
     assert_eq!(binding.owner, alice);
     assert_eq!(binding.handle, None);
+    drop(guard);
 }
 
 #[tokio::test]
 async fn publish_flag_is_the_post_state() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::Platform::from_key("x").unwrap().id();
+    let x = KnownPlatform::X.id();
     let alice = addr(0xA1);
     apply(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
     // A later bind that reports published=false clears the display name.
     apply(&store, 2, retire(x, "alice_1", alice)).await;
     apply(&store, 3, bind(alice, x, "111", "alice_2", 2000, false)).await;
 
-    let resolved: AddressResolution =
-        get(&store, &format!("/v1/resolve/address/{alice}"))
-            .await
-            .answer();
+    let resolved: AddressResolution = get(&pool, &format!("/v1/resolve/address/{alice}"))
+        .await
+        .answer();
     assert!(!only(&resolved.identities).published);
 
     // And HandleUnpublished after a published bind does the same.
@@ -308,11 +304,11 @@ async fn publish_flag_is_the_post_state() {
         },
     )
     .await;
-    let resolved: AddressResolution =
-        get(&store, &format!("/v1/resolve/address/{alice}"))
-            .await
-            .answer();
+    let resolved: AddressResolution = get(&pool, &format!("/v1/resolve/address/{alice}"))
+        .await
+        .answer();
     assert!(!only(&resolved.identities).published);
+    drop(guard);
 }
 
 /// The handles a search answered with, in its order.
@@ -322,12 +318,12 @@ fn handles_of(results: &SearchResults) -> Vec<&str> {
 
 #[tokio::test]
 async fn search_ranks_exact_prefix_substring() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::Platform::from_key("x").unwrap().id();
-    let github = nodes::Platform::from_key("github").unwrap().id();
+    let x = KnownPlatform::X.id();
+    let github = KnownPlatform::GitHub.id();
     apply(&store, 1, bind(addr(1), x, "1", "ali", 1000, false)).await;
     apply(&store, 2, bind(addr(2), x, "2", "alice_1", 1000, true)).await;
     apply(&store, 3, bind(addr(3), x, "3", "malice", 1000, false)).await;
@@ -339,7 +335,7 @@ async fn search_ranks_exact_prefix_substring() {
     )
     .await;
 
-    let results: SearchResults = get(&store, "/v1/search?q=ali").await.answer();
+    let results: SearchResults = get(&pool, "/v1/search?q=ali").await.answer();
     // Exact first, then prefix alphabetically, then substring.
     assert_eq!(
         handles_of(&results),
@@ -354,80 +350,82 @@ async fn search_ranks_exact_prefix_substring() {
     assert_eq!(results.query.as_deref(), Some("ali"));
 
     // Pages walk the same ranked list; a short page is the last one.
-    let page: SearchResults = get(&store, "/v1/search?q=ali&limit=2&offset=1")
+    let page: SearchResults = get(&pool, "/v1/search?q=ali&limit=2&offset=1")
         .await
         .answer();
     assert_eq!((page.limit, page.offset), (2, 1));
     assert_eq!(handles_of(&page), ["alice_1", "alicorn"]);
-    let page: SearchResults = get(&store, "/v1/search?q=ali&limit=2&offset=3")
+    let page: SearchResults = get(&pool, "/v1/search?q=ali&limit=2&offset=3")
         .await
         .answer();
     assert_eq!(page.hits.len(), 1, "{page:?}");
 
     // The platform filter narrows to that keyspace.
-    let results: SearchResults = get(&store, "/v1/search?q=ali&platform=github")
+    let results: SearchResults = get(&pool, "/v1/search?q=ali&platform=github")
         .await
         .answer();
     assert_eq!(handles_of(&results), ["alicorn"]);
     assert_eq!(results.hits[0].platform, Some(KnownPlatform::GitHub));
 
     // Search folds the way normalization does: case and a leading @ vanish.
-    let results: SearchResults = get(&store, "/v1/search?q=%40ALI").await.answer();
+    let results: SearchResults = get(&pool, "/v1/search?q=%40ALI").await.answer();
     assert_eq!(results.hits.len(), 4);
 
     // A wallet's handles, alone or narrowed by text; the two intersect.
-    let results: SearchResults = get(&store, &format!("/v1/search?owner={}", addr(2)))
+    let results: SearchResults = get(&pool, &format!("/v1/search?owner={}", addr(2)))
         .await
         .answer();
     assert_eq!(handles_of(&results), ["alice_1"]);
     assert_eq!(results.owner, Some(addr(2)));
     assert_eq!(results.query, None);
     let results: SearchResults =
-        get(&store, &format!("/v1/search?q=ali&owner={}", addr(1)))
+        get(&pool, &format!("/v1/search?q=ali&owner={}", addr(1)))
             .await
             .answer();
     assert_eq!(handles_of(&results), ["ali"]);
     let results: SearchResults =
-        get(&store, &format!("/v1/search?q=bob&owner={}", addr(1)))
+        get(&pool, &format!("/v1/search?q=bob&owner={}", addr(1)))
             .await
             .answer();
     assert!(results.hits.is_empty(), "{results:?}");
 
     // Neither text nor wallet is not a question, and a wallet must parse.
-    let refusal = get::<SearchResults>(&store, "/v1/search").await.refusal();
+    let refusal = get::<SearchResults>(&pool, "/v1/search").await.refusal();
     assert_eq!(
         refusal,
-        (StatusCode::BAD_REQUEST, "invalid_argument".to_string())
+        (StatusCode::BAD_REQUEST, ErrorCode::InvalidArgument)
     );
-    let refusal = get::<SearchResults>(&store, "/v1/search?owner=nobody")
+    let refusal = get::<SearchResults>(&pool, "/v1/search?owner=nobody")
         .await
         .refusal();
     assert_eq!(
         refusal,
-        (StatusCode::BAD_REQUEST, "invalid_address".to_string())
+        (StatusCode::BAD_REQUEST, ErrorCode::InvalidAddress)
     );
 
     // A retired handle stops matching. Its fuzzy neighbors still do — that
     // is what the trigram branch is for — but the retired name itself is
     // gone from the results.
     apply(&store, 6, retire(x, "alice_1", addr(2))).await;
-    let results: SearchResults = get(&store, "/v1/search?q=alice_1").await.answer();
+    let results: SearchResults = get(&pool, "/v1/search?q=alice_1").await.answer();
     let handles = handles_of(&results);
     assert!(!handles.contains(&"alice_1"), "{handles:?}");
     assert!(!handles.is_empty(), "fuzzy neighbors should still match");
 
     // LIKE metacharacters match themselves, not everything.
-    let results: SearchResults = get(&store, "/v1/search?q=%25").await.answer();
+    let results: SearchResults = get(&pool, "/v1/search?q=%25").await.answer();
     assert!(results.hits.is_empty());
+
+    drop(guard);
 }
 
 #[tokio::test]
 async fn replay_converges_instead_of_duplicating() {
-    let Some((store, pool, _guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::Platform::from_key("x").unwrap().id();
+    let x = KnownPlatform::X.id();
     let alice = addr(0xA1);
     let event = bind(alice, x, "111", "alice_1", 1000, true);
     apply(&store, 1, event.clone()).await;
@@ -441,7 +439,7 @@ async fn replay_converges_instead_of_duplicating() {
             .expect("count");
     assert_eq!(journal, 1);
     let resolved: HandleResolution =
-        get(&store, "/v1/resolve/handle/x/alice_1").await.answer();
+        get(&pool, "/v1/resolve/handle/x/alice_1").await.answer();
     assert_eq!(only(&resolved.bindings).owner, alice);
 
     // The journal conflict gates every projection write, so the one counter
@@ -461,68 +459,68 @@ async fn replay_converges_instead_of_duplicating() {
         count, 1,
         "replayed PlatformConfigured must not double-count"
     );
+    drop(guard);
 }
 
 #[tokio::test]
 async fn unclaimed_names_on_a_configured_platform_are_coded_404s() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::Platform::from_key("x").unwrap().id();
+    let x = KnownPlatform::X.id();
     // The platform row EXISTS — the branch the absent-platform test cannot
     // reach, and the one that once shipped a decode 500.
     apply(&store, 1, NamesEvent::PlatformConfigured { platform_id: x }).await;
 
-    let refusal = get::<HandleResolution>(&store, "/v1/resolve/handle/x/zzz")
+    let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/zzz")
         .await
         .refusal();
-    assert_eq!(
-        refusal,
-        (StatusCode::NOT_FOUND, "handle_not_bound".to_string())
-    );
+    assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::HandleNotBound));
 
-    let refusal = get::<IdResolution>(&store, "/v1/resolve/id/x/999999")
+    let refusal = get::<IdResolution>(&pool, "/v1/resolve/id/x/999999")
         .await
         .refusal();
-    assert_eq!(refusal, (StatusCode::NOT_FOUND, "id_not_bound".to_string()));
+    assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::IdNotBound));
+    drop(guard);
 }
 
 #[tokio::test]
 async fn api_refuses_to_answer_before_the_first_window() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((_store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
     // No window ever committed: resolution must say "not synced", never an
     // authoritative-looking "not bound".
-    let refusal = get::<HandleResolution>(&store, "/v1/resolve/handle/x/alice_1")
+    let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/alice_1")
         .await
         .refusal();
     assert_eq!(
         refusal,
-        (StatusCode::SERVICE_UNAVAILABLE, "not_synced".to_string())
+        (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::NotSynced)
     );
-    let (status, _) = get::<SearchResults>(&store, "/v1/search?q=ali")
+    let (status, _) = get::<SearchResults>(&pool, "/v1/search?q=ali")
         .await
         .refusal();
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     // Status still answers — it is how a caller learns the sync state: the
     // chain is simply not among those the store holds.
-    let status: Status = common::get(&store, "/v1/status").await.answer();
+    let status: Status = common::get(&pool, "/v1/status").await.answer();
     assert!(
         status.chains.iter().all(|c| c.chain_id != CHAIN),
         "{status:?}"
     );
+    drop(guard);
 }
 
 #[tokio::test]
 async fn nul_bytes_neither_stall_the_indexer_nor_crash_the_api() {
-    let Some((store, pool, _guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::Platform::from_key("x").unwrap().id();
+    let x = KnownPlatform::X.id();
     // An adversarial platform emits an id with a NUL byte. The window must
     // apply — lossily, loudly — rather than stall the chain forever behind a
     // value Postgres cannot store.
@@ -543,26 +541,27 @@ async fn nul_bytes_neither_stall_the_indexer_nor_crash_the_api() {
     assert_eq!(stored, "evil\u{fffd}id");
 
     // And a NUL in a query is a 400, not a 500.
-    let refusal = get::<IdResolution>(&store, "/v1/resolve/id/x/evil%00id")
+    let refusal = get::<IdResolution>(&pool, "/v1/resolve/id/x/evil%00id")
         .await
         .refusal();
     assert_eq!(
         refusal,
-        (StatusCode::BAD_REQUEST, "invalid_argument".to_string())
+        (StatusCode::BAD_REQUEST, ErrorCode::InvalidArgument)
     );
-    let (status, _) = get::<SearchResults>(&store, "/v1/search?q=evil%00")
+    let (status, _) = get::<SearchResults>(&pool, "/v1/search?q=evil%00")
         .await
         .refusal();
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    drop(guard);
 }
 
 #[tokio::test]
 async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
-    let Some((store, pool, _guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::Platform::from_key("x").unwrap().id();
+    let x = KnownPlatform::X.id();
     let digest = B256::repeat_byte(0xD1);
     apply(&store, 1, NamesEvent::PlatformConfigured { platform_id: x }).await;
     apply(
@@ -608,7 +607,7 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
 
     // The Proof Verifier is the chain's one verification component; the
     // status reports it so an operator need not ask the RPC.
-    let status: Status = common::get(&store, "/v1/status").await.answer();
+    let status: Status = common::get(&pool, "/v1/status").await.answer();
     let chain = status
         .chains
         .iter()
@@ -616,33 +615,40 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
         .unwrap_or_else(|| panic!("chain {CHAIN} is listed: {status:?}"));
     assert_eq!(chain.proof_verifier, Some(addr(0xEE)));
 
-    // The ceremony's own events are journaled with the payload an operator
-    // asks by, and bind nothing.
-    let journal: Vec<(String, String)> = sqlx::query_as(
-        "SELECT kind, payload::text FROM names.events
-         WHERE chain_id = $1 AND block_number >= 3 ORDER BY block_number",
-    )
-    .bind(CHAIN)
-    .fetch_all(&pool)
-    .await
-    .expect("journal rows");
-    let payloads: Vec<(&str, serde_json::Value)> = journal
-        .iter()
-        .map(|(kind, payload)| {
-            (
-                kind.as_str(),
-                serde_json::from_str(payload).expect("journal payload is JSON"),
-            )
-        })
-        .collect();
-    assert_eq!(payloads[0].0, "ceremony_bound");
-    assert_eq!(payloads[0].1["clientIdentifier"], "0x636c69656e742d61");
+    // The ceremony's own events are journaled with what an operator asks
+    // by — read back here through the histories of the addresses they name —
+    // and bind nothing.
+    let holder: AddressHistory =
+        get(&pool, &format!("/v1/history/address/{}", addr(0xA1)))
+            .await
+            .answer();
+    let [entry] = &holder.entries[..] else {
+        panic!("one ceremony: {holder:?}");
+    };
     assert_eq!(
-        payloads[0].1["authorizationDigest"],
-        digest.to_string().as_str()
+        entry.event,
+        HistoryEvent::CeremonyBound {
+            authorization_digest: digest,
+            holder: addr(0xA1),
+            platform_id: x,
+            client_identifier: Bytes::from_static(b"client-a"),
+        }
     );
-    assert_eq!(payloads[1].0, "bind_fee_paid");
-    assert_eq!(payloads[1].1["amount"], "1000");
+    let receiver: AddressHistory =
+        get(&pool, &format!("/v1/history/address/{}", addr(0xFE)))
+            .await
+            .answer();
+    let [entry] = &receiver.entries[..] else {
+        panic!("one fee: {receiver:?}");
+    };
+    assert_eq!(
+        entry.event,
+        HistoryEvent::BindFeePaid {
+            authorization_digest: digest,
+            receiver: addr(0xFE),
+            amount: U256::from(1_000u64),
+        }
+    );
     let bound: i64 =
         sqlx::query_scalar("SELECT count(*) FROM names.ids WHERE chain_id = $1")
             .bind(CHAIN)
@@ -650,15 +656,16 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
             .await
             .expect("ids count");
     assert_eq!(bound, 0, "a ceremony event alone binds nothing");
+    drop(guard);
 }
 
 #[tokio::test]
 async fn unconfigured_platform_and_impossible_text_name_their_codes() {
-    let Some((store, _pool, _guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let x = nodes::Platform::from_key("x").unwrap().id();
+    let x = KnownPlatform::X.id();
     apply(&store, 1, bind(addr(0xA1), x, "111", "alice_1", 1000, true)).await;
 
     // A platform id the chain never configured is a different fact than an
@@ -666,31 +673,32 @@ async fn unconfigured_platform_and_impossible_text_name_their_codes() {
     // zero-address answer — and the code says which, on both resolve paths.
     let foreign = B256::repeat_byte(7);
     let refusal =
-        get::<HandleResolution>(&store, &format!("/v1/resolve/handle/{foreign}/alice_1"))
+        get::<HandleResolution>(&pool, &format!("/v1/resolve/handle/{foreign}/alice_1"))
             .await
             .refusal();
     assert_eq!(
         refusal,
-        (StatusCode::NOT_FOUND, "platform_not_configured".to_string())
+        (StatusCode::NOT_FOUND, ErrorCode::PlatformNotConfigured)
     );
-    let refusal = get::<IdResolution>(&store, &format!("/v1/resolve/id/{foreign}/111"))
+    let refusal = get::<IdResolution>(&pool, &format!("/v1/resolve/id/{foreign}/111"))
         .await
         .refusal();
     assert_eq!(
         refusal,
-        (StatusCode::NOT_FOUND, "platform_not_configured".to_string())
+        (StatusCode::NOT_FOUND, ErrorCode::PlatformNotConfigured)
     );
 
     // Text X's rules can never hold (an interior space) mirrors the
     // contract's deliberate zero-address answer: "no such handle can exist",
     // a 404 with its own code — not "you asked wrong".
-    let refusal = get::<HandleResolution>(&store, "/v1/resolve/handle/x/a%20b")
+    let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/a%20b")
         .await
         .refusal();
     assert_eq!(
         refusal,
-        (StatusCode::NOT_FOUND, "handle_impossible".to_string())
+        (StatusCode::NOT_FOUND, ErrorCode::HandleImpossible)
     );
+    drop(guard);
 }
 
 /// A wallet is the same address on every chain; its bindings are not. With
@@ -698,26 +706,31 @@ async fn unconfigured_platform_and_impossible_text_name_their_codes() {
 /// result says which one it is from; `?chain=` narrows to one.
 #[tokio::test]
 async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
-    let Some((store, pool, _guard)) = test_store().await else {
+    let Some((store, pool, guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
     let other = ChainStore::new(pool.clone(), OTHER_CHAIN);
-    let x = nodes::Platform::from_key("x").unwrap().id();
+    let x = KnownPlatform::X.id();
     let (alice, bob) = (addr(0xA1), addr(0xB2));
     // The same handle, held by different wallets on the two chains.
     apply(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
     apply(&other, 1, bind(bob, x, "999", "alice_1", 1000, false)).await;
 
-    let resolved: HandleResolution = common::get(&store, "/v1/resolve/handle/x/alice_1")
+    // Other suites share the store, so only this suite's chains are read.
+    let resolved: HandleResolution = common::get(&pool, "/v1/resolve/handle/x/alice_1")
         .await
         .answer();
-    let chains: Vec<i64> = resolved.bindings.iter().map(|b| b.chain_id).collect();
-    assert_eq!(chains, [CHAIN, OTHER_CHAIN], "{resolved:?}");
-    assert_eq!(resolved.bindings[1].owner, bob);
+    let ours: Vec<(i64, Address)> = resolved
+        .bindings
+        .iter()
+        .filter(|b| [CHAIN, OTHER_CHAIN].contains(&b.chain_id))
+        .map(|b| (b.chain_id, b.owner))
+        .collect();
+    assert_eq!(ours, [(CHAIN, alice), (OTHER_CHAIN, bob)], "{resolved:?}");
 
     let resolved: HandleResolution = common::get(
-        &store,
+        &pool,
         &format!("/v1/resolve/handle/x/alice_1?chain={OTHER_CHAIN}"),
     )
     .await
@@ -726,7 +739,7 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
 
     // An address is asked without a chain; each identity names its own.
     let resolved: AddressResolution =
-        common::get(&store, &format!("/v1/resolve/address/{bob}"))
+        common::get(&pool, &format!("/v1/resolve/address/{bob}"))
             .await
             .answer();
     assert!(
@@ -742,7 +755,7 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
     );
 
     // Search too, and a hit says where it lives.
-    let results: SearchResults = common::get(&store, "/v1/search?q=alice_1&platform=x")
+    let results: SearchResults = common::get(&pool, "/v1/search?q=alice_1&platform=x")
         .await
         .answer();
     let hit_chains: Vec<i64> = results
@@ -759,25 +772,21 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
     // A chain nobody indexed is not an error to ask about; it has nothing
     // to answer from, and says so.
     let refusal = common::get::<HandleResolution>(
-        &store,
+        &pool,
         "/v1/resolve/handle/x/alice_1?chain=424242",
     )
     .await
     .refusal();
     assert_eq!(
         refusal,
-        (StatusCode::SERVICE_UNAVAILABLE, "not_synced".to_string())
+        (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::NotSynced)
     );
-    let refusal = common::get::<HandleResolution>(
-        &store,
-        "/v1/resolve/handle/x/alice_1?chain=eden",
-    )
-    .await
-    .refusal();
-    assert_eq!(
-        refusal,
-        (StatusCode::BAD_REQUEST, "invalid_chain".to_string())
-    );
+    let refusal =
+        common::get::<HandleResolution>(&pool, "/v1/resolve/handle/x/alice_1?chain=eden")
+            .await
+            .refusal();
+    assert_eq!(refusal, (StatusCode::BAD_REQUEST, ErrorCode::InvalidChain));
+    drop(guard);
 }
 
 // ─── The replay gate ────────────────────────────────────────────────────────
@@ -798,14 +807,7 @@ async fn seed(store: &ChainStore) {
     apply(
         store,
         1,
-        bind(
-            addr(1),
-            nodes::Platform::from_key("x").unwrap().id(),
-            "1",
-            "alice",
-            1,
-            true,
-        ),
+        bind(addr(1), KnownPlatform::X.id(), "1", "alice", 1, true),
     )
     .await;
     store
@@ -816,7 +818,7 @@ async fn seed(store: &ChainStore) {
 
 #[tokio::test]
 async fn preparing_an_unchanged_chain_keeps_everything() {
-    let Some((store, _pool, _g)) = test_store_with(2).await else {
+    let Some((store, _pool, guard)) = test_store_with(2).await else {
         return;
     };
     let writer = store.acquire_writer().await.expect("lease");
@@ -838,7 +840,7 @@ async fn preparing_an_unchanged_chain_keeps_everything() {
     assert!(
         store
             .resolve_handle(
-                nodes::Platform::from_key("x").unwrap().id(),
+                KnownPlatform::X.id(),
                 &nodes::NormalizedHandle::from_chain("alice"),
             )
             .await
@@ -847,13 +849,14 @@ async fn preparing_an_unchanged_chain_keeps_everything() {
         "the binding survived"
     );
     writer.release().await.expect("the lease releases");
+    drop(guard);
 }
 
 #[tokio::test]
 async fn watching_another_contract_clears_the_chain() {
     // The old contract's bindings are not the new contract's bindings, so
     // inheriting them would answer for an account nobody bound here.
-    let Some((store, _pool, _g)) = test_store_with(2).await else {
+    let Some((store, _pool, guard)) = test_store_with(2).await else {
         return;
     };
     let writer = store.acquire_writer().await.expect("lease");
@@ -875,7 +878,7 @@ async fn watching_another_contract_clears_the_chain() {
     assert!(
         store
             .resolve_handle(
-                nodes::Platform::from_key("x").unwrap().id(),
+                KnownPlatform::X.id(),
                 &nodes::NormalizedHandle::from_chain("alice"),
             )
             .await
@@ -884,6 +887,7 @@ async fn watching_another_contract_clears_the_chain() {
         "the previous contract's binding must not survive"
     );
     writer.release().await.expect("the lease releases");
+    drop(guard);
 }
 
 #[tokio::test]
@@ -892,7 +896,7 @@ async fn the_deployment_block_cache_survives_a_replay() {
     // contract, and `eth_getCode` history does not change shape with the read
     // model. Losing it would re-run the binary search over the whole chain on
     // every version bump.
-    let Some((store, _pool, _g)) = test_store_with(2).await else {
+    let Some((store, _pool, guard)) = test_store_with(2).await else {
         return;
     };
     let writer = store.acquire_writer().await.expect("lease");
@@ -913,6 +917,7 @@ async fn the_deployment_block_cache_survives_a_replay() {
         "the deployment-block cache is keyed by contract and must outlive the wipe"
     );
     writer.release().await.expect("the lease releases");
+    drop(guard);
 }
 
 /// The lease must give the lock back, not merely stop being referenced.
@@ -924,7 +929,7 @@ async fn the_deployment_block_cache_survives_a_replay() {
 /// smallest thing that would have caught it.
 #[tokio::test]
 async fn a_released_lease_frees_the_chain_for_the_next_holder() {
-    let Some((store, _pool, _g)) = test_store_with(2).await else {
+    let Some((store, _pool, guard)) = test_store_with(2).await else {
         return;
     };
     let first = store.acquire_writer().await.expect("first lease");
@@ -933,12 +938,12 @@ async fn a_released_lease_frees_the_chain_for_the_next_holder() {
     // Bounded, because the failure mode is a block rather than an error: on
     // the old code this waits for the pool's idle timeout, not forever, and an
     // unbounded await would look like a hung test rather than a broken lock.
-    let second =
-        tokio::time::timeout(std::time::Duration::from_secs(5), store.acquire_writer())
-            .await
-            .expect("the second lease was still blocked on the first")
-            .expect("second lease");
+    let second = tokio::time::timeout(Duration::from_secs(5), store.acquire_writer())
+        .await
+        .expect("the second lease was still blocked on the first")
+        .expect("second lease");
     second.release().await.expect("release");
+    drop(guard);
 }
 
 /// The report the indexer makes beside the target expires on its own
@@ -946,27 +951,38 @@ async fn a_released_lease_frees_the_chain_for_the_next_holder() {
 /// moving the target — which is what keeps a long catch-up alive.
 #[tokio::test]
 async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
-    let Some((store, _pool, _g)) = test_store().await else {
+    let Some((store, _pool, guard)) = test_store().await else {
         return;
     };
     assert!(
-        store.set_chain_target(5, 1).await,
+        store.set_chain_target(5, Duration::from_secs(1)).await,
         "the target write landed"
     );
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let position = store.index_position().await.expect("position");
+    // The report expires on the database's clock, a second from now.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let position = loop {
+        let position = store.index_position().await.expect("position");
+        if position.valid_for.is_some_and(|d| d < TimeDelta::zero()) {
+            break position;
+        }
+        assert!(Instant::now() < deadline, "never expired: {position:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     assert_eq!(position.target, Some(5));
-    assert!(position.valid_for.is_some_and(|s| s < 0), "{position:?}");
 
-    store.touch_chain_target(120).await;
+    store.touch_chain_target(Duration::from_secs(120)).await;
     let position = store.index_position().await.expect("position");
     assert_eq!(
         position.target,
         Some(5),
         "a renewal must not move the target"
     );
-    assert!(position.valid_for.is_some_and(|s| s > 0), "{position:?}");
+    assert!(
+        position.valid_for.is_some_and(|d| d > TimeDelta::zero()),
+        "{position:?}"
+    );
     assert!(position.reported_at.is_some(), "{position:?}");
+    drop(guard);
 }
 
 /// A chain's names are its indexer's declaration: a set, replaced whole on
@@ -974,10 +990,10 @@ async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
 /// `/v1/status`.
 #[tokio::test]
 async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
-    let Some((store, pool, _g)) = test_store_with(2).await else {
+    let Some((store, pool, guard)) = test_store_with(2).await else {
         return;
     };
-    let name = |s: &str| ens::ChainName::parse(s).unwrap();
+    let name = |s: &str| s.parse::<ens::ChainName>().unwrap();
     let writer = store.acquire_writer().await.expect("lease");
     // In the indexer's order: the chain is prepared, then named.
     store
@@ -1031,7 +1047,7 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
     assert_eq!(reader.chain_named("beta").await.unwrap(), None);
 
     // Supervision sees the declaration.
-    let status: Status = get(&store, "/v1/status").await.answer();
+    let status: Status = get(&pool, "/v1/status").await.answer();
     let row = status
         .chains
         .iter()
@@ -1041,4 +1057,5 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
 
     other_writer.release().await.expect("release");
     writer.release().await.expect("release");
+    drop(guard);
 }

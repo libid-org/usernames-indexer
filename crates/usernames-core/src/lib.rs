@@ -9,8 +9,8 @@
 //! the escrow holds, over what the loop wrote.
 //!
 //! They are separated because they scale and fail differently: one writer per
-//! chain holds a lease, while readers are stateless and horizontal. The halves
-//! stay here together because they share the read model and because the
+//! chain holds a lease, while readers are stateless and horizontal. The indexer
+//! and the API stay here together because they share the read model and the
 //! end-to-end test drives both — the split is a deployment boundary, not a
 //! dependency one.
 

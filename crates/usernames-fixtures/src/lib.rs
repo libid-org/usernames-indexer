@@ -18,8 +18,7 @@
 //!
 //! `gateway.rs` drives the router in process with these; `end_to_end.rs`
 //! deploys the real `HandleResolver` on anvil and walks the protocol with
-//! them. Neither needs ENS or a network. It is a dev-dependency of
-//! `usernames-api` and nothing else links it. It is a crate rather than a
+//! them. Neither needs ENS or a network. It is a crate rather than a
 //! `tests/common` module because each test binary compiles such a module on
 //! its own, and a helper one of them does not call reads as dead code there;
 //! a library's public items never do.
@@ -34,20 +33,27 @@
 #![deny(missing_docs)]
 #![deny(dead_code)]
 
+use std::time::Duration;
+
 use alloy::{
     primitives::{
         Address,
         B256,
+        U256,
     },
     sol_types::SolCall,
 };
 use usernames_core::{
     db::ChainStore,
+    ens::Name,
     events::{
         LogPosition,
         NamesEvent,
     },
-    nodes,
+    nodes::{
+        self,
+        KnownPlatform,
+    },
 };
 
 mod calls {
@@ -86,7 +92,7 @@ pub fn namehash_of(labels: &[&str]) -> B256 {
         .map(|l| (*l).to_string())
         .chain(["handles".to_string(), "link".to_string()])
         .collect();
-    usernames_core::ens::Name::from_labels(full).node()
+    Name::from_labels(full).node()
 }
 
 /// `resolve(name, data)`, encoded by the same codec the gateway decodes with.
@@ -102,7 +108,7 @@ pub fn resolve_call(name: &[u8], inner: &[u8]) -> Vec<u8> {
 pub fn addr_call(labels: &[&str], coin: u64) -> Vec<u8> {
     addr_0Call {
         node: namehash_of(labels),
-        coinType: alloy::primitives::U256::from(coin),
+        coinType: U256::from(coin),
     }
     .abi_encode()
 }
@@ -117,7 +123,7 @@ pub fn legacy_addr_call(labels: &[&str]) -> Vec<u8> {
 
 /// Seed one binding into the read model the gateway answers from.
 pub async fn bind(store: &ChainStore, handle: &str, holder: Address) {
-    let platform = nodes::Platform::from_key("x").unwrap().id();
+    let platform = KnownPlatform::X.id();
     let event = NamesEvent::IdentityBound {
         holder,
         id_node: nodes::id_node(platform, "42"),
@@ -151,5 +157,5 @@ pub async fn bind(store: &ChainStore, handle: &str, holder: Address) {
     // against the TARGET — the block the cursor chases — so that is the one a
     // fixture must record.
     store.set_chain_head(1).await;
-    store.set_chain_target(1, 120).await;
+    store.set_chain_target(1, Duration::from_secs(120)).await;
 }
