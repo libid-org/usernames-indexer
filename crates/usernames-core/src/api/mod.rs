@@ -1,11 +1,17 @@
 //! The read API. Resolution answers exactly what the contract's resolvers
-//! answer, from the projections; search is the one thing the chain cannot do.
-//! The answers' shapes live in [`model`]; the handlers here only translate
-//! HTTP to store calls and rows to those shapes.
+//! answer, from the projections; search, the histories and the escrow's
+//! waiting amounts are what the chain cannot list. The answers' shapes live
+//! in [`model`]; the handlers here and in [`history`] and [`escrow`] only
+//! translate HTTP to store calls and rows to those shapes.
 
+mod escrow;
+mod history;
 pub mod model;
 
-use std::str::FromStr;
+use std::{
+    fmt,
+    str::FromStr,
+};
 
 use alloy::primitives::{
     Address,
@@ -13,11 +19,19 @@ use alloy::primitives::{
 };
 use axum::{
     extract::{
+        rejection::{
+            PathRejection,
+            QueryRejection,
+        },
+        FromRequestParts,
         Path,
         Query,
         State,
     },
-    http::StatusCode,
+    http::{
+        request::Parts,
+        StatusCode,
+    },
     response::{
         IntoResponse,
         Response,
@@ -26,16 +40,24 @@ use axum::{
     Json,
     Router,
 };
-use serde::Deserialize;
+use serde::{
+    de::DeserializeOwned,
+    Deserialize,
+};
 
 use self::model::*;
 use crate::{
     db::{
         self,
         ChainStore,
+        InvalidCursor,
+        Page,
         Store,
     },
-    nodes,
+    nodes::{
+        self,
+        NormalizedHandle,
+    },
 };
 
 /// What every handler needs: the store. Which chains it holds, and which
@@ -82,6 +104,17 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/resolve/id/{platform}/{user_id}", get(resolve_id))
         .route("/v1/resolve/address/{address}", get(resolve_address))
         .route("/v1/search", get(search))
+        .route("/v1/history/address/{address}", get(history::address))
+        .route(
+            "/v1/history/handle/{platform}/{handle}",
+            get(history::handle),
+        )
+        .route("/v1/history/node/{node}", get(history::node))
+        .route("/v1/escrow/claimable/{address}", get(escrow::claimable))
+        .route("/v1/escrow/refundable/{address}", get(escrow::refundable))
+        .route("/v1/escrow/handle/{platform}/{handle}", get(escrow::handle))
+        .route("/v1/escrow/node/{node}", get(escrow::node))
+        .route("/v1/escrow/unclaimed", get(escrow::unclaimed))
         .with_state(state)
 }
 
@@ -117,6 +150,18 @@ impl ApiError {
         }
     }
 
+    /// A stored value this build cannot read back. Logged with `what` where
+    /// it is found; the client gets the same opaque 500 as a database error.
+    fn internal(what: impl fmt::Display) -> Self {
+        tracing::error!(%what, "unreadable stored value");
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal",
+            message: "internal error".into(),
+            source: None,
+        }
+    }
+
     fn not_synced(chain: Option<i64>) -> Self {
         let message = match chain {
             Some(chain) => {
@@ -130,6 +175,43 @@ impl ApiError {
             message,
             source: None,
         }
+    }
+}
+
+/// Text the platform could never hold, refused the way the contract's
+/// `resolveHandle` answers it — the zero address, so a 404 and not a 400:
+/// "nobody holds this", not "you asked wrong".
+impl From<libid_identity::HandleError> for ApiError {
+    fn from(e: libid_identity::HandleError) -> Self {
+        Self::not_found(
+            "handle_impossible",
+            format!("no handle can exist on this platform for this text: {e}"),
+        )
+    }
+}
+
+/// A path segment axum could not take apart, such as invalid UTF-8: a 400 in
+/// the envelope, or the 500 of a route that names no such segment.
+impl From<PathRejection> for ApiError {
+    fn from(rejection: PathRejection) -> Self {
+        if rejection.status().is_server_error() {
+            Self::internal(rejection.body_text())
+        } else {
+            Self::bad_request("invalid_path", rejection.body_text())
+        }
+    }
+}
+
+/// A query string axum could not take apart, such as a repeated key.
+impl From<QueryRejection> for ApiError {
+    fn from(rejection: QueryRejection) -> Self {
+        Self::bad_request("invalid_query", rejection.body_text())
+    }
+}
+
+impl From<InvalidCursor> for ApiError {
+    fn from(e: InvalidCursor) -> Self {
+        Self::bad_request("invalid_cursor", e.to_string())
     }
 }
 
@@ -158,6 +240,123 @@ impl IntoResponse for ApiError {
             },
         };
         (self.status, Json(body)).into_response()
+    }
+}
+
+/// `Path`, refused in the API's envelope instead of axum's plain text.
+struct ApiPath<T>(T);
+
+impl<T, S> FromRequestParts<S> for ApiPath<T>
+where
+    T: DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
+        let Path(value) = Path::<T>::from_request_parts(parts, state).await?;
+        Ok(Self(value))
+    }
+}
+
+/// `Query`, refused in the API's envelope instead of axum's plain text.
+struct ApiQuery<T>(T);
+
+impl<T, S> FromRequestParts<S> for ApiQuery<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
+        let Query(value) = Query::<T>::from_request_parts(parts, state).await?;
+        Ok(Self(value))
+    }
+}
+
+/// `?chain=8453&before=<next>&limit=20`: one page of a list, the cursor the
+/// one the previous page handed out.
+#[derive(Deserialize)]
+struct PageParams {
+    chain: Option<String>,
+    before: Option<String>,
+    limit: Option<String>,
+}
+
+impl PageParams {
+    fn page<C: FromStr<Err = InvalidCursor>>(self) -> Result<Page<C>, ApiError> {
+        Ok(Page {
+            chain: ChainFilter { chain: self.chain }.parse()?,
+            before: self.before.as_deref().map(str::parse).transpose()?,
+            limit: parse_count(self.limit.as_deref(), "limit")?
+                .unwrap_or(PAGE_DEFAULT_LIMIT)
+                .clamp(1, PAGE_MAX_LIMIT),
+        })
+    }
+}
+
+/// A handle as a request names it: by its text on a platform, or by its node
+/// alone, for one somebody deposited for and nobody has bound.
+enum HandleKey {
+    Text {
+        platform: nodes::Platform,
+        handle: NormalizedHandle,
+    },
+    Node(B256),
+}
+
+impl HandleKey {
+    fn of_text(platform: &str, handle: &str) -> Result<Self, ApiError> {
+        let platform = parse_platform(platform)?;
+        reject_nul(handle, "handle")?;
+        let handle = platform.normalize_query(handle)?;
+        Ok(Self::Text { platform, handle })
+    }
+
+    fn of_node(node: &str) -> Result<Self, ApiError> {
+        parse_node(node).map(Self::Node)
+    }
+
+    fn node(&self) -> B256 {
+        match self {
+            Self::Text { platform, handle } => nodes::handle_node(platform.id(), handle),
+            Self::Node(node) => *node,
+        }
+    }
+}
+
+impl HandleQuery {
+    /// The handle a request named, completed from `known` when it named only
+    /// the node: any row about the node names its platform, and its text
+    /// once a bind has carried it.
+    fn of(key: &HandleKey, known: Option<&HandleRef>) -> Self {
+        match key {
+            HandleKey::Text { platform, handle } => Self {
+                platform: platform.known(),
+                platform_id: Some(platform.id()),
+                handle_node: key.node(),
+                handle: Some(handle.as_str().to_string()),
+            },
+            HandleKey::Node(node) => Self {
+                platform: known.and_then(|handle| handle.platform),
+                platform_id: known.map(|handle| handle.platform_id),
+                handle_node: *node,
+                handle: known.and_then(|handle| handle.handle.clone()),
+            },
+        }
+    }
+}
+
+impl HandleRef {
+    /// A stored node with its platform and the text a bind carried, if any.
+    fn of(platform_id: B256, handle_node: B256, handle: Option<String>) -> Self {
+        Self {
+            platform: nodes::Platform::known_of(platform_id),
+            platform_id,
+            handle_node,
+            handle,
+        }
     }
 }
 
@@ -207,6 +406,29 @@ fn parse_address(raw: &str) -> Result<Address, ApiError> {
     })
 }
 
+/// A count from the query string, refused in the API's envelope: typed as a
+/// number in the extractor, `limit=ten` would get axum's plain-text 400.
+fn parse_count(raw: Option<&str>, name: &str) -> Result<Option<i64>, ApiError> {
+    raw.map(|raw| {
+        raw.parse::<i64>().map_err(|_| {
+            ApiError::bad_request(
+                "invalid_argument",
+                format!("{name} must be an integer, not {raw:?}"),
+            )
+        })
+    })
+    .transpose()
+}
+
+fn parse_node(raw: &str) -> Result<B256, ApiError> {
+    B256::from_str(raw).map_err(|_| {
+        ApiError::bad_request(
+            "invalid_node",
+            format!("{raw:?} is not a 0x-hex 32-byte handle node"),
+        )
+    })
+}
+
 async fn health() -> &'static str {
     "ok"
 }
@@ -220,6 +442,7 @@ impl ChainStatus {
             chain_id: store.chain_id(),
             names: store.chain_names().await?,
             contract: store.contract().await?,
+            escrow: store.escrow().await?,
             last_indexed_block: last,
             chain_head_block: head,
             lag_blocks: head.map(|h| h.saturating_sub(last.unwrap_or(0))),
@@ -256,19 +479,8 @@ async fn resolve_handle(
     let chain = filter.parse()?;
     state.synced(chain).await?;
 
-    // Normalize the way the chain did before it keyed the handle. Text the
-    // platform could never hold mirrors the contract's `resolveHandle`,
-    // which deliberately answers the zero address for it — a 404, not a 400:
-    // "nobody holds this", not "you asked wrong".
-    let normalized = match platform.normalize_query(&handle) {
-        Ok(normalized) => normalized,
-        Err(e) => {
-            return Err(ApiError::not_found(
-                "handle_impossible",
-                format!("no handle can exist on this platform for this text: {e}"),
-            ));
-        }
-    };
+    // Normalize the way the chain did before it keyed the handle.
+    let normalized = platform.normalize_query(&handle)?;
 
     let rows = state
         .store
@@ -427,6 +639,10 @@ const SEARCH_MAX_LIMIT: i64 = 50;
 /// database repeats per request; a client that far in wants a narrower
 /// query.
 const SEARCH_MAX_OFFSET: i64 = 10_000;
+/// A list page holds this many entries when the request names no `limit`.
+const PAGE_DEFAULT_LIMIT: i64 = 20;
+/// The most entries one list page holds.
+const PAGE_MAX_LIMIT: i64 = 100;
 
 /// `GET /v1/search?q=gre&platform=x&owner=0x…&chain=8453&limit=10&offset=0`
 /// — live handles matching a partial query (exact first, then prefix,
@@ -499,4 +715,101 @@ async fn search(
         offset,
         hits,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::Body,
+        http::Request,
+    };
+    use http_body_util::BodyExt;
+    use sqlx::PgPool;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    /// The status and code a route refuses `path` with. Every refusal here
+    /// comes before the store is read, so the pool never connects.
+    async fn refusal(path: &str) -> (StatusCode, String) {
+        let pool =
+            PgPool::connect_lazy("postgres://localhost/unread").expect("lazy pool");
+        let response = router(AppState::new(Store::new(pool)))
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let refusal: ErrorBody =
+            serde_json::from_slice(&body).expect("the error envelope");
+        (status, refusal.error.code)
+    }
+
+    #[tokio::test]
+    async fn a_malformed_list_request_is_refused_in_the_envelope() {
+        let address = Address::repeat_byte(0xA1);
+        let bad = |code: &str| (StatusCode::BAD_REQUEST, code.to_string());
+        let cases = [
+            ("/v1/escrow/node/0x1234".to_string(), bad("invalid_node")),
+            ("/v1/history/node/alice".to_string(), bad("invalid_node")),
+            (
+                "/v1/escrow/claimable/0xnope".to_string(),
+                bad("invalid_address"),
+            ),
+            (
+                "/v1/escrow/unclaimed?token=usdc".to_string(),
+                bad("invalid_address"),
+            ),
+            (
+                "/v1/escrow/handle/myspace/tom".to_string(),
+                bad("invalid_platform"),
+            ),
+            (
+                "/v1/history/handle/x/no%20spaces".to_string(),
+                (StatusCode::NOT_FOUND, "handle_impossible".to_string()),
+            ),
+            (
+                "/v1/escrow/unclaimed?limit=ten".to_string(),
+                bad("invalid_argument"),
+            ),
+            (
+                "/v1/history/handle/x/nobody?limit=1.5".to_string(),
+                bad("invalid_argument"),
+            ),
+            (
+                "/v1/escrow/unclaimed?chain=base".to_string(),
+                bad("invalid_chain"),
+            ),
+            (
+                "/v1/escrow/unclaimed?before=nope".to_string(),
+                bad("invalid_cursor"),
+            ),
+            (
+                format!("/v1/history/address/{address}?before=yesterday"),
+                bad("invalid_cursor"),
+            ),
+            (
+                format!("/v1/escrow/refundable/{address}?before=1-2"),
+                bad("invalid_cursor"),
+            ),
+            ("/v1/history/address/%FF".to_string(), bad("invalid_path")),
+            (
+                format!("/v1/escrow/claimable/{address}?chain=1&chain=2"),
+                bad("invalid_query"),
+            ),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(refusal(&path).await, expected, "{path}");
+        }
+    }
 }

@@ -108,6 +108,7 @@ async fn apply(store: &ChainStore, seq: u64, event: NamesEvent) {
         block_number: seq,
         log_index: 0,
         tx_hash: B256::from_slice(&[seq as u8; 32]),
+        block_time: 1_700_000_000 + seq,
     };
     let mut window = store.begin_window().await.expect("begin");
     window.apply(&event, &pos).await.expect("apply");
@@ -556,7 +557,7 @@ async fn nul_bytes_neither_stall_the_indexer_nor_crash_the_api() {
 }
 
 #[tokio::test]
-async fn admin_events_land_in_ops_metadata_and_ceremony_events_only_in_the_journal() {
+async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
     let Some((store, pool, _guard)) = test_store().await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
@@ -616,7 +617,7 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_only_in_the_journ
     assert_eq!(chain.proof_verifier, Some(addr(0xEE)));
 
     // The ceremony's own events are journaled with the payload an operator
-    // asks by, and project nothing.
+    // asks by, and bind nothing.
     let journal: Vec<(String, String)> = sqlx::query_as(
         "SELECT kind, payload::text FROM names.events
          WHERE chain_id = $1 AND block_number >= 3 ORDER BY block_number",
@@ -819,11 +820,17 @@ async fn preparing_an_unchanged_chain_keeps_everything() {
         return;
     };
     let writer = store.acquire_writer().await.expect("lease");
-    store.prepare(&writer, a_contract()).await.expect("first");
+    store
+        .prepare(&writer, a_contract(), None)
+        .await
+        .expect("first");
     seed(&store).await;
 
     // Same version, same contract: nothing to replay.
-    store.prepare(&writer, a_contract()).await.expect("second");
+    store
+        .prepare(&writer, a_contract(), None)
+        .await
+        .expect("second");
     assert!(
         store.cursor().await.unwrap().is_some(),
         "the cursor survived"
@@ -850,11 +857,14 @@ async fn watching_another_contract_clears_the_chain() {
         return;
     };
     let writer = store.acquire_writer().await.expect("lease");
-    store.prepare(&writer, a_contract()).await.expect("first");
+    store
+        .prepare(&writer, a_contract(), None)
+        .await
+        .expect("first");
     seed(&store).await;
 
     store
-        .prepare(&writer, OTHER_CONTRACT)
+        .prepare(&writer, OTHER_CONTRACT, None)
         .await
         .expect("repoint");
 
@@ -886,11 +896,14 @@ async fn the_deployment_block_cache_survives_a_replay() {
         return;
     };
     let writer = store.acquire_writer().await.expect("lease");
-    store.prepare(&writer, a_contract()).await.expect("first");
+    store
+        .prepare(&writer, a_contract(), None)
+        .await
+        .expect("first");
     seed(&store).await;
 
     store
-        .prepare(&writer, OTHER_CONTRACT)
+        .prepare(&writer, OTHER_CONTRACT, None)
         .await
         .expect("repoint");
 
@@ -968,7 +981,7 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
     let writer = store.acquire_writer().await.expect("lease");
     // In the indexer's order: the chain is prepared, then named.
     store
-        .prepare(&writer, a_contract())
+        .prepare(&writer, a_contract(), None)
         .await
         .expect("prepared");
     store

@@ -1,5 +1,5 @@
-//! The read API: resolution, search and the ENS gateway over the indexed
-//! read model.
+//! The read API: resolution, search, histories, escrow balances and the ENS
+//! gateway over the indexed read model.
 //!
 //! Stateless and horizontal: it reads the database the indexer writes and
 //! nothing else, so several of these may serve one database. Both halves serve

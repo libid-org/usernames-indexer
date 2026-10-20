@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Indexes IdentityRegistry events into Postgres."
+description = "Indexes IdentityRegistry and HandleEscrow events into Postgres."
 publish = false
 
 [dependencies]

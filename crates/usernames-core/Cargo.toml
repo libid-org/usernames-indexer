@@ -10,12 +10,14 @@ publish = false
 
 [dependencies]
 alloy.workspace = true
+alloy-primitives.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 libid-contracts.workspace = true
 libid-identity.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_with.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
