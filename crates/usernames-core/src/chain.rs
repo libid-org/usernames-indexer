@@ -83,7 +83,7 @@ pub async fn fetch_logs(
 pub enum RegistryRefused {
     /// `nodeKeyed()` could not be read: not a node-keyed registry.
     #[error(
-        "registry {registry}: nodeKeyed(): {source}; point it at a libID-contracts 0.18 IdentityRegistry"
+        "registry {registry}: nodeKeyed(): {source}; point it at a libID-contracts 0.19 IdentityRegistry"
     )]
     Unread {
         /// The registry asked.

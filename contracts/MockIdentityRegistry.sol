@@ -32,10 +32,9 @@ contract MockIdentityRegistry {
     event BindFeePaid(bytes32 indexed authorizationDigest, address indexed receiver, uint256 amount);
     event HandleRetired(bytes32 indexed platformId, bytes32 indexed handleNode, address indexed holder);
     event ProofVerifierConfigured(address verifier);
-    event HandlePublished(
-        address indexed holder, bytes32 indexed platformId, bytes32 indexed handleNode, string handle
-    );
-    event HandleUnpublished(address indexed holder, bytes32 indexed platformId);
+    event HandleRevealed(bytes32 indexed platformId, bytes32 indexed handleNode, string handle);
+    event HandlePublished(address indexed holder, bytes32 indexed platformId, bytes32 indexed handleNode);
+    event HandleUnpublished(address indexed holder);
 
     /// @notice One `bind`, and what it finds before it writes.
     struct Bind {
@@ -55,6 +54,8 @@ contract MockIdentityRegistry {
         bool retiredNamed;
         /// The disclosed handle; empty for a private bind.
         string handle;
+        /// Whether the disclosed handle becomes the holder's name.
+        bool primary;
         bytes32 authorizationDigest;
     }
 
@@ -71,16 +72,19 @@ contract MockIdentityRegistry {
 
     /// @notice `bind`'s events, in its order: `_write`'s withdrawal of the
     ///         taken handle's name, the previous handle's retirement and its
-    ///         name's withdrawal, the binding; then the disclosure and the
-    ///         ceremony.
+    ///         name's withdrawal, the binding; then the reveal, the name when
+    ///         `primary`, and the ceremony.
     function emitBind(Bind calldata b) external {
-        if (b.takenFrom != address(0)) emit HandleUnpublished(b.takenFrom, b.platformId);
+        if (b.takenFrom != address(0)) emit HandleUnpublished(b.takenFrom);
         if (b.retiredNode != bytes32(0)) {
             emit HandleRetired(b.platformId, b.retiredNode, b.retiredHolder);
-            if (b.retiredNamed) emit HandleUnpublished(b.retiredHolder, b.platformId);
+            if (b.retiredNamed) emit HandleUnpublished(b.retiredHolder);
         }
         emit IdentityBound(b.holder, b.idNode, b.handleNode, b.platformId, b.observedAt, b.ceremonyVersion);
-        if (bytes(b.handle).length != 0) emit HandlePublished(b.holder, b.platformId, b.handleNode, b.handle);
+        if (bytes(b.handle).length != 0) {
+            emit HandleRevealed(b.platformId, b.handleNode, b.handle);
+            if (b.primary) emit HandlePublished(b.holder, b.platformId, b.handleNode);
+        }
         emit CeremonyBound(b.authorizationDigest, b.holder, b.platformId, "");
     }
 
@@ -105,7 +109,12 @@ contract MockIdentityRegistry {
         emit ProofVerifierConfigured(verifier);
     }
 
-    function emitHandleUnpublished(address holder, bytes32 platformId) external {
-        emit HandleUnpublished(holder, platformId);
+    /// @notice `reveal`'s event, or `publish`'s first.
+    function emitHandleRevealed(bytes32 platformId, bytes32 handleNode, string calldata handle) external {
+        emit HandleRevealed(platformId, handleNode, handle);
+    }
+
+    function emitHandleUnpublished(address holder) external {
+        emit HandleUnpublished(holder);
     }
 }

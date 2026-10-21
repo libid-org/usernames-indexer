@@ -17,10 +17,11 @@ where the read model, the event decoding and the loop itself live.
 The chain keys every binding by node: `SHA256(tag || id)` and
 `SHA256(tag || folded handle)`, the nodes the circuits output. No plaintext
 id ever reaches the chain, and handle text reaches it only where somebody
-disclosed it: a disclosing bind or `publish` (`HandlePublished`), or a
-`depositToHandle` (`DepositedToHandle`). The read model holds exactly that
-much. It keys bindings by node, keeps disclosed text in one table, and checks
-that each text hashes to its node before it stores it.
+disclosed it: a disclosing bind, `publish` or `reveal` on the registry, or a
+`depositToHandle` on the escrow. Each logs the text in the one
+`HandleRevealed` event both contracts share. The read model holds exactly
+that much. It keys bindings by node, keeps one map from node to revealed
+text, and checks that each text hashes to its node before it stores it.
 
 ## Running
 
@@ -69,7 +70,7 @@ indexer's settings.
 | `GET /v1/resolve/handle/{platform}/{handle}` | The wallet a handle resolves to (`resolveHandle`) on each chain it is bound on, each with the id node it pairs with. The handle is hashed here into its node |
 | `GET /v1/resolve/handle-node/{handleNode}` | The same, by node |
 | `GET /v1/resolve/id-node/{idNode}` | The wallet an id node resolves to (`resolveId`) on each chain it is bound on, each with the handle node that account holds now. The client hashes the id (`libid-identity`, or `idNode` in `@libid/contracts`); no plaintext id reaches the server |
-| `GET /v1/resolve/address/{address}` | Every identity a wallet proved on every chain, by id node, with `resolves` and `published` flags (`publishedHandleOf`'s reverse display) |
+| `GET /v1/resolve/address/{address}` | Every identity a wallet proved on every chain, by id node, with `resolves`, and `published` on the one whose handle is the wallet's name (`primaryHandleOf`) |
 | `GET /v1/search?q=gre&platform=x&owner=0x…&limit=10&offset=0` | Live handles whose text the chain disclosed, matching a partial query (exact, then prefix, then substring, then trigram-fuzzy), linked to a wallet, or both; one of `q` and `owner` is required. `limit` (1..50, default 10) and `offset` (up to 10000) page the ranked list; a page shorter than `limit` is the last |
 | `GET /v1/history/address/{address}?before=&limit=` | Every event the address took part in, newest first, each with its `roles`: `holder`, `previousHandleHolder` and `previousIdHolder` (an event took that handle or account from it), `feeReceiver`, `depositor`, `refundTo` (a claim took its deposit, too), `claimer`, `recipient` |
 | `GET /v1/history/handle/{platform}/{handle}?before=&limit=` | Every event on the handle: deposits while nobody held it, the binds that gave it a holder, and every claim, refund and payment after |
@@ -97,18 +98,19 @@ chain's own coin is the EIP-7528 token `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEE
 Anybody can deposit a token they wrote, so show the tokens you recognize.
 
 A `deposit` names a handle by its node alone: the store knows no platform
-for it (`platformId` is absent) until a `DepositedToHandle` or a bind names
+for it (`platformId` is absent) until a `HandleRevealed` or a bind names
 one. Asking by text works from the first deposit: the escrow and history
 routes fold the text's A-Z and hash it, the way `depositToHandle` does, so
 `/v1/escrow/handle/x/Bo%22b` finds a deposit to `Bo"b`.
 
 **Handle text shows once the chain disclosed it.** Every response that
 carries handle text (`handle` in resolutions, search hits, histories and
-escrow amounts) takes it from `names.disclosures`: text a disclosing bind, a
-`publish` or a `depositToHandle` carried. The API explores the chain's
+escrow amounts) takes it from `names.disclosures`, the map every
+`HandleRevealed` fills, whichever contract logged it. The API explores the chain's
 history, so a name its holder later withdrew or replaced, or a handle that
 passed privately to another account, still shows the text once disclosed;
-`published` says whether it is the holder's displayed name now. Text is stored
+`published` says whether it is the holder's name now: one per holder, on
+whichever platform. Text is stored
 only when it is a token a circuit hashes (printable ASCII without `"` or `\`,
 within the circuit's buffer) and it hashes to the node it names; a public
 transfer to text no account can bind keeps its deposit but not its text.
@@ -290,14 +292,15 @@ chain; a second deployment can share the database):
 - `handles` — mirrors `handleBindings` + `idNodeByHandle`: handle node → holder;
   `owner NULL` mirrors the contract's retirement, and the `observed_at`
   watermark survives it the way the contract keeps it
-- `published` — the display names, as the node each name hashes to; a row
-  exists exactly while the contract's stored string is nonempty
-- `disclosures` — handle text the chain disclosed, a token a circuit hashes,
+- `published` — each holder's one name, as its platform and the node it
+  hashes to; a row exists exactly while the contract's `primaryHandles`
+  entry is set
+- `disclosures` — handle text a `HandleRevealed` carried, a token a circuit hashes,
   folded and checked against its node: one row per node, kept whatever
   happens to the name or the handle after. `handle_identities` maps each
   disclosed handle to its id node
 - `handle_nodes` — the platform of every handle node a bind,
-  `HandlePublished`, `HandleRetired` or `DepositedToHandle` named; a bare
+  `HandleRevealed`, `HandlePublished` or `HandleRetired` named; a bare
   deposit names none
 - `escrow_held` — mirrors HandleEscrow's `held` and `round` per handle node
   and token
@@ -345,45 +348,18 @@ its name and keeps indexing, but it no longer serves the API. Deploy
 `usernames-api` alongside it, pointed at the same database; it needs nothing
 else. Nothing in the database changes and no re-index is needed.
 
-**Upgrading from 0.2:** the journal kind of the fee event is `bind_fee_paid`,
-declared in `001_schema.sql`, so the indexer refuses a database 0.2 migrated
-(`migration 1 was previously applied but has been modified`). Start it on a
-fresh database, or stop it and run
+**Upgrading to 0.6:** this release indexes the node-keyed `IdentityRegistry`
+and `HandleEscrow` of the libid-contracts release `Cargo.toml` pins, and its
+schema is a single `001_schema.sql`. Start the indexer on a fresh database,
+with `IDENTITY_NAMES_ADDRESS` and `HANDLE_ESCROW_ADDRESS` set to those
+deployments; every chain indexes from its registry's deployment block, or
+from `START_BLOCK`. It refuses a registry whose `nodeKeyed()` does not answer
+true, and a database an earlier release or release candidate migrated. To
+reuse such a database, stop every process on it and run
 `DROP SCHEMA names CASCADE; DROP TABLE _sqlx_migrations;` first; that keeps
-`pg_trgm`, which a least-privilege role cannot create. Every chain then
-replays from its contract's deployment block.
-
-**Upgrading from 0.3:** `IdentityRegistry` 0.15 is a fresh deployment, and
-`001_schema.sql` admits its `handle_unpublished` journal kind, so the indexer
-refuses a database 0.3 migrated, as above. Start it on a fresh database with
-`IDENTITY_NAMES_ADDRESS` set to the 0.15 registry; it indexes from that
-registry's deployment block.
-
-**Upgrading from 0.5:** roll the indexer first. It migrates the database in
-place (`002_escrow_and_history.sql`) and, because `INDEXER_VERSION` is 2,
-replays every chain from its registry's deployment block, filling the escrow
-books and the histories. Set `HANDLE_ESCROW_ADDRESS` before that start, or the
-chain replays again when it is set. A 0.5 API keeps serving its routes over the
-migrated database; a newer API started before the migration answers
-`internal` on the new routes until it lands. A 0.5 indexer refuses a database
-002 has migrated: to go back, start it on a fresh database, or run
-`DROP SCHEMA names CASCADE; DROP TABLE _sqlx_migrations;` first, as above.
-
-**Upgrading to hashed identities:** this build indexes the node-keyed
-`IdentityRegistry` and `HandleEscrow` of the libID-contracts release
-`Cargo.toml` pins, whose events carry nodes rather than plaintext. Point
-`IDENTITY_NAMES_ADDRESS` and `HANDLE_ESCROW_ADDRESS` at those deployments and
-roll the indexer first; it refuses to start against a registry whose
-`nodeKeyed()` does not answer true.
-It migrates in place (`003_hashed_identities.sql`, then
-`004_disclosures_all_show.sql`): 003 deletes
-every row the earlier build wrote — they held plaintext ids and handles — and
-every chain's cursor, then reshapes the tables. Each chain answers
-`not_synced` until its first window commits. Until the replay reaches the
-head, its answers miss what it has not reached yet: gate on `/v1/status`'s
-lag, not on `not_synced`. An earlier indexer refuses a database 003 or 004 has migrated,
-and an earlier API answers `internal`; to go back, start the earlier build on
-a fresh database, as above.
+`pg_trgm`, which a least-privilege role cannot create. Each chain answers
+`not_synced` until its first window commits; gate on `/v1/status`'s lag, not
+on `not_synced`.
 
 Probes belong to the API: `GET /health` for liveness; for readiness gate on
 the status code of `GET /v1/status`, which is 200 whenever the database

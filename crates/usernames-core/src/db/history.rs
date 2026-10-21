@@ -174,16 +174,15 @@ impl Window {
                 involvement.handle_node = ceremony.handle_node;
             }
 
-            // A deposit can come before any bind names the node's platform.
-            NamesEvent::Escrow(EscrowEvent::DepositedToHandle {
+            // These name the platform too: a reveal can come before any bind
+            // names it, and the others matter when the index starts after
+            // the node's bind.
+            NamesEvent::HandleRevealed {
                 handle_node,
                 platform_id,
                 ..
-            }) => involvement.named(*handle_node, *platform_id),
-
-            // Both name the platform too, which matters when the index
-            // starts after the node's bind.
-            NamesEvent::HandlePublished {
+            }
+            | NamesEvent::HandlePublished {
                 handle_node,
                 platform_id,
                 ..
@@ -194,8 +193,8 @@ impl Window {
                 ..
             } => involvement.named(*handle_node, *platform_id),
 
-            // A deposit names no platform; the `DepositedToHandle` after it,
-            // or a bind, does.
+            // A deposit names no platform; the `HandleRevealed` of a
+            // `depositToHandle`, or a bind, does.
             NamesEvent::Escrow(
                 EscrowEvent::Deposited { handle_node, .. }
                 | EscrowEvent::Forwarded { handle_node, .. },

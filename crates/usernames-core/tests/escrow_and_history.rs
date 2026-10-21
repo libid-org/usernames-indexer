@@ -22,9 +22,9 @@ use alloy::primitives::{
 use axum::http::StatusCode;
 use common::{
     bind,
-    deposited_to_handle,
     events,
     retire,
+    revealed,
     unpublish,
     Suite,
 };
@@ -145,7 +145,7 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
             1,
             vec![
                 deposited("Bob_1", NATIVE, carol, carol, 100),
-                deposited_to_handle(X, "Bob_1"),
+                revealed(X, "Bob_1"),
             ],
         )
         .await;
@@ -321,7 +321,7 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
                 HistoryEvent::Refunded { .. },
                 HistoryEvent::Deposited { .. },
                 HistoryEvent::Deposited { .. },
-                HistoryEvent::DepositedToHandle { .. },
+                HistoryEvent::HandleRevealed { .. },
                 HistoryEvent::Deposited { .. },
             ]
         ),
@@ -663,7 +663,7 @@ fn kind(event: &HistoryEvent) -> &'static str {
         HistoryEvent::CeremonyBound { .. } => "ceremony_bound",
         HistoryEvent::BindFeePaid { .. } => "bind_fee_paid",
         HistoryEvent::Deposited { .. } => "deposited",
-        HistoryEvent::DepositedToHandle { .. } => "deposited_to_handle",
+        HistoryEvent::HandleRevealed { .. } => "handle_revealed",
         HistoryEvent::Forwarded { .. } => "forwarded",
         HistoryEvent::Claimed { .. } => "claimed",
         HistoryEvent::Refunded { .. } => "refunded",
@@ -685,12 +685,12 @@ async fn a_retired_handle_is_in_the_history_of_the_address_that_held_it() {
     suite
         .apply_tx(1, bind(alice, X, "777", "kim1", 1_000, true))
         .await;
-    let mut rename = vec![retire(X, "kim1", alice), unpublish(alice, X)];
+    let mut rename = vec![retire(X, "kim1", alice), unpublish(alice)];
     rename.extend(bind(alice, X, "777", "kim2", 2_000, true));
     suite.apply_tx(2, rename).await;
     // The account moves to Bob's address and renames to @kim3, privately:
     // @kim2 retires from Alice, and her name for it goes.
-    let mut to_bob = vec![retire(X, "kim2", alice), unpublish(alice, X)];
+    let mut to_bob = vec![retire(X, "kim2", alice), unpublish(alice)];
     to_bob.extend(bind(bob, X, "777", "kim3", 3_000, false));
     suite.apply_tx(3, to_bob).await;
 
@@ -812,7 +812,7 @@ async fn an_unpublish_concerns_the_handle_it_withdrew() {
     suite
         .apply_tx(1, bind(alice, X, "111", "ann_1", 1_000, true))
         .await;
-    suite.apply(2, unpublish(alice, X)).await;
+    suite.apply(2, unpublish(alice)).await;
 
     let history: HandleHistory = suite.get("/v1/history/handle/x/ann_1").await.answer();
     assert!(matches!(
@@ -820,6 +820,7 @@ async fn an_unpublish_concerns_the_handle_it_withdrew() {
         [
             HistoryEvent::HandleUnpublished { .. },
             HistoryEvent::HandlePublished { .. },
+            HistoryEvent::HandleRevealed { .. },
             HistoryEvent::IdentityBound { .. },
         ]
     ));
@@ -843,7 +844,7 @@ async fn an_unpublish_with_nothing_published_concerns_no_handle() {
     suite
         .apply_tx(1, bind(alice, X, "111", "ann_1", 1_000, false))
         .await;
-    suite.apply(2, unpublish(alice, X)).await;
+    suite.apply(2, unpublish(alice)).await;
 
     let history: AddressHistory = suite
         .get(&format!("/v1/history/address/{alice}"))
@@ -917,7 +918,7 @@ async fn text_finds_a_deposit_the_way_the_chain_hashed_it() {
                     round: U256::ZERO,
                     amount: U256::from(9u64),
                 }),
-                deposited_to_handle(X, "Bo\"b"),
+                revealed(X, "Bo\"b"),
             ],
         )
         .await;

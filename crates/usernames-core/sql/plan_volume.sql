@@ -20,7 +20,7 @@ SELECT 1, id_node, platform_id, owner,
        1, 1, handle_node, block_number, 0
 FROM names.handles WHERE chain_id = 1;
 INSERT INTO names.published (chain_id, owner, platform_id, handle_node)
-SELECT DISTINCT ON (owner, platform_id) 1, owner, platform_id, handle_node
+SELECT DISTINCT ON (owner) 1, owner, platform_id, handle_node
 FROM names.handles WHERE chain_id = 1;
 INSERT INTO names.disclosures
     (chain_id, handle_node, platform_id, handle)

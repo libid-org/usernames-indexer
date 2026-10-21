@@ -139,9 +139,8 @@ impl Window {
                     .await?;
             }
 
-            // Neither moves what is held: a forward pays the holder, and a
-            // `DepositedToHandle` follows its own `Deposited`.
-            EscrowEvent::Forwarded { .. } | EscrowEvent::DepositedToHandle { .. } => {}
+            // A forward pays the holder: nothing held moves.
+            EscrowEvent::Forwarded { .. } => {}
         }
         Ok(())
     }
@@ -153,8 +152,8 @@ impl Window {
 pub struct EscrowSlotRow {
     /// The chain the escrow holds it on.
     pub chain_id: i64,
-    /// The platform of the handle, once a bind or a `DepositedToHandle`
-    /// named it.
+    /// The platform of the handle, once a bind or a `HandleRevealed` named
+    /// it.
     pub platform_id: Option<B256>,
     /// The handle node the amount is held against.
     pub handle_node: B256,

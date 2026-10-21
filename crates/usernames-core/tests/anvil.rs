@@ -117,7 +117,8 @@ async fn indexes_a_real_chain_end_to_end() {
 
     // The scenario, one tx per step (anvil automines a block each): wire the
     // Proof Verifier, bind disclosing the handle — the ceremony's own events
-    // beside it — rename, add a disclosed Google identity, withdraw its name.
+    // beside it — rename, add a disclosed Google identity, whose name replaces
+    // the X one, withdraw that name.
     mock.emitProofVerifierConfigured(verifier)
         .send()
         .await
@@ -167,7 +168,7 @@ async fn indexes_a_real_chain_end_to_end() {
         .watch()
         .await
         .unwrap();
-    mock.emitHandleUnpublished(alice, google.id())
+    mock.emitHandleUnpublished(alice)
         .send()
         .await
         .unwrap()
@@ -340,8 +341,8 @@ async fn indexes_a_real_chain_end_to_end() {
         Some("a.b+tag@example.com")
     );
 
-    // Reverse: both identities; X's name is displayed, Google's was
-    // withdrawn.
+    // Reverse: both identities, neither the name: Google's replaced X's, and
+    // was withdrawn.
     let resolved: AddressResolution = get(&pool, &format!("/v1/resolve/address/{alice}"))
         .await
         .answer();
@@ -354,7 +355,7 @@ async fn indexes_a_real_chain_end_to_end() {
         .collect();
     assert_eq!(
         displayed,
-        [(Some(x), true), (Some(google), false)],
+        [(Some(x), false), (Some(google), false)],
         "{resolved:?}"
     );
     assert!(
@@ -396,14 +397,14 @@ async fn indexes_a_real_chain_end_to_end() {
     assert_eq!(chain.escrow, Some(*escrow.address()));
 
     // The journal holds every event the scenario emitted, each bind's
-    // ceremony and the fee included.
+    // reveal and ceremony and the fee included.
     let journal: i64 =
         sqlx::query_scalar("SELECT count(*) FROM names.events WHERE chain_id = $1")
             .bind(CHAIN as i64)
             .fetch_one(&pool)
             .await
             .expect("journal count");
-    assert_eq!(journal, 18);
+    assert_eq!(journal, 21);
     let fee_kinds: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM names.events WHERE chain_id = $1 AND kind = 'bind_fee_paid'",
     )

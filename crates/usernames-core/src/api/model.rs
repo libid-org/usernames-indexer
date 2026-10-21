@@ -183,7 +183,7 @@ pub struct IdBinding {
     pub handle: Option<String>,
     /// The handle node this account last proved (`handleNodeById`).
     pub handle_node: B256,
-    /// Whether the handle is the wallet's displayed name on the platform.
+    /// Whether the handle is the wallet's name.
     pub published: bool,
 }
 
@@ -225,7 +225,7 @@ pub struct AddressIdentity {
     pub ceremony_version: i64,
     /// Whether the handle still resolves to this wallet.
     pub resolves: bool,
-    /// Whether this is the wallet's displayed name on the platform.
+    /// Whether this is the wallet's name.
     pub published: bool,
 }
 
@@ -258,7 +258,7 @@ pub struct SearchHit {
     pub owner: Address,
     /// The account id node behind it.
     pub id_node: B256,
-    /// Whether the owner displays this handle.
+    /// Whether this handle is the owner's name.
     pub published: bool,
 }
 
@@ -284,7 +284,7 @@ pub struct SearchResults {
 pub struct HandleRef {
     /// The platform's short key, when known.
     pub platform: Option<KnownPlatform>,
-    /// The platform id, once a bind or a `DepositedToHandle` named it: a
+    /// The platform id, once a bind or a `HandleRevealed` named it: a
     /// deposit names only the node.
     pub platform_id: Option<B256>,
     /// The node the chain filed the handle under.
@@ -313,6 +313,10 @@ pub enum HistoryEvent {
         observed_at: u64,
         ceremony_version: u16,
     },
+    HandleRevealed {
+        platform_id: B256,
+        handle_node: B256,
+    },
     HandlePublished {
         holder: Address,
         platform_id: B256,
@@ -325,7 +329,6 @@ pub enum HistoryEvent {
     },
     HandleUnpublished {
         holder: Address,
-        platform_id: B256,
     },
     ProofVerifierConfigured {
         verifier: Address,
@@ -351,10 +354,6 @@ pub enum HistoryEvent {
         round: U256,
         #[serde_as(as = "DisplayFromStr")]
         amount: U256,
-    },
-    DepositedToHandle {
-        handle_node: B256,
-        platform_id: B256,
     },
     Forwarded {
         handle_node: B256,
@@ -414,11 +413,18 @@ impl From<NamesEvent> for HistoryEvent {
                 observed_at,
                 ceremony_version,
             },
+            NamesEvent::HandleRevealed {
+                platform_id,
+                handle_node,
+                handle: _,
+            } => Self::HandleRevealed {
+                platform_id,
+                handle_node,
+            },
             NamesEvent::HandlePublished {
                 holder,
                 platform_id,
                 handle_node,
-                handle: _,
             } => Self::HandlePublished {
                 holder,
                 platform_id,
@@ -433,13 +439,9 @@ impl From<NamesEvent> for HistoryEvent {
                 handle_node,
                 holder,
             },
-            NamesEvent::HandleUnpublished {
-                holder,
-                platform_id,
-            } => Self::HandleUnpublished {
-                holder,
-                platform_id,
-            },
+            NamesEvent::HandleUnpublished { holder } => {
+                Self::HandleUnpublished { holder }
+            }
             NamesEvent::ProofVerifierConfigured { verifier } => {
                 Self::ProofVerifierConfigured { verifier }
             }
@@ -477,14 +479,6 @@ impl From<NamesEvent> for HistoryEvent {
                 depositor,
                 round,
                 amount,
-            },
-            NamesEvent::Escrow(EscrowEvent::DepositedToHandle {
-                handle_node,
-                platform_id,
-                handle: _,
-            }) => Self::DepositedToHandle {
-                handle_node,
-                platform_id,
             },
             NamesEvent::Escrow(EscrowEvent::Forwarded {
                 handle_node,
