@@ -22,9 +22,9 @@ use alloy::primitives::{
 use axum::http::StatusCode;
 use common::{
     bind,
-    deposited_to_handle,
     events,
     retire,
+    revealed,
     unpublish,
     Suite,
 };
@@ -145,7 +145,7 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
             1,
             vec![
                 deposited("Bob_1", NATIVE, carol, carol, 100),
-                deposited_to_handle(X, "Bob_1"),
+                revealed(carol, X, "Bob_1"),
             ],
         )
         .await;
@@ -321,7 +321,7 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
                 HistoryEvent::Refunded { .. },
                 HistoryEvent::Deposited { .. },
                 HistoryEvent::Deposited { .. },
-                HistoryEvent::DepositedToHandle { .. },
+                HistoryEvent::HandleRevealed { .. },
                 HistoryEvent::Deposited { .. },
             ]
         ),
@@ -365,12 +365,14 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
             HistoryEvent::Forwarded { .. },
             HistoryEvent::Claimed { .. },
             HistoryEvent::Deposited { .. },
+            HistoryEvent::HandleRevealed { .. },
             HistoryEvent::Deposited { .. },
         ]
     ));
     assert_eq!(history.entries[2].roles, [Role::Depositor]);
     assert_eq!(history.entries[3].roles, [Role::RefundTo]);
     assert_eq!(history.entries[4].roles, [Role::Depositor, Role::RefundTo]);
+    assert_eq!(history.entries[5].roles, [Role::Revealer]);
     let history: AddressHistory = suite
         .get(&format!("/v1/history/address/{dave}"))
         .await
@@ -663,7 +665,7 @@ fn kind(event: &HistoryEvent) -> &'static str {
         HistoryEvent::CeremonyBound { .. } => "ceremony_bound",
         HistoryEvent::BindFeePaid { .. } => "bind_fee_paid",
         HistoryEvent::Deposited { .. } => "deposited",
-        HistoryEvent::DepositedToHandle { .. } => "deposited_to_handle",
+        HistoryEvent::HandleRevealed { .. } => "handle_revealed",
         HistoryEvent::Forwarded { .. } => "forwarded",
         HistoryEvent::Claimed { .. } => "claimed",
         HistoryEvent::Refunded { .. } => "refunded",
@@ -694,10 +696,11 @@ async fn a_retired_handle_is_in_the_history_of_the_address_that_held_it() {
     to_bob.extend(bind(bob, X, "777", "kim3", 3_000, false));
     suite.apply_tx(3, to_bob).await;
 
-    let (holder, held, moved) = (
+    let (holder, held, moved, revealer) = (
         vec![Role::Holder],
         vec![Role::PreviousHandleHolder],
         vec![Role::PreviousIdHolder],
+        vec![Role::Revealer],
     );
     let row = |kind: &str, roles: &Vec<Role>, handle: &str| {
         (kind.to_string(), roles.clone(), Some(node(handle)))
@@ -713,10 +716,12 @@ async fn a_retired_handle_is_in_the_history_of_the_address_that_held_it() {
             row("handle_unpublished", &holder, "kim2"),
             row("handle_retired", &held, "kim2"),
             row("handle_published", &holder, "kim2"),
+            row("handle_revealed", &revealer, "kim2"),
             row("identity_bound", &holder, "kim2"),
             row("handle_unpublished", &holder, "kim1"),
             row("handle_retired", &held, "kim1"),
             row("handle_published", &holder, "kim1"),
+            row("handle_revealed", &revealer, "kim1"),
             row("identity_bound", &holder, "kim1"),
         ]
     );
@@ -820,6 +825,7 @@ async fn an_unpublish_concerns_the_handle_it_withdrew() {
         [
             HistoryEvent::HandleUnpublished { .. },
             HistoryEvent::HandlePublished { .. },
+            HistoryEvent::HandleRevealed { .. },
             HistoryEvent::IdentityBound { .. },
         ]
     ));
@@ -917,7 +923,7 @@ async fn text_finds_a_deposit_the_way_the_chain_hashed_it() {
                     round: U256::ZERO,
                     amount: U256::from(9u64),
                 }),
-                deposited_to_handle(X, "Bo\"b"),
+                revealed(carol, X, "Bo\"b"),
             ],
         )
         .await;

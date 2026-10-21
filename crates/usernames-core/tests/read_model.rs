@@ -30,6 +30,7 @@ use common::{
     disclosed,
     publish,
     retire,
+    revealed,
     unpublish,
     Reply,
 };
@@ -313,7 +314,7 @@ async fn publishing_another_name_keeps_the_one_it_replaces_disclosed() {
     let (alice, bob) = (addr(0xD1), addr(0xD2));
     apply_tx(&store, 1, bind(alice, x, "71", "kim", 1_000, true)).await;
     apply_tx(&store, 2, bind(alice, x, "72", "lee", 2_000, false)).await;
-    apply(&store, 3, publish(alice, x, "lee")).await;
+    apply_tx(&store, 3, publish(alice, x, "lee")).await;
     let kim = x.handle_node("kim").unwrap();
     assert_eq!(disclosed(&pool, CHAIN, kim).await.as_deref(), Some("kim"));
 
@@ -363,7 +364,7 @@ async fn a_withdrawn_name_is_no_longer_published_but_still_shows() {
     assert_eq!(identity.handle, None, "a private bind shows no text");
 
     // A later `publish` discloses it.
-    apply(&store, 3, publish(alice, x, "alice_2")).await;
+    apply_tx(&store, 3, publish(alice, x, "alice_2")).await;
     let resolved: AddressResolution = get(&pool, &address).await.answer();
     let identity = only(&resolved.identities);
     assert!(identity.published);
@@ -454,7 +455,7 @@ async fn a_name_on_another_platform_replaces_the_one_before() {
     let resolved: IdResolution = get(&pool, &id_route(x, "81")).await.answer();
     assert!(!only(&resolved.bindings).published);
 
-    apply(&store, 3, publish(eve, x, "eve_x")).await;
+    apply_tx(&store, 3, publish(eve, x, "eve_x")).await;
     let resolved: AddressResolution = get(&pool, &address).await.answer();
     assert_eq!(named_platforms(&resolved), [Some(x)]);
     assert_eq!(names_held(&pool, eve).await, 1);
@@ -493,6 +494,42 @@ async fn a_withdrawal_clears_the_name_whatever_its_platform() {
         .answer();
     assert_eq!(found.hits.len(), 2, "{found:?}");
     assert!(found.hits.iter().all(|hit| !hit.published), "{found:?}");
+    drop(guard);
+}
+
+/// Every `HandleRevealed` fills one map from node to text, whichever
+/// contract logged it: a bind that reveals its handle without naming it, and
+/// an escrow `depositToHandle` before anybody holds the handle. Neither sets
+/// a name.
+#[tokio::test]
+async fn every_reveal_fills_one_map_and_sets_no_name() {
+    let Some((store, pool, guard)) = test_store().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let x = KnownPlatform::X;
+    let (eve, payer, fay) = (addr(0xE3), addr(0xE4), addr(0xE5));
+    let mut reveal_only = bind(eve, x, "91", "eve_r", 1_000, false);
+    reveal_only.push(revealed(eve, x, "Eve_R"));
+    apply_tx(&store, 1, reveal_only).await;
+    apply(&store, 2, revealed(payer, x, "Fay_E")).await;
+    apply_tx(&store, 3, bind(fay, x, "92", "fay_e", 2_000, false)).await;
+
+    for (holder, handle) in [(eve, "eve_r"), (fay, "fay_e")] {
+        let node = x.handle_node(handle).unwrap();
+        assert_eq!(disclosed(&pool, CHAIN, node).await.as_deref(), Some(handle));
+        let resolved: AddressResolution =
+            get(&pool, &format!("/v1/resolve/address/{holder}"))
+                .await
+                .answer();
+        let identity = only(&resolved.identities);
+        assert_eq!(identity.handle.as_deref(), Some(handle));
+        assert!(!identity.published, "{resolved:?}");
+        assert_eq!(names_held(&pool, holder).await, 0);
+    }
+    let found: SearchResults = get(&pool, "/v1/search?q=fay_e").await.answer();
+    assert_eq!(handles_of(&found), ["fay_e"]);
+    assert_eq!(only(&found.hits).owner, fay);
     drop(guard);
 }
 
@@ -627,7 +664,8 @@ async fn replay_converges_instead_of_duplicating() {
             .fetch_one(&pool)
             .await
             .expect("count");
-    assert_eq!(journal, 2);
+    // The bind, its reveal and its name.
+    assert_eq!(journal, 3);
     let resolved: HandleResolution =
         get(&pool, "/v1/resolve/handle/x/alice_1").await.answer();
     assert_eq!(only(&resolved.bindings).owner, alice);

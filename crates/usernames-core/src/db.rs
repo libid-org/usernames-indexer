@@ -791,6 +791,9 @@ impl Window {
                     .await?;
             }
 
+            // Its text is the disclosure above; it moves nothing else.
+            NamesEvent::HandleRevealed { .. } => {}
+
             // The holder's one name, on whichever platform: a name on
             // another platform is replaced, and the contract logs no
             // HandleUnpublished for it.

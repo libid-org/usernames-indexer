@@ -122,12 +122,14 @@ pub fn legacy_addr_call(labels: &[&str]) -> Vec<u8> {
 }
 
 /// Seed one disclosing X binding into the read model the gateway answers
-/// from: its `IdentityBound` and `HandlePublished`, in one transaction.
+/// from: its `IdentityBound`, `HandleRevealed` and `HandlePublished`, in one
+/// transaction.
 pub async fn bind(store: &ChainStore, handle: &str, holder: Address) {
     seed(store, handle, holder, true).await;
 }
 
-/// [`bind`] without the `HandlePublished`: a private binding.
+/// [`bind`] without the `HandleRevealed` and `HandlePublished`: a private
+/// binding.
 pub async fn bind_private(store: &ChainStore, handle: &str, holder: Address) {
     seed(store, handle, holder, false).await;
 }
@@ -144,11 +146,16 @@ async fn seed(store: &ChainStore, handle: &str, holder: Address, disclosed: bool
         ceremony_version: 1,
     }];
     if disclosed {
+        events.push(NamesEvent::HandleRevealed {
+            by: holder,
+            platform_id: x.id(),
+            handle_node,
+            handle: DisclosedHandle::verify(x, handle_node, handle),
+        });
         events.push(NamesEvent::HandlePublished {
             holder,
             platform_id: x.id(),
             handle_node,
-            handle: DisclosedHandle::verify(x, handle_node, handle),
         });
     }
     let mut window = store.begin_window().await.expect("begin");

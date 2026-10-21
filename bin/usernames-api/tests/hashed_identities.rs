@@ -87,10 +87,10 @@ fn the_mocks_emit_the_contracts_topics() {
         )+};
     }
     same_topics!(MockIdentityRegistry = IdentityRegistry:
-        IdentityBound, HandlePublished, HandleRetired, HandleUnpublished,
-        ProofVerifierConfigured, CeremonyBound, BindFeePaid);
+        IdentityBound, HandleRevealed, HandlePublished, HandleRetired,
+        HandleUnpublished, ProofVerifierConfigured, CeremonyBound, BindFeePaid);
     same_topics!(MockHandleEscrow = HandleEscrow:
-        Deposited, DepositedToHandle, Forwarded, Claimed, Refunded);
+        Deposited, HandleRevealed, Forwarded, Claimed, Refunded);
 }
 
 use MockIdentityRegistry::Bind;
@@ -303,9 +303,11 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
     let found: SearchResults = h.get("/v1/search?q=alice").await;
     assert!(found.hits.is_empty(), "{found:?}");
 
-    // 2. A disclosing bind: shown on the address and found by search.
+    // 2. A disclosing bind that names the handle: shown on the address and
+    //    found by search.
     let disclosing = Bind {
         handle: "alice_1".into(),
+        primary: true,
         ..x_bind(alice, ALICE_ID, "alice_1", 2000)
     };
     h.mine(registry.emitBind(disclosing).send()).await;
@@ -341,7 +343,7 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
     assert!(history.to_string().contains("alice_1"), "{history}");
 
     // 4. A public deposit to @Bob_2, then Bob binds it privately: the
-    //    disclosed handle maps to his id node. A private deposit names only
+    //    escrow's reveal maps the handle to his id node. A private deposit names only
     //    a node, and no platform.
     let native = address!("EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
     let payer = Address::repeat_byte(0xC0);
@@ -349,7 +351,7 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
     let bob_id = x.id_node(BOB_ID).expect("an id");
     let carol_node = x.handle_node("carol_3").expect("a handle");
     let (round, hundred, five) = (U256::ZERO, U256::from(100u64), U256::from(5u64));
-    let to_bob = escrow.emitDepositedToHandle(
+    let to_bob = escrow.emitDepositToHandle(
         bob_node,
         native,
         payer,
@@ -407,7 +409,8 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
     assert_eq!(bobs.handle.platform_id, Some(x.id()));
     assert_eq!(bobs.handle.handle.as_deref(), Some("bob_2"));
     let payers: AddressHistory = h.get(&format!("/v1/history/address/{payer}")).await;
-    assert_eq!(payers.entries.len(), 2, "{payers:?}");
+    // Two deposits, and the reveal of the one to @Bob_2.
+    assert_eq!(payers.entries.len(), 3, "{payers:?}");
 
     // 5. The privacy scan: no id anywhere, no undisclosed handle anywhere,
     //    and the disclosed ones only in the disclosures table.

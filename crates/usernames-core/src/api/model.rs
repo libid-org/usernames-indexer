@@ -284,7 +284,7 @@ pub struct SearchResults {
 pub struct HandleRef {
     /// The platform's short key, when known.
     pub platform: Option<KnownPlatform>,
-    /// The platform id, once a bind or a `DepositedToHandle` named it: a
+    /// The platform id, once a bind or a `HandleRevealed` named it: a
     /// deposit names only the node.
     pub platform_id: Option<B256>,
     /// The node the chain filed the handle under.
@@ -312,6 +312,11 @@ pub enum HistoryEvent {
         platform_id: B256,
         observed_at: u64,
         ceremony_version: u16,
+    },
+    HandleRevealed {
+        by: Address,
+        platform_id: B256,
+        handle_node: B256,
     },
     HandlePublished {
         holder: Address,
@@ -350,10 +355,6 @@ pub enum HistoryEvent {
         round: U256,
         #[serde_as(as = "DisplayFromStr")]
         amount: U256,
-    },
-    DepositedToHandle {
-        handle_node: B256,
-        platform_id: B256,
     },
     Forwarded {
         handle_node: B256,
@@ -413,11 +414,20 @@ impl From<NamesEvent> for HistoryEvent {
                 observed_at,
                 ceremony_version,
             },
+            NamesEvent::HandleRevealed {
+                by,
+                platform_id,
+                handle_node,
+                handle: _,
+            } => Self::HandleRevealed {
+                by,
+                platform_id,
+                handle_node,
+            },
             NamesEvent::HandlePublished {
                 holder,
                 platform_id,
                 handle_node,
-                handle: _,
             } => Self::HandlePublished {
                 holder,
                 platform_id,
@@ -472,14 +482,6 @@ impl From<NamesEvent> for HistoryEvent {
                 depositor,
                 round,
                 amount,
-            },
-            NamesEvent::Escrow(EscrowEvent::DepositedToHandle {
-                handle_node,
-                platform_id,
-                handle: _,
-            }) => Self::DepositedToHandle {
-                handle_node,
-                platform_id,
             },
             NamesEvent::Escrow(EscrowEvent::Forwarded {
                 handle_node,

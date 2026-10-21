@@ -51,7 +51,6 @@ use usernames_core::{
         Store,
     },
     events::{
-        EscrowEvent,
         LogPosition,
         NamesEvent,
     },
@@ -199,8 +198,8 @@ sol!(
     "../../contracts/MockHandleEscrow.json"
 );
 
-/// The mock's bind of `id` to `handle`, disclosing it when `disclosed`, with
-/// nothing to withdraw or retire.
+/// The mock's bind of `id` to `handle`, disclosing it as the holder's name
+/// when `disclosed`, with nothing to withdraw or retire.
 pub fn mock_bind(
     holder: Address,
     platform: KnownPlatform,
@@ -226,12 +225,14 @@ pub fn mock_bind(
         } else {
             String::new()
         },
+        primary: disclosed,
         authorizationDigest: digest,
     }
 }
 
-/// A bind's events, as the contract emits them: `IdentityBound`, and
-/// `HandlePublished` when the ceremony disclosed the handle.
+/// A bind's events, as the contract emits them: `IdentityBound`, and when
+/// the ceremony disclosed the handle as the holder's name, `HandleRevealed`
+/// and `HandlePublished`.
 pub fn bind(
     holder: Address,
     platform: KnownPlatform,
@@ -249,19 +250,37 @@ pub fn bind(
         ceremony_version: 1,
     }];
     if disclosed {
-        events.push(publish(holder, platform, handle));
+        events.extend(publish(holder, platform, handle));
     }
     events
 }
 
-/// `publish(handle)`'s event.
-pub fn publish(holder: Address, platform: KnownPlatform, handle: &str) -> NamesEvent {
+/// `publish(handle)`'s events: the text, then the name.
+pub fn publish(
+    holder: Address,
+    platform: KnownPlatform,
+    handle: &str,
+) -> Vec<NamesEvent> {
     let handle_node = platform.handle_node(handle).expect("a handle");
-    NamesEvent::HandlePublished {
-        holder,
+    vec![
+        revealed(holder, platform, handle),
+        NamesEvent::HandlePublished {
+            holder,
+            platform_id: platform.id(),
+            handle_node,
+        },
+    ]
+}
+
+/// The `HandleRevealed` of the handle as `by` typed it: from `reveal`,
+/// `publish` or a disclosing bind, or from a `depositToHandle`.
+pub fn revealed(by: Address, platform: KnownPlatform, typed: &str) -> NamesEvent {
+    let (_, handle_node) = platform.folded_handle_node(typed);
+    NamesEvent::HandleRevealed {
+        by,
         platform_id: platform.id(),
         handle_node,
-        handle: DisclosedHandle::verify(platform, handle_node, handle),
+        handle: DisclosedHandle::verify(platform, handle_node, typed),
     }
 }
 
@@ -277,16 +296,6 @@ pub fn retire(platform: KnownPlatform, handle: &str, holder: Address) -> NamesEv
 /// A withdrawal of `holder`'s name.
 pub fn unpublish(holder: Address) -> NamesEvent {
     NamesEvent::HandleUnpublished { holder }
-}
-
-/// A `depositToHandle`'s disclosure of the handle as typed.
-pub fn deposited_to_handle(platform: KnownPlatform, typed: &str) -> NamesEvent {
-    let (_, handle_node) = platform.folded_handle_node(typed);
-    NamesEvent::Escrow(EscrowEvent::DepositedToHandle {
-        handle_node,
-        platform_id: platform.id(),
-        handle: DisclosedHandle::verify(platform, handle_node, typed),
-    })
 }
 
 /// Wait until the indexer has committed through `block`; fail after 30s.

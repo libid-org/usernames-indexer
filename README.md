@@ -17,10 +17,11 @@ where the read model, the event decoding and the loop itself live.
 The chain keys every binding by node: `SHA256(tag || id)` and
 `SHA256(tag || folded handle)`, the nodes the circuits output. No plaintext
 id ever reaches the chain, and handle text reaches it only where somebody
-disclosed it: a disclosing bind or `publish` (`HandlePublished`), or a
-`depositToHandle` (`DepositedToHandle`). The read model holds exactly that
-much. It keys bindings by node, keeps disclosed text in one table, and checks
-that each text hashes to its node before it stores it.
+disclosed it: a disclosing bind, `publish` or `reveal` on the registry, or a
+`depositToHandle` on the escrow. Each logs the text in the one
+`HandleRevealed` event both contracts share. The read model holds exactly
+that much. It keys bindings by node, keeps one map from node to revealed
+text, and checks that each text hashes to its node before it stores it.
 
 ## Running
 
@@ -71,7 +72,7 @@ indexer's settings.
 | `GET /v1/resolve/id-node/{idNode}` | The wallet an id node resolves to (`resolveId`) on each chain it is bound on, each with the handle node that account holds now. The client hashes the id (`libid-identity`, or `idNode` in `@libid/contracts`); no plaintext id reaches the server |
 | `GET /v1/resolve/address/{address}` | Every identity a wallet proved on every chain, by id node, with `resolves`, and `published` on the one whose handle is the wallet's name (`primaryHandleOf`) |
 | `GET /v1/search?q=gre&platform=x&owner=0x…&limit=10&offset=0` | Live handles whose text the chain disclosed, matching a partial query (exact, then prefix, then substring, then trigram-fuzzy), linked to a wallet, or both; one of `q` and `owner` is required. `limit` (1..50, default 10) and `offset` (up to 10000) page the ranked list; a page shorter than `limit` is the last |
-| `GET /v1/history/address/{address}?before=&limit=` | Every event the address took part in, newest first, each with its `roles`: `holder`, `previousHandleHolder` and `previousIdHolder` (an event took that handle or account from it), `feeReceiver`, `depositor`, `refundTo` (a claim took its deposit, too), `claimer`, `recipient` |
+| `GET /v1/history/address/{address}?before=&limit=` | Every event the address took part in, newest first, each with its `roles`: `holder`, `previousHandleHolder` and `previousIdHolder` (an event took that handle or account from it), `feeReceiver`, `depositor`, `refundTo` (a claim took its deposit, too), `claimer`, `recipient`, `revealer` (it put a handle's text on chain) |
 | `GET /v1/history/handle/{platform}/{handle}?before=&limit=` | Every event on the handle: deposits while nobody held it, the binds that gave it a holder, and every claim, refund and payment after |
 | `GET /v1/history/node/{node}?before=&limit=` | The same, by handle node: for a handle nobody has bound, whose text no event carried |
 | `GET /v1/escrow/claimable/{address}?before=&limit=` | What `claim` would pay the address: everything held for the handles it holds now |
@@ -97,15 +98,15 @@ chain's own coin is the EIP-7528 token `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEE
 Anybody can deposit a token they wrote, so show the tokens you recognize.
 
 A `deposit` names a handle by its node alone: the store knows no platform
-for it (`platformId` is absent) until a `DepositedToHandle` or a bind names
+for it (`platformId` is absent) until a `HandleRevealed` or a bind names
 one. Asking by text works from the first deposit: the escrow and history
 routes fold the text's A-Z and hash it, the way `depositToHandle` does, so
 `/v1/escrow/handle/x/Bo%22b` finds a deposit to `Bo"b`.
 
 **Handle text shows once the chain disclosed it.** Every response that
 carries handle text (`handle` in resolutions, search hits, histories and
-escrow amounts) takes it from `names.disclosures`: text a disclosing bind, a
-`publish` or a `depositToHandle` carried. The API explores the chain's
+escrow amounts) takes it from `names.disclosures`, the map every
+`HandleRevealed` fills, whichever contract logged it. The API explores the chain's
 history, so a name its holder later withdrew or replaced, or a handle that
 passed privately to another account, still shows the text once disclosed;
 `published` says whether it is the holder's name now: one per holder, on
@@ -294,12 +295,12 @@ chain; a second deployment can share the database):
 - `published` — each holder's one name, as its platform and the node it
   hashes to; a row exists exactly while the contract's `primaryHandles`
   entry is set
-- `disclosures` — handle text the chain disclosed, a token a circuit hashes,
+- `disclosures` — handle text a `HandleRevealed` carried, a token a circuit hashes,
   folded and checked against its node: one row per node, kept whatever
   happens to the name or the handle after. `handle_identities` maps each
   disclosed handle to its id node
 - `handle_nodes` — the platform of every handle node a bind,
-  `HandlePublished`, `HandleRetired` or `DepositedToHandle` named; a bare
+  `HandleRevealed`, `HandlePublished` or `HandleRetired` named; a bare
   deposit names none
 - `escrow_held` — mirrors HandleEscrow's `held` and `round` per handle node
   and token
@@ -388,11 +389,11 @@ and an earlier API answers `internal`; to go back, start the earlier build on
 a fresh database, as above.
 
 **Upgrading to one name per holder (`INDEXER_VERSION` 5):** this build
-indexes an `IdentityRegistry` whose `HandleUnpublished` names only the
-holder. Point `IDENTITY_NAMES_ADDRESS` at that deployment and roll the
-indexer first. It migrates in place (`005_one_name_per_holder.sql`),
-emptying `published`, and every chain replays from its registry's
-deployment block. An
+indexes an `IdentityRegistry` with one name per holder and a `HandleEscrow`
+that logs `HandleRevealed`. Point `IDENTITY_NAMES_ADDRESS` and
+`HANDLE_ESCROW_ADDRESS` at those deployments and roll the indexer first. It
+migrates in place (`005_names_and_reveals.sql`), deleting every row and
+cursor, and every chain replays from its registry's deployment block. An
 earlier indexer refuses a database 005 has migrated; to go back, start it on
 a fresh database, as above.
 

@@ -22,9 +22,14 @@ use alloy::{
         SolEvent,
     },
 };
+// `HandleRevealed` is one event every libid contract declares through the
+// same interface; the registry's binding decodes the escrow's logs of it too.
 use libid_contracts::bindings::{
     escrow::HandleEscrow,
-    identity::IdentityRegistry,
+    identity::IdentityRegistry::{
+        self,
+        HandleRevealed,
+    },
 };
 use serde::{
     de::Error as _,
@@ -85,15 +90,23 @@ pub enum NamesEvent {
         observed_at: u64,
         ceremony_version: u16,
     },
-    /// A holder disclosed its handle as its name, by a disclosing bind or by
-    /// `publish`, replacing any name it had on any platform. `handle` is the
-    /// text when it hashes to `handle_node`; the journal never holds it.
-    HandlePublished {
-        holder: Address,
+    /// `by` put a handle's text on chain: a disclosing bind, `publish` or
+    /// `reveal` on the registry, or a `depositToHandle` on the escrow, which
+    /// log it the same way. `handle` is the text when it hashes to
+    /// `handle_node`; the journal never holds it.
+    HandleRevealed {
+        by: Address,
         platform_id: B256,
         handle_node: B256,
         #[serde(skip)]
         handle: Option<DisclosedHandle>,
+    },
+    /// A holder made a handle it holds its name, replacing any name it had on
+    /// any platform. The text is in the `HandleRevealed` before it.
+    HandlePublished {
+        holder: Address,
+        platform_id: B256,
+        handle_node: B256,
     },
     /// The identity behind a handle proved a different one; the old node,
     /// which `holder` held, stops resolving but keeps its observed-at
@@ -151,15 +164,6 @@ pub enum EscrowEvent {
         round: U256,
         #[serde_as(as = "DisplayFromStr")]
         amount: U256,
-    },
-    /// A deposit named its handle as text, after its `Deposited` or
-    /// `Forwarded`. `handle` is the text, folded, when it hashes to
-    /// `handle_node`; the journal never holds it.
-    DepositedToHandle {
-        handle_node: B256,
-        platform_id: B256,
-        #[serde(skip)]
-        handle: Option<DisclosedHandle>,
     },
     /// A deposit for a held node, paid straight to its holder.
     Forwarded {
@@ -225,6 +229,8 @@ pub enum Role {
     Claimer,
     /// Was paid by a claim or a refund.
     Recipient,
+    /// Put a handle's text on chain.
+    Revealer,
 }
 
 /// A stored role name this build does not know.
@@ -234,7 +240,7 @@ pub struct UnknownRole(String);
 
 impl Role {
     /// Every role, so a stored name parses back by the same table.
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Holder,
         Self::PreviousHandleHolder,
         Self::PreviousIdHolder,
@@ -243,6 +249,7 @@ impl Role {
         Self::RefundTo,
         Self::Claimer,
         Self::Recipient,
+        Self::Revealer,
     ];
 
     /// The name stored and served: the camelCase the API spells it in.
@@ -256,6 +263,7 @@ impl Role {
             Self::RefundTo => "refundTo",
             Self::Claimer => "claimer",
             Self::Recipient => "recipient",
+            Self::Revealer => "revealer",
         }
     }
 }
@@ -282,6 +290,7 @@ impl NamesEvent {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::IdentityBound { .. } => "identity_bound",
+            Self::HandleRevealed { .. } => "handle_revealed",
             Self::HandlePublished { .. } => "handle_published",
             Self::HandleRetired { .. } => "handle_retired",
             Self::HandleUnpublished { .. } => "handle_unpublished",
@@ -300,6 +309,7 @@ impl NamesEvent {
             | Self::HandlePublished { holder, .. }
             | Self::HandleUnpublished { holder, .. }
             | Self::CeremonyBound { holder, .. } => vec![(*holder, Role::Holder)],
+            Self::HandleRevealed { by, .. } => vec![(*by, Role::Revealer)],
             Self::HandleRetired { holder, .. } => {
                 vec![(*holder, Role::PreviousHandleHolder)]
             }
@@ -309,20 +319,15 @@ impl NamesEvent {
         }
     }
 
-    /// The handle text the event disclosed, with its platform and node.
+    /// The handle text the event revealed, with its platform and node.
     pub fn disclosure(&self) -> Option<(B256, B256, &DisclosedHandle)> {
         match self {
-            Self::HandlePublished {
+            Self::HandleRevealed {
                 platform_id,
                 handle_node,
                 handle,
                 ..
-            }
-            | Self::Escrow(EscrowEvent::DepositedToHandle {
-                platform_id,
-                handle_node,
-                handle,
-            }) => Some((*platform_id, *handle_node, handle.as_ref()?)),
+            } => Some((*platform_id, *handle_node, handle.as_ref()?)),
             _ => None,
         }
     }
@@ -356,12 +361,8 @@ impl NamesEvent {
 impl NamesEvent {
     /// The event as its journal row reads back: disclosed text dropped.
     fn without_text(mut self) -> Self {
-        match &mut self {
-            Self::HandlePublished { handle, .. }
-            | Self::Escrow(EscrowEvent::DepositedToHandle { handle, .. }) => {
-                *handle = None
-            }
-            _ => {}
+        if let Self::HandleRevealed { handle, .. } = &mut self {
+            *handle = None
         }
         self
     }
@@ -372,7 +373,6 @@ impl EscrowEvent {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Deposited { .. } => "deposited",
-            Self::DepositedToHandle { .. } => "deposited_to_handle",
             Self::Forwarded { .. } => "forwarded",
             Self::Claimed { .. } => "claimed",
             Self::Refunded { .. } => "refunded",
@@ -387,7 +387,6 @@ impl EscrowEvent {
                 depositor,
                 ..
             } => vec![(*depositor, Role::Depositor), (*refund_to, Role::RefundTo)],
-            Self::DepositedToHandle { .. } => Vec::new(),
             Self::Forwarded {
                 depositor, holder, ..
             } => vec![(*depositor, Role::Depositor), (*holder, Role::Holder)],
@@ -431,32 +430,43 @@ fn payload_of<E: SolEvent>(log: &Log, event: &'static str) -> Result<E, DecodeEr
         .map_err(|source| DecodeError::Payload { event, source })
 }
 
-/// The text an event disclosed, when it is a handle hashing to the node the
-/// event names. Other text is dropped and logged without itself.
+/// The text a `HandleRevealed` carried, when it is a handle hashing to the
+/// node the event names. Other text is dropped and logged without itself.
 fn disclosed(
-    event: &'static str,
     platform_id: B256,
     handle_node: B256,
     text: &str,
 ) -> Option<DisclosedHandle> {
     let Some(platform) = Platform::known_of(platform_id) else {
         tracing::warn!(
-            event,
             %platform_id,
-            "disclosed text on a platform this build does not know; not stored"
+            "revealed text on a platform this build does not know; not stored"
         );
         return None;
     };
     let verified = DisclosedHandle::verify(platform, handle_node, text);
     if verified.is_none() {
         tracing::warn!(
-            event,
             %platform_id,
             %handle_node,
-            "disclosed text is not a handle hashing to its node; not stored"
+            "revealed text is not a handle hashing to its node; not stored"
         );
     }
     verified
+}
+
+impl NamesEvent {
+    /// The `HandleRevealed` a log carries, whichever libid contract wrote it:
+    /// they share the event, topic and all.
+    fn revealed(log: &Log) -> Result<Self, DecodeError> {
+        let d: HandleRevealed = payload_of(log, "HandleRevealed")?;
+        Ok(Self::HandleRevealed {
+            by: d.by,
+            platform_id: d.platformId,
+            handle_node: d.handleNode,
+            handle: disclosed(d.platformId, d.handleNode, &d.handle),
+        })
+    }
 }
 
 impl LogPosition {
@@ -503,13 +513,14 @@ pub fn decode_registry(
             observed_at: d.observedAt,
             ceremony_version: d.ceremonyVersion,
         }
+    } else if topic0 == HandleRevealed::SIGNATURE_HASH {
+        NamesEvent::revealed(log)?
     } else if topic0 == IdentityRegistry::HandlePublished::SIGNATURE_HASH {
         let d: IdentityRegistry::HandlePublished = payload_of(log, "HandlePublished")?;
         NamesEvent::HandlePublished {
             holder: d.holder,
             platform_id: d.platformId,
             handle_node: d.handleNode,
-            handle: disclosed("HandlePublished", d.platformId, d.handleNode, &d.handle),
         }
     } else if topic0 == IdentityRegistry::HandleRetired::SIGNATURE_HASH {
         let d: IdentityRegistry::HandleRetired = payload_of(log, "HandleRetired")?;
@@ -553,7 +564,8 @@ pub fn decode_registry(
 /// Decode one log from `HandleEscrow`, under the same rules as
 /// [`decode_registry`]: an unknown topic is `Ok(None)`, a known one that does
 /// not decode is an error. The proxy's own events — ownership, upgrades,
-/// initialization — are unknown topics here.
+/// initialization — are unknown topics here. A `depositToHandle`'s
+/// `HandleRevealed` decodes as the registry's does.
 pub fn decode_escrow(
     log: &Log,
 ) -> Result<Option<(NamesEvent, LogPosition)>, DecodeError> {
@@ -561,6 +573,9 @@ pub fn decode_escrow(
     let Some(&topic0) = log.topic0() else {
         return Ok(None);
     };
+    if topic0 == HandleRevealed::SIGNATURE_HASH {
+        return Ok(Some((NamesEvent::revealed(log)?, position)));
+    }
 
     let event = if topic0 == HandleEscrow::Deposited::SIGNATURE_HASH {
         let d: HandleEscrow::Deposited = payload_of(log, "Deposited")?;
@@ -571,13 +586,6 @@ pub fn decode_escrow(
             depositor: d.depositor,
             round: d.round,
             amount: d.amount,
-        }
-    } else if topic0 == HandleEscrow::DepositedToHandle::SIGNATURE_HASH {
-        let d: HandleEscrow::DepositedToHandle = payload_of(log, "DepositedToHandle")?;
-        EscrowEvent::DepositedToHandle {
-            handle_node: d.handleNode,
-            platform_id: d.platformId,
-            handle: disclosed("DepositedToHandle", d.platformId, d.handleNode, &d.handle),
         }
     } else if topic0 == HandleEscrow::Forwarded::SIGNATURE_HASH {
         let d: HandleEscrow::Forwarded = payload_of(log, "Forwarded")?;
@@ -660,7 +668,11 @@ mod tests {
         );
         assert_eq!(
             IdentityRegistry::HandlePublished::SIGNATURE_HASH,
-            b256!("e6f96c6f941ac3c40f5739ffdc56fd29f1fa4428e11a3f0640b3531574cfd06c")
+            b256!("04a31fa5777bb2c9381e5ebd6b6f967c2094d3874b1c7789dc15a80c7dcbcafb")
+        );
+        assert_eq!(
+            HandleRevealed::SIGNATURE_HASH,
+            b256!("8bf5815f7d6358cda69f9796b008b4a18c173a8f699d4c0f5992e0a6f37ee8b3")
         );
         assert_eq!(
             IdentityRegistry::HandleRetired::SIGNATURE_HASH,
@@ -702,16 +714,17 @@ mod tests {
         assert_eq!(position.block_time, 1_700_000_000);
     }
 
-    /// The same fixed points for `HandleEscrow.sol`'s five events.
+    /// The same fixed points for `HandleEscrow.sol`'s own four events, and
+    /// the `HandleRevealed` it shares with the registry.
     #[test]
     fn escrow_topics_match_the_contract() {
         assert_eq!(
-            HandleEscrow::Deposited::SIGNATURE_HASH,
-            b256!("1ffc9b3e17a608abd621c9a1d46d5ea433d46ee04324e33c270ace681efe77a2")
+            HandleEscrow::HandleRevealed::SIGNATURE_HASH,
+            HandleRevealed::SIGNATURE_HASH
         );
         assert_eq!(
-            HandleEscrow::DepositedToHandle::SIGNATURE_HASH,
-            b256!("97acd3a452fdde6e34045582f8f430e3d6c3bb485e62407340311cf17314fe06")
+            HandleEscrow::Deposited::SIGNATURE_HASH,
+            b256!("1ffc9b3e17a608abd621c9a1d46d5ea433d46ee04324e33c270ace681efe77a2")
         );
         assert_eq!(
             HandleEscrow::Forwarded::SIGNATURE_HASH,
@@ -752,7 +765,8 @@ mod tests {
     }
 
     /// An escrow topic means nothing from the registry, and the reverse: each
-    /// contract's logs are decoded against its own events only.
+    /// contract's logs are decoded against its own events, and the
+    /// `HandleRevealed` they share.
     #[test]
     fn each_decoder_knows_only_its_own_contract() {
         let escrow_log = mined(
@@ -807,11 +821,16 @@ mod tests {
                 observed_at: u64::MAX,
                 ceremony_version: u16::MAX,
             },
+            NamesEvent::HandleRevealed {
+                by: a,
+                platform_id: x.id(),
+                handle_node: alice,
+                handle: text,
+            },
             NamesEvent::HandlePublished {
                 holder: a,
                 platform_id: x.id(),
                 handle_node: alice,
-                handle: text.clone(),
             },
             NamesEvent::HandleRetired {
                 platform_id: PLATFORM,
@@ -838,11 +857,6 @@ mod tests {
                 depositor: a,
                 round: U256::from(2u64),
                 amount: U256::MAX,
-            }),
-            NamesEvent::Escrow(EscrowEvent::DepositedToHandle {
-                handle_node: alice,
-                platform_id: x.id(),
-                handle: text,
             }),
             NamesEvent::Escrow(EscrowEvent::Forwarded {
                 handle_node: n,
@@ -880,15 +894,15 @@ mod tests {
         }
     }
 
-    /// Disclosed text decodes only when it hashes to the node beside it.
+    /// Revealed text decodes only when it hashes to the node beside it.
     #[test]
-    fn a_published_handle_keeps_its_text_only_when_it_hashes_to_the_node() {
+    fn a_revealed_handle_keeps_its_text_only_when_it_hashes_to_the_node() {
         let x = KnownPlatform::X;
         let node = x.handle_node("alice_1").unwrap();
-        let published = |handle: &str| {
+        let revealed = |handle: &str| {
             let log = mined(
-                IdentityRegistry::HandlePublished {
-                    holder: HOLDER,
+                HandleRevealed {
+                    by: HOLDER,
                     platformId: x.id(),
                     handleNode: node,
                     handle: handle.into(),
@@ -896,15 +910,42 @@ mod tests {
                 .encode_log_data(),
             );
             match decode_registry(&log).unwrap().expect("a known topic").0 {
-                NamesEvent::HandlePublished { handle, .. } => handle,
+                NamesEvent::HandleRevealed { handle, .. } => handle,
                 other => panic!("{other:?}"),
             }
         };
         assert_eq!(
-            published("Alice_1").as_ref().map(DisclosedHandle::as_str),
+            revealed("Alice_1").as_ref().map(DisclosedHandle::as_str),
             Some("alice_1")
         );
-        assert_eq!(published("bob"), None);
+        assert_eq!(revealed("bob"), None);
+    }
+
+    /// The escrow's `HandleRevealed` is the registry's: the same event, with
+    /// the depositor as the revealer.
+    #[test]
+    fn an_escrow_reveal_decodes_as_the_registrys() {
+        let x = KnownPlatform::X;
+        let node = x.handle_node("bob_1").unwrap();
+        let log = mined(
+            HandleEscrow::HandleRevealed {
+                by: HOLDER,
+                platformId: x.id(),
+                handleNode: node,
+                handle: "Bob_1".into(),
+            }
+            .encode_log_data(),
+        );
+        let (from_escrow, _) = decode_escrow(&log).unwrap().expect("a known topic");
+        let (from_registry, _) = decode_registry(&log).unwrap().expect("a known topic");
+        assert_eq!(from_escrow, from_registry);
+        assert_eq!(from_escrow.parties(), [(HOLDER, Role::Revealer)]);
+        assert_eq!(
+            from_escrow
+                .disclosure()
+                .map(|(_, n, text)| (n, text.as_str())),
+            Some((node, "bob_1"))
+        );
     }
 
     #[test]
