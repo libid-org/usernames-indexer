@@ -318,8 +318,7 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
     assert_eq!(hits, ["alice_1"]);
 
     // 3. Withdrawn: no longer published, the text still shown.
-    h.mine(registry.emitHandleUnpublished(alice, x.id()).send())
-        .await;
+    h.mine(registry.emitHandleUnpublished(alice).send()).await;
     let theirs: AddressResolution = h.get(&format!("/v1/resolve/address/{alice}")).await;
     assert_eq!(theirs.identities[0].handle.as_deref(), Some("alice_1"));
     assert!(!theirs.identities[0].published);

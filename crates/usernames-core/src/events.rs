@@ -85,9 +85,9 @@ pub enum NamesEvent {
         observed_at: u64,
         ceremony_version: u16,
     },
-    /// A holder disclosed its handle as its name on a platform, by a
-    /// disclosing bind or by `publish`. `handle` is the text when it hashes to
-    /// `handle_node`; the journal never holds it.
+    /// A holder disclosed its handle as its name, by a disclosing bind or by
+    /// `publish`, replacing any name it had on any platform. `handle` is the
+    /// text when it hashes to `handle_node`; the journal never holds it.
     HandlePublished {
         holder: Address,
         platform_id: B256,
@@ -103,9 +103,9 @@ pub enum NamesEvent {
         handle_node: B256,
         holder: Address,
     },
-    /// A holder's published handle was withdrawn: by the holder, or by a
-    /// bind that took the handle from it.
-    HandleUnpublished { holder: Address, platform_id: B256 },
+    /// A holder's name was withdrawn: by the holder, or by a bind that took
+    /// or retired the handle it names.
+    HandleUnpublished { holder: Address },
     /// The contract was pointed at the Proof Verifier that checks every claim
     /// and holds the version set the contract itself does not.
     ProofVerifierConfigured { verifier: Address },
@@ -521,10 +521,7 @@ pub fn decode_registry(
     } else if topic0 == IdentityRegistry::HandleUnpublished::SIGNATURE_HASH {
         let d: IdentityRegistry::HandleUnpublished =
             payload_of(log, "HandleUnpublished")?;
-        NamesEvent::HandleUnpublished {
-            holder: d.holder,
-            platform_id: d.platformId,
-        }
+        NamesEvent::HandleUnpublished { holder: d.holder }
     } else if topic0 == IdentityRegistry::ProofVerifierConfigured::SIGNATURE_HASH {
         let d: IdentityRegistry::ProofVerifierConfigured =
             payload_of(log, "ProofVerifierConfigured")?;
@@ -683,25 +680,20 @@ mod tests {
         );
         assert_eq!(
             IdentityRegistry::HandleUnpublished::SIGNATURE_HASH,
-            b256!("327d843d48b64b6d010abe26e340d8c8eb34e327aa886c7fafbb4a024eccc3f8")
+            b256!("916ce5f64b56cb8a45184ccbfe46b3eb4a38158e9cb0defe417c42a9bc42fda5")
         );
     }
 
     #[test]
     fn handle_unpublished_decodes() {
         let log = mined(
-            IdentityRegistry::HandleUnpublished {
-                holder: HOLDER,
-                platformId: PLATFORM,
-            }
-            .encode_log_data(),
+            IdentityRegistry::HandleUnpublished { holder: HOLDER }.encode_log_data(),
         );
         let (event, position) = decode_registry(&log).unwrap().expect("a known topic");
         assert!(
             matches!(
                 event,
-                NamesEvent::HandleUnpublished { holder, platform_id }
-                    if holder == HOLDER && platform_id == PLATFORM
+                NamesEvent::HandleUnpublished { holder } if holder == HOLDER
             ),
             "{event:?}"
         );
@@ -777,11 +769,7 @@ mod tests {
         );
         assert!(decode_registry(&escrow_log).unwrap().is_none());
         let registry_log = mined(
-            IdentityRegistry::HandleUnpublished {
-                holder: HOLDER,
-                platformId: PLATFORM,
-            }
-            .encode_log_data(),
+            IdentityRegistry::HandleUnpublished { holder: HOLDER }.encode_log_data(),
         );
         assert!(decode_escrow(&registry_log).unwrap().is_none());
     }
@@ -789,11 +777,7 @@ mod tests {
     #[test]
     fn a_log_without_its_block_time_fails_instead_of_dating_nothing() {
         let mut log = mined(
-            IdentityRegistry::HandleUnpublished {
-                holder: HOLDER,
-                platformId: PLATFORM,
-            }
-            .encode_log_data(),
+            IdentityRegistry::HandleUnpublished { holder: HOLDER }.encode_log_data(),
         );
         log.block_timestamp = None;
         assert!(matches!(
@@ -834,10 +818,7 @@ mod tests {
                 handle_node: n,
                 holder: a,
             },
-            NamesEvent::HandleUnpublished {
-                holder: a,
-                platform_id: PLATFORM,
-            },
+            NamesEvent::HandleUnpublished { holder: a },
             NamesEvent::ProofVerifierConfigured { verifier: b },
             NamesEvent::CeremonyBound {
                 authorization_digest: p,

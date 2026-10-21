@@ -274,12 +274,9 @@ pub fn retire(platform: KnownPlatform, handle: &str, holder: Address) -> NamesEv
     }
 }
 
-/// A withdrawal of `holder`'s name on the platform.
-pub fn unpublish(holder: Address, platform: KnownPlatform) -> NamesEvent {
-    NamesEvent::HandleUnpublished {
-        holder,
-        platform_id: platform.id(),
-    }
+/// A withdrawal of `holder`'s name.
+pub fn unpublish(holder: Address) -> NamesEvent {
+    NamesEvent::HandleUnpublished { holder }
 }
 
 /// A `depositToHandle`'s disclosure of the handle as typed.

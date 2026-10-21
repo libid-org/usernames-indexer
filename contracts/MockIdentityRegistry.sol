@@ -35,7 +35,7 @@ contract MockIdentityRegistry {
     event HandlePublished(
         address indexed holder, bytes32 indexed platformId, bytes32 indexed handleNode, string handle
     );
-    event HandleUnpublished(address indexed holder, bytes32 indexed platformId);
+    event HandleUnpublished(address indexed holder);
 
     /// @notice One `bind`, and what it finds before it writes.
     struct Bind {
@@ -74,10 +74,10 @@ contract MockIdentityRegistry {
     ///         name's withdrawal, the binding; then the disclosure and the
     ///         ceremony.
     function emitBind(Bind calldata b) external {
-        if (b.takenFrom != address(0)) emit HandleUnpublished(b.takenFrom, b.platformId);
+        if (b.takenFrom != address(0)) emit HandleUnpublished(b.takenFrom);
         if (b.retiredNode != bytes32(0)) {
             emit HandleRetired(b.platformId, b.retiredNode, b.retiredHolder);
-            if (b.retiredNamed) emit HandleUnpublished(b.retiredHolder, b.platformId);
+            if (b.retiredNamed) emit HandleUnpublished(b.retiredHolder);
         }
         emit IdentityBound(b.holder, b.idNode, b.handleNode, b.platformId, b.observedAt, b.ceremonyVersion);
         if (bytes(b.handle).length != 0) emit HandlePublished(b.holder, b.platformId, b.handleNode, b.handle);
@@ -105,7 +105,7 @@ contract MockIdentityRegistry {
         emit ProofVerifierConfigured(verifier);
     }
 
-    function emitHandleUnpublished(address holder, bytes32 platformId) external {
-        emit HandleUnpublished(holder, platformId);
+    function emitHandleUnpublished(address holder) external {
+        emit HandleUnpublished(holder);
     }
 }

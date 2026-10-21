@@ -183,7 +183,7 @@ pub struct IdBinding {
     pub handle: Option<String>,
     /// The handle node this account last proved (`handleNodeById`).
     pub handle_node: B256,
-    /// Whether the handle is the wallet's displayed name on the platform.
+    /// Whether the handle is the wallet's name.
     pub published: bool,
 }
 
@@ -225,7 +225,7 @@ pub struct AddressIdentity {
     pub ceremony_version: i64,
     /// Whether the handle still resolves to this wallet.
     pub resolves: bool,
-    /// Whether this is the wallet's displayed name on the platform.
+    /// Whether this is the wallet's name.
     pub published: bool,
 }
 
@@ -258,7 +258,7 @@ pub struct SearchHit {
     pub owner: Address,
     /// The account id node behind it.
     pub id_node: B256,
-    /// Whether the owner displays this handle.
+    /// Whether this handle is the owner's name.
     pub published: bool,
 }
 
@@ -325,7 +325,6 @@ pub enum HistoryEvent {
     },
     HandleUnpublished {
         holder: Address,
-        platform_id: B256,
     },
     ProofVerifierConfigured {
         verifier: Address,
@@ -433,13 +432,9 @@ impl From<NamesEvent> for HistoryEvent {
                 handle_node,
                 holder,
             },
-            NamesEvent::HandleUnpublished {
-                holder,
-                platform_id,
-            } => Self::HandleUnpublished {
-                holder,
-                platform_id,
-            },
+            NamesEvent::HandleUnpublished { holder } => {
+                Self::HandleUnpublished { holder }
+            }
             NamesEvent::ProofVerifierConfigured { verifier } => {
                 Self::ProofVerifierConfigured { verifier }
             }

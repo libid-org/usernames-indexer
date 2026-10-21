@@ -172,7 +172,7 @@ async fn rename_retires_the_previous_handle() {
     let alice = addr(0xA1);
     apply_tx(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
     // The rename's bind retires alice_1 and withdraws its name first.
-    let mut rename = vec![retire(x, "alice_1", alice), unpublish(alice, x)];
+    let mut rename = vec![retire(x, "alice_1", alice), unpublish(alice)];
     rename.extend(bind(alice, x, "111", "alice_2", 2000, true));
     apply_tx(&store, 2, rename).await;
 
@@ -259,7 +259,7 @@ async fn a_takeover_keeps_the_disclosed_text() {
 
     // (a) Tom discloses @lee1; Uma's account takes it privately.
     apply_tx(&store, 1, bind(tom, x, "555", "lee1", 1_000, true)).await;
-    let mut takeover = vec![unpublish(tom, x)];
+    let mut takeover = vec![unpublish(tom)];
     takeover.extend(bind(uma, x, "556", "lee1", 2_000, false));
     apply_tx(&store, 2, takeover).await;
     let resolved: HandleResolution =
@@ -276,7 +276,7 @@ async fn a_takeover_keeps_the_disclosed_text() {
     // (b) Tom discloses @lee2; Val's account takes it, disclosing it again:
     // still one disclosure.
     apply_tx(&store, 3, bind(tom, x, "555", "lee2", 3_000, true)).await;
-    let mut takeover = vec![unpublish(tom, x)];
+    let mut takeover = vec![unpublish(tom)];
     takeover.extend(bind(val, x, "557", "lee2", 4_000, true));
     apply_tx(&store, 4, takeover).await;
     let resolved: HandleResolution =
@@ -352,7 +352,7 @@ async fn a_withdrawn_name_is_no_longer_published_but_still_shows() {
     apply_tx(&store, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
     // A rename retires the old handle and withdraws the name it published,
     // before the new, private bind.
-    let mut rename = vec![retire(x, "alice_1", alice), unpublish(alice, x)];
+    let mut rename = vec![retire(x, "alice_1", alice), unpublish(alice)];
     rename.extend(bind(alice, x, "111", "alice_2", 2000, false));
     apply_tx(&store, 2, rename).await;
 
@@ -370,7 +370,7 @@ async fn a_withdrawn_name_is_no_longer_published_but_still_shows() {
     assert_eq!(identity.handle.as_deref(), Some("alice_2"));
 
     // HandleUnpublished takes the name down; the text stays.
-    apply(&store, 4, unpublish(alice, x)).await;
+    apply(&store, 4, unpublish(alice)).await;
     let resolved: AddressResolution = get(&pool, &address).await.answer();
     let identity = only(&resolved.identities);
     assert!(!identity.published);
@@ -391,6 +391,108 @@ async fn a_withdrawn_name_is_no_longer_published_but_still_shows() {
         .collect();
     assert!(texts.contains(&"alice_1"), "{history:?}");
     assert!(texts.contains(&"alice_2"), "{history:?}");
+    drop(guard);
+}
+
+/// The platforms of a wallet's identities that carry its name.
+fn named_platforms(resolved: &AddressResolution) -> Vec<Option<KnownPlatform>> {
+    resolved
+        .identities
+        .iter()
+        .filter(|identity| identity.published)
+        .map(|identity| identity.platform)
+        .collect()
+}
+
+/// The names `names.published` holds for a wallet on this suite's chain.
+async fn names_held(pool: &PgPool, owner: Address) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM names.published WHERE chain_id = $1 AND owner = $2",
+    )
+    .bind(CHAIN)
+    .bind(owner)
+    .fetch_one(pool)
+    .await
+    .expect("a name count")
+}
+
+/// A holder has one name: a name on GitHub replaces the one on X, and
+/// `published` marks only the identity whose handle it is. Publishing the X
+/// handle again moves the name back.
+#[tokio::test]
+async fn a_name_on_another_platform_replaces_the_one_before() {
+    let Some((store, pool, guard)) = test_store().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let (x, github) = (KnownPlatform::X, KnownPlatform::GitHub);
+    let eve = addr(0xE1);
+    apply_tx(&store, 1, bind(eve, x, "81", "eve_x", 1_000, true)).await;
+    apply_tx(&store, 2, bind(eve, github, "82", "eve_gh", 1_000, true)).await;
+
+    let address = format!("/v1/resolve/address/{eve}");
+    let resolved: AddressResolution = get(&pool, &address).await.answer();
+    assert_eq!(resolved.identities.len(), 2, "{resolved:?}");
+    assert_eq!(named_platforms(&resolved), [Some(github)]);
+    assert_eq!(names_held(&pool, eve).await, 1);
+    let flags = |found: &SearchResults| -> Vec<(String, bool)> {
+        let mut flags: Vec<_> = found
+            .hits
+            .iter()
+            .map(|hit| (hit.handle.clone(), hit.published))
+            .collect();
+        flags.sort();
+        flags
+    };
+    let found: SearchResults = get(&pool, &format!("/v1/search?owner={eve}"))
+        .await
+        .answer();
+    assert_eq!(
+        flags(&found),
+        [("eve_gh".to_string(), true), ("eve_x".to_string(), false)]
+    );
+    let resolved: IdResolution = get(&pool, &id_route(x, "81")).await.answer();
+    assert!(!only(&resolved.bindings).published);
+
+    apply(&store, 3, publish(eve, x, "eve_x")).await;
+    let resolved: AddressResolution = get(&pool, &address).await.answer();
+    assert_eq!(named_platforms(&resolved), [Some(x)]);
+    assert_eq!(names_held(&pool, eve).await, 1);
+    let found: SearchResults = get(&pool, &format!("/v1/search?owner={eve}"))
+        .await
+        .answer();
+    assert_eq!(
+        flags(&found),
+        [("eve_gh".to_string(), false), ("eve_x".to_string(), true)]
+    );
+    drop(guard);
+}
+
+/// `HandleUnpublished` names no platform: it clears the holder's name
+/// wherever it is, and the other platform's identity shows none either.
+#[tokio::test]
+async fn a_withdrawal_clears_the_name_whatever_its_platform() {
+    let Some((store, pool, guard)) = test_store().await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let (x, github) = (KnownPlatform::X, KnownPlatform::GitHub);
+    let eve = addr(0xE2);
+    apply_tx(&store, 1, bind(eve, x, "83", "eve_x", 1_000, true)).await;
+    apply_tx(&store, 2, bind(eve, github, "84", "eve_gh", 1_000, true)).await;
+    apply(&store, 3, unpublish(eve)).await;
+
+    let resolved: AddressResolution = get(&pool, &format!("/v1/resolve/address/{eve}"))
+        .await
+        .answer();
+    assert_eq!(resolved.identities.len(), 2, "{resolved:?}");
+    assert_eq!(named_platforms(&resolved), []);
+    assert_eq!(names_held(&pool, eve).await, 0);
+    let found: SearchResults = get(&pool, &format!("/v1/search?owner={eve}"))
+        .await
+        .answer();
+    assert_eq!(found.hits.len(), 2, "{found:?}");
+    assert!(found.hits.iter().all(|hit| !hit.published), "{found:?}");
     drop(guard);
 }
 
@@ -415,7 +517,7 @@ async fn search_ranks_exact_prefix_substring() {
     // A private bind is never a hit, whatever it would match.
     apply_tx(&store, 6, bind(addr(6), x, "6", "alina", 1000, false)).await;
     // A name its holder withdrew still is, no longer published.
-    apply(&store, 7, unpublish(addr(3), x)).await;
+    apply(&store, 7, unpublish(addr(3))).await;
 
     let results: SearchResults = get(&pool, "/v1/search?q=ali").await.answer();
     // Exact first, then prefix alphabetically, then substring.
@@ -492,7 +594,7 @@ async fn search_ranks_exact_prefix_substring() {
     apply_tx(
         &store,
         8,
-        vec![retire(x, "alice_1", addr(2)), unpublish(addr(2), x)],
+        vec![retire(x, "alice_1", addr(2)), unpublish(addr(2))],
     )
     .await;
     let results: SearchResults = get(&pool, "/v1/search?q=alice_1").await.answer();

@@ -69,7 +69,7 @@ indexer's settings.
 | `GET /v1/resolve/handle/{platform}/{handle}` | The wallet a handle resolves to (`resolveHandle`) on each chain it is bound on, each with the id node it pairs with. The handle is hashed here into its node |
 | `GET /v1/resolve/handle-node/{handleNode}` | The same, by node |
 | `GET /v1/resolve/id-node/{idNode}` | The wallet an id node resolves to (`resolveId`) on each chain it is bound on, each with the handle node that account holds now. The client hashes the id (`libid-identity`, or `idNode` in `@libid/contracts`); no plaintext id reaches the server |
-| `GET /v1/resolve/address/{address}` | Every identity a wallet proved on every chain, by id node, with `resolves` and `published` flags (`publishedHandleOf`'s reverse display) |
+| `GET /v1/resolve/address/{address}` | Every identity a wallet proved on every chain, by id node, with `resolves`, and `published` on the one whose handle is the wallet's name (`primaryHandleOf`) |
 | `GET /v1/search?q=gre&platform=x&owner=0x…&limit=10&offset=0` | Live handles whose text the chain disclosed, matching a partial query (exact, then prefix, then substring, then trigram-fuzzy), linked to a wallet, or both; one of `q` and `owner` is required. `limit` (1..50, default 10) and `offset` (up to 10000) page the ranked list; a page shorter than `limit` is the last |
 | `GET /v1/history/address/{address}?before=&limit=` | Every event the address took part in, newest first, each with its `roles`: `holder`, `previousHandleHolder` and `previousIdHolder` (an event took that handle or account from it), `feeReceiver`, `depositor`, `refundTo` (a claim took its deposit, too), `claimer`, `recipient` |
 | `GET /v1/history/handle/{platform}/{handle}?before=&limit=` | Every event on the handle: deposits while nobody held it, the binds that gave it a holder, and every claim, refund and payment after |
@@ -108,7 +108,8 @@ escrow amounts) takes it from `names.disclosures`: text a disclosing bind, a
 `publish` or a `depositToHandle` carried. The API explores the chain's
 history, so a name its holder later withdrew or replaced, or a handle that
 passed privately to another account, still shows the text once disclosed;
-`published` says whether it is the holder's displayed name now. Text is stored
+`published` says whether it is the holder's name now: one per holder, on
+whichever platform. Text is stored
 only when it is a token a circuit hashes (printable ASCII without `"` or `\`,
 within the circuit's buffer) and it hashes to the node it names; a public
 transfer to text no account can bind keeps its deposit but not its text.
@@ -290,8 +291,9 @@ chain; a second deployment can share the database):
 - `handles` — mirrors `handleBindings` + `idNodeByHandle`: handle node → holder;
   `owner NULL` mirrors the contract's retirement, and the `observed_at`
   watermark survives it the way the contract keeps it
-- `published` — the display names, as the node each name hashes to; a row
-  exists exactly while the contract's stored string is nonempty
+- `published` — each holder's one name, as its platform and the node it
+  hashes to; a row exists exactly while the contract's `primaryHandles`
+  entry is set
 - `disclosures` — handle text the chain disclosed, a token a circuit hashes,
   folded and checked against its node: one row per node, kept whatever
   happens to the name or the handle after. `handle_identities` maps each
@@ -383,6 +385,15 @@ every chain's cursor, then reshapes the tables. Each chain answers
 head, its answers miss what it has not reached yet: gate on `/v1/status`'s
 lag, not on `not_synced`. An earlier indexer refuses a database 003 or 004 has migrated,
 and an earlier API answers `internal`; to go back, start the earlier build on
+a fresh database, as above.
+
+**Upgrading to one name per holder (`INDEXER_VERSION` 5):** this build
+indexes an `IdentityRegistry` whose `HandleUnpublished` names only the
+holder. Point `IDENTITY_NAMES_ADDRESS` at that deployment and roll the
+indexer first. It migrates in place (`005_one_name_per_holder.sql`),
+emptying `published`, and every chain replays from its registry's
+deployment block. An
+earlier indexer refuses a database 005 has migrated; to go back, start it on
 a fresh database, as above.
 
 Probes belong to the API: `GET /health` for liveness; for readiness gate on

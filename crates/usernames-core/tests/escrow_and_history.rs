@@ -685,12 +685,12 @@ async fn a_retired_handle_is_in_the_history_of_the_address_that_held_it() {
     suite
         .apply_tx(1, bind(alice, X, "777", "kim1", 1_000, true))
         .await;
-    let mut rename = vec![retire(X, "kim1", alice), unpublish(alice, X)];
+    let mut rename = vec![retire(X, "kim1", alice), unpublish(alice)];
     rename.extend(bind(alice, X, "777", "kim2", 2_000, true));
     suite.apply_tx(2, rename).await;
     // The account moves to Bob's address and renames to @kim3, privately:
     // @kim2 retires from Alice, and her name for it goes.
-    let mut to_bob = vec![retire(X, "kim2", alice), unpublish(alice, X)];
+    let mut to_bob = vec![retire(X, "kim2", alice), unpublish(alice)];
     to_bob.extend(bind(bob, X, "777", "kim3", 3_000, false));
     suite.apply_tx(3, to_bob).await;
 
@@ -812,7 +812,7 @@ async fn an_unpublish_concerns_the_handle_it_withdrew() {
     suite
         .apply_tx(1, bind(alice, X, "111", "ann_1", 1_000, true))
         .await;
-    suite.apply(2, unpublish(alice, X)).await;
+    suite.apply(2, unpublish(alice)).await;
 
     let history: HandleHistory = suite.get("/v1/history/handle/x/ann_1").await.answer();
     assert!(matches!(
@@ -843,7 +843,7 @@ async fn an_unpublish_with_nothing_published_concerns_no_handle() {
     suite
         .apply_tx(1, bind(alice, X, "111", "ann_1", 1_000, false))
         .await;
-    suite.apply(2, unpublish(alice, X)).await;
+    suite.apply(2, unpublish(alice)).await;
 
     let history: AddressHistory = suite
         .get(&format!("/v1/history/address/{alice}"))

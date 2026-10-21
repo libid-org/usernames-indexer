@@ -59,7 +59,7 @@ pub use self::{
 /// Bump on any change to what the indexer writes. A mismatch at startup
 /// clears the chain's rows and cursor, so the next loop replays the chain
 /// from the deployment block — the re-index IS the migration.
-pub const INDEXER_VERSION: &str = "4";
+pub const INDEXER_VERSION: &str = "5";
 
 pub use self::sql::{
     CLEAR_CHAIN,
@@ -791,6 +791,9 @@ impl Window {
                     .await?;
             }
 
+            // The holder's one name, on whichever platform: a name on
+            // another platform is replaced, and the contract logs no
+            // HandleUnpublished for it.
             NamesEvent::HandlePublished {
                 holder,
                 platform_id,
@@ -822,14 +825,10 @@ impl Window {
 
             // The contract logs this only when it withdrew a name; with no
             // published row here, the index missed it (a later START_BLOCK).
-            NamesEvent::HandleUnpublished {
-                holder,
-                platform_id,
-            } => {
+            NamesEvent::HandleUnpublished { holder } => {
                 involvement.handle_node = sqlx::query_scalar(sql::WITHDRAW_NAME)
                     .bind(chain_id)
                     .bind(holder)
-                    .bind(platform_id)
                     .fetch_optional(&mut *self.tx)
                     .await?;
             }
@@ -891,7 +890,7 @@ pub struct HandleRow {
 }
 
 /// One `names.ids` row joined with the handle node it points at and the
-/// published mapping: everything `resolveId` and the reverse display answer
+/// holder's name: everything `resolveId` and the reverse display answer
 /// from.
 #[derive(sqlx::FromRow)]
 pub struct IdentityRow {
@@ -915,7 +914,7 @@ pub struct IdentityRow {
     pub handle_owner: Option<Address>,
     /// The id node the handle currently points back at.
     pub handle_id_node: Option<B256>,
-    /// Whether the owner's published name on the platform is this handle.
+    /// Whether the owner's name is this handle, on this platform.
     pub published: bool,
 }
 
@@ -938,8 +937,8 @@ impl IdentityRow {
         }
     }
 
-    /// Whether this is the wallet's displayed name on the platform — only
-    /// while the handle is still the account's.
+    /// Whether this is the wallet's name — only while the handle is still
+    /// the account's, as `primaryHandleOf` answers.
     pub fn displayed(&self) -> bool {
         self.published && self.handle_still_owned()
     }
@@ -961,7 +960,7 @@ pub struct SearchRow {
     pub handle: String,
     /// The holder it resolves to (retired handles never match).
     pub owner: Address,
-    /// Whether the owner displays this handle.
+    /// Whether this handle is the owner's name.
     pub published: bool,
 }
 
@@ -1022,8 +1021,9 @@ impl Store {
             .await
     }
 
-    /// Every identity a wallet proved — `publishedHandleOf`'s reverse
-    /// display, chain by chain and platform by platform.
+    /// Every identity a wallet proved, chain by chain and platform by
+    /// platform, each saying whether its handle is the wallet's name
+    /// (`primaryHandleOf`).
     pub async fn identities_of(
         &self,
         chain: Option<i64>,
@@ -1394,7 +1394,6 @@ pub(crate) mod plan_tests {
                 sqlx::query_scalar(&explain(sql::WITHDRAW_NAME))
                     .bind(1i64)
                     .bind(owner)
-                    .bind(platform)
                     .fetch_all(&mut *conn)
                     .await,
             ),
