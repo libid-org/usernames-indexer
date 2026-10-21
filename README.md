@@ -348,54 +348,18 @@ its name and keeps indexing, but it no longer serves the API. Deploy
 `usernames-api` alongside it, pointed at the same database; it needs nothing
 else. Nothing in the database changes and no re-index is needed.
 
-**Upgrading from 0.2:** the journal kind of the fee event is `bind_fee_paid`,
-declared in `001_schema.sql`, so the indexer refuses a database 0.2 migrated
-(`migration 1 was previously applied but has been modified`). Start it on a
-fresh database, or stop it and run
+**Upgrading to 0.6:** this release indexes the node-keyed `IdentityRegistry`
+and `HandleEscrow` of the libid-contracts release `Cargo.toml` pins, and its
+schema is a single `001_schema.sql`. Start the indexer on a fresh database,
+with `IDENTITY_NAMES_ADDRESS` and `HANDLE_ESCROW_ADDRESS` set to those
+deployments; every chain indexes from its registry's deployment block, or
+from `START_BLOCK`. It refuses a registry whose `nodeKeyed()` does not answer
+true, and a database an earlier release or release candidate migrated. To
+reuse such a database, stop every process on it and run
 `DROP SCHEMA names CASCADE; DROP TABLE _sqlx_migrations;` first; that keeps
-`pg_trgm`, which a least-privilege role cannot create. Every chain then
-replays from its contract's deployment block.
-
-**Upgrading from 0.3:** `IdentityRegistry` 0.15 is a fresh deployment, and
-`001_schema.sql` admits its `handle_unpublished` journal kind, so the indexer
-refuses a database 0.3 migrated, as above. Start it on a fresh database with
-`IDENTITY_NAMES_ADDRESS` set to the 0.15 registry; it indexes from that
-registry's deployment block.
-
-**Upgrading from 0.5:** roll the indexer first. It migrates the database in
-place (`002_escrow_and_history.sql`) and, because `INDEXER_VERSION` is 2,
-replays every chain from its registry's deployment block, filling the escrow
-books and the histories. Set `HANDLE_ESCROW_ADDRESS` before that start, or the
-chain replays again when it is set. A 0.5 API keeps serving its routes over the
-migrated database; a newer API started before the migration answers
-`internal` on the new routes until it lands. A 0.5 indexer refuses a database
-002 has migrated: to go back, start it on a fresh database, or run
-`DROP SCHEMA names CASCADE; DROP TABLE _sqlx_migrations;` first, as above.
-
-**Upgrading to hashed identities:** this build indexes the node-keyed
-`IdentityRegistry` and `HandleEscrow` of the libID-contracts release
-`Cargo.toml` pins, whose events carry nodes rather than plaintext. Point
-`IDENTITY_NAMES_ADDRESS` and `HANDLE_ESCROW_ADDRESS` at those deployments and
-roll the indexer first; it refuses to start against a registry whose
-`nodeKeyed()` does not answer true.
-It migrates in place (`003_hashed_identities.sql`, then
-`004_disclosures_all_show.sql`): 003 deletes
-every row the earlier build wrote — they held plaintext ids and handles — and
-every chain's cursor, then reshapes the tables. Each chain answers
-`not_synced` until its first window commits. Until the replay reaches the
-head, its answers miss what it has not reached yet: gate on `/v1/status`'s
-lag, not on `not_synced`. An earlier indexer refuses a database 003 or 004 has migrated,
-and an earlier API answers `internal`; to go back, start the earlier build on
-a fresh database, as above.
-
-**Upgrading to one name per holder (`INDEXER_VERSION` 5):** this build
-indexes an `IdentityRegistry` with one name per holder and a `HandleEscrow`
-that logs `HandleRevealed`. Point `IDENTITY_NAMES_ADDRESS` and
-`HANDLE_ESCROW_ADDRESS` at those deployments and roll the indexer first. It
-migrates in place (`005_names_and_reveals.sql`), deleting every row and
-cursor, and every chain replays from its registry's deployment block. An
-earlier indexer refuses a database 005 has migrated; to go back, start it on
-a fresh database, as above.
+`pg_trgm`, which a least-privilege role cannot create. Each chain answers
+`not_synced` until its first window commits; gate on `/v1/status`'s lag, not
+on `not_synced`.
 
 Probes belong to the API: `GET /health` for liveness; for readiness gate on
 the status code of `GET /v1/status`, which is 200 whenever the database
