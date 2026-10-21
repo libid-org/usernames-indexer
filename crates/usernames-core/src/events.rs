@@ -90,12 +90,11 @@ pub enum NamesEvent {
         observed_at: u64,
         ceremony_version: u16,
     },
-    /// `by` put a handle's text on chain: a disclosing bind, `publish` or
+    /// A handle's text went on chain: a disclosing bind, `publish` or
     /// `reveal` on the registry, or a `depositToHandle` on the escrow, which
     /// log it the same way. `handle` is the text when it hashes to
     /// `handle_node`; the journal never holds it.
     HandleRevealed {
-        by: Address,
         platform_id: B256,
         handle_node: B256,
         #[serde(skip)]
@@ -229,8 +228,6 @@ pub enum Role {
     Claimer,
     /// Was paid by a claim or a refund.
     Recipient,
-    /// Put a handle's text on chain.
-    Revealer,
 }
 
 /// A stored role name this build does not know.
@@ -240,7 +237,7 @@ pub struct UnknownRole(String);
 
 impl Role {
     /// Every role, so a stored name parses back by the same table.
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 8] = [
         Self::Holder,
         Self::PreviousHandleHolder,
         Self::PreviousIdHolder,
@@ -249,7 +246,6 @@ impl Role {
         Self::RefundTo,
         Self::Claimer,
         Self::Recipient,
-        Self::Revealer,
     ];
 
     /// The name stored and served: the camelCase the API spells it in.
@@ -263,7 +259,6 @@ impl Role {
             Self::RefundTo => "refundTo",
             Self::Claimer => "claimer",
             Self::Recipient => "recipient",
-            Self::Revealer => "revealer",
         }
     }
 }
@@ -309,12 +304,13 @@ impl NamesEvent {
             | Self::HandlePublished { holder, .. }
             | Self::HandleUnpublished { holder, .. }
             | Self::CeremonyBound { holder, .. } => vec![(*holder, Role::Holder)],
-            Self::HandleRevealed { by, .. } => vec![(*by, Role::Revealer)],
             Self::HandleRetired { holder, .. } => {
                 vec![(*holder, Role::PreviousHandleHolder)]
             }
             Self::BindFeePaid { receiver, .. } => vec![(*receiver, Role::FeeReceiver)],
-            Self::ProofVerifierConfigured { .. } => Vec::new(),
+            Self::HandleRevealed { .. } | Self::ProofVerifierConfigured { .. } => {
+                Vec::new()
+            }
             Self::Escrow(event) => event.parties(),
         }
     }
@@ -461,7 +457,6 @@ impl NamesEvent {
     fn revealed(log: &Log) -> Result<Self, DecodeError> {
         let d: HandleRevealed = payload_of(log, "HandleRevealed")?;
         Ok(Self::HandleRevealed {
-            by: d.by,
             platform_id: d.platformId,
             handle_node: d.handleNode,
             handle: disclosed(d.platformId, d.handleNode, &d.handle),
@@ -672,7 +667,7 @@ mod tests {
         );
         assert_eq!(
             HandleRevealed::SIGNATURE_HASH,
-            b256!("8bf5815f7d6358cda69f9796b008b4a18c173a8f699d4c0f5992e0a6f37ee8b3")
+            b256!("8ba0ebc5838d01aae10591d451b810b02cbd938a799162a7dda37f1d37b5e9f7")
         );
         assert_eq!(
             IdentityRegistry::HandleRetired::SIGNATURE_HASH,
@@ -822,7 +817,6 @@ mod tests {
                 ceremony_version: u16::MAX,
             },
             NamesEvent::HandleRevealed {
-                by: a,
                 platform_id: x.id(),
                 handle_node: alice,
                 handle: text,
@@ -902,7 +896,6 @@ mod tests {
         let revealed = |handle: &str| {
             let log = mined(
                 HandleRevealed {
-                    by: HOLDER,
                     platformId: x.id(),
                     handleNode: node,
                     handle: handle.into(),
@@ -921,15 +914,14 @@ mod tests {
         assert_eq!(revealed("bob"), None);
     }
 
-    /// The escrow's `HandleRevealed` is the registry's: the same event, with
-    /// the depositor as the revealer.
+    /// The escrow's `HandleRevealed` is the registry's: the same event, which
+    /// names no address.
     #[test]
     fn an_escrow_reveal_decodes_as_the_registrys() {
         let x = KnownPlatform::X;
         let node = x.handle_node("bob_1").unwrap();
         let log = mined(
             HandleEscrow::HandleRevealed {
-                by: HOLDER,
                 platformId: x.id(),
                 handleNode: node,
                 handle: "Bob_1".into(),
@@ -939,7 +931,7 @@ mod tests {
         let (from_escrow, _) = decode_escrow(&log).unwrap().expect("a known topic");
         let (from_registry, _) = decode_registry(&log).unwrap().expect("a known topic");
         assert_eq!(from_escrow, from_registry);
-        assert_eq!(from_escrow.parties(), [(HOLDER, Role::Revealer)]);
+        assert_eq!(from_escrow.parties(), []);
         assert_eq!(
             from_escrow
                 .disclosure()

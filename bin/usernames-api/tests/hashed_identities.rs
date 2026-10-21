@@ -409,8 +409,7 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
     assert_eq!(bobs.handle.platform_id, Some(x.id()));
     assert_eq!(bobs.handle.handle.as_deref(), Some("bob_2"));
     let payers: AddressHistory = h.get(&format!("/v1/history/address/{payer}")).await;
-    // Two deposits, and the reveal of the one to @Bob_2.
-    assert_eq!(payers.entries.len(), 3, "{payers:?}");
+    assert_eq!(payers.entries.len(), 2, "{payers:?}");
 
     // 5. The privacy scan: no id anywhere, no undisclosed handle anywhere,
     //    and the disclosed ones only in the disclosures table.

@@ -147,7 +147,6 @@ async fn seed(store: &ChainStore, handle: &str, holder: Address, disclosed: bool
     }];
     if disclosed {
         events.push(NamesEvent::HandleRevealed {
-            by: holder,
             platform_id: x.id(),
             handle_node,
             handle: DisclosedHandle::verify(x, handle_node, handle),

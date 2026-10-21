@@ -27,7 +27,7 @@ contract MockHandleEscrow {
         uint256 round,
         uint256 amount
     );
-    event HandleRevealed(address indexed by, bytes32 indexed platformId, bytes32 indexed handleNode, string handle);
+    event HandleRevealed(bytes32 indexed platformId, bytes32 indexed handleNode, string handle);
     event Forwarded(
         bytes32 indexed handleNode,
         address indexed token,
@@ -78,7 +78,7 @@ contract MockHandleEscrow {
         string calldata handle
     ) external {
         emit Deposited(handleNode, token, refundTo, depositor, round, amount);
-        emit HandleRevealed(depositor, platformId, handleNode, handle);
+        emit HandleRevealed(platformId, handleNode, handle);
     }
 
     function emitForwarded(

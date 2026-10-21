@@ -263,7 +263,7 @@ pub fn publish(
 ) -> Vec<NamesEvent> {
     let handle_node = platform.handle_node(handle).expect("a handle");
     vec![
-        revealed(holder, platform, handle),
+        revealed(platform, handle),
         NamesEvent::HandlePublished {
             holder,
             platform_id: platform.id(),
@@ -272,12 +272,11 @@ pub fn publish(
     ]
 }
 
-/// The `HandleRevealed` of the handle as `by` typed it: from `reveal`,
-/// `publish` or a disclosing bind, or from a `depositToHandle`.
-pub fn revealed(by: Address, platform: KnownPlatform, typed: &str) -> NamesEvent {
+/// The `HandleRevealed` of the handle as typed: from `reveal`, `publish` or a
+/// disclosing bind, or from a `depositToHandle`.
+pub fn revealed(platform: KnownPlatform, typed: &str) -> NamesEvent {
     let (_, handle_node) = platform.folded_handle_node(typed);
     NamesEvent::HandleRevealed {
-        by,
         platform_id: platform.id(),
         handle_node,
         handle: DisclosedHandle::verify(platform, handle_node, typed),

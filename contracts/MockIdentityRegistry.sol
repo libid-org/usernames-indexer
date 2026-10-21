@@ -32,7 +32,7 @@ contract MockIdentityRegistry {
     event BindFeePaid(bytes32 indexed authorizationDigest, address indexed receiver, uint256 amount);
     event HandleRetired(bytes32 indexed platformId, bytes32 indexed handleNode, address indexed holder);
     event ProofVerifierConfigured(address verifier);
-    event HandleRevealed(address indexed by, bytes32 indexed platformId, bytes32 indexed handleNode, string handle);
+    event HandleRevealed(bytes32 indexed platformId, bytes32 indexed handleNode, string handle);
     event HandlePublished(address indexed holder, bytes32 indexed platformId, bytes32 indexed handleNode);
     event HandleUnpublished(address indexed holder);
 
@@ -82,7 +82,7 @@ contract MockIdentityRegistry {
         }
         emit IdentityBound(b.holder, b.idNode, b.handleNode, b.platformId, b.observedAt, b.ceremonyVersion);
         if (bytes(b.handle).length != 0) {
-            emit HandleRevealed(b.holder, b.platformId, b.handleNode, b.handle);
+            emit HandleRevealed(b.platformId, b.handleNode, b.handle);
             if (b.primary) emit HandlePublished(b.holder, b.platformId, b.handleNode);
         }
         emit CeremonyBound(b.authorizationDigest, b.holder, b.platformId, "");
@@ -110,8 +110,8 @@ contract MockIdentityRegistry {
     }
 
     /// @notice `reveal`'s event, or `publish`'s first.
-    function emitHandleRevealed(address by, bytes32 platformId, bytes32 handleNode, string calldata handle) external {
-        emit HandleRevealed(by, platformId, handleNode, handle);
+    function emitHandleRevealed(bytes32 platformId, bytes32 handleNode, string calldata handle) external {
+        emit HandleRevealed(platformId, handleNode, handle);
     }
 
     function emitHandleUnpublished(address holder) external {

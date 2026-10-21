@@ -508,11 +508,11 @@ async fn every_reveal_fills_one_map_and_sets_no_name() {
         return;
     };
     let x = KnownPlatform::X;
-    let (eve, payer, fay) = (addr(0xE3), addr(0xE4), addr(0xE5));
+    let (eve, fay) = (addr(0xE3), addr(0xE5));
     let mut reveal_only = bind(eve, x, "91", "eve_r", 1_000, false);
-    reveal_only.push(revealed(eve, x, "Eve_R"));
+    reveal_only.push(revealed(x, "Eve_R"));
     apply_tx(&store, 1, reveal_only).await;
-    apply(&store, 2, revealed(payer, x, "Fay_E")).await;
+    apply(&store, 2, revealed(x, "Fay_E")).await;
     apply_tx(&store, 3, bind(fay, x, "92", "fay_e", 2_000, false)).await;
 
     for (holder, handle) in [(eve, "eve_r"), (fay, "fay_e")] {

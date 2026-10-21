@@ -314,7 +314,6 @@ pub enum HistoryEvent {
         ceremony_version: u16,
     },
     HandleRevealed {
-        by: Address,
         platform_id: B256,
         handle_node: B256,
     },
@@ -415,12 +414,10 @@ impl From<NamesEvent> for HistoryEvent {
                 ceremony_version,
             },
             NamesEvent::HandleRevealed {
-                by,
                 platform_id,
                 handle_node,
                 handle: _,
             } => Self::HandleRevealed {
-                by,
                 platform_id,
                 handle_node,
             },
