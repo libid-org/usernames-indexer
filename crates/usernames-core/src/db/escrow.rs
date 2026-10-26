@@ -107,20 +107,28 @@ impl Window {
                 released,
                 ..
             } => {
-                let moved: Option<B256> = sqlx::query_scalar(sql::ESCROW_REFUND)
+                let covered: Option<bool> = sqlx::query_scalar(sql::ESCROW_REFUND)
                     .bind(chain_id)
                     .bind(handle_node)
                     .bind(token)
                     .bind(released.to_string())
                     .fetch_optional(&mut *self.tx)
                     .await?;
-                if moved.is_none() {
-                    tracing::error!(
+                match covered {
+                    Some(true) => {}
+                    Some(false) => tracing::error!(
+                        %handle_node,
+                        %token,
+                        block = at.block,
+                        "a refund released more than this index holds for the slot: \
+                         its deposit came before the index's start"
+                    ),
+                    None => tracing::error!(
                         %handle_node,
                         %token,
                         block = at.block,
                         "a refund from a slot this index never saw deposited"
-                    );
+                    ),
                 }
                 sqlx::query(sql::ESCROW_TAKE_REFUNDABLE)
                     .bind(chain_id)
@@ -674,7 +682,7 @@ pub(crate) mod plans {
             (
                 "a refund",
                 &["escrow_held_pkey"][..],
-                sqlx::query_scalar(&explain(sql::ESCROW_REFUND))
+                sqlx::query_scalar::<_, String>(&explain(sql::ESCROW_REFUND))
                     .bind(1i64)
                     .bind(node)
                     .bind(token)

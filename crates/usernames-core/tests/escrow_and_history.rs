@@ -1184,3 +1184,62 @@ async fn a_claim_opens_the_next_round() {
     assert!(carols.amounts.is_empty(), "{carols:?}");
     suite.done();
 }
+
+/// An index that starts late meets a slot first in a later round: the
+/// deposit's round is the slot's, and a refund of a deposit made before the
+/// index started empties the slot instead of driving it below zero.
+#[tokio::test]
+async fn a_late_start_keeps_the_round_and_never_holds_below_zero() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let (carol, dave) = (addr(0xC0), addr(0xD0));
+    let late = NamesEvent::Escrow(EscrowEvent::Deposited {
+        handle_node: node("late"),
+        token: NATIVE,
+        sender: carol,
+        round: U256::from(3u64),
+        amount: U256::from(1u64),
+        refundable_at: REFUNDABLE_AT,
+    });
+    suite.apply(1, late).await;
+    let held: HandleAmounts = suite
+        .get(&format!("/v1/escrow/node/{}", node("late")))
+        .await
+        .answer();
+    assert_eq!(
+        held.amounts
+            .iter()
+            .map(|a| (a.amount, a.round))
+            .collect::<Vec<_>>(),
+        [(U256::from(1u64), U256::from(3u64))]
+    );
+
+    // Dave deposited 100 before the index started; his refund is the first
+    // the index hears of it.
+    let refund = NamesEvent::Escrow(EscrowEvent::Refunded {
+        handle_node: node("late"),
+        token: NATIVE,
+        sender: dave,
+        recipient: dave,
+        round: U256::from(3u64),
+        released: U256::from(100u64),
+        received: U256::from(100u64),
+    });
+    suite.apply(2, refund).await;
+    let held: HandleAmounts = suite
+        .get(&format!("/v1/escrow/node/{}", node("late")))
+        .await
+        .answer();
+    assert!(held.amounts.is_empty(), "{held:?}");
+    let unclaimed: Unclaimed = suite.get("/v1/escrow/unclaimed").await.answer();
+    assert!(
+        unclaimed
+            .amounts
+            .iter()
+            .all(|a| a.handle.handle_node != node("late")),
+        "{unclaimed:?}"
+    );
+    suite.done();
+}
