@@ -1,10 +1,10 @@
 //! The histories: which addresses and which handle each journal row involves,
-//! written beside it, and the reads that list either newest first.
+//! and the reads that list either newest first.
 //!
-//! What an event does not name is read from the rows it is about to change,
-//! or from the rows its own transaction recorded just before it: a bind's
-//! previous holders, the handle of a ceremony or a fee, a fee's payer, and the
-//! senders a claim takes from. An unpublish's handle is the row it deletes.
+//! What an event does not name is read from the rows it is about to change:
+//! a bind's previous holders, the senders a claim takes from, and the handle
+//! an unpublish withdraws. A ceremony and a fee take the handle and the payer
+//! of the bind before them in their transaction.
 
 use std::{
     fmt,
@@ -15,10 +15,10 @@ use alloy::primitives::{
     Address,
     B256,
 };
-use serde_json::Value;
 use sqlx::QueryBuilder;
 
 use super::{
+    journal::EventColumns,
     page::{
         Cursor,
         CursorText,
@@ -128,8 +128,16 @@ impl Window {
                 });
             }
 
-            // The withdrawal itself reads which handle it concerns.
-            NamesEvent::HandleUnpublished { .. } => {}
+            // The name it withdraws, read before the delete. The contract
+            // logs this only when it withdrew one; with no published row
+            // here, the index missed it (a later START_BLOCK).
+            NamesEvent::HandleUnpublished { holder } => {
+                involvement.handle_node = sqlx::query_scalar(sql::PUBLISHED_NAME)
+                    .bind(chain_id)
+                    .bind(holder)
+                    .fetch_optional(&mut *self.tx)
+                    .await?;
+            }
 
             // A ceremony and its fee follow their bind in its transaction:
             // they concern its handle, and the fee's payer is its holder.
@@ -201,7 +209,8 @@ impl Window {
         Ok(involvement)
     }
 
-    /// Put the event at `at` in the histories of everything it involves.
+    /// Put the event at `at` in the history of every address it involves,
+    /// and its handle node beside its platform and text.
     pub(crate) async fn record(
         &mut self,
         involvement: Involvement,
@@ -223,14 +232,6 @@ impl Window {
         let Some(handle_node) = involvement.handle_node else {
             return Ok(());
         };
-        sqlx::query(sql::RECORD_HANDLE_EVENT)
-            .bind(chain_id)
-            .bind(at.block)
-            .bind(at.log_index)
-            .bind(handle_node)
-            .bind(at.block_time)
-            .execute(&mut *self.tx)
-            .await?;
         if let Some(platform_id) = involvement.platform_id {
             sqlx::query(sql::RECORD_HANDLE_NODE)
                 .bind(chain_id)
@@ -313,14 +314,11 @@ pub struct HistoryRow {
     pub roles: Option<Vec<String>>,
     /// The transaction that emitted it.
     pub tx_hash: B256,
-    /// The journal's kind discriminator.
-    pub kind: String,
-    /// The journal payload, as [`NamesEvent::payload`] wrote it.
-    pub payload: Value,
-    /// The handle node the event concerns, when it concerns one.
-    pub handle_node: Option<B256>,
-    /// That node's platform.
-    pub platform_id: Option<B256>,
+    /// The event, in the journal's columns.
+    #[sqlx(flatten)]
+    pub event: EventColumns,
+    /// The platform of the handle it concerns.
+    pub node_platform_id: Option<B256>,
     /// That handle's text, once the chain disclosed it.
     pub handle: Option<String>,
 }
@@ -340,11 +338,11 @@ impl Page<HistoryCursor> {
     /// A handle's history page.
     pub(crate) fn node_lookup(&self, prefix: &str, handle_node: B256) -> Statement {
         let mut statement = QueryBuilder::new(format!(
-            "{prefix}{} WHERE he.handle_node = ",
+            "{prefix}{} WHERE e.handle_node = ",
             sql::HANDLE_HISTORY_PROJECTION
         ));
         statement.push_bind(handle_node);
-        self.bound(&mut statement, "he");
+        self.bound(&mut statement, "e");
         statement
     }
 
@@ -461,7 +459,7 @@ pub(crate) mod plans {
         };
         let across: &[&str] = &["address_events_history_idx"];
         let one: &[&str] = &["address_events_pkey"];
-        let handle: &[&str] = &["handle_events_history_idx"];
+        let handle: &[&str] = &["events_handle_history_idx"];
         let mut plans = Vec::new();
         for (name, seeks, statement) in [
             (

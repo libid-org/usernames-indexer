@@ -26,19 +26,44 @@ CREATE TABLE IF NOT EXISTS names.chain_metadata (
 -- they hold what they hold, and its primary key is the idempotency gate for
 -- every projection write.
 CREATE TABLE IF NOT EXISTS names.events (
-    chain_id     BIGINT      NOT NULL,
-    block_number BIGINT      NOT NULL,
-    log_index    BIGINT      NOT NULL,
-    tx_hash      BYTEA       NOT NULL,
-    kind         TEXT        NOT NULL CHECK (kind IN (
+    chain_id     BIGINT NOT NULL,
+    block_number BIGINT NOT NULL,
+    log_index    BIGINT NOT NULL,
+    tx_hash      BYTEA  NOT NULL,
+    block_time   BIGINT NOT NULL,   -- unix seconds
+    kind         TEXT   NOT NULL CHECK (kind IN (
         'identity_bound', 'handle_revealed', 'handle_published', 'handle_retired',
         'handle_unpublished', 'proof_verifier_configured', 'ceremony_bound',
         'bind_fee_paid', 'deposited', 'forwarded', 'claimed', 'refunded'
     )),
-    payload      JSONB       NOT NULL,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- The handle the event concerns, a ceremony's and a fee's included: what
+    -- a handle history lists, from the first deposit to a handle nobody
+    -- holds through every bind and claim after.
+    handle_node          BYTEA,
+    -- The event's parameters: each kind sets the ones it carries.
+    platform_id          BYTEA,
+    holder               BYTEA,
+    id_node              BYTEA,
+    observed_at          BIGINT,
+    ceremony_version     INTEGER,
+    verifier             BYTEA,
+    authorization_digest BYTEA,
+    client_identifier    BYTEA,
+    receiver             BYTEA,
+    token                BYTEA,
+    sender               BYTEA,
+    claimer              BYTEA,
+    recipient            BYTEA,
+    round                NUMERIC(78,0),
+    amount               NUMERIC(78,0),
+    released             NUMERIC(78,0),
+    received             NUMERIC(78,0),
+    refundable_at        BIGINT,
     PRIMARY KEY (chain_id, block_number, log_index)
 );
+CREATE INDEX IF NOT EXISTS events_handle_history_idx
+    ON names.events (handle_node, block_time, chain_id, block_number, log_index)
+    WHERE handle_node IS NOT NULL;
 
 -- Mirrors idBindings plus handleNodeById: one row per id node ever bound. The
 -- identity's current handle node rides along because the contract stores
@@ -196,17 +221,3 @@ CREATE TABLE IF NOT EXISTS names.address_events (
 CREATE INDEX IF NOT EXISTS address_events_history_idx
     ON names.address_events (address, block_time, chain_id, block_number, log_index);
 
--- The handle node each journal row concerns: what a handle history lists,
--- from the first deposit to a handle nobody holds through every bind and
--- claim after. An event concerns one handle at most, so the journal
--- position is the key.
-CREATE TABLE IF NOT EXISTS names.handle_events (
-    chain_id     BIGINT NOT NULL,
-    block_number BIGINT NOT NULL,
-    log_index    BIGINT NOT NULL,
-    handle_node  BYTEA  NOT NULL,
-    block_time   BIGINT NOT NULL,
-    PRIMARY KEY (chain_id, block_number, log_index)
-);
-CREATE INDEX IF NOT EXISTS handle_events_history_idx
-    ON names.handle_events (handle_node, block_time, chain_id, block_number, log_index);

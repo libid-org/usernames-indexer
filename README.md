@@ -304,7 +304,9 @@ Schema `names`, all tables keyed by `chain_id` (one process follows one
 chain; a second deployment can share the database):
 
 - `events` — append-only journal of every decoded log, the audit trail and
-  what the histories list. It holds no handle text: a disclosure's text is in
+  what the histories list: one typed column per event parameter, set for the
+  kinds that carry it, and the handle node the event concerns, which a handle
+  history reads. It holds no handle text: a disclosure's text is in
   `handle_nodes` alone. `CeremonyBound` and `BindFeePaid` have no projection of
   their own: nothing resolves by which client authenticated a binding or what
   fee it paid
@@ -327,11 +329,10 @@ chain; a second deployment can share the database):
 - `escrow_refundable` — mirrors `contribution`: each sender's contribution
   to a slot in its current round, with the `refundableAt` its last deposit
   set; a refund deletes its row, a claim every row of the round
-- `address_events`, `handle_events` — which addresses (with their roles) and
-  which handle each journal row involves, dated by its block. A bind's
-  previous holders, a ceremony's and a fee's handle, and a fee's payer are
-  read from the rows the event changes, or from the events its transaction
-  emitted just before it
+- `address_events` — which addresses each journal row involves, with their
+  roles, dated by its block. A bind's previous holders are read from the
+  rows it changes; a ceremony's and a fee's handle and payer are the bind's
+  before them in their transaction
 
 The Proof Verifier is chain metadata, reported by `/v1/status`.
 

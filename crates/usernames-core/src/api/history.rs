@@ -36,10 +36,10 @@ impl HistoryEntry {
     /// writing, so a row it cannot read back is an internal error.
     fn of(row: HistoryRow) -> Result<Self, ApiError> {
         let at = format!(
-            "journal row {}/{}/{} ({})",
-            row.chain_id, row.block_number, row.log_index, row.kind
+            "journal row {}/{}/{}",
+            row.chain_id, row.block_number, row.log_index
         );
-        let event = NamesEvent::from_journal(&row.kind, row.payload)
+        let event = NamesEvent::try_from(&row.event)
             .map_err(|e| ApiError::internal(format_args!("{at}: {e}")))?;
         let roles = row
             .roles
@@ -50,9 +50,9 @@ impl HistoryEntry {
                     .map_err(|e| ApiError::internal(format_args!("{at}: {e}")))
             })
             .collect::<Result<_, _>>()?;
-        let handle = row
-            .handle_node
-            .map(|handle_node| HandleRef::of(row.platform_id, handle_node, row.handle));
+        let handle = row.event.handle_node.map(|handle_node| {
+            HandleRef::of(row.node_platform_id, handle_node, row.handle)
+        });
         Ok(Self {
             chain_id: row.chain_id,
             block_number: row.block_number,

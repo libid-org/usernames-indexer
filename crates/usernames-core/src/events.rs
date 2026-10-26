@@ -31,21 +31,13 @@ use libid_contracts::bindings::{
         HandleRevealed,
     },
 };
-use serde::{
-    de::Error as _,
-    Deserialize,
-    Serialize,
-};
-use serde_json::Value;
 
 use crate::nodes::{
     DisclosedHandle,
     Platform,
 };
 use serde_with::{
-    serde_as,
     DeserializeFromStr,
-    DisplayFromStr,
     SerializeDisplay,
 };
 
@@ -64,19 +56,11 @@ pub struct LogPosition {
     pub block_time: u64,
 }
 
-/// One decoded `IdentityRegistry` or `HandleEscrow` event, and the journal's
-/// record of it: `kind` names the variant, the fields keep their camelCase
-/// names. Field names track the Solidity event parameters one to one, so
-/// they carry no docs of their own — the contracts' natspec is the
-/// reference. Every `uint256` stays a `U256`, a decimal string in the
-/// journal: escrowed amounts are token units, and nothing bounds them.
-#[serde_as]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "snake_case",
-    rename_all_fields = "camelCase"
-)]
+/// One decoded `IdentityRegistry` or `HandleEscrow` event. Field names track
+/// the Solidity event parameters one to one, so they carry no docs of their
+/// own — the contracts' natspec is the reference. Every `uint256` stays a
+/// `U256`: escrowed amounts are token units, and nothing bounds them.
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(missing_docs)]
 pub enum NamesEvent {
     /// A holder proved an identity: its two nodes, never the id or handle.
@@ -97,7 +81,6 @@ pub enum NamesEvent {
     HandleRevealed {
         platform_id: B256,
         handle_node: B256,
-        #[serde(skip)]
         handle: Option<DisclosedHandle>,
     },
     /// A holder made a handle it holds its name, replacing any name it had on
@@ -134,22 +117,14 @@ pub enum NamesEvent {
     BindFeePaid {
         authorization_digest: B256,
         receiver: Address,
-        #[serde_as(as = "DisplayFromStr")]
         amount: U256,
     },
     /// One of `HandleEscrow`'s events, journaled under its own kind.
-    #[serde(untagged)]
     Escrow(EscrowEvent),
 }
 
 /// One decoded `HandleEscrow` event: what moves the escrow's books.
-#[serde_as]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    rename_all = "snake_case",
-    rename_all_fields = "camelCase"
-)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(missing_docs)]
 pub enum EscrowEvent {
     /// Value escrowed for a handle node nobody holds, booked under `sender`
@@ -159,9 +134,7 @@ pub enum EscrowEvent {
         handle_node: B256,
         token: Address,
         sender: Address,
-        #[serde_as(as = "DisplayFromStr")]
         round: U256,
-        #[serde_as(as = "DisplayFromStr")]
         amount: U256,
         refundable_at: u64,
     },
@@ -171,9 +144,7 @@ pub enum EscrowEvent {
         token: Address,
         sender: Address,
         holder: Address,
-        #[serde_as(as = "DisplayFromStr")]
         amount: U256,
-        #[serde_as(as = "DisplayFromStr")]
         received: U256,
     },
     /// The holder took everything held in one token, closing `round`.
@@ -182,11 +153,8 @@ pub enum EscrowEvent {
         token: Address,
         claimer: Address,
         recipient: Address,
-        #[serde_as(as = "DisplayFromStr")]
         round: U256,
-        #[serde_as(as = "DisplayFromStr")]
         released: U256,
-        #[serde_as(as = "DisplayFromStr")]
         received: U256,
     },
     /// `sender` took its `round` contribution back.
@@ -195,11 +163,8 @@ pub enum EscrowEvent {
         token: Address,
         sender: Address,
         recipient: Address,
-        #[serde_as(as = "DisplayFromStr")]
         round: U256,
-        #[serde_as(as = "DisplayFromStr")]
         released: U256,
-        #[serde_as(as = "DisplayFromStr")]
         received: U256,
     },
 }
@@ -324,36 +289,12 @@ impl NamesEvent {
             _ => None,
         }
     }
-
-    /// The journal payload: the fields under their camelCase names, without
-    /// the `kind` its own column holds.
-    pub fn payload(&self) -> Result<Value, serde_json::Error> {
-        match serde_json::to_value(self)? {
-            Value::Object(mut fields) => {
-                fields.remove("kind");
-                Ok(Value::Object(fields))
-            }
-            _ => Err(serde_json::Error::custom(
-                "an event serializes to an object",
-            )),
-        }
-    }
-
-    /// The event a journal row holds: its kind, and the payload
-    /// [`NamesEvent::payload`] wrote.
-    pub fn from_journal(kind: &str, payload: Value) -> Result<Self, serde_json::Error> {
-        let Value::Object(mut fields) = payload else {
-            return Err(serde_json::Error::custom("a journal payload is an object"));
-        };
-        fields.insert("kind".into(), Value::String(kind.into()));
-        serde_json::from_value(Value::Object(fields))
-    }
 }
 
 #[cfg(test)]
 impl NamesEvent {
     /// The event as its journal row reads back: disclosed text dropped.
-    fn without_text(mut self) -> Self {
+    pub(crate) fn without_text(mut self) -> Self {
         if let Self::HandleRevealed { handle, .. } = &mut self {
             *handle = None
         }
@@ -626,7 +567,6 @@ mod tests {
     use crate::nodes::KnownPlatform;
 
     const HOLDER: Address = Address::repeat_byte(0xA1);
-    const PLATFORM: B256 = B256::repeat_byte(0x0C);
 
     /// A log carrying `data`, as the RPC returns it once mined.
     fn mined(data: LogData) -> Log {
@@ -788,100 +728,6 @@ mod tests {
         ));
     }
 
-    /// Every kind, the largest `uint256` included, reads back from the
-    /// journal row its payload writes: all of it but disclosed text, which
-    /// the journal never holds.
-    #[test]
-    fn every_event_reads_back_from_its_journal_row() {
-        let (a, b) = (Address::repeat_byte(0xA1), Address::repeat_byte(0xB2));
-        let (n, p) = (B256::repeat_byte(0x0D), B256::repeat_byte(0x0C));
-        let big = U256::MAX - U256::from(1u64);
-        let x = KnownPlatform::X;
-        let alice = x.handle_node("alice").unwrap();
-        let text = DisclosedHandle::verify(x, alice, "Alice");
-        assert!(text.is_some());
-        let events = [
-            NamesEvent::IdentityBound {
-                holder: a,
-                id_node: n,
-                handle_node: p,
-                platform_id: PLATFORM,
-                observed_at: u64::MAX,
-                ceremony_version: u16::MAX,
-            },
-            NamesEvent::HandleRevealed {
-                platform_id: x.id(),
-                handle_node: alice,
-                handle: text,
-            },
-            NamesEvent::HandlePublished {
-                holder: a,
-                platform_id: x.id(),
-                handle_node: alice,
-            },
-            NamesEvent::HandleRetired {
-                platform_id: PLATFORM,
-                handle_node: n,
-                holder: a,
-            },
-            NamesEvent::HandleUnpublished { holder: a },
-            NamesEvent::ProofVerifierConfigured { verifier: b },
-            NamesEvent::CeremonyBound {
-                authorization_digest: p,
-                holder: a,
-                platform_id: PLATFORM,
-                client_identifier: Bytes::from_static(b"client"),
-            },
-            NamesEvent::BindFeePaid {
-                authorization_digest: p,
-                receiver: b,
-                amount: big,
-            },
-            NamesEvent::Escrow(EscrowEvent::Deposited {
-                handle_node: n,
-                token: b,
-                sender: a,
-                round: U256::from(2u64),
-                amount: U256::MAX,
-                refundable_at: u64::MAX,
-            }),
-            NamesEvent::Escrow(EscrowEvent::Forwarded {
-                handle_node: n,
-                token: b,
-                sender: a,
-                holder: b,
-                amount: big,
-                received: big,
-            }),
-            NamesEvent::Escrow(EscrowEvent::Claimed {
-                handle_node: n,
-                token: b,
-                claimer: a,
-                recipient: b,
-                round: U256::ZERO,
-                released: big,
-                received: U256::from(1u64),
-            }),
-            NamesEvent::Escrow(EscrowEvent::Refunded {
-                handle_node: n,
-                token: b,
-                sender: a,
-                recipient: b,
-                round: U256::from(1u64),
-                released: U256::from(5u64),
-                received: U256::from(4u64),
-            }),
-        ];
-        for event in events {
-            let payload = event.payload().unwrap();
-            assert!(!payload.to_string().contains("alice"), "{payload}");
-            let read = NamesEvent::from_journal(event.kind(), payload)
-                .unwrap_or_else(|e| panic!("{}: {e}", event.kind()));
-            assert_eq!(read, event.without_text());
-        }
-    }
-
-    /// Revealed text decodes only when it hashes to the node beside it.
     #[test]
     fn a_revealed_handle_keeps_its_text_only_when_it_hashes_to_the_node() {
         let x = KnownPlatform::X;

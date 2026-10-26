@@ -1,10 +1,11 @@
-SELECT he.chain_id, he.block_number, he.log_index, he.block_time,
-       NULL::text[] AS roles,
-       e.tx_hash, e.kind, e.payload,
-       he.handle_node, v.platform_id, v.handle
-FROM names.handle_events he
-JOIN names.events e
-  ON e.chain_id = he.chain_id AND e.block_number = he.block_number
-     AND e.log_index = he.log_index
+SELECT e.chain_id, e.block_number, e.log_index, e.block_time,
+       NULL::text[] AS roles, e.tx_hash, e.kind, e.handle_node, e.platform_id, e.holder, e.id_node, e.observed_at,
+       e.ceremony_version, e.verifier, e.authorization_digest,
+       e.client_identifier, e.receiver, e.token, e.sender, e.claimer,
+       e.recipient, e.round::text AS round, e.amount::text AS amount,
+       e.released::text AS released, e.received::text AS received,
+       e.refundable_at,
+       v.platform_id AS node_platform_id, v.handle
+FROM names.events e
 LEFT JOIN names.handle_nodes v
-  ON v.chain_id = he.chain_id AND v.handle_node = he.handle_node
+  ON v.chain_id = e.chain_id AND v.handle_node = e.handle_node

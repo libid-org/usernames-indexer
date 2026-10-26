@@ -35,6 +35,7 @@ use crate::{
 
 mod escrow;
 mod history;
+mod journal;
 mod page;
 
 pub use self::{
@@ -47,6 +48,10 @@ pub use self::{
     history::{
         HistoryCursor,
         HistoryRow,
+    },
+    journal::{
+        EventColumns,
+        JournalError,
     },
     page::{
         Cursor,
@@ -181,9 +186,6 @@ pub enum ApplyError {
         /// The value itself.
         value: u64,
     },
-    /// The event did not serialize into, or read back from, its journal row.
-    #[error("journal payload: {0}")]
-    Journal(#[from] serde_json::Error),
 }
 
 /// Why a chain's names could not be declared.
@@ -729,14 +731,38 @@ impl Window {
         let at = Position::of(pos)?;
         let (block, log_index) = (at.block, at.log_index);
 
-        let payload = event.payload()?;
+        // Read before the projections move: a bind's previous holders are the
+        // rows it is about to overwrite, and the journal row files the event
+        // under the handle it concerns.
+        let involvement = self.involvement(event, &at).await?;
+
+        let row = EventColumns::of(event, involvement.handle_node)?;
         let journaled = sqlx::query(sql::JOURNAL_EVENT)
             .bind(chain_id)
             .bind(block)
             .bind(log_index)
             .bind(pos.tx_hash)
-            .bind(event.kind())
-            .bind(payload)
+            .bind(at.block_time)
+            .bind(&row.kind)
+            .bind(row.handle_node)
+            .bind(row.platform_id)
+            .bind(row.holder)
+            .bind(row.id_node)
+            .bind(row.observed_at)
+            .bind(row.ceremony_version)
+            .bind(row.verifier)
+            .bind(row.authorization_digest)
+            .bind(&row.client_identifier)
+            .bind(row.receiver)
+            .bind(row.token)
+            .bind(row.sender)
+            .bind(row.claimer)
+            .bind(row.recipient)
+            .bind(&row.round)
+            .bind(&row.amount)
+            .bind(&row.released)
+            .bind(&row.received)
+            .bind(row.refundable_at)
             .execute(&mut *self.tx)
             .await?;
         if journaled.rows_affected() == 0 {
@@ -745,10 +771,6 @@ impl Window {
             // idempotency gate for everything.
             return Ok(false);
         }
-
-        // Read before the projections move: a bind's previous holders are the
-        // rows it is about to overwrite.
-        let mut involvement = self.involvement(event, &at).await?;
 
         match event {
             NamesEvent::IdentityBound {
@@ -822,13 +844,11 @@ impl Window {
                     .await?;
             }
 
-            // The contract logs this only when it withdrew a name; with no
-            // published row here, the index missed it (a later START_BLOCK).
             NamesEvent::HandleUnpublished { holder } => {
-                involvement.handle_node = sqlx::query_scalar(sql::WITHDRAW_NAME)
+                sqlx::query(sql::WITHDRAW_NAME)
                     .bind(chain_id)
                     .bind(holder)
-                    .fetch_optional(&mut *self.tx)
+                    .execute(&mut *self.tx)
                     .await?;
             }
 
@@ -1203,6 +1223,7 @@ mod sql {
     pub const UPSERT_HANDLE: &str = include_str!("../sql/upsert_handle.sql");
     pub const PUBLISH: &str = include_str!("../sql/publish.sql");
     pub const WITHDRAW_NAME: &str = include_str!("../sql/withdraw_name.sql");
+    pub const PUBLISHED_NAME: &str = include_str!("../sql/published_name.sql");
     pub const RETIRE_HANDLE: &str = include_str!("../sql/retire_handle.sql");
     pub const ENS_HOLDER: &str = include_str!("../sql/ens_holder.sql");
     pub const CHAIN_NAMES_TAKEN: &str = include_str!("../sql/chain_names_taken.sql");
@@ -1234,7 +1255,6 @@ mod sql {
     pub const CLAIMED_SENDERS: &str = include_str!("../sql/claimed_senders.sql");
     pub const RECORD_ADDRESS_EVENT: &str =
         include_str!("../sql/record_address_event.sql");
-    pub const RECORD_HANDLE_EVENT: &str = include_str!("../sql/record_handle_event.sql");
     pub const RECORD_HANDLE_NODE: &str = include_str!("../sql/record_handle_node.sql");
     /// An address's history: the events it took part in, each with its
     /// roles, the journal row and the handle the event concerns. The caller
@@ -1388,6 +1408,15 @@ pub(crate) mod plan_tests {
                 "a withdrawn name",
                 &["published_pkey"][..],
                 sqlx::query_scalar(&explain(sql::WITHDRAW_NAME))
+                    .bind(1i64)
+                    .bind(owner)
+                    .fetch_all(&mut *conn)
+                    .await,
+            ),
+            (
+                "the name an unpublish withdraws",
+                &["published_pkey"][..],
+                sqlx::query_scalar(&explain(sql::PUBLISHED_NAME))
                     .bind(1i64)
                     .bind(owner)
                     .fetch_all(&mut *conn)
