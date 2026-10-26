@@ -474,22 +474,6 @@ impl<'a> Session<'a> {
             "eth_getLogs {from}..{to} answered a log outside the window"
         );
         logs.sort_by_key(|log| (log.block_number, log.log_index));
-
-        // The logs and the head estimate may have come from different
-        // backends behind one RPC URL. Before treating this window as final,
-        // require the node answering NOW to have reached its end; a lagging
-        // replica that returned empty logs for blocks it never saw must fail
-        // the window, not advance the cursor past events. (A single
-        // well-behaved endpoint makes this check free; a load balancer makes
-        // it necessary but not sufficient — see the README.)
-        let seen = self
-            .provider
-            .get_block_number()
-            .await
-            .context("eth_blockNumber recheck")?;
-        if seen < to {
-            anyhow::bail!("RPC backend reports block {seen}, behind window end {to}");
-        }
         Ok(logs)
     }
 
