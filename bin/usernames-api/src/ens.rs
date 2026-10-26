@@ -54,7 +54,6 @@ use std::{
 use alloy::primitives::{
     Address,
     Bytes,
-    B256,
 };
 use axum::{
     extract::{
@@ -227,25 +226,27 @@ impl Config {
             }
         }
 
-        // Only now, with an answer actually owed, is staleness worth asking
-        // about.
-        if let Some(why) = indexed.lag().await.staleness(self.max_lag_blocks) {
-            return Ok(Answer::TooStale(why));
-        }
-
-        let owner = match query.subject {
+        let handle_node = match query.subject {
             Subject::Handle { platform, handle } => {
                 // The chain's node for the handle: what `resolveHandle`
-                // keys by.
+                // keys by. Text no node can hold is nobody's.
                 let Ok(handle_node) = platform.handle_node(&handle) else {
                     return Ok(null);
                 };
-                indexed.owner_of(handle_node).await?
+                handle_node
             }
         };
 
+        // Only now, with an answer actually owed, is staleness worth asking
+        // about: in the same read as the holder, so a replay between the two
+        // cannot have the gateway sign for emptied tables.
+        let read = indexed.0.ens_answer(handle_node).await?;
+        if let Some(why) = Lag::of(read.position).staleness(self.max_lag_blocks) {
+            return Ok(Answer::TooStale(why));
+        }
+
         Ok(Answer::Addr {
-            address: owner,
+            address: read.holder,
             shape,
         })
     }
@@ -411,39 +412,22 @@ impl IndexedChain {
         self.0.chain_id()
     }
 
-    /// The owner a name resolves to, as of whatever block this chain's
-    /// indexer last committed. `None` is the null answer — a name nobody
-    /// holds.
-    async fn owner_of(&self, handle_node: B256) -> Result<Option<Address>, GatewayError> {
-        Ok(self.0.ens_holder(handle_node).await?)
-    }
-
     /// Where this index stands, or nothing if the store cannot say.
     async fn position(&self) -> Option<IndexPosition> {
         self.0.index_position().await.ok()
     }
-
-    /// How far this index trails the chain.
-    ///
-    /// The position in one read, because this is the hot path and because the
-    /// values must be a snapshot: the target, the cursor, and whether the
-    /// indexer's report is still good — by the database's clock, the same one
-    /// that stamped it.
-    ///
-    /// Against the TARGET, not the chain head: the indexer only ever advances
-    /// the cursor to `head - CONFIRMATIONS`, so a caught-up index sits
-    /// permanently that far behind the head, and measured that way a healthy
-    /// deployment would refuse forever. And WHETHER the report is still good,
-    /// because the target is the indexer's own claim: a loop that stopped
-    /// leaves target and cursor frozen together, so by blocks alone a dead
-    /// indexer reads as caught up for as long as it stays dead. The report it
-    /// makes beside the target expires on its own schedule, and that notices.
-    async fn lag(&self) -> Lag {
-        Lag::of(self.position().await)
-    }
 }
 
 /// How far behind the chain an answer would be.
+///
+/// Against the TARGET, not the chain head: the indexer only ever advances
+/// the cursor to `head - CONFIRMATIONS`, so a caught-up index sits
+/// permanently that far behind the head, and measured that way a healthy
+/// deployment would refuse forever. And WHETHER the report is still good,
+/// because the target is the indexer's own claim: a loop that stopped
+/// leaves target and cursor frozen together, so by blocks alone a dead
+/// indexer reads as caught up for as long as it stays dead. The report it
+/// makes beside the target expires on its own schedule, and that notices.
 enum Lag {
     /// Read from an index: this many blocks behind the target its indexer
     /// last set, and this long before that indexer's report expires —

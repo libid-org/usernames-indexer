@@ -127,6 +127,24 @@ fn block(value: Option<i64>) -> Option<u64> {
     value.and_then(|value| u64::try_from(value).ok())
 }
 
+/// What the ENS gateway answers from: where the index stands, and who holds
+/// the node asked about, read together.
+#[derive(Clone, Copy, Debug)]
+pub struct EnsAnswer {
+    /// Where the index stands; `None` before an indexer prepared the chain.
+    pub position: Option<IndexPosition>,
+    /// Who holds the node; `None` when nobody does.
+    pub holder: Option<Address>,
+}
+
+/// The chain's row and the holder, as `ens_answer.sql` reads them.
+#[derive(sqlx::FromRow)]
+struct EnsRow {
+    #[sqlx(flatten)]
+    state: ChainState,
+    owner: Option<Address>,
+}
+
 /// A chain's row and the names it goes by: one entry of `/v1/status`.
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub struct ChainStatusRow {
@@ -1047,18 +1065,26 @@ impl Store {
 }
 
 impl ChainStore {
-    /// The holder the ENS gateway answers for a handle node on this chain.
-    /// `ens_holder.sql` says which bindings it answers for.
-    pub async fn ens_holder(
-        &self,
-        handle_node: B256,
-    ) -> Result<Option<Address>, sqlx::Error> {
-        let holder: Option<Option<Address>> = sqlx::query_scalar(sql::ENS_HOLDER)
+    /// What the ENS gateway answers for a handle node on this chain: where
+    /// the index stands and who holds the node, from one snapshot, so a
+    /// replay clearing the chain between the two cannot be signed for.
+    /// `ens_answer.sql` says which bindings it answers for.
+    pub async fn ens_answer(&self, handle_node: B256) -> Result<EnsAnswer, sqlx::Error> {
+        let row: Option<EnsRow> = sqlx::query_as(sql::ENS_ANSWER)
             .bind(self.chain_id)
             .bind(handle_node)
             .fetch_optional(&self.pool)
             .await?;
-        Ok(holder.flatten())
+        Ok(match row {
+            Some(row) => EnsAnswer {
+                position: Some(row.state.position()),
+                holder: row.owner,
+            },
+            None => EnsAnswer {
+                position: None,
+                holder: None,
+            },
+        })
     }
 }
 
@@ -1202,7 +1228,7 @@ mod sql {
     pub const WITHDRAW_NAME: &str = include_str!("../sql/withdraw_name.sql");
     pub const PUBLISHED_NAME: &str = include_str!("../sql/published_name.sql");
     pub const RETIRE_HANDLE: &str = include_str!("../sql/retire_handle.sql");
-    pub const ENS_HOLDER: &str = include_str!("../sql/ens_holder.sql");
+    pub const ENS_ANSWER: &str = include_str!("../sql/ens_answer.sql");
     pub const CHAIN_NAMES_TAKEN: &str = include_str!("../sql/chain_names_taken.sql");
     /// The names the chain goes by in an ENS name.
     pub const CLEAR_CHAIN_NAMES: &str = include_str!("../sql/clear_chain_names.sql");
@@ -1373,9 +1399,9 @@ pub(crate) mod plan_tests {
 
         let reads = [
             (
-                "the gateway's holder",
+                "the gateway's answer",
                 &["handles_pkey|handles_node_chain_idx"][..],
-                sqlx::query_scalar::<_, String>(&explain(sql::ENS_HOLDER))
+                sqlx::query_scalar::<_, String>(&explain(sql::ENS_ANSWER))
                     .bind(1i64)
                     .bind(node)
                     .fetch_all(&mut *conn)

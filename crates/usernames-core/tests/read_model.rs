@@ -1039,9 +1039,10 @@ async fn preparing_an_unchanged_chain_keeps_everything() {
     );
     assert!(
         store
-            .ens_holder(KnownPlatform::X.handle_node("alice").unwrap())
+            .ens_answer(KnownPlatform::X.handle_node("alice").unwrap())
             .await
             .unwrap()
+            .holder
             .is_some(),
         "the binding survived"
     );
@@ -1090,9 +1091,10 @@ async fn watching_another_contract_clears_the_chain() {
     );
     assert!(
         store
-            .ens_holder(KnownPlatform::X.handle_node("alice").unwrap())
+            .ens_answer(KnownPlatform::X.handle_node("alice").unwrap())
             .await
             .unwrap()
+            .holder
             .is_none(),
         "the previous contract's binding must not survive"
     );
