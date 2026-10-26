@@ -48,6 +48,7 @@ use usernames_core::{
     },
     events::{
         EscrowEvent,
+        EventKind,
         LogPosition,
         NamesEvent,
     },
@@ -679,13 +680,13 @@ async fn a_bind_names_what_it_took_and_from_whom() {
 }
 
 /// An address history as (kind, roles, handle node), newest first.
-fn entries(history: &AddressHistory) -> Vec<(String, Vec<Role>, Option<B256>)> {
+fn entries(history: &AddressHistory) -> Vec<(EventKind, Vec<Role>, Option<B256>)> {
     history
         .entries
         .iter()
         .map(|e| {
             (
-                kind(&e.event).to_string(),
+                kind(&e.event),
                 e.roles.clone(),
                 e.handle.as_ref().map(|h| h.handle_node),
             )
@@ -694,20 +695,22 @@ fn entries(history: &AddressHistory) -> Vec<(String, Vec<Role>, Option<B256>)> {
 }
 
 /// The journal kind an event is served under.
-fn kind(event: &HistoryEvent) -> &'static str {
+fn kind(event: &HistoryEvent) -> EventKind {
     match event {
-        HistoryEvent::IdentityBound { .. } => "identity_bound",
-        HistoryEvent::HandlePublished { .. } => "handle_published",
-        HistoryEvent::HandleRetired { .. } => "handle_retired",
-        HistoryEvent::HandleUnpublished { .. } => "handle_unpublished",
-        HistoryEvent::ProofVerifierConfigured { .. } => "proof_verifier_configured",
-        HistoryEvent::CeremonyBound { .. } => "ceremony_bound",
-        HistoryEvent::BindFeePaid { .. } => "bind_fee_paid",
-        HistoryEvent::Deposited { .. } => "deposited",
-        HistoryEvent::HandleRevealed { .. } => "handle_revealed",
-        HistoryEvent::Forwarded { .. } => "forwarded",
-        HistoryEvent::Claimed { .. } => "claimed",
-        HistoryEvent::Refunded { .. } => "refunded",
+        HistoryEvent::IdentityBound { .. } => EventKind::IdentityBound,
+        HistoryEvent::HandlePublished { .. } => EventKind::HandlePublished,
+        HistoryEvent::HandleRetired { .. } => EventKind::HandleRetired,
+        HistoryEvent::HandleUnpublished { .. } => EventKind::HandleUnpublished,
+        HistoryEvent::ProofVerifierConfigured { .. } => {
+            EventKind::ProofVerifierConfigured
+        }
+        HistoryEvent::CeremonyBound { .. } => EventKind::CeremonyBound,
+        HistoryEvent::BindFeePaid { .. } => EventKind::BindFeePaid,
+        HistoryEvent::Deposited { .. } => EventKind::Deposited,
+        HistoryEvent::HandleRevealed { .. } => EventKind::HandleRevealed,
+        HistoryEvent::Forwarded { .. } => EventKind::Forwarded,
+        HistoryEvent::Claimed { .. } => EventKind::Claimed,
+        HistoryEvent::Refunded { .. } => EventKind::Refunded,
     }
 }
 
@@ -740,8 +743,8 @@ async fn a_retired_handle_is_in_the_history_of_the_address_that_held_it() {
         vec![Role::PreviousHandleHolder],
         vec![Role::PreviousIdHolder],
     );
-    let row = |kind: &str, roles: &Vec<Role>, handle: &str| {
-        (kind.to_string(), roles.clone(), Some(node(handle)))
+    let row = |kind: EventKind, roles: &Vec<Role>, handle: &str| {
+        (kind, roles.clone(), Some(node(handle)))
     };
     let history: AddressHistory = suite
         .get(&format!("/v1/history/address/{alice}"))
@@ -750,15 +753,15 @@ async fn a_retired_handle_is_in_the_history_of_the_address_that_held_it() {
     assert_eq!(
         entries(&history),
         [
-            row("identity_bound", &moved, "kim3"),
-            row("handle_unpublished", &holder, "kim2"),
-            row("handle_retired", &held, "kim2"),
-            row("handle_published", &holder, "kim2"),
-            row("identity_bound", &holder, "kim2"),
-            row("handle_unpublished", &holder, "kim1"),
-            row("handle_retired", &held, "kim1"),
-            row("handle_published", &holder, "kim1"),
-            row("identity_bound", &holder, "kim1"),
+            row(EventKind::IdentityBound, &moved, "kim3"),
+            row(EventKind::HandleUnpublished, &holder, "kim2"),
+            row(EventKind::HandleRetired, &held, "kim2"),
+            row(EventKind::HandlePublished, &holder, "kim2"),
+            row(EventKind::IdentityBound, &holder, "kim2"),
+            row(EventKind::HandleUnpublished, &holder, "kim1"),
+            row(EventKind::HandleRetired, &held, "kim1"),
+            row(EventKind::HandlePublished, &holder, "kim1"),
+            row(EventKind::IdentityBound, &holder, "kim1"),
         ]
     );
     // Bob never held @kim2: his history is his own bind.
@@ -766,7 +769,10 @@ async fn a_retired_handle_is_in_the_history_of_the_address_that_held_it() {
         .get(&format!("/v1/history/address/{bob}"))
         .await
         .answer();
-    assert_eq!(entries(&history), [row("identity_bound", &holder, "kim3")]);
+    assert_eq!(
+        entries(&history),
+        [row(EventKind::IdentityBound, &holder, "kim3")]
+    );
     suite.done();
 }
 
@@ -1043,10 +1049,11 @@ async fn another_escrow_replays_the_chain_and_the_same_one_keeps_it() {
     suite.done();
 }
 
-/// A ceremony takes the handle of the bind before it in its own transaction
-/// only: one in another transaction of the same window concerns no handle.
+/// A ceremony and a fee take the handle and payer of the bind before them in
+/// their own transaction only: in another transaction of the same window
+/// they concern no handle and charge no holder.
 #[tokio::test]
-async fn a_ceremony_takes_only_its_own_transactions_bind() {
+async fn a_ceremony_and_a_fee_take_only_their_own_transactions_bind() {
     let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
@@ -1075,6 +1082,12 @@ async fn a_ceremony_takes_only_its_own_transactions_bind() {
         .apply(&ceremony, &at(9, 0x0B))
         .await
         .expect("the ceremony");
+    let fee = NamesEvent::BindFeePaid {
+        authorization_digest: B256::repeat_byte(0xD1),
+        receiver: addr(0xFE),
+        amount: U256::from(5u64),
+    };
+    window.apply(&fee, &at(10, 0x0B)).await.expect("the fee");
     window.commit(1).await.expect("commit");
 
     let history: HandleHistory = suite.get("/v1/history/handle/x/ann_1").await.answer();
@@ -1094,6 +1107,13 @@ async fn a_ceremony_takes_only_its_own_transactions_bind() {
         .find(|entry| matches!(entry.event, HistoryEvent::CeremonyBound { .. }))
         .expect("the ceremony is in the holder's history");
     assert_eq!(ceremony.handle, None);
+    // Nor is the fee: its payer is the holder of its own transaction's bind.
+    assert!(
+        !events(&history.entries)
+            .iter()
+            .any(|event| matches!(event, HistoryEvent::BindFeePaid { .. })),
+        "{history:?}"
+    );
     suite.done();
 }
 

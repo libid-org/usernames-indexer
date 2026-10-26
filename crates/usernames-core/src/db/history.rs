@@ -64,9 +64,8 @@ impl Involvement {
         }
     }
 
-    /// The event concerns `handle_node`, of the platform it names.
-    fn named(&mut self, handle_node: B256, platform_id: B256) {
-        self.handle_node = Some(handle_node);
+    /// The event names its handle's platform.
+    fn named(&mut self, platform_id: B256) {
         self.platform_id = Some(platform_id);
     }
 }
@@ -90,7 +89,9 @@ impl Window {
         let chain_id = self.chain_id;
         let mut involvement = Involvement {
             parties: Vec::new(),
-            handle_node: None,
+            // The event's own node; the unpublish, the ceremony and the fee,
+            // which name none, are given theirs below.
+            handle_node: event.handle_node(),
             platform_id: None,
             handle: event.disclosure().map(|(_, _, text)| text.clone()),
         };
@@ -122,7 +123,7 @@ impl Window {
                         involvement.add(previous, role);
                     }
                 }
-                involvement.named(*handle_node, *platform_id);
+                involvement.named(*platform_id);
                 self.bind = Some(Bind {
                     tx_hash: at.tx_hash,
                     holder: *holder,
@@ -161,28 +162,17 @@ impl Window {
             // These name the platform too: a reveal can come before any bind
             // names it, and the others matter when the index starts after
             // the node's bind.
-            NamesEvent::HandleRevealed {
-                handle_node,
-                platform_id,
-                ..
+            NamesEvent::HandleRevealed { platform_id, .. }
+            | NamesEvent::HandlePublished { platform_id, .. }
+            | NamesEvent::HandleRetired { platform_id, .. } => {
+                involvement.named(*platform_id)
             }
-            | NamesEvent::HandlePublished {
-                handle_node,
-                platform_id,
-                ..
-            }
-            | NamesEvent::HandleRetired {
-                handle_node,
-                platform_id,
-                ..
-            } => involvement.named(*handle_node, *platform_id),
 
             // A deposit names no platform; the `HandleRevealed` of a
             // `depositToHandle`, or a bind, does.
             NamesEvent::Escrow(
-                EscrowEvent::Deposited { handle_node, .. }
-                | EscrowEvent::Forwarded { handle_node, .. },
-            ) => involvement.handle_node = Some(*handle_node),
+                EscrowEvent::Deposited { .. } | EscrowEvent::Forwarded { .. },
+            ) => {}
 
             // A claim ends the refunds of everybody whose deposit it took:
             // the round's refundable rows, read before the claim deletes them.
@@ -198,12 +188,9 @@ impl Window {
                 for sender in senders {
                     involvement.add(sender, Role::Sender);
                 }
-                involvement.handle_node = Some(*handle_node);
             }
 
-            NamesEvent::Escrow(EscrowEvent::Refunded { handle_node, .. }) => {
-                involvement.handle_node = Some(*handle_node);
-            }
+            NamesEvent::Escrow(EscrowEvent::Refunded { .. }) => {}
 
             NamesEvent::ProofVerifierConfigured { .. } => {}
         }
@@ -348,9 +335,11 @@ impl Page<HistoryCursor> {
         statement
     }
 
-    /// The chain, the cursor, the order and the fetch limit. The history
-    /// index serves the page as one backward range, with the chain in the
-    /// comparison only when it does not filter the page.
+    /// The chain, the cursor, the order and the fetch limit. On one chain the
+    /// chain leaves the comparison, so an index led by the address or node
+    /// with time next serves the page as one backward range, the address
+    /// table's key included; across chains the history index does, with the
+    /// chain in the comparison.
     fn bound(&self, statement: &mut Statement, table: &str) {
         let order = match self.chain {
             Some(chain) => {

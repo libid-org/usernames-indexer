@@ -530,7 +530,7 @@ mod tests {
     #[test]
     fn a_row_missing_a_column_is_refused_by_name() {
         let row = EventColumns {
-            kind: "handle_unpublished".into(),
+            kind: EventKind::HandleUnpublished.to_string(),
             ..EventColumns::default()
         };
         assert!(matches!(

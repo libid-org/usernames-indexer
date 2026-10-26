@@ -242,21 +242,33 @@ impl FromStr for Role {
     }
 }
 
-/// Which event a journal row holds.
+/// Which event a journal row holds: one per [`NamesEvent`] and
+/// [`EscrowEvent`] variant of the same name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(missing_docs)]
 pub enum EventKind {
+    /// [`NamesEvent::IdentityBound`].
     IdentityBound,
+    /// [`NamesEvent::HandleRevealed`].
     HandleRevealed,
+    /// [`NamesEvent::HandlePublished`].
     HandlePublished,
+    /// [`NamesEvent::HandleRetired`].
     HandleRetired,
+    /// [`NamesEvent::HandleUnpublished`].
     HandleUnpublished,
+    /// [`NamesEvent::ProofVerifierConfigured`].
     ProofVerifierConfigured,
+    /// [`NamesEvent::CeremonyBound`].
     CeremonyBound,
+    /// [`NamesEvent::BindFeePaid`].
     BindFeePaid,
+    /// [`EscrowEvent::Deposited`].
     Deposited,
+    /// [`EscrowEvent::Forwarded`].
     Forwarded,
+    /// [`EscrowEvent::Claimed`].
     Claimed,
+    /// [`EscrowEvent::Refunded`].
     Refunded,
 }
 

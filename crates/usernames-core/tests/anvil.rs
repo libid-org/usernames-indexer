@@ -41,6 +41,7 @@ use usernames_core::{
         self,
         ChainStore,
     },
+    events::EventKind,
     indexer::{
         self,
         LogSource,
@@ -355,9 +356,10 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
             .expect("journal count");
     assert_eq!(journal, 26);
     let fee_kinds: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM names.events WHERE chain_id = $1 AND kind = 'bind_fee_paid'",
+        "SELECT count(*) FROM names.events WHERE chain_id = $1 AND kind = $2",
     )
     .bind(chain_id as i64)
+    .bind(EventKind::BindFeePaid.as_str())
     .fetch_one(&pool)
     .await
     .expect("fee count");
