@@ -4,12 +4,13 @@
 //! standing in for each platform's proof check.
 
 use alloy::{
-    contract::{
-        CallBuilder,
-        CallDecoder,
+    node_bindings::{
+        Anvil,
+        AnvilInstance,
     },
     primitives::{
         Address,
+        Bytes,
         B256,
         U256,
     },
@@ -18,7 +19,10 @@ use alloy::{
         Provider,
         ProviderBuilder,
     },
-    rpc::types::TransactionReceipt,
+    rpc::types::{
+        TransactionReceipt,
+        TransactionRequest,
+    },
     sol,
     sol_types::SolValue,
 };
@@ -37,6 +41,7 @@ use libid_contracts::{
     deploy::deploy_behind_proxy,
     Artifacts,
 };
+use url::Url;
 use usernames_core::nodes::KnownPlatform;
 
 use StubPlatformVerifier::StubPlatformVerifierInstance;
@@ -101,12 +106,38 @@ pub enum Disclose {
     Name,
 }
 
-/// Anvil with every dev account's key in the wallet, on `chain`.
-pub fn anvil(chain: u64) -> DynProvider {
-    ProviderBuilder::new()
-        .connect_anvil_with_wallet_and_config(|anvil| anvil.chain_id(chain))
-        .expect("anvil spawns")
-        .erased()
+/// Anvil on one chain id, and a provider whose wallet holds every dev
+/// account's key.
+pub struct Node {
+    pub provider: DynProvider,
+    instance: AnvilInstance,
+}
+
+impl Node {
+    /// Anvil on `chain`.
+    pub fn spawn(chain: u64) -> Self {
+        let instance = Anvil::new().chain_id(chain).spawn();
+        let provider = ProviderBuilder::new()
+            .wallet(instance.wallet().expect("anvil's dev accounts"))
+            .connect_http(instance.endpoint_url())
+            .erased();
+        Self { provider, instance }
+    }
+
+    /// The JSON-RPC endpoint an indexer dials.
+    pub fn rpc(&self) -> Url {
+        self.instance.endpoint_url()
+    }
+
+    /// The WebSocket endpoint.
+    pub fn ws(&self) -> Url {
+        self.instance.ws_endpoint_url()
+    }
+
+    /// The dev accounts; the first deploys.
+    pub fn accounts(&self) -> &[Address] {
+        self.instance.addresses()
+    }
 }
 
 /// The deployed contracts, and the stubs that verify for them.
@@ -119,8 +150,8 @@ pub struct Libid {
     /// The block the registry's proxy was deployed in.
     pub deployed_at: u64,
     stubs: Vec<(KnownPlatform, StubPlatformVerifierInstance<DynProvider>)>,
-    /// Binds so far, which keeps each one's authorization nonce unique.
-    binds: u64,
+    /// Proofs so far, which keeps each one's authorization nonce unique.
+    proofs: u64,
 }
 
 impl Libid {
@@ -144,7 +175,10 @@ impl Libid {
             .expect("deploy the Proof Verifier"),
             provider.clone(),
         );
-        mined(registry.setProofVerifier(*proof_verifier.address())).await;
+        let wire = registry
+            .setProofVerifier(*proof_verifier.address())
+            .into_transaction_request();
+        mined(provider, wire).await;
 
         let mut stubs = Vec::new();
         for platform in PLATFORMS {
@@ -152,12 +186,10 @@ impl Libid {
                 StubPlatformVerifier::deploy(provider.clone(), platform.id(), U256::ZERO)
                     .await
                     .expect("deploy a stub verifier");
-            mined(proof_verifier.setVerifier(
-                platform.id(),
-                VERIFIER_VERSION,
-                *stub.address(),
-            ))
-            .await;
+            let wire = proof_verifier
+                .setVerifier(platform.id(), VERIFIER_VERSION, *stub.address())
+                .into_transaction_request();
+            mined(provider, wire).await;
             stubs.push((platform, stub));
         }
 
@@ -173,7 +205,7 @@ impl Libid {
             native,
             deployed_at,
             stubs,
-            binds: 0,
+            proofs: 0,
         }
     }
 
@@ -210,26 +242,31 @@ impl Libid {
         .expect("deploy the escrow")
     }
 
-    /// `holder` binds what `proof` reports, disclosing as `disclose` says
-    /// and paying `fee` to [`FEE_RECEIVER`] when it is not zero.
-    pub async fn bind(
-        &mut self,
-        holder: Address,
-        proof: Proof,
-        disclose: Disclose,
-        fee: U256,
-    ) {
-        self.binds += 1;
+    /// Point the platform's stub at what `proof` reports; the payload of
+    /// `holder`'s bind of it.
+    pub async fn prove(&mut self, holder: Address, proof: Proof) -> Bytes {
+        self.proofs += 1;
         let Handle(platform, handle) = proof.handle;
         let (_, stub) = self
             .stubs
             .iter()
             .find(|(p, _)| *p == platform)
             .expect("a stub verifies the platform");
-        mined(stub.set(proof.id.into(), handle.into())).await;
-        mined(stub.setObservedAt(proof.observed_at)).await;
+        let provider = self.registry.provider();
+        mined(
+            provider,
+            stub.set(proof.id.into(), handle.into())
+                .into_transaction_request(),
+        )
+        .await;
+        mined(
+            provider,
+            stub.setObservedAt(proof.observed_at)
+                .into_transaction_request(),
+        )
+        .await;
 
-        let payload = StubPayload {
+        StubPayload {
             ceremonyVersion: CEREMONY_VERSION,
             operationDomain: self
                 .registry
@@ -237,30 +274,38 @@ impl Libid {
                 .call()
                 .await
                 .expect("the operation domain"),
-            authorizationNonce: B256::from(U256::from(self.binds)),
+            authorizationNonce: B256::from(U256::from(self.proofs)),
             transactionData: holder.abi_encode().into(),
         }
         .abi_encode()
-        .into();
+        .into()
+    }
+
+    /// `holder`'s bind of a proved `payload`, unsent: disclosing as
+    /// `disclose` says, and paying `fee` to [`FEE_RECEIVER`] when it is not
+    /// zero.
+    pub fn binding(
+        &self,
+        holder: Address,
+        Handle(platform, handle): Handle,
+        payload: Bytes,
+        disclose: Disclose,
+        fee: U256,
+    ) -> TransactionRequest {
         let fee_receiver = if fee.is_zero() {
             Address::ZERO
         } else {
             FEE_RECEIVER
         };
         let (platform, version) = (platform.id(), VERIFIER_VERSION);
-        match disclose {
-            Disclose::Nothing => {
-                let call = self.registry.bindPrivately(
-                    platform,
-                    version,
-                    payload,
-                    fee,
-                    fee_receiver,
-                );
-                mined(call.from(holder).value(fee)).await;
-            }
-            Disclose::Text | Disclose::Name => {
-                let call = self.registry.bind(
+        let request = match disclose {
+            Disclose::Nothing => self
+                .registry
+                .bindPrivately(platform, version, payload, fee, fee_receiver)
+                .into_transaction_request(),
+            Disclose::Text | Disclose::Name => self
+                .registry
+                .bind(
                     platform,
                     version,
                     payload,
@@ -268,39 +313,50 @@ impl Libid {
                     disclose == Disclose::Name,
                     fee,
                     fee_receiver,
-                );
-                mined(call.from(holder).value(fee)).await;
-            }
-        }
+                )
+                .into_transaction_request(),
+        };
+        request.from(holder).value(fee)
+    }
+
+    /// `holder` binds what `proof` reports; the block the bind landed in.
+    pub async fn bind(
+        &mut self,
+        holder: Address,
+        proof: Proof,
+        disclose: Disclose,
+        fee: U256,
+    ) -> u64 {
+        let payload = self.prove(holder, proof).await;
+        let request = self.binding(holder, proof.handle, payload, disclose, fee);
+        self.send(request).await
     }
 
     /// `holder` names a handle it holds.
     pub async fn publish(&self, holder: Address, Handle(platform, handle): Handle) {
-        mined(
-            self.registry
-                .publish(platform.id(), handle.into())
-                .from(holder),
-        )
-        .await;
+        let request = self
+            .registry
+            .publish(platform.id(), handle.into())
+            .into_transaction_request();
+        self.send(request.from(holder)).await;
     }
 
     /// `holder` withdraws its name.
     pub async fn unpublish(&self, holder: Address) {
-        mined(self.registry.unpublish().from(holder)).await;
+        let request = self.registry.unpublish().into_transaction_request();
+        self.send(request.from(holder)).await;
     }
 
     /// `payer` sends `amount` of the chain's coin to a handle by its node,
-    /// refundable to itself while it waits.
-    pub async fn deposit(&self, payer: Address, handle: Handle, amount: u64) {
+    /// refundable to itself while it waits; the block it landed in.
+    pub async fn deposit(&self, payer: Address, handle: Handle, amount: u64) -> u64 {
         let node = self.node(handle).await;
         let amount = U256::from(amount);
-        mined(
-            self.escrow
-                .deposit(handle.0.id(), node, self.native, amount, payer)
-                .from(payer)
-                .value(amount),
-        )
-        .await;
+        let request = self
+            .escrow
+            .deposit(handle.0.id(), node, self.native, amount, payer)
+            .into_transaction_request();
+        self.send(request.from(payer).value(amount)).await
     }
 
     /// The same, naming the handle's text on chain.
@@ -309,32 +365,33 @@ impl Libid {
         payer: Address,
         Handle(platform, handle): Handle,
         amount: u64,
-    ) {
+    ) -> u64 {
         let amount = U256::from(amount);
-        mined(
-            self.escrow
-                .depositToHandle(platform.id(), handle.into(), self.native, amount, payer)
-                .from(payer)
-                .value(amount),
-        )
-        .await;
+        let request = self
+            .escrow
+            .depositToHandle(platform.id(), handle.into(), self.native, amount, payer)
+            .into_transaction_request();
+        self.send(request.from(payer).value(amount)).await
     }
 
     /// `holder` takes what waits for its handle.
     pub async fn claim(&self, holder: Address, handle: Handle) {
         let node = self.node(handle).await;
-        mined(
-            self.escrow
-                .claim(node, vec![self.native], holder)
-                .from(holder),
-        )
-        .await;
+        let request = self
+            .escrow
+            .claim(node, vec![self.native], holder)
+            .into_transaction_request();
+        self.send(request.from(holder)).await;
     }
 
     /// `payer` takes back what it put towards a handle.
     pub async fn refund(&self, payer: Address, handle: Handle) {
         let node = self.node(handle).await;
-        mined(self.escrow.refund(node, self.native, payer).from(payer)).await;
+        let request = self
+            .escrow
+            .refund(node, self.native, payer)
+            .into_transaction_request();
+        self.send(request.from(payer)).await;
     }
 
     /// The node the registry files a handle under.
@@ -363,19 +420,28 @@ impl Libid {
             .await
             .expect("refundable")
     }
+
+    /// Send `request`; the block it landed in.
+    async fn send(&self, request: TransactionRequest) -> u64 {
+        mined(self.registry.provider(), request)
+            .await
+            .block_number
+            .expect("a mined transaction")
+    }
 }
 
-/// Send a call and wait for its block; a revert fails the test.
-async fn mined<P: Provider, D: CallDecoder>(
-    call: CallBuilder<P, D>,
+/// Send a transaction and wait for its block; a revert fails the test.
+async fn mined(
+    provider: &DynProvider,
+    request: TransactionRequest,
 ) -> TransactionReceipt {
-    let receipt = call
-        .send()
+    let receipt = provider
+        .send_transaction(request)
         .await
-        .expect("the call is accepted")
+        .expect("the transaction is accepted")
         .get_receipt()
         .await
-        .expect("the call is mined");
+        .expect("the transaction is mined");
     assert!(receipt.status(), "reverted: {receipt:?}");
     receipt
 }

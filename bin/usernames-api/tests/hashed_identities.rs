@@ -21,17 +21,14 @@ use alloy::{
         B256,
         U256,
     },
-    providers::{
-        DynProvider,
-        Provider,
-    },
+    providers::Provider,
 };
 use common::{
     libid::{
-        self,
         Disclose,
         Handle,
         Libid,
+        Node,
         Proof,
     },
     Reply,
@@ -73,7 +70,7 @@ struct Harness {
     chain: u64,
     pool: PgPool,
     store: ChainStore,
-    provider: DynProvider,
+    node: Node,
     libid: Libid,
     cancel: CancellationToken,
     indexer: JoinHandle<()>,
@@ -95,9 +92,8 @@ impl Harness {
         common::clear_chain(&pool, chain as i64).await;
         let store = ChainStore::new(pool.clone(), chain as i64);
 
-        let provider = libid::anvil(chain);
-        let owner = provider.get_accounts().await.expect("accounts")[0];
-        let libid = Libid::deploy(&provider, owner).await;
+        let node = Node::spawn(chain);
+        let libid = Libid::deploy(&node.provider, node.accounts()[0]).await;
         let (registry, escrow) = (*libid.registry.address(), *libid.escrow.address());
 
         let writer = store.acquire_writer().await.expect("writer lease");
@@ -109,12 +105,14 @@ impl Harness {
         let indexer = tokio::spawn(
             indexer::Indexer::new(
                 store.clone(),
-                provider.clone(),
+                node.rpc(),
                 indexer::IndexerConfig {
                     contract: registry,
                     escrow: Some(escrow),
                     confirmations: 0,
+                    source: indexer::LogSource::Poll,
                     poll_interval: Duration::from_millis(10),
+                    head_interval: Duration::from_millis(10),
                     max_block_range: 100,
                     start_block: None,
                     stale_after: Duration::from_secs(120),
@@ -127,7 +125,7 @@ impl Harness {
             chain,
             pool,
             store,
-            provider,
+            node,
             libid,
             cancel,
             indexer,
@@ -150,14 +148,13 @@ impl Harness {
 
     /// Wait for the indexer to commit every block mined so far.
     async fn settle(&self) {
-        let latest = self.provider.get_block_number().await.expect("latest");
+        let latest = self.node.provider.get_block_number().await.expect("latest");
         common::wait_for_cursor(&self.store, latest).await;
     }
 
     /// The anvil accounts that act in the scenario, after the deployer.
-    async fn accounts(&self) -> Vec<Address> {
-        let accounts = self.provider.get_accounts().await.expect("accounts");
-        accounts[1..].to_vec()
+    fn accounts(&self) -> &[Address] {
+        &self.node.accounts()[1..]
     }
 
     /// Every column holding text, bytes or JSON on this chain where `needle`
@@ -217,9 +214,8 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
     let Some(mut h) = Harness::open(CHAIN).await else {
         return;
     };
-    let accounts = h.accounts().await;
-    let &[alice, bob, dave, payer, ..] = &accounts[..] else {
-        panic!("anvil has fewer than five accounts: {accounts:?}");
+    let &[alice, bob, dave, payer, ..] = h.accounts() else {
+        panic!("anvil has fewer than five accounts");
     };
 
     let x = KnownPlatform::X;

@@ -36,3 +36,4 @@ libid-contracts.workspace = true
 alloy = { workspace = true, features = ["signer-local", "node-bindings"] }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
+url.workspace = true
