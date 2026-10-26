@@ -102,17 +102,7 @@ async fn gateway_parts(
     // serves: the store IS what the gateway serves, so a leftover chain from
     // another test would be served here too.
     for id in SUITE_CHAINS {
-        for statement in [
-            db::CLEAR_CHAIN,
-            db::CLEAR_CHAIN_METADATA,
-            db::CLEAR_CHAIN_NAMES,
-        ] {
-            sqlx::query(statement)
-                .bind(id)
-                .execute(&pool)
-                .await
-                .expect("cleanup");
-        }
+        ChainStore::new(pool.clone(), id).forget().await;
     }
 
     // Every chain starts SYNCED AND EMPTY, which is a different state from
@@ -621,16 +611,12 @@ async fn one_gateway_answers_for_every_chain_it_serves() {
 /// window.
 #[tokio::test]
 async fn an_index_that_cannot_report_its_position_refuses() {
-    let (router, store, pool, guard) = gateway_or_skip!(32);
+    let (router, store, _pool, guard) = gateway_or_skip!(32);
     bind(&store, "alice", Address::from([0xbe; 20])).await;
 
     // Wipe what the index knows about its own progress, leaving the binding
     // in place: the rows say one thing, the cursor says nothing.
-    sqlx::query(db::CLEAR_CHAIN_METADATA)
-        .bind(CHAIN)
-        .execute(&pool)
-        .await
-        .expect("clear metadata");
+    store.forget_progress().await;
 
     let call = resolve_call(
         &wire_name(&["alice", "x"]),

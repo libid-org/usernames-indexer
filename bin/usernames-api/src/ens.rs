@@ -462,7 +462,7 @@ impl Lag {
     /// and unknown is refused: folding it into "no lag" is how a gateway ends
     /// up signing authoritative nulls off a wiped or unreachable database — a
     /// fresh deployment, a version-bump replay clearing
-    /// `names.chain_metadata`, a chain nobody indexed yet, or Postgres simply
+    /// `names.chains`, a chain nobody indexed yet, or Postgres simply
     /// being down all produce it.
     fn of(position: Option<IndexPosition>) -> Self {
         match position {

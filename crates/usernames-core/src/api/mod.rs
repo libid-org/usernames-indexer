@@ -40,7 +40,6 @@ use axum::{
     Json,
     Router,
 };
-use futures_util::future::try_join_all;
 use serde::{
     de::DeserializeOwned,
     Deserialize,
@@ -50,7 +49,7 @@ use self::model::*;
 use crate::{
     db::{
         self,
-        ChainStore,
+        ChainStatusRow,
         InvalidCursor,
         Page,
         Store,
@@ -452,53 +451,36 @@ async fn health() -> &'static str {
 }
 
 impl ChainStatus {
-    async fn of(store: ChainStore) -> Result<Self, ApiError> {
-        let (
-            last,
-            head,
-            position,
+    /// A chain's status from its row and names.
+    fn of(row: ChainStatusRow) -> Self {
+        let ChainStatusRow { state, names } = row;
+        let position = state.position();
+        let head = state.head.and_then(|head| u64::try_from(head).ok());
+        Self {
+            chain_id: state.chain_id,
             names,
-            contract,
-            escrow,
-            last_window_error,
-            proof_verifier,
-        ) = tokio::try_join!(
-            store.cursor(),
-            store.chain_head(),
-            store.index_position(),
-            store.chain_names(),
-            store.contract(),
-            store.escrow(),
-            store.window_error(),
-            store.proof_verifier(),
-        )?;
-        Ok(Self {
-            chain_id: store.chain_id(),
-            names,
-            contract,
-            escrow,
-            last_indexed_block: last,
+            contract: state.contract,
+            escrow: state.escrow,
+            last_indexed_block: position.cursor,
             chain_head_block: head,
-            lag_blocks: head.map(|h| h.saturating_sub(last.unwrap_or(0))),
+            lag_blocks: head.map(|h| h.saturating_sub(position.cursor.unwrap_or(0))),
             indexer_reported_at: position.reported_at,
-            report_valid_for: position.valid_for.map(|valid_for| valid_for.num_seconds()),
-            last_window_error,
-            proof_verifier,
-        })
+            report_valid_for: state.valid_for,
+            last_window_error: state.window_error,
+            proof_verifier: state.proof_verifier,
+        }
     }
 }
 
 /// `GET /v1/status` — every chain in the store, as its indexer last left it.
 async fn status(State(state): State<AppState>) -> Result<Json<Status>, ApiError> {
-    let chains = try_join_all(
-        state
-            .store
-            .known_chains()
-            .await?
-            .into_iter()
-            .map(|chain_id| ChainStatus::of(state.store.chain(chain_id))),
-    )
-    .await?;
+    let chains = state
+        .store
+        .chain_statuses()
+        .await?
+        .into_iter()
+        .map(ChainStatus::of)
+        .collect();
     Ok(Json(Status {
         chains,
         indexer_version: db::INDEXER_VERSION.to_string(),

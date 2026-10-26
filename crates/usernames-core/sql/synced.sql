@@ -1,1 +1,1 @@
-SELECT true FROM names.chain_metadata
+SELECT true FROM names.chains WHERE cursor IS NOT NULL

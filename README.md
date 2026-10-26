@@ -240,7 +240,7 @@ the gateway reads them per request. A name belongs to one chain across the
 store — an indexer declaring a name another chain holds refuses to start — and
 is never a platform key, so the parse stays unambiguous. A label naming no
 chain in the store is a name nobody holds. To stop serving a chain, delete its
-`names.chain_metadata` and `names.chain_names` rows (and its projection rows);
+`names.chains` and `names.chain_names` rows (and its projection rows);
 the gateway stops listing it on the next request. A database shared by
 deployments is a served set shared by their gateways — give a gateway its own
 database to narrow it.
@@ -334,7 +334,10 @@ chain; a second deployment can share the database):
   rows it changes; a ceremony's and a fee's handle and payer are the bind's
   before them in their transaction
 
-The Proof Verifier is chain metadata, reported by `/v1/status`.
+`chains` holds one row per chain: the version and contracts its rows were
+written from, the registry's deployment block, the cursor, head and target,
+the last report and window error, and the Proof Verifier, which
+`/v1/status` reports.
 
 Each window commits in one transaction — journal, projections and cursor
 together — and the journal's `(chain, block, log)` conflict gates the

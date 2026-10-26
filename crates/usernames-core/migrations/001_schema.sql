@@ -10,15 +10,24 @@
 CREATE SCHEMA IF NOT EXISTS names;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
--- What the indexer records about a chain beside its rows: the cursor, the
--- head and the target it chases with the report's expiry, the contracts and
--- the Proof Verifier it saw, the read-model version, the cached deployment
--- block, the last window error. The API's status is read from here.
-CREATE TABLE IF NOT EXISTS names.chain_metadata (
-    chain_id BIGINT NOT NULL,
-    key      TEXT   NOT NULL,
-    value    TEXT   NOT NULL,
-    PRIMARY KEY (chain_id, key)
+-- One row per chain an indexer has prepared: the read-model version it
+-- writes and the contracts it watches, the registry's cached deployment
+-- block, how far it got and how far the chain has grown, its last report
+-- and window error, and the Proof Verifier the registry was pointed at.
+-- The API's status is read from here.
+CREATE TABLE IF NOT EXISTS names.chains (
+    chain_id        BIGINT PRIMARY KEY,
+    indexer_version TEXT,
+    contract        BYTEA,
+    escrow          BYTEA,
+    deploy_block    BIGINT,   -- of `contract`
+    cursor          BIGINT,
+    head            BIGINT,
+    target          BIGINT,
+    reported_at     BIGINT,   -- unix seconds, by the database's clock
+    valid_until     BIGINT,   -- unix seconds, by the database's clock
+    window_error    TEXT,
+    proof_verifier  BYTEA
 );
 
 -- Append-only journal of every decoded contract event, in chain order. The

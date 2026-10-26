@@ -66,24 +66,63 @@ pub use self::{
 /// from the deployment block — the re-index IS the migration.
 pub const INDEXER_VERSION: &str = "1";
 
-pub use self::sql::{
-    CLEAR_CHAIN,
-    CLEAR_CHAIN_METADATA,
-    CLEAR_CHAIN_NAMES,
-};
+/// One chain's row: what its indexer watches and writes, how far it got,
+/// and its last report. Blocks and times are what the indexer wrote, so
+/// never negative.
+#[derive(Clone, Debug, Default, sqlx::FromRow)]
+pub struct ChainState {
+    /// The chain.
+    pub chain_id: i64,
+    /// The [`INDEXER_VERSION`] its rows were written by.
+    pub indexer_version: Option<String>,
+    /// The registry its rows come from.
+    pub contract: Option<Address>,
+    /// The escrow its escrow rows come from, when it watches one.
+    pub escrow: Option<Address>,
+    /// The registry's deployment block, once detected.
+    pub deploy_block: Option<i64>,
+    /// The last block a window committed through.
+    pub cursor: Option<i64>,
+    /// How far the chain had grown at the indexer's last look.
+    pub head: Option<i64>,
+    /// The block the indexer last set out to reach.
+    pub target: Option<i64>,
+    /// Unix seconds at which the indexer last reported.
+    pub reported_at: Option<i64>,
+    /// Seconds until that report expires; negative once it has.
+    pub valid_for: Option<i64>,
+    /// The last window failure, while the most recent window failed.
+    pub window_error: Option<String>,
+    /// The Proof Verifier the registry was last pointed at.
+    pub proof_verifier: Option<Address>,
+}
 
-// The chain_metadata keys. Chain scoping is the table's chain_id column;
-// only the deployment-block cache still carries anything in its key.
-const SCHEMA_VERSION_KEY: &str = "schema_version";
-const CONTRACT_KEY: &str = "contract";
-const ESCROW_KEY: &str = "escrow";
-const CURSOR_KEY: &str = "cursor";
-const HEAD_KEY: &str = "head";
-const TARGET_KEY: &str = "target";
-const TARGET_REPORTED_AT_KEY: &str = "target_reported_at";
-const TARGET_VALID_UNTIL_KEY: &str = "target_valid_until";
-const WINDOW_ERROR_KEY: &str = "window_error";
-const PROOF_VERIFIER_KEY: &str = "proof_verifier";
+impl ChainState {
+    /// Where the index stands.
+    pub fn position(&self) -> IndexPosition {
+        IndexPosition {
+            target: block(self.target),
+            cursor: block(self.cursor),
+            reported_at: block(self.reported_at),
+            valid_for: self.valid_for.map(TimeDelta::seconds),
+        }
+    }
+}
+
+/// A stored block number or time, which the indexer wrote from a `u64`.
+fn block(value: Option<i64>) -> Option<u64> {
+    value.and_then(|value| u64::try_from(value).ok())
+}
+
+/// A chain's row and the names it goes by: one entry of `/v1/status`.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct ChainStatusRow {
+    /// The chain's row.
+    #[sqlx(flatten)]
+    pub state: ChainState,
+    /// The names its indexer declared.
+    pub names: Vec<String>,
+}
 
 /// The index's standing, as [`ChainStore::index_position`] reads it, every
 /// moment by the database's clock.
@@ -126,10 +165,11 @@ impl Store {
         ChainStore::new(self.pool.clone(), chain_id)
     }
 
-    /// Every chain an indexer has touched, cursor or not: what `/v1/status`
-    /// lists, so a chain still in its first window is visible there.
-    pub async fn known_chains(&self) -> Result<Vec<i64>, sqlx::Error> {
-        sqlx::query_scalar(sql::KNOWN_CHAINS)
+    /// Every chain an indexer has prepared, cursor or not, with its names:
+    /// what `/v1/status` lists, so a chain still in its first window is
+    /// visible there.
+    pub async fn chain_statuses(&self) -> Result<Vec<ChainStatusRow>, sqlx::Error> {
+        sqlx::query_as(sql::CHAIN_STATUSES)
             .fetch_all(&self.pool)
             .await
     }
@@ -137,7 +177,6 @@ impl Store {
     /// Every chain an indexer has written into this store, by cursor.
     pub async fn indexed_chains(&self) -> Result<Vec<i64>, sqlx::Error> {
         sqlx::query_scalar(sql::INDEXED_CHAINS)
-            .bind(CURSOR_KEY)
             .fetch_all(&self.pool)
             .await
     }
@@ -260,22 +299,16 @@ impl ChainStore {
         self.chain_id
     }
 
-    async fn get_metadata(&self, key: &str) -> Result<Option<String>, sqlx::Error> {
-        sqlx::query_scalar(sql::GET_METADATA)
+    /// The chain's row; all `None` before an indexer prepared it.
+    pub async fn state(&self) -> Result<ChainState, sqlx::Error> {
+        let state: Option<ChainState> = sqlx::query_as(sql::CHAIN_STATE)
             .bind(self.chain_id)
-            .bind(key)
             .fetch_optional(&self.pool)
-            .await
-    }
-
-    async fn set_metadata(&self, key: &str, value: &str) -> Result<(), sqlx::Error> {
-        sqlx::query(sql::UPSERT_METADATA)
-            .bind(self.chain_id)
-            .bind(key)
-            .bind(value)
-            .execute(&self.pool)
             .await?;
-        Ok(())
+        Ok(state.unwrap_or(ChainState {
+            chain_id: self.chain_id,
+            ..ChainState::default()
+        }))
     }
 
     /// Take the chain's writer lease, waiting (with a log line) if another
@@ -334,27 +367,21 @@ impl ChainStore {
             "writer lease locks chain {}, but this store prepares chain {}",
             writer.chain_id, self.chain_id
         );
-        let (version, known_contract, known_escrow) = tokio::try_join!(
-            self.get_metadata(SCHEMA_VERSION_KEY),
-            self.get_metadata(CONTRACT_KEY),
-            self.get_metadata(ESCROW_KEY),
-        )?;
-        let contract_now = contract.to_string().to_lowercase();
-        let escrow_now = escrow.map(|escrow| escrow.to_string().to_lowercase());
-        let version_ok = version.as_deref() == Some(INDEXER_VERSION);
-        let contract_ok = known_contract.as_deref() == Some(contract_now.as_str());
-        let escrow_ok = known_escrow == escrow_now;
-        if version_ok && contract_ok && escrow_ok {
+        let known = self.state().await?;
+        if known.indexer_version.as_deref() == Some(INDEXER_VERSION)
+            && known.contract == Some(contract)
+            && known.escrow == escrow
+        {
             return Ok(());
         }
         tracing::warn!(
             chain_id = self.chain_id,
-            version_from = version.as_deref().unwrap_or("<none>"),
+            version_from = known.indexer_version.as_deref().unwrap_or("<none>"),
             version_to = INDEXER_VERSION,
-            contract_from = known_contract.as_deref().unwrap_or("<none>"),
-            contract_to = %contract_now,
-            escrow_from = known_escrow.as_deref().unwrap_or("<none>"),
-            escrow_to = escrow_now.as_deref().unwrap_or("<none>"),
+            contract_from = ?known.contract,
+            contract_to = %contract,
+            escrow_from = ?known.escrow,
+            escrow_to = ?escrow,
             "read-model shape or a watched contract changed; clearing this chain for a full replay"
         );
         let mut tx = self.pool.begin().await?;
@@ -362,26 +389,13 @@ impl ChainStore {
             .bind(self.chain_id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query(sql::CLEAR_CHAIN_METADATA)
+        sqlx::query(sql::RESET_CHAIN)
             .bind(self.chain_id)
+            .bind(INDEXER_VERSION)
+            .bind(contract)
+            .bind(escrow)
             .execute(&mut *tx)
             .await?;
-        let stamps = [
-            (SCHEMA_VERSION_KEY, Some(INDEXER_VERSION.to_string())),
-            (CONTRACT_KEY, Some(contract_now)),
-            (ESCROW_KEY, escrow_now),
-        ];
-        for (key, value) in stamps
-            .into_iter()
-            .filter_map(|(key, value)| Some((key, value?)))
-        {
-            sqlx::query(sql::UPSERT_METADATA)
-                .bind(self.chain_id)
-                .bind(key)
-                .bind(value)
-                .execute(&mut *tx)
-                .await?;
-        }
         tx.commit().await?;
         tracing::info!(
             chain_id = self.chain_id,
@@ -395,15 +409,14 @@ impl ChainStore {
     /// gap between this and the cursor as lag. Best effort, outside any
     /// window.
     pub async fn set_chain_head(&self, head: u64) {
-        if let Err(e) = self.set_metadata(HEAD_KEY, &head.to_string()).await {
+        let written = sqlx::query(sql::SET_CHAIN_HEAD)
+            .bind(self.chain_id)
+            .bind(i64::try_from(head).unwrap_or(i64::MAX))
+            .execute(&self.pool)
+            .await;
+        if let Err(e) = written {
             tracing::warn!(%e, "failed to record the chain head");
         }
-    }
-
-    /// The chain head as last observed by the indexer loop.
-    pub async fn chain_head(&self) -> Result<Option<u64>, sqlx::Error> {
-        let value = self.get_metadata(HEAD_KEY).await?;
-        Ok(value.and_then(|v| v.parse().ok()))
     }
 
     /// Record the block the cursor is actually chasing: the head minus the
@@ -429,10 +442,7 @@ impl ChainStore {
     pub async fn set_chain_target(&self, target: u64, valid_for: Duration) -> bool {
         let written = sqlx::query(sql::SET_CHAIN_TARGET)
             .bind(self.chain_id)
-            .bind(TARGET_KEY)
-            .bind(target.to_string())
-            .bind(TARGET_REPORTED_AT_KEY)
-            .bind(TARGET_VALID_UNTIL_KEY)
+            .bind(i64::try_from(target).unwrap_or(i64::MAX))
             .bind(Self::valid_for_bind(valid_for))
             .execute(&self.pool)
             .await;
@@ -452,21 +462,12 @@ impl ChainStore {
     pub async fn touch_chain_target(&self, valid_for: Duration) {
         let touched = sqlx::query(sql::TOUCH_CHAIN_TARGET)
             .bind(self.chain_id)
-            .bind(TARGET_REPORTED_AT_KEY)
-            .bind(TARGET_VALID_UNTIL_KEY)
             .bind(Self::valid_for_bind(valid_for))
             .execute(&self.pool)
             .await;
         if let Err(e) = touched {
             tracing::warn!(%e, "failed to renew the chain target's report");
         }
-    }
-
-    /// The metadata key the deployment block of `contract` is cached under.
-    /// The address is part of it: repointing the indexer at a different
-    /// contract must not inherit the old contract's deployment block.
-    fn deploy_block_key(contract: Address) -> String {
-        format!("deploy_block:{contract}")
     }
 
     /// The validity the store will write for a report, in the whole seconds
@@ -533,12 +534,38 @@ impl ChainStore {
     /// [`Self::touch_chain_target`], relative to the database's clock.
     #[cfg(feature = "test-seams")]
     pub async fn set_chain_target_valid_until(&self, secs: u64) {
-        if let Err(e) = self
-            .set_metadata(TARGET_VALID_UNTIL_KEY, &secs.to_string())
+        sqlx::query(sql::SET_VALID_UNTIL)
+            .bind(self.chain_id)
+            .bind(i64::try_from(secs).unwrap_or(i64::MAX))
+            .execute(&self.pool)
             .await
-        {
-            tracing::warn!(%e, "failed to record when the chain target's report expires");
+            .expect("the report's expiry is written");
+    }
+
+    /// Delete every row this chain has: the read model, the chain's row and
+    /// its names. How a suite starts its chain from nothing.
+    #[cfg(feature = "test-seams")]
+    pub async fn forget(&self) {
+        let mut tx = self.pool.begin().await.expect("a transaction");
+        for statement in [sql::CLEAR_CHAIN, sql::FORGET_CHAIN, sql::CLEAR_CHAIN_NAMES] {
+            sqlx::query(statement)
+                .bind(self.chain_id)
+                .execute(&mut *tx)
+                .await
+                .expect("the chain is forgotten");
         }
+        tx.commit().await.expect("the chain is forgotten");
+    }
+
+    /// Delete the chain's row and keep its read model: an index that cannot
+    /// say how far it got.
+    #[cfg(feature = "test-seams")]
+    pub async fn forget_progress(&self) {
+        sqlx::query(sql::FORGET_CHAIN)
+            .bind(self.chain_id)
+            .execute(&self.pool)
+            .await
+            .expect("the chain's row is deleted");
     }
 
     /// Where the index stands, in one read: the target, the cursor, when the
@@ -547,112 +574,47 @@ impl ChainStore {
     /// statement, so the four are a snapshot and one round trip on the
     /// gateway's hot path.
     pub async fn index_position(&self) -> Result<IndexPosition, sqlx::Error> {
-        let rows: Vec<(String, String, i64)> = sqlx::query_as(sql::INDEX_POSITION)
-            .bind(self.chain_id)
-            .bind(TARGET_KEY)
-            .bind(CURSOR_KEY)
-            .bind(TARGET_REPORTED_AT_KEY)
-            .bind(TARGET_VALID_UNTIL_KEY)
-            .fetch_all(&self.pool)
-            .await?;
-        let mut position = IndexPosition::default();
-        for (key, value, now) in rows {
-            if key == TARGET_KEY {
-                position.target = value.parse().ok();
-            } else if key == CURSOR_KEY {
-                position.cursor = value.parse().ok();
-            } else if key == TARGET_REPORTED_AT_KEY {
-                position.reported_at = value.parse().ok();
-            } else if key == TARGET_VALID_UNTIL_KEY {
-                position.valid_for = value
-                    .parse::<i64>()
-                    .ok()
-                    .map(|until| TimeDelta::seconds(until.saturating_sub(now)));
-            }
-        }
-        Ok(position)
-    }
-
-    /// The block the cursor is chasing, as last recorded by the indexer loop.
-    ///
-    /// `None` before the first window of a fresh deployment, and on an indexer
-    /// old enough to predate the key — a caller that must not answer off a
-    /// stale model treats both as "cannot tell".
-    pub async fn chain_target(&self) -> Result<Option<u64>, sqlx::Error> {
-        let value = self.get_metadata(TARGET_KEY).await?;
-        Ok(value.and_then(|v| v.parse().ok()))
+        Ok(self.state().await?.position())
     }
 
     /// Record (or clear, with `None`) the last window failure, so a stalled
     /// loop is visible in `/v1/status` instead of only in the logs. Best
     /// effort.
     pub async fn set_window_error(&self, error: Option<&str>) {
-        let result = match error {
-            Some(msg) => self.set_metadata(WINDOW_ERROR_KEY, msg).await,
-            None => sqlx::query(sql::DELETE_METADATA)
-                .bind(self.chain_id)
-                .bind(WINDOW_ERROR_KEY)
-                .execute(&self.pool)
-                .await
-                .map(|_| ()),
-        };
-        if let Err(e) = result {
+        let written = sqlx::query(sql::SET_WINDOW_ERROR)
+            .bind(self.chain_id)
+            .bind(error)
+            .execute(&self.pool)
+            .await;
+        if let Err(e) = written {
             tracing::warn!(%e, "failed to record the window error state");
         }
     }
 
-    /// The last window failure, if the most recent window failed.
-    pub async fn window_error(&self) -> Result<Option<String>, sqlx::Error> {
-        self.get_metadata(WINDOW_ERROR_KEY).await
-    }
-
-    /// The Proof Verifier the contract was last pointed at, as its
-    /// `ProofVerifierConfigured` reported it. `None` until one is indexed.
-    pub async fn proof_verifier(&self) -> Result<Option<Address>, sqlx::Error> {
-        let value = self.get_metadata(PROOF_VERIFIER_KEY).await?;
-        Ok(value.and_then(|v| v.parse().ok()))
-    }
-
-    /// The contract this chain's rows were indexed from, as the indexer
-    /// recorded it when it prepared the chain. `None` before that.
-    pub async fn contract(&self) -> Result<Option<Address>, sqlx::Error> {
-        let value = self.get_metadata(CONTRACT_KEY).await?;
-        Ok(value.and_then(|v| v.parse().ok()))
-    }
-
-    /// The HandleEscrow this chain's escrow rows were indexed from, as the
-    /// indexer recorded it when it prepared the chain. `None` when it watches
-    /// none.
-    pub async fn escrow(&self) -> Result<Option<Address>, sqlx::Error> {
-        let value = self.get_metadata(ESCROW_KEY).await?;
-        Ok(value.and_then(|v| v.parse().ok()))
-    }
-
     /// The last fully-processed block, if any window ever committed.
     pub async fn cursor(&self) -> Result<Option<u64>, sqlx::Error> {
-        let value = self.get_metadata(CURSOR_KEY).await?;
-        Ok(value.and_then(|v| v.parse().ok()))
+        Ok(self.state().await?.position().cursor)
     }
 
-    /// The cached deployment block for this contract on this chain, if
-    /// detected before.
+    /// The cached deployment block of `contract` on this chain, if detected
+    /// for it before.
     pub async fn deploy_block(
         &self,
         contract: Address,
     ) -> Result<Option<u64>, sqlx::Error> {
-        let value = self.get_metadata(&Self::deploy_block_key(contract)).await?;
-        Ok(value.and_then(|v| v.parse().ok()))
+        let state = self.state().await?;
+        Ok(block(state.deploy_block).filter(|_| state.contract == Some(contract)))
     }
 
     /// Cache a detected deployment block so a re-index does not redo the
-    /// binary search.
-    pub async fn set_deploy_block(
-        &self,
-        contract: Address,
-        block: u64,
-    ) -> Result<(), sqlx::Error> {
-        self.set_metadata(&Self::deploy_block_key(contract), &block.to_string())
-            .await
+    /// binary search. The chain's row names the contract it belongs to.
+    pub async fn set_deploy_block(&self, block: u64) -> Result<(), sqlx::Error> {
+        sqlx::query(sql::SET_DEPLOY_BLOCK)
+            .bind(self.chain_id)
+            .bind(i64::try_from(block).unwrap_or(i64::MAX))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// Open a window. Everything applied through it commits atomically
@@ -707,10 +669,9 @@ impl Window {
     /// transaction: the cursor and the writes it stands for land together or
     /// not at all.
     pub async fn commit(mut self, through_block: u64) -> Result<(), sqlx::Error> {
-        sqlx::query(sql::UPSERT_METADATA)
+        sqlx::query(sql::SET_CURSOR)
             .bind(self.chain_id)
-            .bind(CURSOR_KEY)
-            .bind(through_block.to_string())
+            .bind(i64::try_from(through_block).unwrap_or(i64::MAX))
             .execute(&mut *self.tx)
             .await?;
         self.tx.commit().await
@@ -853,10 +814,9 @@ impl Window {
             }
 
             NamesEvent::ProofVerifierConfigured { verifier } => {
-                sqlx::query(sql::UPSERT_METADATA)
+                sqlx::query(sql::SET_PROOF_VERIFIER)
                     .bind(chain_id)
-                    .bind(PROOF_VERIFIER_KEY)
-                    .bind(verifier.to_string().to_lowercase())
+                    .bind(verifier)
                     .execute(&mut *self.tx)
                     .await?;
             }
@@ -1004,7 +964,6 @@ impl Store {
     /// from, and a 404 would claim more than the store knows.
     pub async fn synced(&self, chain: Option<i64>) -> Result<bool, sqlx::Error> {
         let mut statement = QueryBuilder::new(sql::SYNCED);
-        statement.push(" WHERE key = ").push_bind(CURSOR_KEY);
         scoped(&mut statement, "chain_id", chain);
         statement.push(" LIMIT 1");
         let found: Option<bool> = statement
@@ -1201,23 +1160,27 @@ fn search_lookup(
 /// the file says what. Read at compile time, so a missing file fails the
 /// build rather than a request.
 mod sql {
-    pub const KNOWN_CHAINS: &str = include_str!("../sql/known_chains.sql");
+    pub const CHAIN_STATE: &str = include_str!("../sql/chain_state.sql");
+    pub const CHAIN_STATUSES: &str = include_str!("../sql/chain_statuses.sql");
     pub const INDEXED_CHAINS: &str = include_str!("../sql/indexed_chains.sql");
-    pub const GET_METADATA: &str = include_str!("../sql/get_metadata.sql");
-    pub const UPSERT_METADATA: &str = include_str!("../sql/upsert_metadata.sql");
-    pub const DELETE_METADATA: &str = include_str!("../sql/delete_metadata.sql");
+    pub const RESET_CHAIN: &str = include_str!("../sql/reset_chain.sql");
+    pub const SET_CURSOR: &str = include_str!("../sql/set_cursor.sql");
+    pub const SET_CHAIN_HEAD: &str = include_str!("../sql/set_chain_head.sql");
+    pub const SET_DEPLOY_BLOCK: &str = include_str!("../sql/set_deploy_block.sql");
+    pub const SET_PROOF_VERIFIER: &str = include_str!("../sql/set_proof_verifier.sql");
+    pub const SET_WINDOW_ERROR: &str = include_str!("../sql/set_window_error.sql");
+    #[cfg(feature = "test-seams")]
+    pub const SET_VALID_UNTIL: &str = include_str!("../sql/set_valid_until.sql");
+    #[cfg(feature = "test-seams")]
+    pub const FORGET_CHAIN: &str = include_str!("../sql/forget_chain.sql");
     /// Every row an indexer wrote for one chain into the read model: what a
-    /// replay clears, and what a suite clears before it writes the chain.
+    /// replay clears.
     pub const CLEAR_CHAIN: &str = include_str!("../sql/clear_chain.sql");
-    /// The chain's metadata but its deployment-block cache.
-    pub const CLEAR_CHAIN_METADATA: &str =
-        include_str!("../sql/clear_chain_metadata.sql");
     pub const WRITER_TRY_LOCK: &str = include_str!("../sql/writer_try_lock.sql");
     pub const WRITER_LOCK: &str = include_str!("../sql/writer_lock.sql");
     pub const WRITER_UNLOCK: &str = include_str!("../sql/writer_unlock.sql");
     pub const SET_CHAIN_TARGET: &str = include_str!("../sql/set_chain_target.sql");
     pub const TOUCH_CHAIN_TARGET: &str = include_str!("../sql/touch_chain_target.sql");
-    pub const INDEX_POSITION: &str = include_str!("../sql/index_position.sql");
     pub const JOURNAL_EVENT: &str = include_str!("../sql/journal_event.sql");
     pub const UPSERT_ID: &str = include_str!("../sql/upsert_id.sql");
     pub const UPSERT_HANDLE: &str = include_str!("../sql/upsert_handle.sql");

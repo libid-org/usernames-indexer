@@ -187,17 +187,7 @@ async fn walk(who: WhoSigns) -> Option<Result<Address, contract::Error>> {
     // ── the read model the gateway answers from ──────────────────────
     let pool = sqlx::PgPool::connect(&url).await.expect("connect");
     db::MIGRATOR.run(&pool).await.expect("migrations");
-    for statement in [
-        db::CLEAR_CHAIN,
-        db::CLEAR_CHAIN_METADATA,
-        db::CLEAR_CHAIN_NAMES,
-    ] {
-        sqlx::query(statement)
-            .bind(CHAIN)
-            .execute(&pool)
-            .await
-            .expect("cleanup");
-    }
+    ChainStore::new(pool.clone(), CHAIN).forget().await;
     let store = ChainStore::new(pool.clone(), CHAIN);
     let owner = Address::from([0xbe; 20]);
     bind(&store, "alice", owner).await;

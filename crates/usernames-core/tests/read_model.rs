@@ -1012,10 +1012,7 @@ async fn seed(store: &ChainStore) {
         bind(addr(1), KnownPlatform::X, "1", "alice", 1, true),
     )
     .await;
-    store
-        .set_deploy_block(a_contract(), 4321)
-        .await
-        .expect("deploy block");
+    store.set_deploy_block(4321).await.expect("deploy block");
 }
 
 #[tokio::test]
@@ -1087,11 +1084,10 @@ async fn watching_another_contract_clears_the_chain() {
 }
 
 #[tokio::test]
-async fn the_deployment_block_cache_survives_a_replay() {
-    // The one carve-out, and the reason for it: the cache is keyed by
-    // contract, and `eth_getCode` history does not change shape with the read
-    // model. Losing it would re-run the binary search over the whole chain on
-    // every version bump.
+async fn the_deployment_block_survives_a_replay_of_the_same_registry() {
+    // A replay restarts from the registry's deployment block; losing it would
+    // re-run the binary search over the whole chain. Another registry has
+    // another deployment block.
     let Some((store, _pool, guard)) = test_store_with(2).await else {
         return;
     };
@@ -1102,16 +1098,20 @@ async fn the_deployment_block_cache_survives_a_replay() {
         .expect("first");
     seed(&store).await;
 
+    // A newly watched escrow replays the chain from the same registry.
+    let escrow = Address::repeat_byte(0xE5);
     store
-        .prepare(&writer, OTHER_CONTRACT, None)
+        .prepare(&writer, a_contract(), Some(escrow))
+        .await
+        .expect("an escrow added");
+    assert!(store.cursor().await.unwrap().is_none(), "the chain replays");
+    assert_eq!(store.deploy_block(a_contract()).await.unwrap(), Some(4321));
+
+    store
+        .prepare(&writer, OTHER_CONTRACT, Some(escrow))
         .await
         .expect("repoint");
-
-    assert_eq!(
-        store.deploy_block(a_contract()).await.unwrap(),
-        Some(4321),
-        "the deployment-block cache is keyed by contract and must outlive the wipe"
-    );
+    assert_eq!(store.deploy_block(OTHER_CONTRACT).await.unwrap(), None);
     writer.release().await.expect("the lease releases");
     drop(guard);
 }

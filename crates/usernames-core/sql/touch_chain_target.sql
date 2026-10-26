@@ -1,4 +1,7 @@
-INSERT INTO names.chain_metadata (chain_id, key, value)
-VALUES ($1, $2, EXTRACT(EPOCH FROM now())::bigint::text),
-       ($1, $3, (EXTRACT(EPOCH FROM now())::bigint + $4)::text)
-ON CONFLICT (chain_id, key) DO UPDATE SET value = EXCLUDED.value
+-- The report renewed without moving the target.
+INSERT INTO names.chains (chain_id, reported_at, valid_until)
+VALUES ($1, EXTRACT(EPOCH FROM now())::bigint,
+        EXTRACT(EPOCH FROM now())::bigint + $2)
+ON CONFLICT (chain_id) DO UPDATE SET
+    reported_at = EXCLUDED.reported_at,
+    valid_until = EXCLUDED.valid_until

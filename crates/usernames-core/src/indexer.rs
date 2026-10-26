@@ -537,7 +537,7 @@ impl<'a> Session<'a> {
         match chain::find_deployment_block(&self.provider, contract, latest).await {
             Ok(Some(block)) => {
                 tracing::info!(block, "detected contract deployment block");
-                if let Err(e) = indexer.store.set_deploy_block(contract, block).await {
+                if let Err(e) = indexer.store.set_deploy_block(block).await {
                     tracing::warn!(%e, "failed to cache the deployment block");
                 }
                 Some(block)

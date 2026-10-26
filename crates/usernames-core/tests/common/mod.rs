@@ -132,17 +132,9 @@ impl Suite {
     }
 }
 
-/// Delete every row the store holds for `chain`: what a replay clears, the
-/// deployment-block cache a replay keeps, and the chain's names.
+/// Delete every row the store holds for `chain`.
 pub async fn clear_chain(pool: &PgPool, chain: i64) {
-    let forget_metadata = include_str!("forget_chain_metadata.sql");
-    for statement in [db::CLEAR_CHAIN, forget_metadata, db::CLEAR_CHAIN_NAMES] {
-        sqlx::query(statement)
-            .bind(chain)
-            .execute(pool)
-            .await
-            .expect("cleanup");
-    }
+    ChainStore::new(pool.clone(), chain).forget().await;
 }
 
 /// Apply one transaction's events at `block`, in log order, and commit
