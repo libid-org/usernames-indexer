@@ -1,5 +1,6 @@
 SELECT r.chain_id, n.platform_id, r.handle_node, v.handle, h.owner AS holder,
-       r.token, r.amount::text AS amount, r.round::text AS round
+       r.token, r.amount::text AS amount, r.round::text AS round,
+       r.refundable_at
 FROM names.escrow_refundable r
 LEFT JOIN names.handle_nodes n
   ON n.chain_id = r.chain_id AND n.handle_node = r.handle_node

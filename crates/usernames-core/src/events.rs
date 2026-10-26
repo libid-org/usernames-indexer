@@ -152,23 +152,24 @@ pub enum NamesEvent {
 )]
 #[allow(missing_docs)]
 pub enum EscrowEvent {
-    /// Value escrowed for a handle node nobody holds, booked under `refund_to`
-    /// in `round`, which the node's next `Claimed` closes.
+    /// Value escrowed for a handle node nobody holds, booked under `sender`
+    /// in `round`, which the node's next `Claimed` closes. The sender's whole
+    /// contribution to the slot is refundable from `refundable_at`.
     Deposited {
         handle_node: B256,
         token: Address,
-        refund_to: Address,
-        depositor: Address,
+        sender: Address,
         #[serde_as(as = "DisplayFromStr")]
         round: U256,
         #[serde_as(as = "DisplayFromStr")]
         amount: U256,
+        refundable_at: u64,
     },
-    /// A deposit for a held node, paid straight to its holder.
+    /// `sender`'s deposit for a held node, paid straight to its holder.
     Forwarded {
         handle_node: B256,
         token: Address,
-        depositor: Address,
+        sender: Address,
         holder: Address,
         #[serde_as(as = "DisplayFromStr")]
         amount: U256,
@@ -188,11 +189,11 @@ pub enum EscrowEvent {
         #[serde_as(as = "DisplayFromStr")]
         received: U256,
     },
-    /// `refund_to` took its `round` contribution back.
+    /// `sender` took its `round` contribution back.
     Refunded {
         handle_node: B256,
         token: Address,
-        refund_to: Address,
+        sender: Address,
         recipient: Address,
         #[serde_as(as = "DisplayFromStr")]
         round: U256,
@@ -219,11 +220,9 @@ pub enum Role {
     PreviousIdHolder,
     /// Was paid a bind's service fee.
     FeeReceiver,
-    /// Paid a deposit.
-    Depositor,
-    /// May refund an escrowed deposit, did, or lost the right when the
-    /// holder claimed it.
-    RefundTo,
+    /// Sent a deposit: escrowed it, which it may refund, did refund, or lost
+    /// to the holder's claim, or paid it straight to a holder.
+    Sender,
     /// Claimed what a handle it holds was sent.
     Claimer,
     /// Was paid by a claim or a refund.
@@ -237,13 +236,12 @@ pub struct UnknownRole(String);
 
 impl Role {
     /// Every role, so a stored name parses back by the same table.
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 7] = [
         Self::Holder,
         Self::PreviousHandleHolder,
         Self::PreviousIdHolder,
         Self::FeeReceiver,
-        Self::Depositor,
-        Self::RefundTo,
+        Self::Sender,
         Self::Claimer,
         Self::Recipient,
     ];
@@ -255,8 +253,7 @@ impl Role {
             Self::PreviousHandleHolder => "previousHandleHolder",
             Self::PreviousIdHolder => "previousIdHolder",
             Self::FeeReceiver => "feeReceiver",
-            Self::Depositor => "depositor",
-            Self::RefundTo => "refundTo",
+            Self::Sender => "sender",
             Self::Claimer => "claimer",
             Self::Recipient => "recipient",
         }
@@ -378,22 +375,16 @@ impl EscrowEvent {
     /// The addresses the event names, each with the part it plays.
     fn parties(&self) -> Vec<(Address, Role)> {
         match self {
-            Self::Deposited {
-                refund_to,
-                depositor,
-                ..
-            } => vec![(*depositor, Role::Depositor), (*refund_to, Role::RefundTo)],
-            Self::Forwarded {
-                depositor, holder, ..
-            } => vec![(*depositor, Role::Depositor), (*holder, Role::Holder)],
+            Self::Deposited { sender, .. } => vec![(*sender, Role::Sender)],
+            Self::Forwarded { sender, holder, .. } => {
+                vec![(*sender, Role::Sender), (*holder, Role::Holder)]
+            }
             Self::Claimed {
                 claimer, recipient, ..
             } => vec![(*claimer, Role::Claimer), (*recipient, Role::Recipient)],
             Self::Refunded {
-                refund_to,
-                recipient,
-                ..
-            } => vec![(*refund_to, Role::RefundTo), (*recipient, Role::Recipient)],
+                sender, recipient, ..
+            } => vec![(*sender, Role::Sender), (*recipient, Role::Recipient)],
         }
     }
 }
@@ -577,17 +568,17 @@ pub fn decode_escrow(
         EscrowEvent::Deposited {
             handle_node: d.handleNode,
             token: d.token,
-            refund_to: d.refundTo,
-            depositor: d.depositor,
+            sender: d.sender,
             round: d.round,
             amount: d.amount,
+            refundable_at: d.refundableAt,
         }
     } else if topic0 == HandleEscrow::Forwarded::SIGNATURE_HASH {
         let d: HandleEscrow::Forwarded = payload_of(log, "Forwarded")?;
         EscrowEvent::Forwarded {
             handle_node: d.handleNode,
             token: d.token,
-            depositor: d.depositor,
+            sender: d.sender,
             holder: d.holder,
             amount: d.amount,
             received: d.received,
@@ -608,7 +599,7 @@ pub fn decode_escrow(
         EscrowEvent::Refunded {
             handle_node: d.handleNode,
             token: d.token,
-            refund_to: d.refundTo,
+            sender: d.sender,
             recipient: d.recipient,
             round: d.round,
             released: d.released,
@@ -719,7 +710,7 @@ mod tests {
         );
         assert_eq!(
             HandleEscrow::Deposited::SIGNATURE_HASH,
-            b256!("1ffc9b3e17a608abd621c9a1d46d5ea433d46ee04324e33c270ace681efe77a2")
+            b256!("590730108e214366abd2912d060c6195480c59b924619145601d0d07ab14a61d")
         );
         assert_eq!(
             HandleEscrow::Forwarded::SIGNATURE_HASH,
@@ -736,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn a_deposit_decodes_with_both_of_its_parties() {
+    fn a_deposit_decodes_with_its_sender_and_refund_date() {
         let node = B256::repeat_byte(0x0D);
         let token = Address::repeat_byte(0xEE);
         let payer = Address::repeat_byte(0xB0);
@@ -744,19 +735,21 @@ mod tests {
             HandleEscrow::Deposited {
                 handleNode: node,
                 token,
-                refundTo: payer,
-                depositor: payer,
+                sender: payer,
                 round: U256::from(2u64),
                 amount: U256::MAX,
+                refundableAt: u64::MAX,
             }
             .encode_log_data(),
         );
         let (event, _) = decode_escrow(&log).unwrap().expect("a known topic");
         assert_eq!(event.kind(), "deposited");
-        assert_eq!(
-            event.parties(),
-            [(payer, Role::Depositor), (payer, Role::RefundTo)]
-        );
+        assert_eq!(event.parties(), [(payer, Role::Sender)]);
+        assert!(matches!(
+            event,
+            NamesEvent::Escrow(EscrowEvent::Deposited { refundable_at, .. })
+                if refundable_at == u64::MAX
+        ));
     }
 
     /// An escrow topic means nothing from the registry, and the reverse: each
@@ -768,7 +761,7 @@ mod tests {
             HandleEscrow::Refunded {
                 handleNode: B256::ZERO,
                 token: Address::ZERO,
-                refundTo: HOLDER,
+                sender: HOLDER,
                 recipient: HOLDER,
                 round: U256::ZERO,
                 released: U256::from(1u64),
@@ -847,15 +840,15 @@ mod tests {
             NamesEvent::Escrow(EscrowEvent::Deposited {
                 handle_node: n,
                 token: b,
-                refund_to: a,
-                depositor: a,
+                sender: a,
                 round: U256::from(2u64),
                 amount: U256::MAX,
+                refundable_at: u64::MAX,
             }),
             NamesEvent::Escrow(EscrowEvent::Forwarded {
                 handle_node: n,
                 token: b,
-                depositor: a,
+                sender: a,
                 holder: b,
                 amount: big,
                 received: big,
@@ -872,7 +865,7 @@ mod tests {
             NamesEvent::Escrow(EscrowEvent::Refunded {
                 handle_node: n,
                 token: b,
-                refund_to: a,
+                sender: a,
                 recipient: b,
                 round: U256::from(1u64),
                 released: U256::from(5u64),

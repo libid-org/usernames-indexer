@@ -3500,9 +3500,9 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libid-contracts"
-version = "0.19.0"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef579ef859a923f39bcacc0b0c8768656c7e69a952591580554ac649e04f626e"
+checksum = "f6657a1341da87a76081ce13db4cf5b6fe24455cc6bab13d0a934e76dc4d7ef0"
 dependencies = [
  "alloy",
  "include_dir",
@@ -3514,18 +3514,18 @@ dependencies = [
 
 [[package]]
 name = "libid-identity"
-version = "0.19.0"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3720e94b0c669552d133c45269ed51fe945eeb7b13bb43c8404cd70f483ecf3d"
+checksum = "d26d0973966a461e2058b70b30783f67d912374ae17308d20dd0b5c6fb3a54e0"
 dependencies = [
  "sha2 0.10.9",
 ]
 
 [[package]]
 name = "libid-profiles"
-version = "0.19.0"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12e94f0d823aed4252c3409b2c742e0c0ab7008990071ea1fff95425c5a9b47a"
+checksum = "c3f82f0498962d6dd4906ea3bbce9cc5d68f80d2f80a0bb92e8133a0eaaed62f"
 
 [[package]]
 name = "libid-signer"

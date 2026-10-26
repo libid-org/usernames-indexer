@@ -1,7 +1,7 @@
 //! The libid contracts on anvil, wired as a deployment wires them: the
 //! crate's `IdentityRegistry`, `CeremonyProofVerifier` and `HandleEscrow`
-//! behind their proxies, with libid-contracts' `StubPlatformVerifier`
-//! standing in for each platform's proof check.
+//! behind their proxies, with the crate's `StubPlatformVerifier` (feature
+//! `testing`) standing in for each platform's proof check.
 
 use alloy::{
     node_bindings::{
@@ -15,6 +15,7 @@ use alloy::{
         U256,
     },
     providers::{
+        ext::AnvilApi,
         DynProvider,
         Provider,
         ProviderBuilder,
@@ -23,7 +24,6 @@ use alloy::{
         TransactionReceipt,
         TransactionRequest,
     },
-    sol,
     sol_types::SolValue,
 };
 use libid_contracts::{
@@ -39,32 +39,19 @@ use libid_contracts::{
         },
     },
     deploy::deploy_behind_proxy,
+    testing::{
+        deploy_stub_platform_verifier,
+        stub_payload,
+        StubPayload,
+        StubPlatformVerifier::{
+            self,
+            StubPlatformVerifierInstance,
+        },
+    },
     Artifacts,
 };
 use url::Url;
 use usernames_core::nodes::KnownPlatform;
-
-use StubPlatformVerifier::StubPlatformVerifierInstance;
-
-sol!(
-    /// libid-contracts' stand-in for a Platform Verifier: it answers any
-    /// payload with the nodes of the account and handle it was last `set` to.
-    /// Compiled from libid-contracts v0.19.0; see contracts/README.md.
-    #[sol(rpc)]
-    StubPlatformVerifier,
-    "../../contracts/StubPlatformVerifier.json"
-);
-
-sol! {
-    /// The payload `StubPlatformVerifier.verify` decodes: what the
-    /// authorization digest is built from.
-    struct StubPayload {
-        uint16 ceremonyVersion;
-        bytes32 operationDomain;
-        bytes32 authorizationNonce;
-        bytes transactionData;
-    }
-}
 
 /// The Proof Verifier's slot each platform's stub fills.
 const VERIFIER_VERSION: u16 = 1;
@@ -182,15 +169,20 @@ impl Libid {
 
         let mut stubs = Vec::new();
         for platform in PLATFORMS {
-            let stub =
-                StubPlatformVerifier::deploy(provider.clone(), platform.id(), U256::ZERO)
-                    .await
-                    .expect("deploy a stub verifier");
+            let stub = deploy_stub_platform_verifier(
+                provider,
+                &ARTIFACTS,
+                platform.id(),
+                U256::ZERO,
+                None,
+            )
+            .await
+            .expect("deploy a stub verifier");
             let wire = proof_verifier
-                .setVerifier(platform.id(), VERIFIER_VERSION, *stub.address())
+                .setVerifier(platform.id(), VERIFIER_VERSION, stub)
                 .into_transaction_request();
             mined(provider, wire).await;
-            stubs.push((platform, stub));
+            stubs.push((platform, StubPlatformVerifier::new(stub, provider.clone())));
         }
 
         let escrow = HandleEscrow::new(
@@ -266,7 +258,7 @@ impl Libid {
         )
         .await;
 
-        StubPayload {
+        stub_payload(&StubPayload {
             ceremonyVersion: CEREMONY_VERSION,
             operationDomain: self
                 .registry
@@ -276,9 +268,7 @@ impl Libid {
                 .expect("the operation domain"),
             authorizationNonce: B256::from(U256::from(self.proofs)),
             transactionData: holder.abi_encode().into(),
-        }
-        .abi_encode()
-        .into()
+        })
     }
 
     /// `holder`'s bind of a proved `payload`, unsent: disclosing as
@@ -348,13 +338,14 @@ impl Libid {
     }
 
     /// `payer` sends `amount` of the chain's coin to a handle by its node,
-    /// refundable to itself while it waits; the block it landed in.
+    /// which only `payer` may refund, from its refund date, while it waits;
+    /// the block it landed in.
     pub async fn deposit(&self, payer: Address, handle: Handle, amount: u64) -> u64 {
         let node = self.node(handle).await;
         let amount = U256::from(amount);
         let request = self
             .escrow
-            .deposit(handle.0.id(), node, self.native, amount, payer)
+            .deposit(handle.0.id(), node, self.native, amount)
             .into_transaction_request();
         self.send(request.from(payer).value(amount)).await
     }
@@ -369,7 +360,7 @@ impl Libid {
         let amount = U256::from(amount);
         let request = self
             .escrow
-            .depositToHandle(platform.id(), handle.into(), self.native, amount, payer)
+            .depositToHandle(platform.id(), handle.into(), self.native, amount)
             .into_transaction_request();
         self.send(request.from(payer).value(amount)).await
     }
@@ -384,7 +375,8 @@ impl Libid {
         self.send(request.from(holder)).await;
     }
 
-    /// `payer` takes back what it put towards a handle.
+    /// `payer` takes back what it put towards a handle, once its refund date
+    /// has come.
     pub async fn refund(&self, payer: Address, handle: Handle) {
         let node = self.node(handle).await;
         let request = self
@@ -412,13 +404,26 @@ impl Libid {
             .expect("escrowed")
     }
 
-    /// What `refund` would pay `payer` from a handle now.
-    pub async fn refundable(&self, handle: Handle, payer: Address) -> U256 {
-        self.escrow
-            .refundable(self.node(handle).await, self.native, payer)
+    /// What `payer` has booked against a handle, and when `refund` opens for
+    /// it.
+    pub async fn contribution(&self, handle: Handle, payer: Address) -> (U256, u64) {
+        let booked = self
+            .escrow
+            .contribution(self.node(handle).await, self.native, payer)
             .call()
             .await
-            .expect("refundable")
+            .expect("contribution");
+        (booked.amount, booked.refundableAt)
+    }
+
+    /// Move anvil's clock past every refund date set so far.
+    pub async fn pass_refund_grace(&self) {
+        let grace = self.escrow.REFUND_GRACE().call().await.expect("the grace");
+        self.registry
+            .provider()
+            .anvil_increase_time(grace.to::<u64>())
+            .await
+            .expect("the clock moves");
     }
 
     /// Send `request`; the block it landed in.

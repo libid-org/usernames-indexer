@@ -33,7 +33,7 @@ FROM generate_series(1, 5000) i;
 INSERT INTO names.address_events
     (chain_id, address, block_number, log_index, block_time, roles)
 SELECT 1, substring(sha256(('address' || i % 1000)::bytea) FROM 1 FOR 20),
-       i, 0, i, ARRAY['depositor']
+       i, 0, i, ARRAY['sender']
 FROM generate_series(1, 5000) i;
 INSERT INTO names.handle_events
     (chain_id, block_number, log_index, handle_node, block_time)
@@ -49,10 +49,10 @@ SELECT 1, sha256(('node' || i)::bytea),
        i, 0, i, 0
 FROM generate_series(1, 5000) i;
 INSERT INTO names.escrow_refundable
-    (refund_to, chain_id, handle_node, token, round, amount)
+    (sender, chain_id, handle_node, token, round, amount, refundable_at)
 SELECT substring(sha256(('address' || i % 1000)::bytea) FROM 1 FOR 20), 1,
        sha256(('node' || i)::bytea),
-       substring(sha256(('token' || i % 5)::bytea) FROM 1 FOR 20), 0, i
+       substring(sha256(('token' || i % 5)::bytea) FROM 1 FOR 20), 0, i, i
 FROM generate_series(1, 5000) i;
 -- Vacuum moves a GIN index's pending entries into it; the rows above wait there.
 SELECT gin_clean_pending_list('names.disclosures_handle_trgm_idx');

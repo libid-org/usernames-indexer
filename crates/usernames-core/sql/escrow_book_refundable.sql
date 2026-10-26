@@ -1,7 +1,10 @@
--- The deposit's refundTo may take this much more back, until the round closes.
+-- The deposit's sender may take this much more back, until the round closes.
+-- Each deposit moves the date `refund` opens for the sender's whole
+-- contribution.
 INSERT INTO names.escrow_refundable
-    (chain_id, handle_node, token, round, refund_to, amount)
-VALUES ($1, $2, $3, $4::numeric, $5, $6::numeric)
-ON CONFLICT (refund_to, chain_id, handle_node, token, round) DO UPDATE SET
+    (chain_id, handle_node, token, round, sender, amount, refundable_at)
+VALUES ($1, $2, $3, $4::numeric, $5, $6::numeric, $7)
+ON CONFLICT (sender, chain_id, handle_node, token, round) DO UPDATE SET
     amount = names.escrow_refundable.amount + EXCLUDED.amount,
+    refundable_at = EXCLUDED.refundable_at,
     updated_at = now()

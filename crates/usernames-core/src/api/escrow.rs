@@ -13,6 +13,8 @@ use serde::Deserialize;
 use super::{
     model::{
         AddressAmounts,
+        AddressContributions,
+        Contribution,
         EscrowAmount,
         HandleAmounts,
         HandleQuery,
@@ -28,6 +30,7 @@ use super::{
     PageParams,
 };
 use crate::db::{
+    ContributionRow,
     EscrowSlotRow,
     Rows,
 };
@@ -51,17 +54,27 @@ impl EscrowAmount {
             handle: HandleRef::of(row.platform_id, row.handle_node, row.handle),
         })
     }
+}
 
-    /// A page's amounts, and the cursor that fetches the next one.
-    fn page<C: Display>(
-        rows: Rows<EscrowSlotRow, C>,
-    ) -> Result<(Vec<Self>, Option<String>), ApiError> {
-        let amounts = rows
-            .rows
-            .into_iter()
-            .map(Self::of)
-            .collect::<Result<_, _>>()?;
-        Ok((amounts, rows.next.map(|next| next.to_string())))
+impl Contribution {
+    /// A stored contribution, under the rule of [`EscrowAmount::of`].
+    fn of(row: ContributionRow) -> Result<Self, ApiError> {
+        Ok(Self {
+            amount: EscrowAmount::of(row.slot)?,
+            refundable_at: row.refundable_at,
+        })
+    }
+}
+
+impl<R, C: Display> Rows<R, C> {
+    /// The page's rows as the API serves them, and the cursor that fetches the
+    /// next one.
+    fn served<T>(
+        self,
+        of: impl Fn(R) -> Result<T, ApiError>,
+    ) -> Result<(Vec<T>, Option<String>), ApiError> {
+        let served = self.rows.into_iter().map(of).collect::<Result<_, _>>()?;
+        Ok((served, self.next.map(|next| next.to_string())))
     }
 }
 
@@ -76,8 +89,11 @@ pub(crate) async fn claimable(
     let page = params.page()?;
     state.synced(page.chain).await?;
 
-    let (amounts, next) =
-        EscrowAmount::page(state.store.claimable(address, page).await?)?;
+    let (amounts, next) = state
+        .store
+        .claimable(address, page)
+        .await?
+        .served(EscrowAmount::of)?;
     Ok(Json(AddressAmounts {
         address,
         amounts,
@@ -85,21 +101,24 @@ pub(crate) async fn claimable(
     }))
 }
 
-/// `GET /v1/escrow/refundable/{address}?chain=&before=&limit=` — what deposits
-/// naming the address as `refundTo` booked and nobody has claimed yet, which
-/// `refund` pays back.
+/// `GET /v1/escrow/refundable/{address}?chain=&before=&limit=` — what the
+/// address sent that nobody has claimed yet, which `refund` pays back from
+/// each contribution's `refundableAt`.
 pub(crate) async fn refundable(
     State(state): State<AppState>,
     ApiPath(address): ApiPath<String>,
     ApiQuery(params): ApiQuery<PageParams>,
-) -> Result<Json<AddressAmounts>, ApiError> {
+) -> Result<Json<AddressContributions>, ApiError> {
     let address = parse_address(&address)?;
     let page = params.page()?;
     state.synced(page.chain).await?;
 
-    let (amounts, next) =
-        EscrowAmount::page(state.store.refundable(address, page).await?)?;
-    Ok(Json(AddressAmounts {
+    let (amounts, next) = state
+        .store
+        .refundable(address, page)
+        .await?
+        .served(Contribution::of)?;
+    Ok(Json(AddressContributions {
         address,
         amounts,
         next,
@@ -134,8 +153,11 @@ async fn of_handle(
     let page = params.page()?;
     state.synced(page.chain).await?;
 
-    let (amounts, next) =
-        EscrowAmount::page(state.store.escrowed_for(key.node(), page).await?)?;
+    let (amounts, next) = state
+        .store
+        .escrowed_for(key.node(), page)
+        .await?
+        .served(EscrowAmount::of)?;
     let known = amounts.first().map(|amount| &amount.handle);
     Ok(Json(HandleAmounts {
         handle: HandleQuery::of(&key, known),
@@ -164,7 +186,11 @@ pub(crate) async fn unclaimed(
     let page = params.page.page()?;
     state.synced(page.chain).await?;
 
-    let (amounts, next) = EscrowAmount::page(state.store.unclaimed(token, page).await?)?;
+    let (amounts, next) = state
+        .store
+        .unclaimed(token, page)
+        .await?
+        .served(EscrowAmount::of)?;
     Ok(Json(Unclaimed {
         token,
         limit: page.limit,
