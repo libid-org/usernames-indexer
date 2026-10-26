@@ -169,7 +169,7 @@ impl Window {
             }
 
             // A deposit names no platform; the `HandleRevealed` of a
-            // `depositToHandle`, or a bind, does.
+            // `depositToHandle`, a bind, a publish or a retire does.
             NamesEvent::Escrow(
                 EscrowEvent::Deposited { .. } | EscrowEvent::Forwarded { .. },
             ) => {}

@@ -849,8 +849,7 @@ pub struct HandleRow {
     /// The proof-freshness watermark, kept even through retirement.
     pub observed_at: i64,
     /// The ceremony version that proved the last binding at this node. Kept
-    /// through retirement: the contract never stored it, and this row is its
-    /// only record.
+    /// through retirement: the contract never stored it, so the index does.
     pub ceremony_version: i64,
     /// The account id node this handle points back at (`idNodeByHandle`).
     pub id_node: B256,

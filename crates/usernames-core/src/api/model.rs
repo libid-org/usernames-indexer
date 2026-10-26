@@ -284,8 +284,8 @@ pub struct SearchResults {
 pub struct HandleRef {
     /// The platform's short key, when known.
     pub platform: Option<KnownPlatform>,
-    /// The platform id, once a request, a bind or a `HandleRevealed` named
-    /// it: a deposit names only the node.
+    /// The platform id, once a request or an event named it (a bind, a
+    /// reveal, a publish or a retire): a deposit names only the node.
     pub platform_id: Option<B256>,
     /// The node the chain filed the handle under.
     pub handle_node: B256,

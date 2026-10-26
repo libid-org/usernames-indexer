@@ -119,8 +119,8 @@ chain's own coin is the EIP-7528 token `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEE
 Anybody can deposit a token they wrote, so show the tokens you recognize.
 
 A `deposit` names a handle by its node alone: the store knows no platform
-for it (`platformId` is absent) until a `HandleRevealed` or a bind names
-one. Asking by text works from the first deposit: the escrow and history
+for it (`platformId` is absent) until a bind, a `HandleRevealed`, a
+publish or a retire names one. Asking by text works from the first deposit: the escrow and history
 routes fold the text's A-Z and hash it, the way `depositToHandle` does, so
 `/v1/escrow/handle/x/Bo%22b` finds a deposit to `Bo"b`.
 

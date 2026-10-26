@@ -1117,16 +1117,20 @@ async fn a_ceremony_and_a_fee_take_only_their_own_transactions_bind() {
     suite.done();
 }
 
-/// A claim closes its slot's round: a deposit after it opens the next, and
-/// only it is held, refundable to its own sender, under the new round.
+/// A claim opens its slot's next round: after the holder claims and leaves
+/// the handle, a deposit to it is held alone under that round, refundable to
+/// its own sender.
 #[tokio::test]
-async fn a_deposit_after_a_claim_opens_the_next_round() {
+async fn a_claim_opens_the_next_round() {
     let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
     let (bob, carol, dave) = (addr(0xB0), addr(0xC0), addr(0xD0));
     suite.apply(1, deposited("r1", NATIVE, carol, 10)).await;
+    suite
+        .apply_tx(2, bind(bob, X, "222", "r1", 1_000, false))
+        .await;
     let claim = NamesEvent::Escrow(EscrowEvent::Claimed {
         handle_node: node("r1"),
         token: NATIVE,
@@ -1136,7 +1140,12 @@ async fn a_deposit_after_a_claim_opens_the_next_round() {
         released: U256::from(10u64),
         received: U256::from(10u64),
     });
-    suite.apply(2, claim).await;
+    suite.apply(3, claim).await;
+    // Bob's account moves to another handle, which retires @r1: a deposit to
+    // it is escrowed again, under the round the claim opened.
+    let mut rename = vec![retire(X, "r1", bob)];
+    rename.extend(bind(bob, X, "222", "r2", 2_000, false));
+    suite.apply_tx(4, rename).await;
     let next = NamesEvent::Escrow(EscrowEvent::Deposited {
         handle_node: node("r1"),
         token: NATIVE,
@@ -1145,7 +1154,7 @@ async fn a_deposit_after_a_claim_opens_the_next_round() {
         amount: U256::from(4u64),
         refundable_at: REFUNDABLE_AT,
     });
-    suite.apply(3, next).await;
+    suite.apply(5, next).await;
 
     let held: HandleAmounts = suite
         .get(&format!("/v1/escrow/node/{}", node("r1")))
@@ -1161,7 +1170,8 @@ async fn a_deposit_after_a_claim_opens_the_next_round() {
         .get(&format!("/v1/escrow/refundable/{dave}"))
         .await
         .answer();
-    assert_eq!(contributions(&daves), [(NATIVE, 4, REFUNDABLE_AT as i64)]);
+    let refundable_at = i64::try_from(REFUNDABLE_AT).expect("a date");
+    assert_eq!(contributions(&daves), [(NATIVE, 4, refundable_at)]);
     assert_eq!(daves.amounts[0].amount.round, U256::from(1u64));
     let carols: AddressContributions = suite
         .get(&format!("/v1/escrow/refundable/{carol}"))
