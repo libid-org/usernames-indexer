@@ -284,8 +284,8 @@ pub struct SearchResults {
 pub struct HandleRef {
     /// The platform's short key, when known.
     pub platform: Option<KnownPlatform>,
-    /// The platform id, once a bind or a `HandleRevealed` named it: a
-    /// deposit names only the node.
+    /// The platform id, once a request, a bind or a `HandleRevealed` named
+    /// it: a deposit names only the node.
     pub platform_id: Option<B256>,
     /// The node the chain filed the handle under.
     pub handle_node: B256,
@@ -641,7 +641,7 @@ pub struct Contribution {
 pub struct AddressContributions {
     /// The address asked about.
     pub address: Address,
-    /// By chain, node, token and round, descending.
+    /// By chain, node and token, descending.
     pub amounts: Vec<Contribution>,
     /// Pass as `before` for the next page; absent on the last one.
     pub next: Option<String>,

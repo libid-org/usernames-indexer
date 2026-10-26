@@ -410,6 +410,20 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
         history.entries[0].event,
         HistoryEvent::Forwarded { received, .. } if received == U256::from(7u64)
     ));
+    // The app's fee is in its payer's history, as the holder of the handle it
+    // bought.
+    let fee = history
+        .entries
+        .iter()
+        .find(|entry| matches!(entry.event, HistoryEvent::BindFeePaid { .. }))
+        .expect("the fee is in Alice's history");
+    assert_eq!(fee.roles, [Role::Holder]);
+    assert_eq!(
+        fee.handle
+            .as_ref()
+            .and_then(|handle| handle.handle.as_deref()),
+        Some("alice_1")
+    );
     let history: AddressHistory =
         get(&pool, chain_id, &format!("/v1/history/address/{refunder}"))
             .await

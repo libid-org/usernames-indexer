@@ -35,6 +35,7 @@ use usernames_core::{
         AddressAmounts,
         AddressContributions,
         AddressHistory,
+        Contribution,
         ErrorCode,
         EscrowAmount,
         HandleAmounts,
@@ -560,9 +561,13 @@ async fn every_escrow_list_pages_by_cursor_without_gaps_or_repeats() {
     assert_eq!((paged.len(), paged), (6, keys(&whole.amounts)));
 
     let path = format!("/v1/escrow/refundable/{carol}");
-    let whole: AddressAmounts = suite.get(&path).await.answer();
-    let paged = every_page(&suite, &path, |p: AddressAmounts| (p.amounts, p.next)).await;
-    assert_eq!((paged.len(), paged), (9, keys(&whole.amounts)));
+    let whole: AddressContributions = suite.get(&path).await.answer();
+    let slots = |list: Vec<_>| list.into_iter().map(|c: Contribution| c.amount).collect();
+    let paged = every_page(&suite, &path, |p: AddressContributions| {
+        (slots(p.amounts), p.next)
+    })
+    .await;
+    assert_eq!((paged.len(), paged), (9, keys(&slots(whole.amounts))));
 
     let path = format!("/v1/escrow/node/{}", node("p3"));
     let whole: HandleAmounts = suite.get(&path).await.answer();
@@ -1089,5 +1094,59 @@ async fn a_ceremony_takes_only_its_own_transactions_bind() {
         .find(|entry| matches!(entry.event, HistoryEvent::CeremonyBound { .. }))
         .expect("the ceremony is in the holder's history");
     assert_eq!(ceremony.handle, None);
+    suite.done();
+}
+
+/// A claim closes its slot's round: a deposit after it opens the next, and
+/// only it is held, refundable to its own sender, under the new round.
+#[tokio::test]
+async fn a_deposit_after_a_claim_opens_the_next_round() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let (bob, carol, dave) = (addr(0xB0), addr(0xC0), addr(0xD0));
+    suite.apply(1, deposited("r1", NATIVE, carol, 10)).await;
+    let claim = NamesEvent::Escrow(EscrowEvent::Claimed {
+        handle_node: node("r1"),
+        token: NATIVE,
+        claimer: bob,
+        recipient: bob,
+        round: U256::ZERO,
+        released: U256::from(10u64),
+        received: U256::from(10u64),
+    });
+    suite.apply(2, claim).await;
+    let next = NamesEvent::Escrow(EscrowEvent::Deposited {
+        handle_node: node("r1"),
+        token: NATIVE,
+        sender: dave,
+        round: U256::from(1u64),
+        amount: U256::from(4u64),
+        refundable_at: REFUNDABLE_AT,
+    });
+    suite.apply(3, next).await;
+
+    let held: HandleAmounts = suite
+        .get(&format!("/v1/escrow/node/{}", node("r1")))
+        .await
+        .answer();
+    let slot = &held.amounts[..];
+    assert_eq!(slot.len(), 1, "{held:?}");
+    assert_eq!(
+        (slot[0].amount, slot[0].round),
+        (U256::from(4u64), U256::from(1u64))
+    );
+    let daves: AddressContributions = suite
+        .get(&format!("/v1/escrow/refundable/{dave}"))
+        .await
+        .answer();
+    assert_eq!(contributions(&daves), [(NATIVE, 4, REFUNDABLE_AT as i64)]);
+    assert_eq!(daves.amounts[0].amount.round, U256::from(1u64));
+    let carols: AddressContributions = suite
+        .get(&format!("/v1/escrow/refundable/{carol}"))
+        .await
+        .answer();
+    assert!(carols.amounts.is_empty(), "{carols:?}");
     suite.done();
 }

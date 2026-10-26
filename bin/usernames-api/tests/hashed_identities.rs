@@ -309,6 +309,7 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
         h.get(&format!("/v1/resolve/handle-node/{bob_node}")).await;
     assert_eq!(by_node.bindings[0].handle.as_deref(), Some("bob_2"));
     assert_eq!(by_node.bindings[0].id_node, bob_id);
+    assert_eq!(by_node.bindings[0].owner, bob);
     let by_id: IdResolution = h.get(&format!("/v1/resolve/id-node/{bob_id}")).await;
     assert_eq!(by_id.bindings[0].handle.as_deref(), Some("bob_2"));
     let carols: HandleAmounts = h.get(&format!("/v1/escrow/node/{carol_node}")).await;

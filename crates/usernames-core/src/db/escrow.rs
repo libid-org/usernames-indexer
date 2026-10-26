@@ -236,9 +236,9 @@ impl Cursor<EscrowSlotRow> for UnclaimedCursor {
     }
 }
 
-/// Where a page of slots ends: a holder's claimable slots, or one handle's.
-/// Both run by chain, node and token, descending. Its text is
-/// `chainId-node-token`.
+/// Where a page of slots ends: a holder's claimable slots, a sender's
+/// refundable contributions, or one handle's slots. Each runs by chain, node
+/// and token, descending. Its text is `chainId-node-token`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotCursor {
     /// The slot's chain.
