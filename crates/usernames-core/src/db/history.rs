@@ -336,10 +336,10 @@ impl Page<HistoryCursor> {
     }
 
     /// The chain, the cursor, the order and the fetch limit. On one chain the
-    /// chain leaves the comparison, so an index led by the address or node
-    /// with time next serves the page as one backward range, the address
-    /// table's key included; across chains the history index does, with the
-    /// chain in the comparison.
+    /// chain leaves the comparison, so the address table's key (chain,
+    /// address, time) or the node's history index serves the page as one
+    /// backward range; across chains the history index does, with the chain
+    /// in the comparison.
     fn bound(&self, statement: &mut Statement, table: &str) {
         let order = match self.chain {
             Some(chain) => {

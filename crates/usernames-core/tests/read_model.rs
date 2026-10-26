@@ -998,6 +998,7 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
 // deployment block survives a replay of the same registry.
 
 const OTHER_CONTRACT: Address = Address::new([0xcd; 20]);
+const OTHER_ESCROW: Address = Address::new([0xce; 20]);
 
 fn a_contract() -> Address {
     Address::new([0xab; 20])
@@ -1068,7 +1069,7 @@ async fn watching_another_contract_clears_the_chain() {
     apply(&store, 2, verifier).await;
 
     store
-        .prepare(&writer, OTHER_CONTRACT, None)
+        .prepare(&writer, OTHER_CONTRACT, Some(OTHER_ESCROW))
         .await
         .expect("repoint");
 
@@ -1083,6 +1084,7 @@ async fn watching_another_contract_clears_the_chain() {
             chain_id: store.chain_id(),
             indexer_version: Some(db::INDEXER_VERSION.to_string()),
             contract: Some(OTHER_CONTRACT),
+            escrow: Some(OTHER_ESCROW),
             ..ChainState::default()
         }
     );

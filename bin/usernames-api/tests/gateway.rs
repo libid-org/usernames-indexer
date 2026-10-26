@@ -665,6 +665,10 @@ async fn a_report_expiring_out_of_range_is_refused() {
     );
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        body.refused().contains("cannot report its position"),
+        "{body}"
+    );
     drop(guard);
 }
 

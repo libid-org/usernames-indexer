@@ -86,9 +86,8 @@ pub struct EventColumns {
 }
 
 impl EventColumns {
-    /// The columns `event` sets. An event that names a handle node is filed
-    /// under it; `concerned` files the others: a ceremony and a fee under
-    /// their bind's node, an unpublish under the name it withdrew.
+    /// The columns `event` sets, filed under the handle node it concerns,
+    /// as the window's involvement decided it.
     pub(crate) fn of(
         event: &NamesEvent,
         concerned: Option<B256>,
@@ -96,7 +95,7 @@ impl EventColumns {
         let text = |value: &U256| Some(value.to_string());
         let base = Self {
             kind: event.kind().to_string(),
-            handle_node: event.handle_node().or(concerned),
+            handle_node: concerned,
             ..Self::default()
         };
         Ok(match event {

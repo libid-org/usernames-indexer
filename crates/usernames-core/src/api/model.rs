@@ -110,7 +110,9 @@ pub struct ChainStatus {
     /// freeze together — so watch this and `report_valid_for` too.
     pub indexer_reported_at: Option<u64>,
     /// Seconds until the indexer's last report expires, negative once it
-    /// has: past zero the ENS gateway refuses this chain's index.
+    /// has: past zero the ENS gateway refuses this chain's index. Absent
+    /// before a report, or when the stored expiry is out of range, which the
+    /// gateway refuses too.
     pub report_valid_for: Option<i64>,
     /// The last window failure, while the most recent window failed.
     pub last_window_error: Option<String>,

@@ -1072,9 +1072,11 @@ async fn a_ceremony_and_a_fee_take_only_their_own_transactions_bind() {
             .await
             .expect("the bind");
     }
+    // Another holder's ceremony and fee, in another transaction.
+    let dave = addr(0xD0);
     let ceremony = NamesEvent::CeremonyBound {
         authorization_digest: B256::repeat_byte(0xD1),
-        holder: alice,
+        holder: dave,
         platform_id: X.id(),
         client_identifier: Bytes::from_static(b"app"),
     };
@@ -1090,28 +1092,30 @@ async fn a_ceremony_and_a_fee_take_only_their_own_transactions_bind() {
     window.apply(&fee, &at(10, 0x0B)).await.expect("the fee");
     window.commit(1).await.expect("commit");
 
+    let stray = |event: &&HistoryEvent| {
+        matches!(
+            event,
+            HistoryEvent::CeremonyBound { .. } | HistoryEvent::BindFeePaid { .. }
+        )
+    };
     let history: HandleHistory = suite.get("/v1/history/handle/x/ann_1").await.answer();
-    assert!(
-        !events(&history.entries)
-            .iter()
-            .any(|event| matches!(event, HistoryEvent::CeremonyBound { .. })),
-        "{history:?}"
-    );
+    assert!(!events(&history.entries).iter().any(stray), "{history:?}");
     let history: AddressHistory = suite
         .get(&format!("/v1/history/address/{alice}"))
         .await
         .answer();
-    let ceremony = history
-        .entries
-        .iter()
-        .find(|entry| matches!(entry.event, HistoryEvent::CeremonyBound { .. }))
-        .expect("the ceremony is in the holder's history");
-    assert_eq!(ceremony.handle, None);
-    // Nor is the fee: its payer is the holder of its own transaction's bind.
+    assert!(!events(&history.entries).iter().any(stray), "{history:?}");
+    // The ceremony stays its own holder's, concerning no handle.
+    let history: AddressHistory = suite
+        .get(&format!("/v1/history/address/{dave}"))
+        .await
+        .answer();
     assert!(
-        !events(&history.entries)
-            .iter()
-            .any(|event| matches!(event, HistoryEvent::BindFeePaid { .. })),
+        matches!(
+            &history.entries[..],
+            [entry] if matches!(entry.event, HistoryEvent::CeremonyBound { .. })
+                && entry.handle.is_none()
+        ),
         "{history:?}"
     );
     suite.done();
