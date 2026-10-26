@@ -39,6 +39,7 @@ mod page;
 
 pub use self::{
     escrow::{
+        ContributionRow,
         EscrowSlotRow,
         RefundCursor,
         SlotCursor,
@@ -1236,7 +1237,7 @@ mod sql {
     pub const ESCROW_TAKE_REFUNDABLE: &str =
         include_str!("../sql/escrow_take_refundable.sql");
     pub const PREVIOUS_HOLDERS: &str = include_str!("../sql/previous_holders.sql");
-    pub const CLAIMED_REFUND_TOS: &str = include_str!("../sql/claimed_refund_tos.sql");
+    pub const CLAIMED_SENDERS: &str = include_str!("../sql/claimed_senders.sql");
     pub const CEREMONY_HANDLE: &str = include_str!("../sql/ceremony_handle.sql");
     pub const FEE_PAYER: &str = include_str!("../sql/fee_payer.sql");
     pub const RECORD_ADDRESS_EVENT: &str =
@@ -1258,7 +1259,7 @@ mod sql {
     /// The same shape, driven from the handles an address holds.
     pub const CLAIMABLE_PROJECTION: &str =
         include_str!("../sql/claimable_projection.sql");
-    /// One `refundTo`'s contributions in the same shape.
+    /// One sender's contributions in the same shape, with their refund dates.
     pub const REFUNDABLE_PROJECTION: &str =
         include_str!("../sql/refundable_projection.sql");
 }

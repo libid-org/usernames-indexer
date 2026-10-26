@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use usernames_core::{
     api::model::{
         AddressAmounts,
+        AddressContributions,
         AddressHistory,
         AddressResolution,
         HandleAmounts,
@@ -146,13 +147,15 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
 
     // A payer escrows for @bob_x, whom nobody holds yet, pays Alice's held
     // @alice_2 straight through, and escrows for @carol_x. A second payer
-    // escrows for @carol_x, takes it back, and escrows again. Bob then binds
-    // @bob_x privately and claims what waited; nobody binds @carol_x.
+    // escrows for @carol_x, takes it back once its refund date has come, and
+    // escrows again. Bob then binds @bob_x privately and claims what waited;
+    // nobody binds @carol_x.
     let (bob_x, carol_x) = (Handle(x, "bob_x"), Handle(x, "carol_x"));
     libid.deposit(payer, bob_x, 100).await;
     libid.deposit(payer, Handle(x, "alice_2"), 7).await;
     libid.deposit(payer, carol_x, 30).await;
     libid.deposit(refunder, carol_x, 20).await;
+    libid.pass_refund_grace().await;
     libid.refund(refunder, carol_x).await;
     libid.deposit(refunder, carol_x, 15).await;
     let bob_proof = Proof {
@@ -397,8 +400,8 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
         ),
         "{history:?}"
     );
-    assert_eq!(history.entries[0].roles, [Role::RefundTo]);
-    assert_eq!(history.entries[3].roles, [Role::Depositor, Role::RefundTo]);
+    assert_eq!(history.entries[0].roles, [Role::Sender]);
+    assert_eq!(history.entries[3].roles, [Role::Sender]);
     let history: AddressHistory =
         get(&pool, chain_id, &format!("/v1/history/address/{alice}"))
             .await
@@ -425,7 +428,8 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
     );
 
     // The books match the escrow's own: Bob's slot is empty, and what waits
-    // for @carol_x is what each payer could take back.
+    // for @carol_x is what each payer could take back, from the date the
+    // escrow set.
     let bobs: AddressAmounts =
         get(&pool, chain_id, &format!("/v1/escrow/claimable/{bob}"))
             .await
@@ -441,18 +445,20 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
     let unclaimed: Unclaimed =
         get(&pool, chain_id, "/v1/escrow/unclaimed").await.answer();
     assert_eq!(unclaimed.amounts, carols.amounts);
-    for (depositor, put_in) in [(payer, 30u64), (refunder, 15)] {
-        let refundable: AddressAmounts = get(
-            &pool,
-            chain_id,
-            &format!("/v1/escrow/refundable/{depositor}"),
-        )
-        .await
-        .answer();
+    for (sender, put_in) in [(payer, 30u64), (refunder, 15)] {
+        let refundable: AddressContributions =
+            get(&pool, chain_id, &format!("/v1/escrow/refundable/{sender}"))
+                .await
+                .answer();
         assert_eq!(refundable.amounts.len(), 1, "{refundable:?}");
-        let amount = refundable.amounts[0].amount;
-        assert_eq!(amount, libid.refundable(carol_x, depositor).await);
-        assert_eq!(amount, U256::from(put_in));
+        let served = &refundable.amounts[0];
+        let (booked, refundable_at) = libid.contribution(carol_x, sender).await;
+        assert_eq!(served.amount.amount, booked);
+        assert_eq!(served.amount.amount, U256::from(put_in));
+        assert_eq!(
+            u64::try_from(served.refundable_at).ok(),
+            Some(refundable_at)
+        );
     }
 }
 

@@ -33,6 +33,7 @@ use tokio::sync::Mutex;
 use usernames_core::{
     api::model::{
         AddressAmounts,
+        AddressContributions,
         AddressHistory,
         ErrorCode,
         EscrowAmount,
@@ -70,22 +71,39 @@ fn node(handle: &str) -> B256 {
     X.handle_node(handle).expect("an X handle")
 }
 
+/// When the suite's deposits open for refund: the escrow's 30 days past the
+/// suite's block times.
+const REFUNDABLE_AT: u64 = 1_700_000_000 + 30 * 24 * 60 * 60;
+
 /// A `deposit` by node: no platform, no text.
-fn deposited(
+fn deposited(handle: &str, token: Address, sender: Address, amount: u64) -> NamesEvent {
+    deposited_until(handle, token, sender, amount, REFUNDABLE_AT)
+}
+
+/// A `deposit` by node that moves its sender's refund date to `refundable_at`.
+fn deposited_until(
     handle: &str,
     token: Address,
-    depositor: Address,
-    refund_to: Address,
+    sender: Address,
     amount: u64,
+    refundable_at: u64,
 ) -> NamesEvent {
     NamesEvent::Escrow(EscrowEvent::Deposited {
         handle_node: node(handle),
         token,
-        refund_to,
-        depositor,
+        sender,
         round: U256::ZERO,
         amount: U256::from(amount),
+        refundable_at,
     })
+}
+
+/// (token, amount, refund date) triples, in the order served.
+fn contributions(list: &AddressContributions) -> Vec<(Address, u64, i64)> {
+    list.amounts
+        .iter()
+        .map(|c| (c.amount.token, c.amount.amount.to::<u64>(), c.refundable_at))
+        .collect()
 }
 
 /// (token, amount) pairs, in the order served.
@@ -134,27 +152,21 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let (bob, carol, dave, erin, dave_wallet) =
-        (addr(0xB0), addr(0xC0), addr(0xD0), addr(0xE0), addr(0xD1));
+    let (bob, carol, dave, dave_wallet) =
+        (addr(0xB0), addr(0xC0), addr(0xD0), addr(0xD1));
     let bob_node = node("bob_1");
+    let at = i64::try_from(REFUNDABLE_AT).expect("a date");
 
     // Nobody holds @bob_1: three deposits escrow, the first to the handle as
-    // typed. Erin pays for Dave, whose address is the one that may refund.
+    // typed.
     suite
         .apply_tx(
             1,
-            vec![
-                deposited("Bob_1", NATIVE, carol, carol, 100),
-                revealed(X, "Bob_1"),
-            ],
+            vec![deposited("Bob_1", NATIVE, carol, 100), revealed(X, "Bob_1")],
         )
         .await;
-    suite
-        .apply(2, deposited("bob_1", NATIVE, erin, dave, 50))
-        .await;
-    suite
-        .apply(3, deposited("bob_1", USDC, carol, carol, 7))
-        .await;
+    suite.apply(2, deposited("bob_1", NATIVE, dave, 50)).await;
+    suite.apply(3, deposited("bob_1", USDC, carol, 7)).await;
 
     // The deposit to the handle disclosed its platform and, folded, its
     // text. Token by token, descending: the native coin's address sorts
@@ -172,9 +184,7 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
     assert_eq!(held.handle.handle_node, bob_node);
     assert_eq!(held.handle.handle.as_deref(), Some("bob_1"));
     // A deposit by node alone names no platform and no text.
-    suite
-        .apply(20, deposited("anon_1", DAI, carol, carol, 1))
-        .await;
+    suite.apply(20, deposited("anon_1", DAI, carol, 1)).await;
     let anon: HandleAmounts = suite
         .get(&format!("/v1/escrow/node/{}", node("anon_1")))
         .await
@@ -186,7 +196,7 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
             NamesEvent::Escrow(EscrowEvent::Refunded {
                 handle_node: node("anon_1"),
                 token: DAI,
-                refund_to: carol,
+                sender: carol,
                 recipient: carol,
                 round: U256::ZERO,
                 released: U256::from(1u64),
@@ -195,23 +205,17 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
         )
         .await;
 
-    // The payers see what they may take back; a payer that named somebody
-    // else's refund address sees nothing.
-    let carols: AddressAmounts = suite
+    // The senders see what they may take back, and from when.
+    let carols: AddressContributions = suite
         .get(&format!("/v1/escrow/refundable/{carol}"))
         .await
         .answer();
-    assert_eq!(amounts(&carols.amounts), [(NATIVE, 100), (USDC, 7)]);
-    let daves: AddressAmounts = suite
+    assert_eq!(contributions(&carols), [(NATIVE, 100, at), (USDC, 7, at)]);
+    let daves: AddressContributions = suite
         .get(&format!("/v1/escrow/refundable/{dave}"))
         .await
         .answer();
-    assert_eq!(amounts(&daves.amounts), [(NATIVE, 50)]);
-    let erins: AddressAmounts = suite
-        .get(&format!("/v1/escrow/refundable/{erin}"))
-        .await
-        .answer();
-    assert!(erins.amounts.is_empty());
+    assert_eq!(contributions(&daves), [(NATIVE, 50, at)]);
 
     // Dave takes his back, paid to another address of his, through a token
     // that keeps a fee on transfer: the books release what the escrow sent.
@@ -221,7 +225,7 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
             NamesEvent::Escrow(EscrowEvent::Refunded {
                 handle_node: bob_node,
                 token: NATIVE,
-                refund_to: dave,
+                sender: dave,
                 recipient: dave_wallet,
                 round: U256::ZERO,
                 released: U256::from(50u64),
@@ -229,7 +233,7 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
             }),
         )
         .await;
-    let daves: AddressAmounts = suite
+    let daves: AddressContributions = suite
         .get(&format!("/v1/escrow/refundable/{dave}"))
         .await
         .answer();
@@ -252,13 +256,14 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
     // The refund released Dave's 50 from the books, not the 49 he received.
     let history: HandleHistory = suite.get("/v1/history/handle/x/bob_1").await.answer();
     assert_eq!(owed(&history.entries), by_token(&bobs.amounts));
-    // Carol may still refund until he claims: the race is the contract's.
-    let carols: AddressAmounts = suite
+    // Carol may still refund until he claims, once her date has come: the
+    // race is the contract's.
+    let carols: AddressContributions = suite
         .get(&format!("/v1/escrow/refundable/{carol}"))
         .await
         .answer();
-    assert_eq!(amounts(&carols.amounts), [(NATIVE, 100), (USDC, 7)]);
-    assert!(carols.amounts.iter().all(|a| a.holder == Some(bob)));
+    assert_eq!(contributions(&carols), [(NATIVE, 100, at), (USDC, 7, at)]);
+    assert!(carols.amounts.iter().all(|c| c.amount.holder == Some(bob)));
 
     // Bob claims the native coin: that round closes, and with it Carol's
     // refund of it. The USDC slot is untouched.
@@ -281,11 +286,11 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
         .await
         .answer();
     assert_eq!(amounts(&bobs.amounts), [(USDC, 7)]);
-    let carols: AddressAmounts = suite
+    let carols: AddressContributions = suite
         .get(&format!("/v1/escrow/refundable/{carol}"))
         .await
         .answer();
-    assert_eq!(amounts(&carols.amounts), [(USDC, 7)]);
+    assert_eq!(contributions(&carols), [(USDC, 7, at)]);
 
     // A held handle is paid straight through: nothing escrows.
     suite
@@ -294,7 +299,7 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
             NamesEvent::Escrow(EscrowEvent::Forwarded {
                 handle_node: bob_node,
                 token: NATIVE,
-                depositor: carol,
+                sender: carol,
                 holder: bob,
                 amount: U256::from(5u64),
                 received: U256::from(5u64),
@@ -368,9 +373,9 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
             HistoryEvent::Deposited { .. },
         ]
     ));
-    assert_eq!(history.entries[2].roles, [Role::Depositor]);
-    assert_eq!(history.entries[3].roles, [Role::RefundTo]);
-    assert_eq!(history.entries[4].roles, [Role::Depositor, Role::RefundTo]);
+    assert_eq!(history.entries[2].roles, [Role::Sender]);
+    assert_eq!(history.entries[3].roles, [Role::Sender]);
+    assert_eq!(history.entries[4].roles, [Role::Sender]);
     let history: AddressHistory = suite
         .get(&format!("/v1/history/address/{dave}"))
         .await
@@ -382,8 +387,8 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
             HistoryEvent::Deposited { .. }
         ]
     ));
-    assert_eq!(history.entries[0].roles, [Role::RefundTo]);
-    assert_eq!(history.entries[1].roles, [Role::RefundTo]);
+    assert_eq!(history.entries[0].roles, [Role::Sender]);
+    assert_eq!(history.entries[1].roles, [Role::Sender]);
     let history: AddressHistory = suite
         .get(&format!("/v1/history/address/{dave_wallet}"))
         .await
@@ -393,15 +398,45 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
         history.entries[0].event,
         HistoryEvent::Refunded { received, .. } if received == U256::from(49u64)
     ));
-    let history: AddressHistory = suite
-        .get(&format!("/v1/history/address/{erin}"))
-        .await
-        .answer();
-    assert_eq!(history.entries[0].roles, [Role::Depositor]);
 
     // Only USDC is still waiting anywhere on this chain.
     let unclaimed: Unclaimed = suite.get("/v1/escrow/unclaimed").await.answer();
     assert_eq!(amounts(&unclaimed.amounts), [(USDC, 7)]);
+    suite.done();
+}
+
+/// Each deposit moves its own sender's refund date for the sender's whole
+/// contribution to the slot, and nobody else's.
+#[tokio::test]
+async fn a_top_up_moves_only_its_senders_refund_date() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let (carol, dave) = (addr(0xC0), addr(0xD0));
+    let (first, later) = (REFUNDABLE_AT, REFUNDABLE_AT + 600);
+    suite
+        .apply(1, deposited_until("bob_1", NATIVE, carol, 10, first))
+        .await;
+    suite
+        .apply(2, deposited_until("bob_1", NATIVE, dave, 20, first))
+        .await;
+    suite
+        .apply(3, deposited_until("bob_1", NATIVE, carol, 5, later))
+        .await;
+
+    let carols: AddressContributions = suite
+        .get(&format!("/v1/escrow/refundable/{carol}"))
+        .await
+        .answer();
+    let later = i64::try_from(later).expect("a date");
+    assert_eq!(contributions(&carols), [(NATIVE, 15, later)]);
+    let daves: AddressContributions = suite
+        .get(&format!("/v1/escrow/refundable/{dave}"))
+        .await
+        .answer();
+    let first = i64::try_from(first).expect("a date");
+    assert_eq!(contributions(&daves), [(NATIVE, 20, first)]);
     suite.done();
 }
 
@@ -418,7 +453,7 @@ async fn six_unclaimed_slots(suite: &Suite) {
     ];
     for (block, (handle, token, amount)) in (1u64..).zip(deposits) {
         suite
-            .apply(block, deposited(handle, token, payer, payer, amount))
+            .apply(block, deposited(handle, token, payer, amount))
             .await;
     }
 }
@@ -507,7 +542,7 @@ async fn every_escrow_list_pages_by_cursor_without_gaps_or_repeats() {
     for (block, handle) in (1u64..).step_by(3).zip(["p1", "p2", "p3"]) {
         for (offset, token) in (0u64..).zip([NATIVE, USDC, DAI]) {
             suite
-                .apply(block + offset, deposited(handle, token, carol, carol, 10))
+                .apply(block + offset, deposited(handle, token, carol, 10))
                 .await;
         }
     }
@@ -553,8 +588,8 @@ async fn a_history_pages_by_cursor_without_gaps_or_repeats() {
         .apply_tx(
             1,
             vec![
-                deposited("p1", NATIVE, payer, payer, 1),
-                deposited("p2", NATIVE, payer, payer, 2),
+                deposited("p1", NATIVE, payer, 1),
+                deposited("p2", NATIVE, payer, 2),
             ],
         )
         .await;
@@ -562,7 +597,7 @@ async fn a_history_pages_by_cursor_without_gaps_or_repeats() {
         suite
             .apply(
                 block,
-                deposited(&format!("p{}", block + 1), NATIVE, payer, payer, block),
+                deposited(&format!("p{}", block + 1), NATIVE, payer, block),
             )
             .await;
     }
@@ -913,10 +948,10 @@ async fn text_finds_a_deposit_the_way_the_chain_hashed_it() {
                 NamesEvent::Escrow(EscrowEvent::Deposited {
                     handle_node: quoted,
                     token: NATIVE,
-                    refund_to: carol,
-                    depositor: carol,
+                    sender: carol,
                     round: U256::ZERO,
                     amount: U256::from(9u64),
+                    refundable_at: REFUNDABLE_AT,
                 }),
                 revealed(X, "Bo\"b"),
             ],
@@ -973,9 +1008,7 @@ async fn another_escrow_replays_the_chain_and_the_same_one_keeps_it() {
         .await
         .expect("prepare");
     let payer = addr(0xC0);
-    suite
-        .apply(1, deposited("h1", NATIVE, payer, payer, 1))
-        .await;
+    suite.apply(1, deposited("h1", NATIVE, payer, 1)).await;
 
     suite
         .store

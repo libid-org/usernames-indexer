@@ -348,17 +348,17 @@ pub enum HistoryEvent {
     Deposited {
         handle_node: B256,
         token: Address,
-        refund_to: Address,
-        depositor: Address,
+        sender: Address,
         #[serde_as(as = "DisplayFromStr")]
         round: U256,
         #[serde_as(as = "DisplayFromStr")]
         amount: U256,
+        refundable_at: u64,
     },
     Forwarded {
         handle_node: B256,
         token: Address,
-        depositor: Address,
+        sender: Address,
         holder: Address,
         #[serde_as(as = "DisplayFromStr")]
         amount: U256,
@@ -380,7 +380,7 @@ pub enum HistoryEvent {
     Refunded {
         handle_node: B256,
         token: Address,
-        refund_to: Address,
+        sender: Address,
         recipient: Address,
         #[serde_as(as = "DisplayFromStr")]
         round: U256,
@@ -468,29 +468,29 @@ impl From<NamesEvent> for HistoryEvent {
             NamesEvent::Escrow(EscrowEvent::Deposited {
                 handle_node,
                 token,
-                refund_to,
-                depositor,
+                sender,
                 round,
                 amount,
+                refundable_at,
             }) => Self::Deposited {
                 handle_node,
                 token,
-                refund_to,
-                depositor,
+                sender,
                 round,
                 amount,
+                refundable_at,
             },
             NamesEvent::Escrow(EscrowEvent::Forwarded {
                 handle_node,
                 token,
-                depositor,
+                sender,
                 holder,
                 amount,
                 received,
             }) => Self::Forwarded {
                 handle_node,
                 token,
-                depositor,
+                sender,
                 holder,
                 amount,
                 received,
@@ -515,7 +515,7 @@ impl From<NamesEvent> for HistoryEvent {
             NamesEvent::Escrow(EscrowEvent::Refunded {
                 handle_node,
                 token,
-                refund_to,
+                sender,
                 recipient,
                 round,
                 released,
@@ -523,7 +523,7 @@ impl From<NamesEvent> for HistoryEvent {
             }) => Self::Refunded {
                 handle_node,
                 token,
-                refund_to,
+                sender,
                 recipient,
                 round,
                 released,
@@ -623,9 +623,7 @@ pub struct EscrowAmount {
 }
 
 /// `GET /v1/escrow/claimable/{address}`: held for the handles the address
-/// holds now, which `claim` pays it; `GET /v1/escrow/refundable/{address}`:
-/// what it may take back from deposits nobody has claimed yet, whether or
-/// not the handle has a holder, which `refund` pays it.
+/// holds now, which `claim` pays it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddressAmounts {
@@ -633,6 +631,33 @@ pub struct AddressAmounts {
     pub address: Address,
     /// By chain, node and token, descending.
     pub amounts: Vec<EscrowAmount>,
+    /// Pass as `before` for the next page; absent on the last one.
+    pub next: Option<String>,
+}
+
+/// One sender's contribution to a slot: what `refund` pays it, and from when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Contribution {
+    /// The amount, its slot and the slot's round.
+    #[serde(flatten)]
+    pub amount: EscrowAmount,
+    /// When `refund` opens for it, in unix seconds: `REFUND_GRACE` after the
+    /// sender's last deposit to the slot. Until then only the holder's claim
+    /// moves it.
+    pub refundable_at: i64,
+}
+
+/// `GET /v1/escrow/refundable/{address}`: what the address sent to handles
+/// nobody has claimed yet, whether or not the handle has a holder, which
+/// `refund` pays back from each contribution's date.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddressContributions {
+    /// The address asked about.
+    pub address: Address,
+    /// By chain, node, token and round, descending.
+    pub amounts: Vec<Contribution>,
     /// Pass as `before` for the next page; absent on the last one.
     pub next: Option<String>,
 }

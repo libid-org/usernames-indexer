@@ -4,7 +4,7 @@
 //! What an event does not name is read from the rows it is about to change,
 //! or from the rows its own transaction recorded just before it: a bind's
 //! previous holders, the handle of a ceremony or a fee, a fee's payer, and the
-//! refundTos a claim takes from. An unpublish's handle is the row it deletes.
+//! senders a claim takes from. An unpublish's handle is the row it deletes.
 
 use std::{
     fmt,
@@ -208,16 +208,15 @@ impl Window {
                 round,
                 ..
             }) => {
-                let refund_tos: Vec<Address> =
-                    sqlx::query_scalar(sql::CLAIMED_REFUND_TOS)
-                        .bind(chain_id)
-                        .bind(handle_node)
-                        .bind(token)
-                        .bind(round.to_string())
-                        .fetch_all(&mut *self.tx)
-                        .await?;
-                for refund_to in refund_tos {
-                    involvement.add(refund_to, Role::RefundTo);
+                let senders: Vec<Address> = sqlx::query_scalar(sql::CLAIMED_SENDERS)
+                    .bind(chain_id)
+                    .bind(handle_node)
+                    .bind(token)
+                    .bind(round.to_string())
+                    .fetch_all(&mut *self.tx)
+                    .await?;
+                for sender in senders {
+                    involvement.add(sender, Role::Sender);
                 }
                 involvement.handle_node = Some(*handle_node);
             }
@@ -586,9 +585,9 @@ pub(crate) mod plans {
                     .await,
             ),
             (
-                "the refundTos a claim takes from",
+                "the senders a claim takes from",
                 &["escrow_refundable_round_idx"][..],
-                sqlx::query_scalar(&explain(sql::CLAIMED_REFUND_TOS))
+                sqlx::query_scalar(&explain(sql::CLAIMED_SENDERS))
                     .bind(1i64)
                     .bind(node)
                     .bind(address)

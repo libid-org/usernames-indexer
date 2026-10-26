@@ -93,11 +93,11 @@ anything happened.
 | `GET /v1/resolve/id-node/{idNode}` | The wallet an id node resolves to (`resolveId`) on each chain it is bound on, each with the handle node that account holds now. The client hashes the id (`libid-identity`, or `idNode` in `@libid/contracts`); no plaintext id reaches the server |
 | `GET /v1/resolve/address/{address}` | Every identity a wallet proved on every chain, by id node, with `resolves`, and `published` on the one whose handle is the wallet's name (`primaryHandleOf`) |
 | `GET /v1/search?q=gre&platform=x&owner=0x…&limit=10&offset=0` | Live handles whose text the chain disclosed, matching a partial query (exact, then prefix, then substring, then trigram-fuzzy), linked to a wallet, or both; one of `q` and `owner` is required. `limit` (1..50, default 10) and `offset` (up to 10000) page the ranked list; a page shorter than `limit` is the last |
-| `GET /v1/history/address/{address}?before=&limit=` | Every event the address took part in, newest first, each with its `roles`: `holder`, `previousHandleHolder` and `previousIdHolder` (an event took that handle or account from it), `feeReceiver`, `depositor`, `refundTo` (a claim took its deposit, too), `claimer`, `recipient` |
+| `GET /v1/history/address/{address}?before=&limit=` | Every event the address took part in, newest first, each with its `roles`: `holder`, `previousHandleHolder` and `previousIdHolder` (an event took that handle or account from it), `feeReceiver`, `sender` (of a deposit; a claim that took it names it too), `claimer`, `recipient` |
 | `GET /v1/history/handle/{platform}/{handle}?before=&limit=` | Every event on the handle: deposits while nobody held it, the binds that gave it a holder, and every claim, refund and payment after |
 | `GET /v1/history/node/{node}?before=&limit=` | The same, by handle node: for a handle nobody has bound, whose text no event carried |
 | `GET /v1/escrow/claimable/{address}?before=&limit=` | What `claim` would pay the address: everything held for the handles it holds now |
-| `GET /v1/escrow/refundable/{address}?before=&limit=` | What `refund` would pay the address: what deposits naming it as `refundTo` booked that nobody has claimed yet |
+| `GET /v1/escrow/refundable/{address}?before=&limit=` | What the address sent that nobody has claimed yet, each contribution with its `refundableAt`: when `refund` opens for it |
 | `GET /v1/escrow/handle/{platform}/{handle}?before=&limit=` | What a handle holds, token by token, and its holder; `/v1/escrow/node/{node}` by node |
 | `GET /v1/escrow/unclaimed?token=0x…&before=&limit=` | Every slot still holding something, bound or not: token by token, descending, the largest amount first within each |
 | `GET /v1/status` | Every chain the store holds: chain id, contract, escrow, last indexed block, chain head, lag, when the indexer last reported and how long that report is still good, last window error, the Proof Verifier the contract is wired to; and the read-model version |
@@ -325,8 +325,9 @@ chain; a second deployment can share the database):
   deposit names none
 - `escrow_held` — mirrors HandleEscrow's `held` and `round` per handle node
   and token
-- `escrow_refundable` — mirrors `refundable`: each `refundTo`'s contribution
-  in a slot's current round; a refund deletes its row, a claim the round's
+- `escrow_refundable` — mirrors `contribution`: each sender's contribution
+  to a slot in its current round, with the `refundableAt` its last deposit
+  set; a refund deletes its row, a claim every row of the round
 - `address_events`, `handle_events` — which addresses (with their roles) and
   which handle each journal row involves, dated by its block. A bind's
   previous holders, a ceremony's and a fee's handle, and a fee's payer are

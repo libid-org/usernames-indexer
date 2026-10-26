@@ -1,5 +1,5 @@
 //! HandleEscrow's books: what each handle node holds per token, and what each
-//! deposit's `refundTo` may still take back, moved the way the contract moves
+//! sender may still take back and from when, moved the way the contract moves
 //! its own storage — and the lists of what is waiting, paged by their keys.
 
 use std::{
@@ -15,6 +15,7 @@ use alloy::primitives::{
 use sqlx::QueryBuilder;
 
 use super::{
+    as_i64,
     page::{
         Cursor,
         CursorText,
@@ -46,10 +47,10 @@ impl Window {
             EscrowEvent::Deposited {
                 handle_node,
                 token,
-                refund_to,
+                sender,
                 round,
                 amount,
-                ..
+                refundable_at,
             } => {
                 sqlx::query(sql::ESCROW_DEPOSIT)
                     .bind(chain_id)
@@ -66,8 +67,9 @@ impl Window {
                     .bind(handle_node)
                     .bind(token)
                     .bind(round.to_string())
-                    .bind(refund_to)
+                    .bind(sender)
                     .bind(amount.to_string())
+                    .bind(as_i64(*refundable_at, "refundableAt")?)
                     .execute(&mut *self.tx)
                     .await?;
             }
@@ -107,7 +109,7 @@ impl Window {
             EscrowEvent::Refunded {
                 handle_node,
                 token,
-                refund_to,
+                sender,
                 round,
                 released,
                 ..
@@ -134,7 +136,7 @@ impl Window {
                     .bind(handle_node)
                     .bind(token)
                     .bind(round.to_string())
-                    .bind(refund_to)
+                    .bind(sender)
                     .execute(&mut *self.tx)
                     .await?;
             }
@@ -147,7 +149,7 @@ impl Window {
 }
 
 /// One amount waiting in the escrow, with the handle it waits for: a slot's
-/// held amount, or one `refundTo`'s contribution to it.
+/// held amount, or one sender's contribution to it.
 #[derive(sqlx::FromRow)]
 pub struct EscrowSlotRow {
     /// The chain the escrow holds it on.
@@ -180,6 +182,17 @@ impl EscrowSlotRow {
     pub fn round(&self) -> Option<U256> {
         self.round.parse().ok()
     }
+}
+
+/// One sender's contribution to a slot, and when `refund` opens for it.
+#[derive(sqlx::FromRow)]
+pub struct ContributionRow {
+    /// The slot, with the amount the sender may take back.
+    #[sqlx(flatten)]
+    pub slot: EscrowSlotRow,
+    /// When `refund` opens for it, in unix seconds: `REFUND_GRACE` after the
+    /// sender's last deposit to the slot.
+    pub refundable_at: i64,
 }
 
 /// Where an unclaimed page ends. The list runs by token, then amount, chain
@@ -321,14 +334,14 @@ impl fmt::Display for RefundCursor {
 }
 
 impl Cursor for RefundCursor {
-    type Row = EscrowSlotRow;
+    type Row = ContributionRow;
 
-    fn after(row: &EscrowSlotRow) -> Option<Self> {
+    fn after(ContributionRow { slot, .. }: &ContributionRow) -> Option<Self> {
         Some(Self {
-            chain_id: row.chain_id,
-            handle_node: row.handle_node,
-            token: row.token,
-            round: row.round()?,
+            chain_id: slot.chain_id,
+            handle_node: slot.handle_node,
+            token: slot.token,
+            round: slot.round()?,
         })
     }
 }
@@ -467,18 +480,14 @@ impl Page<SlotCursor> {
 }
 
 impl Page<RefundCursor> {
-    /// What `refund_to` may take back: its contributions in their slots'
+    /// What `sender` may take back: its contributions in their slots'
     /// current rounds, in the order of the table's key.
-    pub(crate) fn refundable_lookup(
-        &self,
-        prefix: &str,
-        refund_to: Address,
-    ) -> Statement {
+    pub(crate) fn refundable_lookup(&self, prefix: &str, sender: Address) -> Statement {
         let mut statement = QueryBuilder::new(format!(
-            "{prefix}{} WHERE r.refund_to = ",
+            "{prefix}{} WHERE r.sender = ",
             sql::REFUNDABLE_PROJECTION
         ));
-        statement.push_bind(refund_to);
+        statement.push_bind(sender);
         match self.chain {
             Some(chain) => {
                 statement.push(" AND r.chain_id = ").push_bind(chain);
@@ -534,15 +543,16 @@ impl Store {
         Ok(page.split(rows))
     }
 
-    /// What an address may refund now: its contribution to every slot in the
-    /// slot's current round, whether or not anybody holds the handle yet.
+    /// What a sender may take back: its contribution to every slot in the
+    /// slot's current round, whether or not anybody holds the handle yet,
+    /// with the date `refund` opens for each.
     pub async fn refundable(
         &self,
-        refund_to: Address,
+        sender: Address,
         page: Page<RefundCursor>,
-    ) -> Result<Rows<EscrowSlotRow, RefundCursor>, sqlx::Error> {
+    ) -> Result<Rows<ContributionRow, RefundCursor>, sqlx::Error> {
         let rows = page
-            .refundable_lookup("", refund_to)
+            .refundable_lookup("", sender)
             .build_query_as()
             .fetch_all(&self.pool)
             .await?;
