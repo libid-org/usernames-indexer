@@ -1,7 +1,7 @@
-//! Hashed identities end to end: mocks with the contracts' event surface emit
-//! private and disclosing binds, an unpublish and deposits on anvil; the
-//! indexer's own loop indexes them; the read API answers; and no plaintext the
-//! chain did not disclose is left anywhere in the store.
+//! Hashed identities end to end: the libid contracts on anvil take private
+//! and disclosing binds, an unpublish and deposits; the indexer's own loop
+//! indexes them; the read API answers; and no plaintext the chain did not
+//! disclose is left anywhere in the store.
 //!
 //! Skips without `DATABASE_URL`, or without `anvil` on PATH, unless `CI` is
 //! set: there a missing one fails. Everything past those checks panics on
@@ -12,35 +12,29 @@ mod common;
 
 use std::{
     fmt::Debug,
-    future::Future,
-    process::Command,
     time::Duration,
 };
 
 use alloy::{
-    network::Ethereum,
     primitives::{
-        address,
         Address,
         B256,
         U256,
     },
     providers::{
         DynProvider,
-        PendingTransactionBuilder,
         Provider,
-        ProviderBuilder,
     },
-    sol_types::SolEvent,
 };
 use common::{
-    MockHandleEscrow,
-    MockIdentityRegistry,
+    libid::{
+        self,
+        Disclose,
+        Handle,
+        Libid,
+        Proof,
+    },
     Reply,
-};
-use libid_contracts::bindings::{
-    escrow::HandleEscrow,
-    identity::IdentityRegistry,
 };
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
@@ -73,50 +67,14 @@ const ALICE_ID: &str = "4815162342";
 const BOB_ID: &str = "1234567890123";
 const DAVE_ID: &str = "9081726354";
 
-/// The mocks' topics are the bindings' topics, for every event the indexer
-/// decodes: a mock that drifted from the contracts would test nothing.
-#[test]
-fn the_mocks_emit_the_contracts_topics() {
-    macro_rules! same_topics {
-        ($mock:ident = $binding:ident: $($event:ident),+) => {$(
-            assert_eq!(
-                $mock::$event::SIGNATURE_HASH,
-                $binding::$event::SIGNATURE_HASH,
-                stringify!($event)
-            );
-        )+};
-    }
-    same_topics!(MockIdentityRegistry = IdentityRegistry:
-        IdentityBound, HandleRevealed, HandlePublished, HandleRetired,
-        HandleUnpublished, ProofVerifierConfigured, CeremonyBound, BindFeePaid);
-    same_topics!(MockHandleEscrow = HandleEscrow:
-        Deposited, HandleRevealed, Forwarded, Claimed, Refunded);
-}
-
-use MockIdentityRegistry::Bind;
-
-/// Skip the test, except under CI, where missing infrastructure fails it.
-fn skip<T>(missing: &str) -> Option<T> {
-    assert!(
-        std::env::var_os("CI").is_none(),
-        "{missing}: CI runs this suite against Postgres and anvil"
-    );
-    eprintln!("skipping: {missing}");
-    None
-}
-
-type Registry = MockIdentityRegistry::MockIdentityRegistryInstance<DynProvider>;
-type Escrow = MockHandleEscrow::MockHandleEscrowInstance<DynProvider>;
-
-/// One test's chain: its own anvil with both doubles deployed, and the
-/// indexer's loop over them.
+/// One test's chain: its own anvil with the libid contracts deployed, and
+/// the indexer's loop over them.
 struct Harness {
     chain: u64,
     pool: PgPool,
     store: ChainStore,
     provider: DynProvider,
-    registry: Registry,
-    escrow: Escrow,
+    libid: Libid,
     cancel: CancellationToken,
     indexer: JoinHandle<()>,
     writer: WriterLease,
@@ -125,33 +83,26 @@ struct Harness {
 impl Harness {
     /// A fresh `chain`, indexed; `None` when the suite skips.
     async fn open(chain: u64) -> Option<Self> {
-        let Ok(url) = std::env::var("DATABASE_URL") else {
-            return skip("DATABASE_URL not set");
+        let Some(url) = common::database_url() else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return None;
         };
-        if Command::new("anvil").arg("--version").output().is_err() {
-            return skip("anvil not on PATH");
+        if !common::anvil_available() {
+            eprintln!("skipping: anvil not on PATH");
+            return None;
         }
         let pool = db::connect_and_migrate(&url).await.expect("database");
         common::clear_chain(&pool, chain as i64).await;
         let store = ChainStore::new(pool.clone(), chain as i64);
 
-        let provider = ProviderBuilder::new()
-            .connect_anvil_with_wallet_and_config(|anvil| anvil.chain_id(chain))
-            .expect("anvil spawns");
-        provider
-            .client()
-            .set_poll_interval(Duration::from_millis(10));
-        let provider = provider.erased();
-        let registry = MockIdentityRegistry::deploy(provider.clone())
-            .await
-            .expect("deploy the registry");
-        let escrow = MockHandleEscrow::deploy(provider.clone(), *registry.address())
-            .await
-            .expect("deploy the escrow");
+        let provider = libid::anvil(chain);
+        let owner = provider.get_accounts().await.expect("accounts")[0];
+        let libid = Libid::deploy(&provider, owner).await;
+        let (registry, escrow) = (*libid.registry.address(), *libid.escrow.address());
 
         let writer = store.acquire_writer().await.expect("writer lease");
         store
-            .prepare(&writer, *registry.address(), Some(*escrow.address()))
+            .prepare(&writer, registry, Some(escrow))
             .await
             .expect("prepare");
         let cancel = CancellationToken::new();
@@ -160,8 +111,8 @@ impl Harness {
                 store.clone(),
                 provider.clone(),
                 indexer::IndexerConfig {
-                    contract: *registry.address(),
-                    escrow: Some(*escrow.address()),
+                    contract: registry,
+                    escrow: Some(escrow),
                     confirmations: 0,
                     poll_interval: Duration::from_millis(10),
                     max_block_range: 100,
@@ -177,8 +128,7 @@ impl Harness {
             pool,
             store,
             provider,
-            registry,
-            escrow,
+            libid,
             cancel,
             indexer,
             writer,
@@ -198,16 +148,16 @@ impl Harness {
         reply.answer()
     }
 
-    /// Mine one transaction and wait for the indexer to commit it.
-    async fn mine(
-        &self,
-        send: impl Future<
-            Output = alloy::contract::Result<PendingTransactionBuilder<Ethereum>>,
-        >,
-    ) {
-        send.await.unwrap().watch().await.unwrap();
+    /// Wait for the indexer to commit every block mined so far.
+    async fn settle(&self) {
         let latest = self.provider.get_block_number().await.expect("latest");
         common::wait_for_cursor(&self.store, latest).await;
+    }
+
+    /// The anvil accounts that act in the scenario, after the deployer.
+    async fn accounts(&self) -> Vec<Address> {
+        let accounts = self.provider.get_accounts().await.expect("accounts");
+        accounts[1..].to_vec()
     }
 
     /// Every column holding text, bytes or JSON on this chain where `needle`
@@ -253,45 +203,36 @@ impl Harness {
     }
 }
 
-/// A private bind of `id` to `handle` on X with nothing to withdraw or
-/// retire.
-fn x_bind(holder: Address, id: &str, handle: &str, observed_at: u64) -> Bind {
-    let digest = B256::from(U256::from(observed_at));
-    common::mock_bind(
-        holder,
-        KnownPlatform::X,
+/// What a proof of `id` holding `handle` on X reports.
+fn x_proof(id: &'static str, handle: &'static str, observed_at: u64) -> Proof {
+    Proof {
+        handle: Handle(KnownPlatform::X, handle),
         id,
-        handle,
         observed_at,
-        false,
-        digest,
-    )
+    }
 }
 
 #[tokio::test]
 async fn private_binds_stay_private_and_disclosures_stay_shown() {
-    let Some(h) = Harness::open(CHAIN).await else {
+    let Some(mut h) = Harness::open(CHAIN).await else {
         return;
     };
-    let (registry, escrow) = (&h.registry, &h.escrow);
+    let accounts = h.accounts().await;
+    let &[alice, bob, dave, payer, ..] = &accounts[..] else {
+        panic!("anvil has fewer than five accounts: {accounts:?}");
+    };
 
     let x = KnownPlatform::X;
-    let (alice, bob, dave) = (
-        Address::repeat_byte(0xA1),
-        Address::repeat_byte(0xB0),
-        Address::repeat_byte(0xD0),
-    );
     let alice_node = x.handle_node("Alice_1").expect("a handle");
     let alice_id = x.id_node(ALICE_ID).expect("an id");
 
     // 1. A private bind of @Alice_1: nodes only, resolved by hashing here,
     //    with no text to show.
-    h.mine(
-        registry
-            .emitBind(x_bind(alice, ALICE_ID, "alice_1", 1000))
-            .send(),
-    )
-    .await;
+    let private = x_proof(ALICE_ID, "alice_1", 1000);
+    h.libid
+        .bind(alice, private, Disclose::Nothing, U256::ZERO)
+        .await;
+    h.settle().await;
     let resolved: HandleResolution = h.get("/v1/resolve/handle/x/Alice_1").await;
     assert_eq!(resolved.handle_node, alice_node);
     assert_eq!(resolved.bindings[0].owner, alice);
@@ -305,12 +246,11 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
 
     // 2. A disclosing bind that names the handle: shown on the address and
     //    found by search.
-    let disclosing = Bind {
-        handle: "alice_1".into(),
-        primary: true,
-        ..x_bind(alice, ALICE_ID, "alice_1", 2000)
-    };
-    h.mine(registry.emitBind(disclosing).send()).await;
+    let disclosing = x_proof(ALICE_ID, "alice_1", 2000);
+    h.libid
+        .bind(alice, disclosing, Disclose::Name, U256::ZERO)
+        .await;
+    h.settle().await;
     let theirs: AddressResolution = h.get(&format!("/v1/resolve/address/{alice}")).await;
     assert_eq!(theirs.identities.len(), 1, "{theirs:?}");
     assert_eq!(theirs.identities[0].handle.as_deref(), Some("alice_1"));
@@ -320,7 +260,8 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
     assert_eq!(hits, ["alice_1"]);
 
     // 3. Withdrawn: no longer published, the text still shown.
-    h.mine(registry.emitHandleUnpublished(alice).send()).await;
+    h.libid.unpublish(alice).await;
+    h.settle().await;
     let theirs: AddressResolution = h.get(&format!("/v1/resolve/address/{alice}")).await;
     assert_eq!(theirs.identities[0].handle.as_deref(), Some("alice_1"));
     assert!(!theirs.identities[0].published);
@@ -339,40 +280,36 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
             .as_deref(),
         Some("alice_1")
     );
-    let history: serde_json::Value = h.get(&format!("/v1/history/address/{alice}")).await;
-    assert!(history.to_string().contains("alice_1"), "{history}");
+    let history: AddressHistory = h.get(&format!("/v1/history/address/{alice}")).await;
+    assert!(
+        history.entries.iter().any(|e| e
+            .handle
+            .as_ref()
+            .and_then(|h| h.handle.as_deref())
+            == Some("alice_1")),
+        "{history:?}"
+    );
 
     // 4. A public deposit to @Bob_2, then Bob binds it privately: the
     //    escrow's reveal maps the handle to his id node. A private deposit names only
     //    a node, and no platform.
-    let native = address!("EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
-    let payer = Address::repeat_byte(0xC0);
     let bob_node = x.handle_node("bob_2").expect("a handle");
     let bob_id = x.id_node(BOB_ID).expect("an id");
     let carol_node = x.handle_node("carol_3").expect("a handle");
-    let (round, hundred, five) = (U256::ZERO, U256::from(100u64), U256::from(5u64));
-    let to_bob = escrow.emitDepositToHandle(
-        bob_node,
-        native,
-        payer,
-        payer,
-        round,
-        hundred,
-        x.id(),
-        "Bob_2".into(),
-    );
-    h.mine(to_bob.send()).await;
-    let to_carol = escrow.emitDeposited(carol_node, native, payer, payer, round, five);
-    h.mine(to_carol.send()).await;
-    h.mine(registry.emitBind(x_bind(bob, BOB_ID, "bob_2", 3000)).send())
+    h.libid
+        .deposit_to_handle(payer, Handle(x, "Bob_2"), 100)
+        .await;
+    h.libid.deposit(payer, Handle(x, "carol_3"), 5).await;
+    let bobs_proof = x_proof(BOB_ID, "bob_2", 3000);
+    h.libid
+        .bind(bob, bobs_proof, Disclose::Nothing, U256::ZERO)
         .await;
     // Dave binds privately and is never disclosed.
-    h.mine(
-        registry
-            .emitBind(x_bind(dave, DAVE_ID, "dave_4", 4000))
-            .send(),
-    )
-    .await;
+    let daves_proof = x_proof(DAVE_ID, "dave_4", 4000);
+    h.libid
+        .bind(dave, daves_proof, Disclose::Nothing, U256::ZERO)
+        .await;
+    h.settle().await;
 
     let mapping: Vec<(String, B256, Option<B256>, Option<Address>)> = sqlx::query_as(
         "SELECT handle, handle_node, id_node, holder FROM names.handle_identities
@@ -404,7 +341,7 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
     let carols: HandleAmounts = h.get(&format!("/v1/escrow/node/{carol_node}")).await;
     assert_eq!(carols.handle.platform_id, None, "{carols:?}");
     assert_eq!(carols.handle.handle, None);
-    assert_eq!(carols.amounts[0].amount, five);
+    assert_eq!(carols.amounts[0].amount, U256::from(5u64));
     let bobs: HandleAmounts = h.get("/v1/escrow/handle/x/BOB_2").await;
     assert_eq!(bobs.handle.platform_id, Some(x.id()));
     assert_eq!(bobs.handle.handle.as_deref(), Some("bob_2"));
@@ -430,11 +367,10 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
             "{handle}"
         );
     }
-    let bob_history: serde_json::Value =
-        h.get(&format!("/v1/history/address/{bob}")).await;
-    let bob_history = bob_history.to_string();
+    let bob_history: AddressHistory = h.get(&format!("/v1/history/address/{bob}")).await;
+    let shown = format!("{bob_history:?}");
     for secret in [BOB_ID, "alice_1", "carol_3", "dave_4"] {
-        assert!(!bob_history.contains(secret), "{secret}: {bob_history}");
+        assert!(!shown.contains(secret), "{secret}: {shown}");
     }
     h.close().await;
 }

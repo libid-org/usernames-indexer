@@ -1,24 +1,19 @@
-//! End to end against a real chain: anvil runs, mock contracts with the exact
-//! IdentityRegistry and HandleEscrow event surfaces emit a scenario, and the
-//! indexer's own loop — deployment-block detection included — indexes both
-//! into Postgres, where the API answers.
+//! End to end against a real chain: anvil runs the libid contracts a
+//! deployment runs, with a stub in place of each platform's proof check (see
+//! `common::libid`). The indexer's own loop, deployment-block detection
+//! included, indexes the registry and the escrow into Postgres, where the API
+//! answers.
 //!
-//! Skips silently in exactly two cases: `DATABASE_URL` unset, or no `anvil`
-//! binary on PATH. Everything past those checks panics on failure.
+//! Skips without `DATABASE_URL` or `anvil`, unless `CI` is set: there a
+//! missing one fails. Everything past those checks panics on failure.
 
 use std::time::Duration;
 
 use alloy::{
-    primitives::{
-        address,
-        Address,
-        B256,
-        U256,
-    },
+    primitives::U256,
     providers::{
         ext::AnvilApi,
         Provider,
-        ProviderBuilder,
     },
 };
 use axum::http::StatusCode;
@@ -30,6 +25,7 @@ use usernames_core::{
         AddressAmounts,
         AddressHistory,
         AddressResolution,
+        HandleAmounts,
         HandleHistory,
         HandleResolution,
         HistoryEvent,
@@ -37,6 +33,7 @@ use usernames_core::{
         Role,
         SearchResults,
         Status,
+        Unclaimed,
     },
     chain,
     db::{
@@ -50,8 +47,14 @@ use usernames_core::{
 mod common;
 use common::{
     events,
-    MockHandleEscrow,
-    MockIdentityRegistry,
+    libid::{
+        self,
+        Disclose,
+        Handle,
+        Libid,
+        Proof,
+        CEREMONY_VERSION,
+    },
     Reply,
 };
 
@@ -62,23 +65,11 @@ async fn get<T: DeserializeOwned>(pool: &PgPool, path: &str) -> Reply<T> {
 }
 
 /// Not 31337: the read-model tests use anvil's default id against the same
-/// database, and chain_id keying is exactly the isolation this exercises.
+/// database, and chain_id keying is the isolation this exercises.
 const CHAIN: u64 = 43117;
 
 /// A Google account id as the platform issues it: the OIDC `sub`.
 const GOOGLE_USER_ID: &str = "123456789012345678901";
-
-/// A bind of `id` that discloses `handle`, with nothing to withdraw or retire.
-fn disclosing_bind(
-    holder: Address,
-    platform: KnownPlatform,
-    id: &str,
-    handle: &str,
-    observed_at: u64,
-    digest: B256,
-) -> MockIdentityRegistry::Bind {
-    common::mock_bind(holder, platform, id, handle, observed_at, true, digest)
-}
 
 #[tokio::test]
 async fn indexes_a_real_chain_end_to_end() {
@@ -97,166 +88,85 @@ async fn indexes_a_real_chain_end_to_end() {
     // must start from a clean slate to make block-number assertions exact.
     common::clear_chain(&pool, CHAIN as i64).await;
 
-    let provider = ProviderBuilder::new()
-        .connect_anvil_with_wallet_and_config(|anvil| anvil.chain_id(CHAIN))
-        .expect("anvil spawns");
+    let provider = libid::anvil(CHAIN);
+    let accounts = provider.get_accounts().await.expect("accounts");
+    let &[owner, alice, bob, payer, refunder, ..] = &accounts[..] else {
+        panic!("anvil has fewer than five accounts: {accounts:?}");
+    };
 
     // Blocks before the deploy give the binary search something to find.
     provider.anvil_mine(Some(5), None).await.expect("mine");
-
-    let mock = MockIdentityRegistry::deploy(provider.clone())
-        .await
-        .expect("deploy");
-    let deploy_block = provider.get_block_number().await.expect("block");
-
+    let mut libid = Libid::deploy(&provider, owner).await;
     let (x, google) = (KnownPlatform::X, KnownPlatform::Google);
-    let alice = Address::repeat_byte(0xA1);
-    let verifier = Address::repeat_byte(0xEE);
-    let fee_receiver = Address::repeat_byte(0xFE);
-    let digest = B256::repeat_byte(0xD1);
 
-    // The scenario, one tx per step (anvil automines a block each): wire the
-    // Proof Verifier, bind disclosing the handle — the ceremony's own events
-    // beside it — rename, add a disclosed Google identity, whose name replaces
-    // the X one, withdraw that name.
-    mock.emitProofVerifierConfigured(verifier)
-        .send()
-        .await
-        .unwrap()
-        .watch()
-        .await
-        .unwrap();
-    mock.emitBind(disclosing_bind(alice, x, "111", "alice_1", 1000, digest))
-        .send()
-        .await
-        .unwrap()
-        .watch()
-        .await
-        .unwrap();
-    mock.emitBindFeePaid(digest, fee_receiver, U256::from(5u64))
-        .send()
-        .await
-        .unwrap()
-        .watch()
-        .await
-        .unwrap();
-    // The rename retires alice_1 and withdraws its name in the same bind.
-    let digest_2 = B256::repeat_byte(0xD2);
-    let mut rename = disclosing_bind(alice, x, "111", "alice_2", 2000, digest_2);
-    rename.retiredNode = x.handle_node("alice_1").unwrap();
-    rename.retiredHolder = alice;
-    rename.retiredNamed = true;
-    mock.emitBind(rename)
-        .send()
-        .await
-        .unwrap()
-        .watch()
-        .await
-        .unwrap();
-    let google_bind = disclosing_bind(
-        alice,
-        google,
-        GOOGLE_USER_ID,
-        "a.b+tag@example.com",
-        3000,
-        B256::repeat_byte(0xD3),
-    );
-    mock.emitBind(google_bind)
-        .send()
-        .await
-        .unwrap()
-        .watch()
-        .await
-        .unwrap();
-    mock.emitHandleUnpublished(alice)
-        .send()
-        .await
-        .unwrap()
-        .watch()
-        .await
-        .unwrap();
+    // Alice binds @alice_1 as her name and pays the app's fee, renames to
+    // @alice_2, binds a Google address whose name replaces the X one, and
+    // withdraws that name.
+    let alice_1 = Proof {
+        handle: Handle(x, "alice_1"),
+        id: "111",
+        observed_at: 1000,
+    };
+    libid
+        .bind(alice, alice_1, Disclose::Name, U256::from(5u64))
+        .await;
+    let alice_2 = Proof {
+        handle: Handle(x, "alice_2"),
+        id: "111",
+        observed_at: 2000,
+    };
+    libid.bind(alice, alice_2, Disclose::Name, U256::ZERO).await;
+    let alice_google = Proof {
+        handle: Handle(google, "A.B+tag@Example.COM"),
+        id: GOOGLE_USER_ID,
+        observed_at: 3000,
+    };
+    libid
+        .bind(alice, alice_google, Disclose::Name, U256::ZERO)
+        .await;
+    libid.unpublish(alice).await;
 
-    // The escrow, deployed after the registry it resolves through: a payer
-    // escrows for @bob_x, whom nobody holds yet, and pays Alice's held handle
-    // straight through; Bob then binds @bob_x and claims what waited.
-    let escrow = MockHandleEscrow::deploy(provider.clone(), *mock.address())
-        .await
-        .expect("deploy the escrow");
-    chain::check_escrow(&provider, *escrow.address(), *mock.address())
+    // A payer escrows for @bob_x, whom nobody holds yet, pays Alice's held
+    // @alice_2 straight through, and escrows for @carol_x. A second payer
+    // escrows for @carol_x, takes it back, and escrows again. Bob then binds
+    // @bob_x privately and claims what waited; nobody binds @carol_x.
+    let (bob_x, carol_x) = (Handle(x, "bob_x"), Handle(x, "carol_x"));
+    libid.deposit(payer, bob_x, 100).await;
+    libid.deposit(payer, Handle(x, "alice_2"), 7).await;
+    libid.deposit(payer, carol_x, 30).await;
+    libid.deposit(refunder, carol_x, 20).await;
+    libid.refund(refunder, carol_x).await;
+    libid.deposit(refunder, carol_x, 15).await;
+    let bob_proof = Proof {
+        handle: bob_x,
+        id: "222",
+        observed_at: 4000,
+    };
+    libid
+        .bind(bob, bob_proof, Disclose::Nothing, U256::ZERO)
+        .await;
+    libid.claim(bob, bob_x).await;
+
+    let latest = provider.get_block_number().await.expect("latest");
+    let (registry, escrow) = (*libid.registry.address(), *libid.escrow.address());
+
+    // What the binary does before its loop: check both contracts, take the
+    // chain's writer lease and prepare the chain, which records the contracts
+    // the rows come from.
+    chain::check_escrow(&provider, escrow, registry)
         .await
         .expect("the escrow resolves holders through the registry");
-    chain::check_registry(&provider, *mock.address())
+    chain::check_registry(&provider, registry)
         .await
         .expect("the registry is keyed by nodes");
     // The escrow has no `nodeKeyed`: an indexer pointed at it refuses.
     assert!(matches!(
-        chain::check_registry(&provider, *escrow.address()).await,
+        chain::check_registry(&provider, escrow).await,
         Err(chain::RegistryRefused::Unread { .. })
     ));
-    let native = address!("EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
-    let (payer, bob) = (Address::repeat_byte(0xC0), Address::repeat_byte(0xB0));
-    let bob_node = x.handle_node("bob_x").unwrap();
-    escrow
-        .emitDeposited(
-            bob_node,
-            native,
-            payer,
-            payer,
-            U256::ZERO,
-            U256::from(100u64),
-        )
-        .send()
-        .await
-        .unwrap()
-        .watch()
-        .await
-        .unwrap();
-    escrow
-        .emitForwarded(
-            x.handle_node("alice_2").unwrap(),
-            native,
-            payer,
-            alice,
-            U256::from(7u64),
-            U256::from(7u64),
-        )
-        .send()
-        .await
-        .unwrap()
-        .watch()
-        .await
-        .unwrap();
-    mock.emitIdentityBound(bob, x.id_node("222").unwrap(), bob_node, x.id(), 4000, 1)
-        .send()
-        .await
-        .unwrap()
-        .watch()
-        .await
-        .unwrap();
-    escrow
-        .emitClaimed(
-            bob_node,
-            native,
-            bob,
-            bob,
-            U256::ZERO,
-            U256::from(100u64),
-            U256::from(100u64),
-        )
-        .send()
-        .await
-        .unwrap()
-        .watch()
-        .await
-        .unwrap();
-
-    let latest = provider.get_block_number().await.expect("latest");
-
-    // What the binary does before its loop: take the chain's writer lease and
-    // prepare the chain, which records the contract the rows come from.
     let writer = store.acquire_writer().await.expect("writer lease");
     store
-        .prepare(&writer, *mock.address(), Some(*escrow.address()))
+        .prepare(&writer, registry, Some(escrow))
         .await
         .expect("prepare");
 
@@ -265,8 +175,8 @@ async fn indexes_a_real_chain_end_to_end() {
     // confirmation lag on a chain that cannot reorg.
     let cancel = CancellationToken::new();
     let config = indexer::IndexerConfig {
-        contract: *mock.address(),
-        escrow: Some(*escrow.address()),
+        contract: registry,
+        escrow: Some(escrow),
         confirmations: 0,
         poll_interval: Duration::from_millis(20),
         max_block_range: 2,
@@ -285,8 +195,11 @@ async fn indexes_a_real_chain_end_to_end() {
     writer.release().await.expect("the lease releases");
 
     // Detection ran once and its answer was cached — and it is the right one.
-    let cached = store.deploy_block(*mock.address()).await.expect("metadata");
-    assert_eq!(cached, Some(deploy_block), "cached deployment block");
+    let cached = store.deploy_block(registry).await.expect("metadata");
+    assert_eq!(cached, Some(libid.deployed_at), "cached deployment block");
+
+    // The indexer files a handle under the node the registry does.
+    assert_eq!(x.handle_node("bob_x").unwrap(), libid.node(bob_x).await);
 
     // alice_1 retired, alice_2 resolves, and the id followed the rename.
     let (status, _) = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/alice_1")
@@ -298,7 +211,7 @@ async fn indexes_a_real_chain_end_to_end() {
     let binding = &resolved.bindings[0];
     assert_eq!(binding.chain_id, CHAIN as i64);
     assert_eq!(binding.owner, alice);
-    assert_eq!(binding.ceremony_version, 1);
+    assert_eq!(binding.ceremony_version, i64::from(CEREMONY_VERSION));
     assert_eq!(binding.handle.as_deref(), Some("alice_2"));
     let resolved: IdResolution = get(
         &pool,
@@ -308,8 +221,9 @@ async fn indexes_a_real_chain_end_to_end() {
     .answer();
     assert_eq!(resolved.bindings[0].handle.as_deref(), Some("alice_2"));
 
-    // The Google identity resolves through the URL-encoded raw form; its
-    // name was withdrawn, and the text it disclosed still comes back.
+    // The registry folded the Google address it was given; the API finds it
+    // through the URL-encoded raw form, and the text it disclosed still comes
+    // back after the name was withdrawn.
     let resolved: HandleResolution =
         get(&pool, "/v1/resolve/handle/google/A.B%2Btag%40Example.COM")
             .await
@@ -377,7 +291,7 @@ async fn indexes_a_real_chain_end_to_end() {
         .iter()
         .find(|c| c.chain_id == CHAIN as i64)
         .unwrap_or_else(|| panic!("chain {CHAIN} is listed: {status:?}"));
-    assert_eq!(chain.contract, Some(*mock.address()));
+    assert_eq!(chain.contract, Some(registry));
     // The loop reports beside every target it sets, with an expiry in the
     // future, and the API surfaces both: this is what tells a caught-up
     // index from one whose indexer stopped.
@@ -393,18 +307,21 @@ async fn indexes_a_real_chain_end_to_end() {
         chain.last_indexed_block.is_some_and(|b| b >= latest),
         "{chain:?}"
     );
-    assert_eq!(chain.proof_verifier, Some(verifier));
-    assert_eq!(chain.escrow, Some(*escrow.address()));
+    assert_eq!(chain.proof_verifier, Some(libid.proof_verifier));
+    assert_eq!(chain.escrow, Some(escrow));
 
-    // The journal holds every event the scenario emitted, each bind's
-    // reveal and ceremony and the fee included.
+    // The journal holds every event the registry and the escrow emitted: the
+    // Proof Verifier configured; four binds, each with its ceremony, the
+    // disclosing ones with their reveal and name, the first with its fee and
+    // the rename with its retirement and withdrawal; the withdrawal; six
+    // escrow moves and the claim.
     let journal: i64 =
         sqlx::query_scalar("SELECT count(*) FROM names.events WHERE chain_id = $1")
             .bind(CHAIN as i64)
             .fetch_one(&pool)
             .await
             .expect("journal count");
-    assert_eq!(journal, 21);
+    assert_eq!(journal, 26);
     let fee_kinds: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM names.events WHERE chain_id = $1 AND kind = 'bind_fee_paid'",
     )
@@ -415,14 +332,15 @@ async fn indexes_a_real_chain_end_to_end() {
     assert_eq!(fee_kinds, 1);
 
     // Both emitters' logs, in one history: the handle's from the deposit made
-    // while nobody held it through the bind to the claim, each dated by its
-    // block.
+    // while nobody held it, through the bind and its ceremony, to the claim,
+    // each dated by its block.
     let history: HandleHistory = get(&pool, "/v1/history/handle/x/bob_x").await.answer();
     assert!(
         matches!(
             events(&history.entries)[..],
             [
                 HistoryEvent::Claimed { .. },
+                HistoryEvent::CeremonyBound { .. },
                 HistoryEvent::IdentityBound { .. },
                 HistoryEvent::Deposited { .. },
             ]
@@ -439,6 +357,7 @@ async fn indexes_a_real_chain_end_to_end() {
             events(&history.entries)[..],
             [
                 HistoryEvent::Claimed { .. },
+                HistoryEvent::Deposited { .. },
                 HistoryEvent::Forwarded { .. },
                 HistoryEvent::Deposited { .. },
             ]
@@ -446,7 +365,7 @@ async fn indexes_a_real_chain_end_to_end() {
         "{history:?}"
     );
     assert_eq!(history.entries[0].roles, [Role::RefundTo]);
-    assert_eq!(history.entries[2].roles, [Role::Depositor, Role::RefundTo]);
+    assert_eq!(history.entries[3].roles, [Role::Depositor, Role::RefundTo]);
     let history: AddressHistory = get(&pool, &format!("/v1/history/address/{alice}"))
         .await
         .answer();
@@ -455,16 +374,44 @@ async fn indexes_a_real_chain_end_to_end() {
         history.entries[0].event,
         HistoryEvent::Forwarded { received, .. } if received == U256::from(7u64)
     ));
+    let history: AddressHistory = get(&pool, &format!("/v1/history/address/{refunder}"))
+        .await
+        .answer();
+    assert!(
+        matches!(
+            events(&history.entries)[..],
+            [
+                HistoryEvent::Deposited { .. },
+                HistoryEvent::Refunded { .. },
+                HistoryEvent::Deposited { .. },
+            ]
+        ),
+        "{history:?}"
+    );
 
-    // Claimed: nothing waits for Bob, and the payer's refund ended with it.
+    // The books match the escrow's own: Bob's slot is empty, and what waits
+    // for @carol_x is what each payer could take back.
     let bobs: AddressAmounts = get(&pool, &format!("/v1/escrow/claimable/{bob}"))
         .await
         .answer();
     assert!(bobs.amounts.is_empty(), "{bobs:?}");
-    let payers: AddressAmounts = get(&pool, &format!("/v1/escrow/refundable/{payer}"))
-        .await
-        .answer();
-    assert!(payers.amounts.is_empty(), "{payers:?}");
+    assert_eq!(libid.escrowed(bob_x).await, U256::ZERO);
+    let carols: HandleAmounts = get(&pool, "/v1/escrow/handle/x/carol_x").await.answer();
+    assert_eq!(carols.amounts.len(), 1, "{carols:?}");
+    assert_eq!(carols.amounts[0].amount, libid.escrowed(carol_x).await);
+    assert_eq!(carols.amounts[0].amount, U256::from(45u64));
+    let unclaimed: Unclaimed = get(&pool, "/v1/escrow/unclaimed").await.answer();
+    assert_eq!(unclaimed.amounts, carols.amounts);
+    for (depositor, put_in) in [(payer, 30u64), (refunder, 15)] {
+        let refundable: AddressAmounts =
+            get(&pool, &format!("/v1/escrow/refundable/{depositor}"))
+                .await
+                .answer();
+        assert_eq!(refundable.amounts.len(), 1, "{refundable:?}");
+        let amount = refundable.amounts[0].amount;
+        assert_eq!(amount, libid.refundable(carol_x, depositor).await);
+        assert_eq!(amount, U256::from(put_in));
+    }
 }
 
 #[tokio::test]
@@ -473,15 +420,13 @@ async fn an_escrow_of_another_registry_is_refused() {
         eprintln!("skipping: anvil not on PATH");
         return;
     }
-    let provider = ProviderBuilder::new()
-        .connect_anvil_with_wallet_and_config(|anvil| anvil.chain_id(CHAIN))
-        .expect("anvil spawns");
-    let (indexed, other) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
-    let escrow = MockHandleEscrow::deploy(provider.clone(), other)
-        .await
-        .expect("deploy the escrow");
+    let provider = libid::anvil(CHAIN);
+    let owner = provider.get_accounts().await.expect("accounts")[0];
+    let indexed = Libid::registry(&provider, owner).await;
+    let other = Libid::registry(&provider, owner).await;
+    let escrow = Libid::escrow(&provider, owner, other).await;
 
-    let refused = chain::check_escrow(&provider, *escrow.address(), indexed).await;
+    let refused = chain::check_escrow(&provider, escrow, indexed).await;
     assert!(
         matches!(
             refused,

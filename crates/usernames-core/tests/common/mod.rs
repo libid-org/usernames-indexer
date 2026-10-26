@@ -6,12 +6,11 @@
 // Every suite compiles its own copy of this module and uses part of it.
 #![allow(dead_code)]
 
-use alloy::{
-    primitives::{
-        Address,
-        B256,
-    },
-    sol,
+pub mod libid;
+
+use alloy::primitives::{
+    Address,
+    B256,
 };
 use axum::{
     body::Body,
@@ -178,56 +177,6 @@ pub async fn disclosed(pool: &PgPool, chain: i64, handle_node: B256) -> Option<S
     .fetch_optional(pool)
     .await
     .expect("a disclosure read")
-}
-
-sol!(
-    /// The event surface of IdentityRegistry behind bare emit functions,
-    /// compiled from contracts/MockIdentityRegistry.sol.
-    #[allow(clippy::too_many_arguments)]
-    #[sol(rpc)]
-    MockIdentityRegistry,
-    "../../contracts/MockIdentityRegistry.json"
-);
-
-sol!(
-    /// The event surface of HandleEscrow behind bare emit functions, and its
-    /// `registry` view, compiled from contracts/MockHandleEscrow.sol.
-    #[allow(clippy::too_many_arguments)]
-    #[sol(rpc)]
-    MockHandleEscrow,
-    "../../contracts/MockHandleEscrow.json"
-);
-
-/// The mock's bind of `id` to `handle`, disclosing it as the holder's name
-/// when `disclosed`, with nothing to withdraw or retire.
-pub fn mock_bind(
-    holder: Address,
-    platform: KnownPlatform,
-    id: &str,
-    handle: &str,
-    observed_at: u64,
-    disclosed: bool,
-    digest: B256,
-) -> MockIdentityRegistry::Bind {
-    MockIdentityRegistry::Bind {
-        holder,
-        idNode: platform.id_node(id).expect("an id"),
-        handleNode: platform.handle_node(handle).expect("a handle"),
-        platformId: platform.id(),
-        observedAt: observed_at,
-        ceremonyVersion: 1,
-        takenFrom: Address::ZERO,
-        retiredNode: B256::ZERO,
-        retiredHolder: Address::ZERO,
-        retiredNamed: false,
-        handle: if disclosed {
-            handle.into()
-        } else {
-            String::new()
-        },
-        primary: disclosed,
-        authorizationDigest: digest,
-    }
 }
 
 /// A bind's events, as the contract emits them: `IdentityBound`, and when
