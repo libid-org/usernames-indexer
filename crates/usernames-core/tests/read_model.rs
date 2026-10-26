@@ -1133,6 +1133,28 @@ async fn the_deployment_block_survives_a_replay_of_the_same_registry() {
     drop(guard);
 }
 
+/// A lease whose session ends — a database restart, a failover, an idle
+/// timeout — has lost its lock, and says so within an interval.
+#[tokio::test]
+async fn a_lease_whose_session_ends_reports_itself_lost() {
+    let Some((store, pool, guard)) = test_store_with(2).await else {
+        return;
+    };
+    let mut lease = store.acquire_writer().await.expect("lease");
+    sqlx::query(include_str!("common/end_writer_session.sql"))
+        .bind(store.chain_id())
+        .execute(&pool)
+        .await
+        .expect("the lease's session ends");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        lease.lost(Duration::from_millis(20)),
+    )
+    .await
+    .expect("the lease reports itself lost");
+    drop(guard);
+}
+
 /// The lease must give the lock back, not merely stop being referenced.
 ///
 /// It used to hold `pg_try_advisory_lock` on a POOLED connection, so dropping

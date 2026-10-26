@@ -202,7 +202,7 @@ pub async fn run() -> anyhow::Result<()> {
     // may write the chain, no other instance may. prepare runs under it —
     // the lease is a parameter there, so a version-bump replay cannot race a
     // still-running older pod.
-    let writer = store.acquire_writer().await?;
+    let mut writer = store.acquire_writer().await?;
     store.prepare(&writer, contract, escrow).await?;
     store.set_chain_names(&writer, &config.chain_names).await?;
 
@@ -237,6 +237,13 @@ pub async fn run() -> anyhow::Result<()> {
             Ok(()) => Err(anyhow::anyhow!("indexer task exited unexpectedly")),
             Err(e) => Err(anyhow::anyhow!("indexer task died: {e}")),
         },
+        // Another instance may take the chain once the lock is gone, so this
+        // one stops writing and exits for its supervisor to restart.
+        lost = writer.lost(config.poll_interval) => {
+            cancel.cancel();
+            let _ = task.await;
+            return Err(anyhow::Error::new(lost).context("the writer lease was lost"));
+        }
     };
     // The loop no longer writes: the chain is the next instance's.
     writer.release().await?;

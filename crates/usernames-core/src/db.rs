@@ -282,6 +282,18 @@ pub struct WriterLease {
 }
 
 impl WriterLease {
+    /// Return once the lease is lost: its session ended, and the lock with
+    /// it, so another instance may now write the chain. Checked every
+    /// `interval`, which also keeps the session from idling out.
+    pub async fn lost(&mut self, interval: Duration) -> sqlx::Error {
+        loop {
+            tokio::time::sleep(interval).await;
+            if let Err(e) = sqlx::query(sql::WRITER_ALIVE).execute(&mut self.conn).await {
+                return e;
+            }
+        }
+    }
+
     /// Give the lock back and close the session.
     ///
     /// Dropping the lease also releases it, by closing the socket — but on
@@ -1167,6 +1179,7 @@ mod sql {
     pub const WRITER_TRY_LOCK: &str = include_str!("../sql/writer_try_lock.sql");
     pub const WRITER_LOCK: &str = include_str!("../sql/writer_lock.sql");
     pub const WRITER_UNLOCK: &str = include_str!("../sql/writer_unlock.sql");
+    pub const WRITER_ALIVE: &str = include_str!("../sql/writer_alive.sql");
     pub const SET_CHAIN_TARGET: &str = include_str!("../sql/set_chain_target.sql");
     pub const TOUCH_CHAIN_TARGET: &str = include_str!("../sql/touch_chain_target.sql");
     pub const JOURNAL_EVENT: &str = include_str!("../sql/journal_event.sql");
