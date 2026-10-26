@@ -51,7 +51,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_MSRV }}
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - run: cargo check --all-targets
 
@@ -83,11 +83,11 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
           components: clippy
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       # The end-to-end test spawns anvil; without it the test would skip and
       # the suite would quietly stop covering the chain path.
-      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+      - uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
         with:
           version: ${{ env.FOUNDRY_VERSION }}
 
