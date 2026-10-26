@@ -660,6 +660,7 @@ impl ChainStore {
         Ok(Window {
             tx: self.pool.begin().await?,
             chain_id: self.chain_id,
+            bind: None,
         })
     }
 }
@@ -694,6 +695,10 @@ impl Position {
 pub struct Window {
     tx: Transaction<'static, Postgres>,
     chain_id: i64,
+    /// The last bind this window applied. A bind's `CeremonyBound` and
+    /// `BindFeePaid` follow its `IdentityBound` in the same transaction, and
+    /// a window holds whole blocks.
+    bind: Option<history::Bind>,
 }
 
 impl Window {
@@ -1238,8 +1243,6 @@ mod sql {
         include_str!("../sql/escrow_take_refundable.sql");
     pub const PREVIOUS_HOLDERS: &str = include_str!("../sql/previous_holders.sql");
     pub const CLAIMED_SENDERS: &str = include_str!("../sql/claimed_senders.sql");
-    pub const CEREMONY_HANDLE: &str = include_str!("../sql/ceremony_handle.sql");
-    pub const FEE_PAYER: &str = include_str!("../sql/fee_payer.sql");
     pub const RECORD_ADDRESS_EVENT: &str =
         include_str!("../sql/record_address_event.sql");
     pub const RECORD_HANDLE_EVENT: &str = include_str!("../sql/record_handle_event.sql");

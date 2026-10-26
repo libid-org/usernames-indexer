@@ -66,13 +66,12 @@ impl Involvement {
     }
 }
 
-/// The ceremony a bind fee was paid beside: its journal row, and the handle
-/// its bind recorded.
-#[derive(sqlx::FromRow)]
-struct FeeCeremony {
-    kind: String,
-    payload: Value,
-    handle_node: Option<B256>,
+/// A bind as the events after it in its transaction need it: who bound
+/// which handle node.
+pub(crate) struct Bind {
+    tx_hash: B256,
+    holder: Address,
+    handle_node: B256,
 }
 
 impl Window {
@@ -117,61 +116,31 @@ impl Window {
                     }
                 }
                 involvement.named(*handle_node, *platform_id);
+                self.bind = Some(Bind {
+                    tx_hash: at.tx_hash,
+                    holder: *holder,
+                    handle_node: *handle_node,
+                });
             }
 
             // The withdrawal itself reads which handle it concerns.
             NamesEvent::HandleUnpublished { .. } => {}
 
-            NamesEvent::CeremonyBound {
-                holder,
-                platform_id,
-                ..
-            } => {
-                involvement.handle_node = sqlx::query_scalar(sql::CEREMONY_HANDLE)
-                    .bind(chain_id)
-                    .bind(at.block)
-                    .bind(at.tx_hash)
-                    .bind(at.log_index)
-                    .bind(holder)
-                    .bind(at.block_time)
-                    .bind(Role::Holder.as_str())
-                    .bind(platform_id)
-                    .fetch_optional(&mut *self.tx)
-                    .await?;
-                if involvement.handle_node.is_none() {
-                    tracing::warn!(
+            // A ceremony and its fee follow their bind in its transaction:
+            // they concern its handle, and the fee's payer is its holder.
+            NamesEvent::CeremonyBound { .. } | NamesEvent::BindFeePaid { .. } => {
+                match self.bind.as_ref().filter(|bind| bind.tx_hash == at.tx_hash) {
+                    Some(bind) => {
+                        involvement.add(bind.holder, Role::Holder);
+                        involvement.handle_node = Some(bind.handle_node);
+                    }
+                    None => tracing::warn!(
                         block = at.block,
                         log_index = at.log_index,
-                        "a ceremony without the bind beside it"
-                    );
+                        kind = event.kind(),
+                        "a ceremony or a bind fee without the bind before it"
+                    ),
                 }
-            }
-
-            NamesEvent::BindFeePaid {
-                authorization_digest,
-                ..
-            } => {
-                let ceremony: Option<FeeCeremony> = sqlx::query_as(sql::FEE_PAYER)
-                    .bind(chain_id)
-                    .bind(at.block)
-                    .bind(at.tx_hash)
-                    .bind(authorization_digest.to_string())
-                    .fetch_optional(&mut *self.tx)
-                    .await?;
-                let Some(ceremony) = ceremony else {
-                    tracing::warn!(
-                        block = at.block,
-                        log_index = at.log_index,
-                        "a bind fee without the ceremony beside it"
-                    );
-                    return Ok(involvement);
-                };
-                if let NamesEvent::CeremonyBound { holder, .. } =
-                    NamesEvent::from_journal(&ceremony.kind, ceremony.payload)?
-                {
-                    involvement.add(holder, Role::Holder);
-                }
-                involvement.handle_node = ceremony.handle_node;
             }
 
             // These name the platform too: a reveal can come before any bind
@@ -550,37 +519,6 @@ pub(crate) mod plans {
                     .bind(1i64)
                     .bind(node)
                     .bind(node)
-                    .fetch_all(&mut *conn)
-                    .await,
-            ),
-            (
-                "a ceremony's handle",
-                &[
-                    "handle_events_pkey",
-                    "events_pkey",
-                    "handle_nodes_pkey",
-                    "address_events_pkey|address_events_history_idx",
-                ][..],
-                sqlx::query_scalar(&explain(sql::CEREMONY_HANDLE))
-                    .bind(1i64)
-                    .bind(10i64)
-                    .bind(node)
-                    .bind(3i64)
-                    .bind(address)
-                    .bind(1_700_000_000i64)
-                    .bind(Role::Holder.as_str())
-                    .bind(node)
-                    .fetch_all(&mut *conn)
-                    .await,
-            ),
-            (
-                "a bind fee's ceremony",
-                &["events_pkey"][..],
-                sqlx::query_scalar(&explain(sql::FEE_PAYER))
-                    .bind(1i64)
-                    .bind(10i64)
-                    .bind(node)
-                    .bind(node.to_string())
                     .fetch_all(&mut *conn)
                     .await,
             ),
