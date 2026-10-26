@@ -44,10 +44,10 @@ pub struct Config {
     #[arg(long, env = "RPC_URL", hide_env_values = true)]
     pub rpc_url: Url,
 
-    /// How the indexer learns of new blocks and logs: `subscribe` holds
-    /// `eth_subscribe` streams of heads and logs on a WebSocket; `poll` asks
-    /// with `eth_getLogs` every `POLL_INTERVAL`, for an endpoint that serves
-    /// no WebSocket.
+    /// How the indexer learns of new blocks: `subscribe` holds an
+    /// `eth_subscribe("newHeads")` stream on a WebSocket; `poll` reads the
+    /// head and asks with `eth_getLogs` every `POLL_INTERVAL`, for an
+    /// endpoint that serves no WebSocket.
     #[arg(long, env = "LOG_SOURCE", default_value = "subscribe")]
     pub log_source: LogSource,
 
@@ -83,8 +83,8 @@ pub struct Config {
     pub confirmations: u64,
 
     /// The loop's cadence, and the retry delay after a failure: `5s`,
-    /// `1500ms`. A poll cycle; with a subscription, a renewal of the report,
-    /// and a head read while pushed logs wait for their confirmations.
+    /// `1500ms`. A poll cycle; with a subscription, how often it checks that
+    /// heads still arrive.
     #[arg(long, env = "POLL_INTERVAL", default_value = "5s", value_parser = humantime::parse_duration)]
     pub poll_interval: Duration,
 
@@ -107,14 +107,13 @@ pub struct Config {
 
 impl Config {
     /// How many blocks behind the head to stay: `CONFIRMATIONS`, refused at
-    /// zero with a subscription. The stream's logs for the head block can
-    /// still be on their way when the head is read, and committing that
-    /// block would skip them.
+    /// zero with a subscription. An endpoint can push a head before it
+    /// serves that block's logs, and fetching them then would find none.
     fn confirmations(&self) -> anyhow::Result<u64> {
         anyhow::ensure!(
             self.confirmations > 0 || self.log_source == LogSource::Poll,
-            "LOG_SOURCE=subscribe needs CONFIRMATIONS of at least 1: the logs of \
-             the head block can still be on their way when the head is read"
+            "LOG_SOURCE=subscribe needs CONFIRMATIONS of at least 1: an endpoint \
+             can push a head before it serves that block's logs"
         );
         Ok(self.confirmations)
     }

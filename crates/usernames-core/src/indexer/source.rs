@@ -1,6 +1,5 @@
-//! Where the loop learns of new blocks and logs: `eth_subscribe` streams of
-//! heads and of the watched contracts' logs on a WebSocket, or `eth_getLogs`
-//! windows polled on a timer.
+//! Where the loop learns of new blocks: an `eth_subscribe("newHeads")`
+//! stream on a WebSocket, or a head read polled on a timer.
 
 use std::{
     fmt,
@@ -20,11 +19,7 @@ use alloy::{
     },
     rpc::{
         client::ClientBuilder,
-        types::{
-            Filter,
-            Header,
-            Log,
-        },
+        types::Header,
     },
     transports::{
         ws::WsConnect,
@@ -39,12 +34,11 @@ use url::Url;
 /// How the loop learns of new logs, configured as `subscribe` or `poll`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogSource {
-    /// `eth_subscribe` streams on a WebSocket: the endpoint pushes every new
-    /// head and the watched contracts' logs as their blocks arrive. A block
-    /// is fetched once confirmed when a log was pushed for it; the cursor
-    /// passes any other block without a call. It needs at least one
-    /// confirmation: a block's logs can still be on their way when its
-    /// successor's head arrives.
+    /// An `eth_subscribe("newHeads")` stream on a WebSocket: the endpoint
+    /// pushes every new head. A confirmed block is fetched when its head's
+    /// bloom admits a watched contract, or when the heads before it did not
+    /// arrive as one unbroken line; the cursor passes any other block
+    /// without a call.
     Subscribe,
     /// `eth_getLogs` windows every poll interval, for an endpoint that serves
     /// no WebSocket.
@@ -108,7 +102,7 @@ fn websocket(rpc: &Url) -> TransportResult<Url> {
         "https" | "wss" => "wss",
         other => {
             return Err(TransportErrorKind::custom_str(&format!(
-                "a log subscription needs an http(s) or ws(s) RPC URL, not {other}"
+                "a head subscription needs an http(s) or ws(s) RPC URL, not {other}"
             )));
         }
     };
@@ -145,13 +139,8 @@ impl PubSubConnect for Unretried {
 pub(crate) enum Feed {
     /// Nothing: each poll reads the head and asks for the logs itself.
     Poll,
-    /// The streams the endpoint pushes.
-    Subscribe {
-        /// Every new head.
-        heads: Subscription<Header>,
-        /// The watched contracts' logs.
-        logs: Subscription<Log>,
-    },
+    /// Every new head, as the endpoint pushes it.
+    Subscribe(Subscription<Header>),
 }
 
 /// What ended a [`Feed::wait`].
@@ -161,45 +150,36 @@ pub(crate) enum Wake {
     Cancelled,
     /// The interval ran out.
     Tick,
-    /// The endpoint pushed a head at this height.
-    Head(u64),
-    /// The endpoint pushed a log from this block, or withdrew one a reorg
-    /// removed.
-    Log(u64),
+    /// The endpoint pushed a head.
+    Head(Box<Header>),
 }
 
-/// Pushes a stream holds while the loop is busy fetching or committing. Past
-/// it the stream reports a lag, which ends the session, and the next one
-/// backfills from the cursor.
+/// Heads the stream holds while the loop is busy fetching or committing.
+/// Past it the stream reports a lag, which ends the session, and the next one
+/// catches up from the cursor.
 const STREAM_CAPACITY: usize = 1024;
 
 impl Feed {
-    /// Open what `source` follows the chain with. The streams are live on the
-    /// endpoint when this returns, so every block from here on is pushed.
+    /// Open what `source` follows the chain with. The stream is live on the
+    /// endpoint when this returns, so every head from here on is pushed.
     pub(crate) async fn open(
         source: LogSource,
         provider: &RootProvider,
-        filter: &Filter,
     ) -> TransportResult<Self> {
         match source {
             LogSource::Poll => Ok(Self::Poll),
-            LogSource::Subscribe => {
-                let logs = provider
-                    .subscribe_logs(filter)
-                    .channel_size(STREAM_CAPACITY)
-                    .await?;
-                let heads = provider
+            LogSource::Subscribe => Ok(Self::Subscribe(
+                provider
                     .subscribe_blocks()
                     .channel_size(STREAM_CAPACITY)
-                    .await?;
-                Ok(Self::Subscribe { heads, logs })
-            }
+                    .await?,
+            )),
         }
     }
 
-    /// Wait for the next push, or `interval`, or cancellation. A stream that
-    /// closed, overflowed or pushed something unreadable is an error: logs
-    /// may be lost, and only the next session's catch-up finds them.
+    /// Wait for the next head, or `interval`, or cancellation. A stream that
+    /// closed, overflowed or pushed something unreadable is an error: heads
+    /// may be lost, and only the next session's catch-up covers them.
     pub(crate) async fn wait(
         &mut self,
         interval: Duration,
@@ -210,26 +190,13 @@ impl Feed {
                 _ = cancel.cancelled() => Ok(Wake::Cancelled),
                 _ = tokio::time::sleep(interval) => Ok(Wake::Tick),
             },
-            // In this order: a block's logs are pushed before the head that
-            // confirms it, and a head taken first would let the cursor pass a
-            // block whose logs wait in the other stream.
-            Self::Subscribe { heads, logs } => tokio::select! {
-                biased;
+            Self::Subscribe(heads) => tokio::select! {
                 _ = cancel.cancelled() => Ok(Wake::Cancelled),
-                log = logs.recv_result() => {
-                    let log = log
-                        .context("the log subscription ended")?
-                        .context("the log subscription pushed something that is not a log")?;
-                    let block = log
-                        .block_number
-                        .context("the log subscription pushed a log without its block")?;
-                    Ok(Wake::Log(block))
-                }
                 head = heads.recv_result() => {
                     let head = head
                         .context("the head subscription ended")?
                         .context("the head subscription pushed something that is not a head")?;
-                    Ok(Wake::Head(head.number))
+                    Ok(Wake::Head(Box::new(head)))
                 }
                 _ = tokio::time::sleep(interval) => Ok(Wake::Tick),
             },
@@ -240,13 +207,7 @@ impl Feed {
 #[cfg(test)]
 mod tests {
     use alloy::{
-        primitives::{
-            Address,
-            Bytes,
-            Log as PrimitiveLog,
-            LogData,
-            B256,
-        },
+        primitives::B256,
         pubsub::RawSubscription,
     };
     use serde_json::value::{
@@ -259,26 +220,15 @@ mod tests {
 
     type Pushes = broadcast::Sender<Box<RawValue>>;
 
-    /// A subscription fed by hand: what the test sends is what it pushes.
-    fn stream<T>(capacity: usize) -> (Pushes, Subscription<T>) {
+    /// A head stream fed by hand: what the test sends is what it pushes.
+    fn heads(capacity: usize) -> (Pushes, Feed) {
         let (pushes, rx) = broadcast::channel(capacity);
-        let subscription = RawSubscription {
+        let heads = RawSubscription {
             rx,
             local_id: B256::ZERO,
         }
         .into_typed();
-        (pushes, subscription)
-    }
-
-    /// Head and log streams fed by hand.
-    fn streams(capacity: usize) -> (Pushes, Pushes, Feed) {
-        let (heads, head_stream) = stream(capacity);
-        let (logs, log_stream) = stream(capacity);
-        let feed = Feed::Subscribe {
-            heads: head_stream,
-            logs: log_stream,
-        };
-        (heads, logs, feed)
+        (pushes, Feed::Subscribe(heads))
     }
 
     /// A head at `height`, as the endpoint pushes it.
@@ -290,65 +240,38 @@ mod tests {
         to_raw_value(&head).unwrap()
     }
 
-    /// A mined log at `height`, as the endpoint pushes it.
-    fn log(height: u64) -> Box<RawValue> {
-        let log = Log {
-            inner: PrimitiveLog {
-                address: Address::repeat_byte(0xAA),
-                data: LogData::new_unchecked(vec![], Bytes::new()),
-            },
-            block_hash: Some(B256::repeat_byte(0xA1)),
-            block_number: Some(height),
-            block_timestamp: Some(1_000 + height),
-            transaction_hash: Some(B256::repeat_byte(0x77)),
-            transaction_index: Some(0),
-            log_index: Some(0),
-            removed: false,
-        };
-        to_raw_value(&log).unwrap()
-    }
-
     async fn wake(feed: &mut Feed) -> anyhow::Result<Wake> {
         feed.wait(Duration::from_secs(60), &CancellationToken::new())
             .await
     }
 
     #[tokio::test]
-    async fn a_pushed_head_or_log_wakes_the_loop_with_its_block() {
-        let (heads, logs, mut feed) = streams(8);
-        heads.send(head(12)).unwrap();
-        assert_eq!(wake(&mut feed).await.unwrap(), Wake::Head(12));
-        logs.send(log(11)).unwrap();
-        assert_eq!(wake(&mut feed).await.unwrap(), Wake::Log(11));
-    }
-
-    #[tokio::test]
-    async fn a_log_waiting_beside_a_later_head_wakes_first() {
-        let (heads, logs, mut feed) = streams(8);
-        heads.send(head(13)).unwrap();
-        logs.send(log(11)).unwrap();
-        assert_eq!(wake(&mut feed).await.unwrap(), Wake::Log(11));
-        assert_eq!(wake(&mut feed).await.unwrap(), Wake::Head(13));
+    async fn a_pushed_head_wakes_the_loop() {
+        let (pushes, mut feed) = heads(8);
+        pushes.send(head(12)).unwrap();
+        assert!(
+            matches!(wake(&mut feed).await.unwrap(), Wake::Head(head) if head.number == 12)
+        );
     }
 
     #[tokio::test]
     async fn a_stream_that_overflowed_ends_the_session() {
-        let (_heads, logs, mut feed) = streams(1);
-        logs.send(log(10)).unwrap();
-        logs.send(log(11)).unwrap();
+        let (pushes, mut feed) = heads(1);
+        pushes.send(head(10)).unwrap();
+        pushes.send(head(11)).unwrap();
         assert!(wake(&mut feed).await.is_err());
     }
 
     #[tokio::test]
     async fn a_closed_stream_ends_the_session() {
-        let (heads, _logs, mut feed) = streams(8);
-        drop(heads);
+        let (pushes, mut feed) = heads(8);
+        drop(pushes);
         assert!(wake(&mut feed).await.is_err());
     }
 
     #[tokio::test]
     async fn an_idle_feed_wakes_when_the_interval_ends() {
-        let (_heads, _logs, mut feed) = streams(8);
+        let (_pushes, mut feed) = heads(8);
         let woke = feed
             .wait(Duration::from_millis(20), &CancellationToken::new())
             .await

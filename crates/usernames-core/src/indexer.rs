@@ -1,14 +1,17 @@
 //! The indexing loop: catch up with `eth_getLogs` windows, then follow the
-//! chain, by polling or from pushed heads and logs.
+//! chain, by polling or from pushed heads.
 //!
 //! Each window commits through [`crate::db::Window`] — journal rows, projection
 //! writes and the cursor together — so a crash replays a whole window instead
 //! of resuming inside one, and the journal's conflict gates every write, so
 //! the replay converges.
 
+mod heads;
 mod source;
 
 use std::time::Duration;
+
+use tokio::time::Instant;
 
 use alloy::{
     primitives::Address,
@@ -25,13 +28,16 @@ use anyhow::Context;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use self::source::{
-    Feed,
-    Wake,
-};
 pub use self::source::{
     LogSource,
     UnknownLogSource,
+};
+use self::{
+    heads::Heads,
+    source::{
+        Feed,
+        Wake,
+    },
 };
 use crate::{
     chain,
@@ -63,11 +69,10 @@ pub struct IndexerConfig {
     /// least one with a subscription, whose logs for the head block may still
     /// be on their way.
     pub confirmations: u64,
-    /// How the loop learns of new blocks and logs.
+    /// How the loop learns of new blocks.
     pub source: LogSource,
-    /// The loop's cadence: a poll cycle, or with a subscription the renewal
-    /// of the report while no head arrives. Also the retry delay after a
-    /// failure.
+    /// The loop's cadence: a poll cycle, or with a subscription how often it
+    /// checks that heads still arrive. Also the retry delay after a failure.
     pub poll_interval: Duration,
     /// Largest `eth_getLogs` window, sized to the RPC provider's limits.
     pub max_block_range: u64,
@@ -76,10 +81,11 @@ pub struct IndexerConfig {
     /// is detected by binary search over `eth_getCode` and cached.
     pub start_block: Option<u64>,
     /// How long readers may trust a report this loop makes. Set beside every
-    /// target and renewed every poll interval and per committed chunk; a
-    /// reader that finds it expired treats the index as stale. It has to
-    /// cover a poll interval, a slow chunk and a missed cycle, which is why
-    /// the CLI derives it from `poll_interval` when nothing sets it.
+    /// target and renewed per committed chunk; a reader that finds it expired
+    /// treats the index as stale. It has to cover a poll interval, a slow
+    /// chunk and a missed cycle, which is why the CLI derives it from
+    /// `poll_interval` when nothing sets it. A subscription that hears no
+    /// head for half of it reconnects.
     pub stale_after: Duration,
 }
 
@@ -230,7 +236,7 @@ impl<'a> Session<'a> {
             .connect(&indexer.rpc)
             .await
             .context("connecting to the RPC")?;
-        let feed = Feed::open(source, &provider, &indexer.filter)
+        let feed = Feed::open(source, &provider)
             .await
             .context("eth_subscribe")?;
         Ok(Self {
@@ -242,52 +248,42 @@ impl<'a> Session<'a> {
 
     /// Catch up, then follow: a poll catches up again every interval; a
     /// subscription commits through each pushed head's confirmation depth,
-    /// fetching only the blocks a pushed log or the catch-up left unread.
+    /// fetching only the blocks its heads cannot vouch are free of watched
+    /// logs. A subscription that hears no head for half the report's life
+    /// ends the session, so the next one reconnects and catches up: an open
+    /// but silent socket would otherwise leave the index frozen and the
+    /// report never renewed.
     async fn follow(mut self, cancel: &CancellationToken) -> anyhow::Result<()> {
         let config = &self.indexer.config;
-        let (mut vouched, caught_up_to) = self.catch_up(cancel).await?;
-        // Blocks up to here may hold logs nobody fetched: the catch-up stopped
-        // at its confirmation depth, and a block mined before the streams
-        // opened was never pushed. The first pushed head extends it, since an
-        // endpoint behind a load balancer may have read the catch-up's head
-        // from a lagging node.
-        let mut unread = Some(caught_up_to);
-        let mut first_head = true;
+        let watched: Vec<Address> = std::iter::once(config.contract)
+            .chain(config.escrow)
+            .collect();
+        let quiet = config.stale_after / 2;
+        self.catch_up(cancel).await?;
+        let mut heads = Heads::default();
+        let mut heard = Instant::now();
         loop {
             match self.feed.wait(config.poll_interval, cancel).await? {
                 Wake::Cancelled => return Ok(()),
                 Wake::Tick => match self.feed {
-                    Feed::Poll => (vouched, _) = self.catch_up(cancel).await?,
-                    // No head in a whole interval: the stream is open, so the
-                    // loop vouches it is alive, for a target that landed.
-                    Feed::Subscribe { .. } => {
-                        if vouched {
-                            self.indexer
-                                .store
-                                .touch_chain_target(config.stale_after)
-                                .await;
-                        }
+                    Feed::Poll => self.catch_up(cancel).await?,
+                    Feed::Subscribe(_) if heard.elapsed() >= quiet => {
+                        anyhow::bail!("no head pushed for {quiet:?}; reconnecting")
                     }
+                    Feed::Subscribe(_) => {}
                 },
-                Wake::Log(block) => unread = unread.max(Some(block)),
                 Wake::Head(head) => {
-                    if first_head {
-                        unread = unread.max(Some(head));
-                        first_head = false;
-                    }
-                    vouched = self.advance(head, &mut unread).await?;
+                    heard = Instant::now();
+                    heads.push(&head, &watched);
+                    self.advance(head.number, &mut heads).await?;
                 }
             }
         }
     }
 
     /// Read the head and commit every confirmed block past the cursor in
-    /// `eth_getLogs` windows. Returns whether the target write landed, which
-    /// is all a later renewal may vouch for, and the head it read.
-    async fn catch_up(
-        &mut self,
-        cancel: &CancellationToken,
-    ) -> anyhow::Result<(bool, u64)> {
+    /// `eth_getLogs` windows.
+    async fn catch_up(&mut self, cancel: &CancellationToken) -> anyhow::Result<()> {
         let indexer = self.indexer;
         let config = &indexer.config;
         let (head, mut from) = tokio::try_join!(self.head(), self.next_block())?;
@@ -317,23 +313,19 @@ impl<'a> Session<'a> {
         if total > 0 {
             tracing::info!(events = total, through_block = target, "indexed");
         }
-        Ok((vouched, head))
+        Ok(())
     }
 
-    /// Commit through `head`'s confirmation depth. Blocks up to `unread` may
-    /// hold logs not yet fetched, so they are; the cursor passes any other
-    /// block without a call. Returns whether the target write landed.
-    async fn advance(
-        &mut self,
-        head: u64,
-        unread: &mut Option<u64>,
-    ) -> anyhow::Result<bool> {
+    /// Commit through `head`'s confirmation depth: fetched when the heads
+    /// say a block there may hold a watched log, passed without a call
+    /// otherwise.
+    async fn advance(&mut self, head: u64, heads: &mut Heads) -> anyhow::Result<()> {
         let indexer = self.indexer;
         let config = &indexer.config;
         let target = head.saturating_sub(config.confirmations);
         let from = self.next_block().await?;
         if from <= target {
-            if unread.is_some_and(|unread| unread >= from) {
+            if heads.settle(from, target) {
                 let mut start = from;
                 let mut total = 0usize;
                 while start <= target {
@@ -350,16 +342,13 @@ impl<'a> Session<'a> {
                     .await
                     .with_context(|| format!("blocks {from}..{target}"))?;
             }
-            if unread.is_some_and(|unread| unread <= target) {
-                *unread = None;
-            }
         }
-        let ((), vouched, ()) = tokio::join!(
+        tokio::join!(
             indexer.store.set_chain_head(head),
             indexer.store.set_chain_target(target, config.stale_after),
             indexer.store.set_window_error(None),
         );
-        Ok(vouched)
+        Ok(())
     }
 
     /// Fetch blocks `from..=to` and commit them with the cursor; how many

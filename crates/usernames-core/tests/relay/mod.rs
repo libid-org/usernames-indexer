@@ -1,6 +1,6 @@
 //! A WebSocket relay between the indexer and anvil: it records the JSON-RPC
 //! methods the indexer calls, and on demand cuts every connection and holds
-//! new ones until it reopens.
+//! new ones until it reopens, or keeps the socket open but silent.
 
 use std::{
     net::SocketAddr,
@@ -36,6 +36,8 @@ pub struct Relay {
     open: watch::Sender<bool>,
     /// How many connections are being relayed right now.
     live: watch::Sender<usize>,
+    /// Whether subscription pushes are dropped, the socket left open.
+    silent: watch::Sender<bool>,
 }
 
 /// What every relayed connection reads and writes.
@@ -45,7 +47,8 @@ struct Shared {
     calls: Mutex<Vec<String>>,
 }
 
-/// The part of a JSON-RPC request the relay reads.
+/// The part of a JSON-RPC message the relay reads: a request's method, or
+/// `eth_subscription` on a push.
 #[derive(Deserialize)]
 struct Call {
     method: String,
@@ -61,19 +64,22 @@ impl Relay {
         let shared = Arc::new(Shared::default());
         let (open, _) = watch::channel(true);
         let (live, _) = watch::channel(0);
+        let (silent, _) = watch::channel(false);
         let relay = Self {
             addr,
             shared: shared.clone(),
             open: open.clone(),
             live: live.clone(),
+            silent: silent.clone(),
         };
         tokio::spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
-                let (upstream, shared, mut open, live) = (
+                let (upstream, shared, mut open, live, silent) = (
                     upstream.clone(),
                     shared.clone(),
                     open.subscribe(),
                     live.clone(),
+                    silent.subscribe(),
                 );
                 tokio::spawn(async move {
                     // A connection made while the relay is cut waits for it to
@@ -81,7 +87,7 @@ impl Relay {
                     let reopened = open.wait_for(|open| *open).await.is_ok();
                     if reopened {
                         live.send_modify(|live| *live += 1);
-                        pipe(socket, upstream, shared, open).await;
+                        pipe(socket, upstream, shared, open, silent).await;
                         live.send_modify(|live| *live -= 1);
                     }
                 });
@@ -113,19 +119,27 @@ impl Relay {
         self.open.send_replace(true);
     }
 
+    /// Drop every subscription push from now on, or stop dropping them; the
+    /// sockets stay open and answer calls.
+    pub fn silence(&self, silent: bool) {
+        self.silent.send_replace(silent);
+    }
+
     /// Every method the indexer called through the relay, in order.
     pub fn calls(&self) -> Vec<String> {
         self.shared.calls.lock().expect("the call log").clone()
     }
 }
 
-/// Relay one connection both ways, recording each request's method, until
-/// either side closes or the relay is cut.
+/// Relay one connection both ways, recording each request's method and
+/// dropping pushes while silenced, until either side closes or the relay is
+/// cut.
 async fn pipe(
     socket: TcpStream,
     upstream: Url,
     shared: Arc<Shared>,
     mut open: watch::Receiver<bool>,
+    silent: watch::Receiver<bool>,
 ) {
     let Ok(client) = accept_async(socket).await else {
         return;
@@ -151,6 +165,14 @@ async fn pipe(
             }
             message = from_server.next() => {
                 let Some(Ok(message)) = message else { return };
+                let push = match &message {
+                    Message::Text(text) => serde_json::from_str::<Call>(text.as_str())
+                        .is_ok_and(|call| call.method == "eth_subscription"),
+                    _ => false,
+                };
+                if push && *silent.borrow() {
+                    continue;
+                }
                 if to_client.send(message).await.is_err() {
                     return;
                 }

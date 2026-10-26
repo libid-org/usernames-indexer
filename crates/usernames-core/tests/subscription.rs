@@ -1,7 +1,7 @@
-//! The subscription source against a real chain. anvil pushes heads and the
-//! libid contracts' logs over a WebSocket, through a relay that can drop the
-//! socket and records every call the indexer makes, so each test checks what
-//! the indexer committed and what the RPC was asked for it.
+//! The subscription source against a real chain. anvil pushes heads over a
+//! WebSocket, through a relay that can drop the socket or silence it and
+//! records every call the indexer makes, so each test checks what the
+//! indexer committed and what the RPC was asked for it.
 //!
 //! Skips without `DATABASE_URL` or `anvil`, unless `CI` is set: there a
 //! missing one fails. Everything past those checks panics on failure.
@@ -127,7 +127,7 @@ impl Chain {
         })
     }
 
-    /// The suite's indexer settings: a log subscription over the relay,
+    /// The suite's indexer settings: a head subscription over the relay,
     /// `confirmations` behind the head, on short intervals.
     fn config(&self, confirmations: u64) -> IndexerConfig {
         IndexerConfig {
@@ -321,7 +321,7 @@ async fn a_dropped_socket_is_backfilled_from_the_cursor_on_reconnect() {
     chain.mine(1).await;
     chain.wait_for_index(chain.head().await - 2).await;
 
-    // The streams are gone before the event is emitted, so only the next
+    // The stream is gone before the event is emitted, so only the next
     // session's catch-up can find it.
     chain.relay.cut().await;
     let holder = chain.accounts()[0];
@@ -342,10 +342,39 @@ async fn a_dropped_socket_is_backfilled_from_the_cursor_on_reconnect() {
         ),
         "{history:?}"
     );
-    // Heads and logs, once per session.
+    // Heads, once per session.
     assert_eq!(
         chain.called("eth_subscribe"),
-        4,
+        2,
+        "{:?}",
+        chain.relay.calls()
+    );
+    chain.stop(running).await;
+}
+
+/// A socket that stays open but pushes nothing would leave the index frozen
+/// behind the chain; once no head arrives for half the report's life, the
+/// session ends, and the next one catches up from the cursor.
+#[tokio::test]
+async fn a_silent_socket_is_left_and_the_next_session_catches_up() {
+    let Some(mut chain) = Chain::start(43126).await else {
+        return;
+    };
+    let running = chain.run(IndexerConfig {
+        stale_after: Duration::from_secs(2),
+        ..chain.config(2)
+    });
+    chain.wait_for_index(chain.head().await - 2).await;
+
+    chain.relay.silence(true);
+    let holder = chain.accounts()[0];
+    let bound = chain.bind("silenced_1", holder).await;
+    chain.mine(3).await;
+    chain.wait_for_index(bound).await;
+
+    assert_eq!(chain.resolve("silenced_1").await, Ok(holder));
+    assert!(
+        chain.called("eth_subscribe") >= 2,
         "{:?}",
         chain.relay.calls()
     );
