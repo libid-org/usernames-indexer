@@ -751,16 +751,6 @@ impl Window {
         // rows it is about to overwrite.
         let mut involvement = self.involvement(event, &at).await?;
 
-        if let Some((platform_id, handle_node, handle)) = event.disclosure() {
-            sqlx::query(sql::DISCLOSE)
-                .bind(chain_id)
-                .bind(handle_node)
-                .bind(platform_id)
-                .bind(handle.as_str())
-                .execute(&mut *self.tx)
-                .await?;
-        }
-
         match event {
             NamesEvent::IdentityBound {
                 holder,
@@ -797,7 +787,8 @@ impl Window {
                     .await?;
             }
 
-            // Its text is the disclosure above; it moves nothing else.
+            // Its text goes beside its node with the histories; it moves
+            // nothing else.
             NamesEvent::HandleRevealed { .. } => {}
 
             // The holder's one name, on whichever platform: a name on
@@ -1213,7 +1204,6 @@ mod sql {
     pub const UPSERT_HANDLE: &str = include_str!("../sql/upsert_handle.sql");
     pub const PUBLISH: &str = include_str!("../sql/publish.sql");
     pub const WITHDRAW_NAME: &str = include_str!("../sql/withdraw_name.sql");
-    pub const DISCLOSE: &str = include_str!("../sql/disclose.sql");
     pub const RETIRE_HANDLE: &str = include_str!("../sql/retire_handle.sql");
     pub const ENS_HOLDER: &str = include_str!("../sql/ens_holder.sql");
     pub const CHAIN_NAMES_TAKEN: &str = include_str!("../sql/chain_names_taken.sql");
@@ -1365,12 +1355,12 @@ pub(crate) mod plan_tests {
             ),
             (
                 "search by text, any chain",
-                Some(&["disclosures_handle_trgm_idx"][..]),
+                Some(&["handle_nodes_handle_trgm_idx"][..]),
                 search_lookup("EXPLAIN ", None, None, None, Some("ali"), 10, 0),
             ),
             (
                 "search by text on a platform, one chain",
-                Some(&["disclosures_handle_trgm_idx"][..]),
+                Some(&["handle_nodes_handle_trgm_idx"][..]),
                 search_lookup(
                     "EXPLAIN ",
                     Some(1),
@@ -1473,7 +1463,6 @@ pub(crate) mod plan_tests {
                 "handles",
                 "ids",
                 "published",
-                "disclosures",
                 "events",
                 "escrow_held",
                 "escrow_refundable",

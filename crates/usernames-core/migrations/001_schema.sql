@@ -5,7 +5,7 @@
 -- Everything is keyed by chain_id. One indexer process follows one chain, any
 -- number of them share a database, and the API reads across all of them.
 -- Identities and handles are keyed by their nodes; handle text lives in
--- disclosures alone.
+-- handle_nodes alone.
 
 CREATE SCHEMA IF NOT EXISTS names;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
@@ -88,15 +88,21 @@ CREATE INDEX IF NOT EXISTS handles_node_chain_idx
 CREATE INDEX IF NOT EXISTS handles_owner_chain_node_idx
     ON names.handles (owner, chain_id, handle_node) WHERE owner IS NOT NULL;
 
--- The platform of every handle node a bind, HandleRevealed, HandlePublished
--- or HandleRetired named. A node belongs to one platform, so what keys by
--- node reads it from here.
+-- Every handle node an event named with its platform: a bind,
+-- HandleRevealed, HandlePublished or HandleRetired. `handle` is the text a
+-- HandleRevealed carried, folded and checked to hash to the node before it
+-- is written, and kept whatever happens to the name or the handle after; a
+-- bare deposit names no node here.
 CREATE TABLE IF NOT EXISTS names.handle_nodes (
     chain_id    BIGINT NOT NULL,
     handle_node BYTEA  NOT NULL,
     platform_id BYTEA  NOT NULL,
+    handle      TEXT,
     PRIMARY KEY (chain_id, handle_node)
 );
+-- Substring and fuzzy search: pg_trgm similarity and LIKE '%q%'.
+CREATE INDEX IF NOT EXISTS handle_nodes_handle_trgm_idx
+    ON names.handle_nodes USING gin (handle gin_trgm_ops);
 
 -- Mirrors primaryHandles: each holder's one name, as its platform and the
 -- node it hashes to, never its text. A row exists exactly while the
@@ -110,28 +116,15 @@ CREATE TABLE IF NOT EXISTS names.published (
     PRIMARY KEY (chain_id, owner)
 );
 
--- Handle text a HandleRevealed carried, folded and checked to hash to its
--- node before it is written. One row per node, kept whatever happens to the
--- name or the handle after.
-CREATE TABLE IF NOT EXISTS names.disclosures (
-    chain_id    BIGINT NOT NULL,
-    handle_node BYTEA  NOT NULL,
-    platform_id BYTEA  NOT NULL,
-    handle      TEXT   NOT NULL,
-    PRIMARY KEY (chain_id, handle_node)
-);
--- Substring and fuzzy search: pg_trgm similarity and LIKE '%q%'.
-CREATE INDEX IF NOT EXISTS disclosures_handle_trgm_idx
-    ON names.disclosures USING gin (handle gin_trgm_ops);
-
 -- Each disclosed handle and the identity behind it: the id node, never an id.
 -- id_node and holder are NULL until a bind takes the node.
 CREATE OR REPLACE VIEW names.handle_identities AS
 SELECT d.chain_id, d.platform_id, d.handle, d.handle_node, h.id_node,
        h.owner AS holder
-FROM names.disclosures d
+FROM names.handle_nodes d
 LEFT JOIN names.handles h
-  ON h.chain_id = d.chain_id AND h.handle_node = d.handle_node;
+  ON h.chain_id = d.chain_id AND h.handle_node = d.handle_node
+WHERE d.handle IS NOT NULL;
 
 -- The names a chain goes by in an ENS name: the `base` in
 -- `alice.x.base.handles.link`. Each chain's indexer writes its own from its

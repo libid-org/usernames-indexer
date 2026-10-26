@@ -345,7 +345,7 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
     assert_eq!(payers.entries.len(), 2, "{payers:?}");
 
     // 5. The privacy scan: no id anywhere, no undisclosed handle anywhere,
-    //    and the disclosed ones only in the disclosures table.
+    //    and the disclosed ones only beside their nodes.
     for id in [ALICE_ID, BOB_ID, DAVE_ID] {
         assert_eq!(h.where_found(id).await, Vec::<String>::new(), "id {id}");
     }
@@ -359,7 +359,7 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
     for handle in ["alice_1", "bob_2"] {
         assert_eq!(
             h.where_found(handle).await,
-            ["disclosures.handle"],
+            ["handle_nodes.handle"],
             "{handle}"
         );
     }

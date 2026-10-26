@@ -671,7 +671,7 @@ async fn replay_converges_instead_of_duplicating() {
     assert_eq!(only(&resolved.bindings).owner, alice);
 
     let disclosures: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM names.disclosures WHERE chain_id = $1")
+        sqlx::query_scalar("SELECT count(*) FROM names.handle_nodes WHERE chain_id = $1 AND handle IS NOT NULL")
             .bind(CHAIN)
             .fetch_one(&pool)
             .await

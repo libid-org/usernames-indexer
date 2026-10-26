@@ -22,10 +22,6 @@ FROM names.handles WHERE chain_id = 1;
 INSERT INTO names.published (chain_id, owner, platform_id, handle_node)
 SELECT DISTINCT ON (owner) 1, owner, platform_id, handle_node
 FROM names.handles WHERE chain_id = 1;
-INSERT INTO names.disclosures
-    (chain_id, handle_node, platform_id, handle)
-SELECT 1, handle_node, platform_id, md5(block_number::text)
-FROM names.handles WHERE chain_id = 1;
 INSERT INTO names.events
     (chain_id, block_number, log_index, tx_hash, kind, payload)
 SELECT 1, i, 0, sha256(('tx' || i)::bytea), 'deposited', '{}'
@@ -39,9 +35,9 @@ INSERT INTO names.handle_events
     (chain_id, block_number, log_index, handle_node, block_time)
 SELECT 1, i, 0, sha256(('node' || i % 1000)::bytea), i
 FROM generate_series(1, 5000) i;
-INSERT INTO names.handle_nodes (chain_id, handle_node, platform_id)
-SELECT 1, sha256(('node' || i)::bytea), sha256(('platform' || i % 3)::bytea)
-FROM generate_series(1, 5000) i;
+INSERT INTO names.handle_nodes (chain_id, handle_node, platform_id, handle)
+SELECT 1, handle_node, platform_id, md5(block_number::text)
+FROM names.handles WHERE chain_id = 1;
 INSERT INTO names.escrow_held
     (chain_id, handle_node, token, held, round, block_number, log_index)
 SELECT 1, sha256(('node' || i)::bytea),
@@ -55,7 +51,7 @@ SELECT substring(sha256(('address' || i % 1000)::bytea) FROM 1 FOR 20), 1,
        substring(sha256(('token' || i % 5)::bytea) FROM 1 FOR 20), 0, i, i
 FROM generate_series(1, 5000) i;
 -- Vacuum moves a GIN index's pending entries into it; the rows above wait there.
-SELECT gin_clean_pending_list('names.disclosures_handle_trgm_idx');
-ANALYZE names.handles, names.ids, names.published, names.disclosures, names.events,
+SELECT gin_clean_pending_list('names.handle_nodes_handle_trgm_idx');
+ANALYZE names.handles, names.ids, names.published, names.events,
         names.address_events, names.handle_events, names.handle_nodes,
         names.escrow_held, names.escrow_refundable;

@@ -126,7 +126,7 @@ routes fold the text's A-Z and hash it, the way `depositToHandle` does, so
 
 **Handle text shows once the chain disclosed it.** Every response that
 carries handle text (`handle` in resolutions, search hits, histories and
-escrow amounts) takes it from `names.disclosures`, the map every
+escrow amounts) takes it from `names.handle_nodes`, the map every
 `HandleRevealed` fills, whichever contract logged it. The API explores the chain's
 history, so a name its holder later withdrew or replaced, or a handle that
 passed privately to another account, still shows the text once disclosed;
@@ -305,7 +305,7 @@ chain; a second deployment can share the database):
 
 - `events` — append-only journal of every decoded log, the audit trail and
   what the histories list. It holds no handle text: a disclosure's text is in
-  `disclosures` alone. `CeremonyBound` and `BindFeePaid` have no projection of
+  `handle_nodes` alone. `CeremonyBound` and `BindFeePaid` have no projection of
   their own: nothing resolves by which client authenticated a binding or what
   fee it paid
 - `ids` — mirrors `idBindings` + `handleNodeById`: id node → holder, current
@@ -316,13 +316,12 @@ chain; a second deployment can share the database):
 - `published` — each holder's one name, as its platform and the node it
   hashes to; a row exists exactly while the contract's `primaryHandles`
   entry is set
-- `disclosures` — handle text a `HandleRevealed` carried, a token a circuit hashes,
-  folded and checked against its node: one row per node, kept whatever
-  happens to the name or the handle after. `handle_identities` maps each
-  disclosed handle to its id node
 - `handle_nodes` — the platform of every handle node a bind,
-  `HandleRevealed`, `HandlePublished` or `HandleRetired` named; a bare
-  deposit names none
+  `HandleRevealed`, `HandlePublished` or `HandleRetired` named, and the text
+  a `HandleRevealed` carried, a token a circuit hashes, folded and checked
+  against its node; kept whatever happens to the name or the handle after.
+  A bare deposit names none. `handle_identities` maps each disclosed handle
+  to its id node
 - `escrow_held` — mirrors HandleEscrow's `held` and `round` per handle node
   and token
 - `escrow_refundable` — mirrors `contribution`: each sender's contribution

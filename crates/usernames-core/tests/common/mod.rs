@@ -170,7 +170,7 @@ pub async fn apply(store: &ChainStore, block: u64, event: NamesEvent) {
 /// The text the chain disclosed for the node on `chain`, when it did.
 pub async fn disclosed(pool: &PgPool, chain: i64, handle_node: B256) -> Option<String> {
     sqlx::query_scalar(
-        "SELECT handle FROM names.disclosures WHERE chain_id = $1 AND handle_node = $2",
+        "SELECT handle FROM names.handle_nodes WHERE chain_id = $1 AND handle_node = $2 AND handle IS NOT NULL",
     )
     .bind(chain)
     .bind(handle_node)

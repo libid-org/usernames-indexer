@@ -46,6 +46,8 @@ pub(crate) struct Involvement {
     parties: Vec<(Address, Vec<Role>)>,
     pub(crate) handle_node: Option<B256>,
     platform_id: Option<B256>,
+    /// The node's text, when the event disclosed it.
+    handle: Option<String>,
 }
 
 impl Involvement {
@@ -86,6 +88,9 @@ impl Window {
             parties: Vec::new(),
             handle_node: None,
             platform_id: None,
+            handle: event
+                .disclosure()
+                .map(|(_, _, text)| text.as_str().to_string()),
         };
         for (address, role) in event.parties() {
             involvement.add(address, role);
@@ -235,6 +240,7 @@ impl Window {
                 .bind(chain_id)
                 .bind(handle_node)
                 .bind(platform_id)
+                .bind(involvement.handle)
                 .execute(&mut *self.tx)
                 .await?;
         }
