@@ -382,9 +382,7 @@ impl Config {
                 names,
                 lag_blocks: lag.blocks(),
                 indexer_reported_at: position.and_then(|p| p.reported_at),
-                report_valid_for: position
-                    .and_then(|p| p.valid_for)
-                    .map(|valid_for| valid_for.num_seconds()),
+                report_valid_for: position.and_then(|p| p.valid_for_seconds()),
                 ambiguous,
                 stale: ambiguous || lag.staleness(self.max_lag_blocks).is_some(),
             });

@@ -651,6 +651,23 @@ async fn an_expired_report_is_too_stale_however_small_the_lag() {
     drop(guard);
 }
 
+/// A report whose expiry is out of any duration's range cannot be read as a
+/// validity, so the gateway refuses rather than trusts it.
+#[tokio::test]
+async fn a_report_expiring_out_of_range_is_refused() {
+    let (router, store, _pool, guard) = gateway_or_skip!(32);
+    bind(&store, "alice", Address::from([0xbe; 20])).await;
+    store.set_chain_target_valid_until(i64::MAX as u64).await;
+
+    let call = resolve_call(
+        &wire_name(&["alice", "x"]),
+        &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
+    );
+    let (status, body) = ask(&router, RESOLVER, &call).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    drop(guard);
+}
+
 /// One chain's dead indexer is that chain's problem. Every row the gate reads
 /// is keyed by chain, so the refusal reaches the chain whose report expired
 /// and no other — the API keeps answering for everyone else. And supervision

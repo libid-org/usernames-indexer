@@ -56,6 +56,7 @@ use usernames_core::{
     },
     db::{
         self,
+        ChainState,
         ChainStore,
     },
     ens,
@@ -993,9 +994,8 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
 
 // ─── The replay gate ────────────────────────────────────────────────────────
 // `prepare` is the only thing in the process that deletes a chain's rows, and
-// it decides to on two conditions nothing else tests. It also carries one
-// deliberate exception — the deployment-block cache survives — which until now
-// existed as a comment.
+// it decides to on two conditions nothing else tests. The registry's
+// deployment block survives a replay of the same registry.
 
 const OTHER_CONTRACT: Address = Address::new([0xcd; 20]);
 
@@ -1077,19 +1077,14 @@ async fn watching_another_contract_clears_the_chain() {
         "the cursor must be gone so the scan restarts"
     );
     // Everything the chain's row held about the old contract goes with it.
-    let state = store.state().await.unwrap();
-    assert_eq!(state.contract, Some(OTHER_CONTRACT));
     assert_eq!(
-        (
-            state.deploy_block,
-            state.head,
-            state.target,
-            state.reported_at,
-            state.window_error.as_deref(),
-            state.proof_verifier,
-        ),
-        (None, None, None, None, None, None),
-        "{state:?}"
+        store.state().await.unwrap(),
+        ChainState {
+            chain_id: store.chain_id(),
+            indexer_version: Some(db::INDEXER_VERSION.to_string()),
+            contract: Some(OTHER_CONTRACT),
+            ..ChainState::default()
+        }
     );
     assert!(
         store

@@ -69,7 +69,7 @@ pub const INDEXER_VERSION: &str = "1";
 /// One chain's row: what its indexer watches and writes, how far it got,
 /// and its last report. Blocks and times are what the indexer wrote, so
 /// never negative.
-#[derive(Clone, Debug, Default, sqlx::FromRow)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, sqlx::FromRow)]
 pub struct ChainState {
     /// The chain.
     pub chain_id: i64,
@@ -101,6 +101,13 @@ impl ChainState {
     /// How far the chain had grown at the indexer's last look.
     pub fn head(&self) -> Option<u64> {
         block(self.head)
+    }
+
+    /// The registry's deployment block as stored, while the row is about
+    /// `contract`.
+    pub fn deploy_block_of(&self, contract: Address) -> Option<i64> {
+        self.deploy_block
+            .filter(|_| self.contract == Some(contract))
     }
 
     /// Where the index stands.
@@ -142,6 +149,13 @@ pub struct IndexPosition {
     /// How long until the indexer's last report expires; negative once it
     /// has.
     pub valid_for: Option<TimeDelta>,
+}
+
+impl IndexPosition {
+    /// Whole seconds until the last report expires, negative once it has.
+    pub fn valid_for_seconds(&self) -> Option<i64> {
+        self.valid_for.map(|valid_for| valid_for.num_seconds())
+    }
 }
 
 /// The longest a report may be trusted: a year. The indexer refuses a longer
@@ -346,10 +360,10 @@ impl ChainStore {
     /// than the database holds — or when a watched contract changed, because
     /// the old contract's bindings are not the new contract's bindings, and an
     /// escrow watched from now on has events behind the cursor.
-    /// Strictly scoped to this chain: a co-tenant chain's rows, cursor and
-    /// row are untouched. The registry's deployment block survives a replay
-    /// of the same registry: `eth_getCode` history does not change shape
-    /// with the read model.
+    /// Strictly scoped to this chain: a co-tenant chain's rows are
+    /// untouched. The registry's deployment block survives a replay of the
+    /// same registry: `eth_getCode` history does not change shape with the
+    /// read model.
     ///
     /// The lease parameter is the safety argument in the signature: without
     /// the chain's writer lock, the check-clear-stamp sequence could race a
@@ -399,9 +413,7 @@ impl ChainStore {
             .bind(self.chain_id)
             .execute(&mut *tx)
             .await?;
-        let deploy_block = known
-            .deploy_block
-            .filter(|_| known.contract == Some(contract));
+        let deploy_block = known.deploy_block_of(contract);
         sqlx::query(sql::RESET_CHAIN)
             .bind(self.chain_id)
             .bind(INDEXER_VERSION)
@@ -616,8 +628,7 @@ impl ChainStore {
         &self,
         contract: Address,
     ) -> Result<Option<u64>, sqlx::Error> {
-        let state = self.state().await?;
-        Ok(block(state.deploy_block).filter(|_| state.contract == Some(contract)))
+        Ok(block(self.state().await?.deploy_block_of(contract)))
     }
 
     /// Cache a detected deployment block so a re-index does not redo the
