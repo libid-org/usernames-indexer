@@ -278,7 +278,7 @@ pub struct SearchResults {
     pub hits: Vec<SearchHit>,
 }
 
-/// The handle an event or an amount concerns.
+/// The handle an event, an amount or a request concerns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HandleRef {
@@ -577,26 +577,11 @@ pub struct AddressHistory {
 #[serde(rename_all = "camelCase")]
 pub struct HandleHistory {
     /// The handle, as far as the store knows it: always its node.
-    pub handle: HandleQuery,
+    pub handle: HandleRef,
     /// Newest first: by block time, then chain, block and log index.
     pub entries: Vec<HistoryEntry>,
     /// Pass as `before` for the next page; absent on the last one.
     pub next: Option<String>,
-}
-
-/// A handle as a request named it: by its text, which names the platform
-/// too, or by its node, which names neither until an event does.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HandleQuery {
-    /// The platform's short key, when known.
-    pub platform: Option<KnownPlatform>,
-    /// The platform id, when the request or an event named it.
-    pub platform_id: Option<B256>,
-    /// The node the chain files the handle under.
-    pub handle_node: B256,
-    /// The handle's text, once the chain disclosed it.
-    pub handle: Option<String>,
 }
 
 /// One amount waiting in the escrow, and what it waits for.
@@ -668,7 +653,7 @@ pub struct AddressContributions {
 #[serde(rename_all = "camelCase")]
 pub struct HandleAmounts {
     /// The handle, as far as the store knows it.
-    pub handle: HandleQuery,
+    pub handle: HandleRef,
     /// One per chain and token still holding something, descending.
     pub amounts: Vec<EscrowAmount>,
     /// Pass as `before` for the next page; absent on the last one.

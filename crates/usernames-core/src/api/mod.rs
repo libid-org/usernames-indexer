@@ -332,10 +332,10 @@ impl HandleKey {
     }
 }
 
-impl HandleQuery {
+impl HandleRef {
     /// The handle a request named, completed from `known`: any row about the
     /// node names its platform, and its text once disclosed.
-    fn of(key: &HandleKey, known: Option<&HandleRef>) -> Self {
+    fn asked(key: &HandleKey, known: Option<&HandleRef>) -> Self {
         let (platform, platform_id) = match key {
             HandleKey::Text { platform, .. } => (Some(*platform), Some(platform.id())),
             HandleKey::Node(_) => (
@@ -350,9 +350,7 @@ impl HandleQuery {
             handle: known.and_then(|handle| handle.handle.clone()),
         }
     }
-}
 
-impl HandleRef {
     /// A stored node with its platform, when known, and its disclosed text.
     fn of(platform_id: Option<B256>, handle_node: B256, handle: Option<String>) -> Self {
         Self {

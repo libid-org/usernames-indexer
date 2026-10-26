@@ -10,7 +10,6 @@ use super::{
     model::{
         AddressHistory,
         HandleHistory,
-        HandleQuery,
         HandleRef,
         HistoryEntry,
     },
@@ -133,7 +132,7 @@ async fn of_handle(
         HistoryEntry::page(state.store.handle_history(key.node(), page).await?)?;
     let known = entries.iter().find_map(|entry| entry.handle.as_ref());
     Ok(Json(HandleHistory {
-        handle: HandleQuery::of(&key, known),
+        handle: HandleRef::asked(&key, known),
         entries,
         next,
     }))

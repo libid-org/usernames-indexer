@@ -139,9 +139,8 @@ pub struct IndexPosition {
     pub valid_for: Option<TimeDelta>,
 }
 
-/// The longest a report may be trusted: a year. A longer setting is a
-/// mistake, and the store clamps what it writes to this, so the `bigint`
-/// addition in Postgres never overflows and fails the statement.
+/// The longest a report may be trusted: a year. The indexer refuses a longer
+/// setting at startup; the store adds it to the clock as a `bigint`.
 pub const MAX_VALID_FOR: Duration = Duration::from_secs(366 * 24 * 60 * 60);
 
 /// The whole store: every chain any indexer has written into one database.
@@ -471,9 +470,9 @@ impl ChainStore {
     }
 
     /// The validity the store will write for a report, in the whole seconds
-    /// the SQL adds to its clock, at most [`MAX_VALID_FOR`].
+    /// the SQL adds to its clock.
     fn valid_for_bind(valid_for: Duration) -> i64 {
-        i64::try_from(valid_for.min(MAX_VALID_FOR).as_secs()).unwrap_or(i64::MAX)
+        i64::try_from(valid_for.as_secs()).unwrap_or(i64::MAX)
     }
 
     /// Declare the names this chain goes by in an ENS name, replacing whatever
@@ -751,8 +750,6 @@ impl Window {
                     .bind(observed)
                     .bind(i64::from(*ceremony_version))
                     .bind(handle_node)
-                    .bind(block)
-                    .bind(log_index)
                     .execute(&mut *self.tx)
                     .await?;
                 sqlx::query(sql::UPSERT_HANDLE)
@@ -763,8 +760,6 @@ impl Window {
                     .bind(observed)
                     .bind(i64::from(*ceremony_version))
                     .bind(id_node)
-                    .bind(block)
-                    .bind(log_index)
                     .execute(&mut *self.tx)
                     .await?;
             }
@@ -799,8 +794,6 @@ impl Window {
                 sqlx::query(sql::RETIRE_HANDLE)
                     .bind(chain_id)
                     .bind(handle_node)
-                    .bind(block)
-                    .bind(log_index)
                     .execute(&mut *self.tx)
                     .await?;
             }

@@ -135,9 +135,8 @@ whichever platform. Text is stored
 only when it is a token a circuit hashes (printable ASCII without `"` or `\`,
 within the circuit's buffer) and it hashes to the node it names; a public
 transfer to text no account can bind keeps its deposit but not its text.
-Search lists disclosed handles only, and `names.handle_identities` maps each
-to its id node and holder. A binding nothing disclosed still resolves by text
-or by node, without text in the answer.
+Search lists disclosed handles only. A binding nothing disclosed still
+resolves by text or by node, without text in the answer.
 
 `{platform}` is a short key (`x`, `github`, `google`) or a 0x-hex 32-byte
 platform id. A text route hashes its text with `libid-identity`, so it needs a
@@ -322,8 +321,7 @@ chain; a second deployment can share the database):
   `HandleRevealed`, `HandlePublished` or `HandleRetired` named, and the text
   a `HandleRevealed` carried, a token a circuit hashes, folded and checked
   against its node; kept whatever happens to the name or the handle after.
-  A bare deposit names none. `handle_identities` maps each disclosed handle
-  to its id node
+  A bare deposit names none
 - `escrow_held` — mirrors HandleEscrow's `held` and `round` per handle node
   and token
 - `escrow_refundable` — mirrors `contribution`: each sender's contribution

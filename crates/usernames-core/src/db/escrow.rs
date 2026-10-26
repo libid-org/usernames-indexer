@@ -58,8 +58,6 @@ impl Window {
                     .bind(token)
                     .bind(amount.to_string())
                     .bind(round.to_string())
-                    .bind(at.block)
-                    .bind(at.log_index)
                     .execute(&mut *self.tx)
                     .await?;
                 sqlx::query(sql::ESCROW_BOOK_REFUNDABLE)
@@ -84,8 +82,6 @@ impl Window {
                     .bind(handle_node)
                     .bind(token)
                     .bind(round.to_string())
-                    .bind(at.block)
-                    .bind(at.log_index)
                     .fetch_optional(&mut *self.tx)
                     .await?;
                 if moved.is_none() {
@@ -116,8 +112,6 @@ impl Window {
                     .bind(handle_node)
                     .bind(token)
                     .bind(released.to_string())
-                    .bind(at.block)
-                    .bind(at.log_index)
                     .fetch_optional(&mut *self.tx)
                     .await?;
                 if moved.is_none() {
@@ -664,8 +658,6 @@ pub(crate) mod plans {
                     .bind(node)
                     .bind(token)
                     .bind("0")
-                    .bind(10i64)
-                    .bind(0i64)
                     .fetch_all(&mut *conn)
                     .await,
             ),
@@ -687,8 +679,6 @@ pub(crate) mod plans {
                     .bind(node)
                     .bind(token)
                     .bind("1")
-                    .bind(10i64)
-                    .bind(0i64)
                     .fetch_all(&mut *conn)
                     .await,
             ),

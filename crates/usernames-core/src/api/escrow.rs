@@ -17,7 +17,6 @@ use super::{
         Contribution,
         EscrowAmount,
         HandleAmounts,
-        HandleQuery,
         HandleRef,
         Unclaimed,
     },
@@ -160,7 +159,7 @@ async fn of_handle(
         .served(EscrowAmount::of)?;
     let known = amounts.first().map(|amount| &amount.handle);
     Ok(Json(HandleAmounts {
-        handle: HandleQuery::of(&key, known),
+        handle: HandleRef::asked(&key, known),
         amounts,
         next,
     }))

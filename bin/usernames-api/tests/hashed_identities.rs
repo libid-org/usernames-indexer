@@ -18,7 +18,6 @@ use std::{
 use alloy::{
     primitives::{
         Address,
-        B256,
         U256,
     },
     providers::Provider,
@@ -307,27 +306,6 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
         .await;
     h.settle().await;
 
-    let mapping: Vec<(String, B256, Option<B256>, Option<Address>)> = sqlx::query_as(
-        "SELECT handle, handle_node, id_node, holder FROM names.handle_identities
-         WHERE chain_id = $1 ORDER BY handle",
-    )
-    .bind(CHAIN as i64)
-    .fetch_all(&h.pool)
-    .await
-    .expect("the mapping");
-    assert_eq!(
-        mapping,
-        [
-            (
-                "alice_1".to_string(),
-                alice_node,
-                Some(alice_id),
-                Some(alice)
-            ),
-            ("bob_2".to_string(), bob_node, Some(bob_id), Some(bob)),
-        ],
-        "carol and dave were never disclosed"
-    );
     let by_node: HandleResolution =
         h.get(&format!("/v1/resolve/handle-node/{bob_node}")).await;
     assert_eq!(by_node.bindings[0].handle.as_deref(), Some("bob_2"));

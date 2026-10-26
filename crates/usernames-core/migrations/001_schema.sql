@@ -85,9 +85,6 @@ CREATE TABLE IF NOT EXISTS names.ids (
     observed_at      BIGINT      NOT NULL,   -- shared scale, as emitted
     ceremony_version BIGINT      NOT NULL,   -- logged by the contract, never stored there
     handle_node      BYTEA       NOT NULL,   -- handleNodeById
-    block_number     BIGINT      NOT NULL,   -- provenance: the write that produced this row
-    log_index        BIGINT      NOT NULL,
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (chain_id, id_node)
 );
 -- Reads ask by node or by holder, across every chain or one; chain_id trails
@@ -110,9 +107,6 @@ CREATE TABLE IF NOT EXISTS names.handles (
     observed_at      BIGINT      NOT NULL,
     ceremony_version BIGINT      NOT NULL,   -- of the last binding at this node
     id_node          BYTEA       NOT NULL,   -- idNodeByHandle back-pointer
-    block_number     BIGINT      NOT NULL,
-    log_index        BIGINT      NOT NULL,
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (chain_id, handle_node)
 );
 CREATE INDEX IF NOT EXISTS handles_node_chain_idx
@@ -145,20 +139,9 @@ CREATE TABLE IF NOT EXISTS names.published (
     chain_id    BIGINT      NOT NULL,
     owner       BYTEA       NOT NULL,
     platform_id BYTEA       NOT NULL,
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     handle_node BYTEA       NOT NULL,
     PRIMARY KEY (chain_id, owner)
 );
-
--- Each disclosed handle and the identity behind it: the id node, never an id.
--- id_node and holder are NULL until a bind takes the node.
-CREATE OR REPLACE VIEW names.handle_identities AS
-SELECT d.chain_id, d.platform_id, d.handle, d.handle_node, h.id_node,
-       h.owner AS holder
-FROM names.handle_nodes d
-LEFT JOIN names.handles h
-  ON h.chain_id = d.chain_id AND h.handle_node = d.handle_node
-WHERE d.handle IS NOT NULL;
 
 -- The names a chain goes by in an ENS name: the `base` in
 -- `alice.x.base.handles.link`. Each chain's indexer writes its own from its
@@ -167,8 +150,7 @@ WHERE d.handle IS NOT NULL;
 -- across the whole store, which is what lets a label mean one thing.
 CREATE TABLE IF NOT EXISTS names.chain_names (
     name       TEXT        PRIMARY KEY,
-    chain_id   BIGINT      NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    chain_id   BIGINT      NOT NULL
 );
 CREATE INDEX IF NOT EXISTS chain_names_chain_idx
     ON names.chain_names (chain_id);
@@ -181,9 +163,6 @@ CREATE TABLE IF NOT EXISTS names.escrow_held (
     token        BYTEA         NOT NULL,   -- 20 bytes; EIP-7528 0xEeee…EEeE is the chain's coin
     held         NUMERIC(78,0) NOT NULL,   -- what `claim` would pay the holder now
     round        NUMERIC(78,0) NOT NULL,   -- claims so far: the round deposits book under
-    block_number BIGINT        NOT NULL,   -- provenance: the write that produced this row
-    log_index    BIGINT        NOT NULL,
-    updated_at   TIMESTAMPTZ   NOT NULL DEFAULT now(),
     PRIMARY KEY (chain_id, handle_node, token)
 );
 -- The unclaimed list, token by token, largest first, read backwards: across
@@ -208,7 +187,6 @@ CREATE TABLE IF NOT EXISTS names.escrow_refundable (
     token         BYTEA         NOT NULL,
     amount        NUMERIC(78,0) NOT NULL,
     refundable_at BIGINT        NOT NULL,   -- unix seconds; the sender's last deposit sets it
-    updated_at    TIMESTAMPTZ   NOT NULL DEFAULT now(),
     PRIMARY KEY (sender, chain_id, handle_node, token)
 );
 -- A claim closes one slot's round for every sender at once.
