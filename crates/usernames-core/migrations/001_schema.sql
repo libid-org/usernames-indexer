@@ -20,12 +20,12 @@ CREATE TABLE IF NOT EXISTS names.chains (
     indexer_version TEXT,
     contract        BYTEA,
     escrow          BYTEA,
-    deploy_block    BIGINT,   -- of `contract`
-    cursor          BIGINT,
-    head            BIGINT,
-    target          BIGINT,
-    reported_at     BIGINT,   -- unix seconds, by the database's clock
-    valid_until     BIGINT,   -- unix seconds, by the database's clock
+    deploy_block    BIGINT CHECK (deploy_block >= 0),   -- of `contract`
+    cursor          BIGINT CHECK (cursor >= 0),
+    head            BIGINT CHECK (head >= 0),
+    target          BIGINT CHECK (target >= 0),
+    reported_at     BIGINT CHECK (reported_at >= 0),    -- unix seconds, by the database's clock
+    valid_until     BIGINT CHECK (valid_until >= 0),    -- unix seconds, by the database's clock
     window_error    TEXT,
     proof_verifier  BYTEA
 );

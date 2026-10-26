@@ -1061,6 +1061,11 @@ async fn watching_another_contract_clears_the_chain() {
         .await
         .expect("first");
     seed(&store).await;
+    store.set_chain_head(9).await;
+    store.set_chain_target(7, Duration::from_secs(60)).await;
+    store.set_window_error(Some("a window failed")).await;
+    let verifier = NamesEvent::ProofVerifierConfigured { verifier: addr(9) };
+    apply(&store, 2, verifier).await;
 
     store
         .prepare(&writer, OTHER_CONTRACT, None)
@@ -1070,6 +1075,21 @@ async fn watching_another_contract_clears_the_chain() {
     assert!(
         store.cursor().await.unwrap().is_none(),
         "the cursor must be gone so the scan restarts"
+    );
+    // Everything the chain's row held about the old contract goes with it.
+    let state = store.state().await.unwrap();
+    assert_eq!(state.contract, Some(OTHER_CONTRACT));
+    assert_eq!(
+        (
+            state.deploy_block,
+            state.head,
+            state.target,
+            state.reported_at,
+            state.window_error.as_deref(),
+            state.proof_verifier,
+        ),
+        (None, None, None, None, None, None),
+        "{state:?}"
     );
     assert!(
         store

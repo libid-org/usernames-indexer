@@ -453,7 +453,7 @@ impl ChainStatus {
     fn of(row: ChainStatusRow) -> Self {
         let ChainStatusRow { state, names } = row;
         let position = state.position();
-        let head = state.head.and_then(|head| u64::try_from(head).ok());
+        let head = state.head();
         Self {
             chain_id: state.chain_id,
             names,

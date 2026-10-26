@@ -98,13 +98,18 @@ pub struct ChainState {
 }
 
 impl ChainState {
+    /// How far the chain had grown at the indexer's last look.
+    pub fn head(&self) -> Option<u64> {
+        block(self.head)
+    }
+
     /// Where the index stands.
     pub fn position(&self) -> IndexPosition {
         IndexPosition {
             target: block(self.target),
             cursor: block(self.cursor),
             reported_at: block(self.reported_at),
-            valid_for: self.valid_for.map(TimeDelta::seconds),
+            valid_for: self.valid_for.and_then(TimeDelta::try_seconds),
         }
     }
 }
@@ -342,9 +347,9 @@ impl ChainStore {
     /// the old contract's bindings are not the new contract's bindings, and an
     /// escrow watched from now on has events behind the cursor.
     /// Strictly scoped to this chain: a co-tenant chain's rows, cursor and
-    /// metadata are untouched. The deployment-block cache survives a version
-    /// bump (it is keyed by contract, and `eth_getCode` history does not
-    /// change shape with the read model).
+    /// row are untouched. The registry's deployment block survives a replay
+    /// of the same registry: `eth_getCode` history does not change shape
+    /// with the read model.
     ///
     /// The lease parameter is the safety argument in the signature: without
     /// the chain's writer lock, the check-clear-stamp sequence could race a
@@ -388,11 +393,21 @@ impl ChainStore {
             .bind(self.chain_id)
             .execute(&mut *tx)
             .await?;
+        // The row starts over, so nothing it holds survives the replay unless
+        // it is carried here: the deployment block, while the registry stays.
+        sqlx::query(sql::FORGET_CHAIN)
+            .bind(self.chain_id)
+            .execute(&mut *tx)
+            .await?;
+        let deploy_block = known
+            .deploy_block
+            .filter(|_| known.contract == Some(contract));
         sqlx::query(sql::RESET_CHAIN)
             .bind(self.chain_id)
             .bind(INDEXER_VERSION)
             .bind(contract)
             .bind(escrow)
+            .bind(deploy_block)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -1135,7 +1150,6 @@ mod sql {
     pub const SET_WINDOW_ERROR: &str = include_str!("../sql/set_window_error.sql");
     #[cfg(feature = "test-seams")]
     pub const SET_VALID_UNTIL: &str = include_str!("../sql/set_valid_until.sql");
-    #[cfg(feature = "test-seams")]
     pub const FORGET_CHAIN: &str = include_str!("../sql/forget_chain.sql");
     /// Every row an indexer wrote for one chain into the read model: what a
     /// replay clears.
