@@ -47,6 +47,7 @@ use usernames_core::{
     },
     events::{
         EscrowEvent,
+        LogPosition,
         NamesEvent,
     },
     nodes::KnownPlatform,
@@ -1034,5 +1035,59 @@ async fn another_escrow_replays_the_chain_and_the_same_one_keeps_it() {
         (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::NotSynced)
     );
     writer.release().await.expect("release");
+    suite.done();
+}
+
+/// A ceremony takes the handle of the bind before it in its own transaction
+/// only: one in another transaction of the same window concerns no handle.
+#[tokio::test]
+async fn a_ceremony_takes_only_its_own_transactions_bind() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let alice = addr(0xA1);
+    let at = |log_index, tx: u8| LogPosition {
+        block_number: 1,
+        log_index,
+        tx_hash: B256::repeat_byte(tx),
+        block_time: 1_700_000_001,
+    };
+    let mut window = suite.store.begin_window().await.expect("a window");
+    for (log_index, event) in (0u64..).zip(bind(alice, X, "111", "ann_1", 1_000, true)) {
+        window
+            .apply(&event, &at(log_index, 0x0A))
+            .await
+            .expect("the bind");
+    }
+    let ceremony = NamesEvent::CeremonyBound {
+        authorization_digest: B256::repeat_byte(0xD1),
+        holder: alice,
+        platform_id: X.id(),
+        client_identifier: Bytes::from_static(b"app"),
+    };
+    window
+        .apply(&ceremony, &at(9, 0x0B))
+        .await
+        .expect("the ceremony");
+    window.commit(1).await.expect("commit");
+
+    let history: HandleHistory = suite.get("/v1/history/handle/x/ann_1").await.answer();
+    assert!(
+        !events(&history.entries)
+            .iter()
+            .any(|event| matches!(event, HistoryEvent::CeremonyBound { .. })),
+        "{history:?}"
+    );
+    let history: AddressHistory = suite
+        .get(&format!("/v1/history/address/{alice}"))
+        .await
+        .answer();
+    let ceremony = history
+        .entries
+        .iter()
+        .find(|entry| matches!(entry.event, HistoryEvent::CeremonyBound { .. }))
+        .expect("the ceremony is in the holder's history");
+    assert_eq!(ceremony.handle, None);
     suite.done();
 }

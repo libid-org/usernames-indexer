@@ -33,10 +33,13 @@ use super::{
     Store,
     Window,
 };
-use crate::events::{
-    EscrowEvent,
-    NamesEvent,
-    Role,
+use crate::{
+    events::{
+        EscrowEvent,
+        NamesEvent,
+        Role,
+    },
+    nodes::DisclosedHandle,
 };
 
 /// What one event involves: the addresses, each with every part it plays in
@@ -47,7 +50,7 @@ pub(crate) struct Involvement {
     pub(crate) handle_node: Option<B256>,
     platform_id: Option<B256>,
     /// The node's text, when the event disclosed it.
-    handle: Option<String>,
+    handle: Option<DisclosedHandle>,
 }
 
 impl Involvement {
@@ -77,7 +80,8 @@ pub(crate) struct Bind {
 }
 
 impl Window {
-    /// What `event` involves, read before its projections move.
+    /// What `event` involves, read before its projections move. A bind is
+    /// remembered here for the ceremony and the fee after it.
     pub(crate) async fn involvement(
         &mut self,
         event: &NamesEvent,
@@ -88,9 +92,7 @@ impl Window {
             parties: Vec::new(),
             handle_node: None,
             platform_id: None,
-            handle: event
-                .disclosure()
-                .map(|(_, _, text)| text.as_str().to_string()),
+            handle: event.disclosure().map(|(_, _, text)| text.clone()),
         };
         for (address, role) in event.parties() {
             involvement.add(address, role);
@@ -150,7 +152,7 @@ impl Window {
                     None => tracing::warn!(
                         block = at.block,
                         log_index = at.log_index,
-                        kind = event.kind(),
+                        kind = %event.kind(),
                         "a ceremony or a bind fee without the bind before it"
                     ),
                 }
@@ -237,7 +239,7 @@ impl Window {
                 .bind(chain_id)
                 .bind(handle_node)
                 .bind(platform_id)
-                .bind(involvement.handle)
+                .bind(involvement.handle.as_ref().map(DisclosedHandle::as_str))
                 .execute(&mut *self.tx)
                 .await?;
         }
@@ -346,10 +348,9 @@ impl Page<HistoryCursor> {
         statement
     }
 
-    /// The chain, the cursor, the order and the fetch limit. On one chain the
-    /// chain leaves the comparison, so the table's key — chain, then time —
-    /// serves the page as one backward range; across chains the history
-    /// index does, with the chain in the comparison.
+    /// The chain, the cursor, the order and the fetch limit. The history
+    /// index serves the page as one backward range, with the chain in the
+    /// comparison only when it does not filter the page.
     fn bound(&self, statement: &mut Statement, table: &str) {
         let order = match self.chain {
             Some(chain) => {

@@ -42,7 +42,7 @@ use serde_with::{
 };
 
 /// Where in the chain a log sat. The pair (block, log index) is the natural
-/// id every table keys provenance by.
+/// id the journal keys each event by.
 #[derive(Debug, Clone, Copy)]
 pub struct LogPosition {
     /// The block that holds the log.
@@ -242,19 +242,115 @@ impl FromStr for Role {
     }
 }
 
-impl NamesEvent {
-    /// The journal's `kind` discriminator.
-    pub fn kind(&self) -> &'static str {
+/// Which event a journal row holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum EventKind {
+    IdentityBound,
+    HandleRevealed,
+    HandlePublished,
+    HandleRetired,
+    HandleUnpublished,
+    ProofVerifierConfigured,
+    CeremonyBound,
+    BindFeePaid,
+    Deposited,
+    Forwarded,
+    Claimed,
+    Refunded,
+}
+
+/// A stored kind this build does not know.
+#[derive(Debug, thiserror::Error)]
+#[error("unknown event kind {0:?}")]
+pub struct UnknownKind(String);
+
+impl EventKind {
+    /// Every kind, so a stored name parses back by the same table.
+    const ALL: [Self; 12] = [
+        Self::IdentityBound,
+        Self::HandleRevealed,
+        Self::HandlePublished,
+        Self::HandleRetired,
+        Self::HandleUnpublished,
+        Self::ProofVerifierConfigured,
+        Self::CeremonyBound,
+        Self::BindFeePaid,
+        Self::Deposited,
+        Self::Forwarded,
+        Self::Claimed,
+        Self::Refunded,
+    ];
+
+    /// The name the journal stores.
+    pub fn as_str(self) -> &'static str {
         match self {
-            Self::IdentityBound { .. } => "identity_bound",
-            Self::HandleRevealed { .. } => "handle_revealed",
-            Self::HandlePublished { .. } => "handle_published",
-            Self::HandleRetired { .. } => "handle_retired",
-            Self::HandleUnpublished { .. } => "handle_unpublished",
-            Self::ProofVerifierConfigured { .. } => "proof_verifier_configured",
-            Self::CeremonyBound { .. } => "ceremony_bound",
-            Self::BindFeePaid { .. } => "bind_fee_paid",
+            Self::IdentityBound => "identity_bound",
+            Self::HandleRevealed => "handle_revealed",
+            Self::HandlePublished => "handle_published",
+            Self::HandleRetired => "handle_retired",
+            Self::HandleUnpublished => "handle_unpublished",
+            Self::ProofVerifierConfigured => "proof_verifier_configured",
+            Self::CeremonyBound => "ceremony_bound",
+            Self::BindFeePaid => "bind_fee_paid",
+            Self::Deposited => "deposited",
+            Self::Forwarded => "forwarded",
+            Self::Claimed => "claimed",
+            Self::Refunded => "refunded",
+        }
+    }
+}
+
+impl fmt::Display for EventKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for EventKind {
+    type Err = UnknownKind;
+
+    fn from_str(name: &str) -> Result<Self, UnknownKind> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == name)
+            .ok_or_else(|| UnknownKind(name.to_string()))
+    }
+}
+
+impl NamesEvent {
+    /// Which event this is.
+    pub fn kind(&self) -> EventKind {
+        match self {
+            Self::IdentityBound { .. } => EventKind::IdentityBound,
+            Self::HandleRevealed { .. } => EventKind::HandleRevealed,
+            Self::HandlePublished { .. } => EventKind::HandlePublished,
+            Self::HandleRetired { .. } => EventKind::HandleRetired,
+            Self::HandleUnpublished { .. } => EventKind::HandleUnpublished,
+            Self::ProofVerifierConfigured { .. } => EventKind::ProofVerifierConfigured,
+            Self::CeremonyBound { .. } => EventKind::CeremonyBound,
+            Self::BindFeePaid { .. } => EventKind::BindFeePaid,
             Self::Escrow(event) => event.kind(),
+        }
+    }
+
+    /// The handle node the event names itself, when it names one.
+    pub fn handle_node(&self) -> Option<B256> {
+        match self {
+            Self::IdentityBound { handle_node, .. }
+            | Self::HandleRevealed { handle_node, .. }
+            | Self::HandlePublished { handle_node, .. }
+            | Self::HandleRetired { handle_node, .. }
+            | Self::Escrow(
+                EscrowEvent::Deposited { handle_node, .. }
+                | EscrowEvent::Forwarded { handle_node, .. }
+                | EscrowEvent::Claimed { handle_node, .. }
+                | EscrowEvent::Refunded { handle_node, .. },
+            ) => Some(*handle_node),
+            Self::HandleUnpublished { .. }
+            | Self::ProofVerifierConfigured { .. }
+            | Self::CeremonyBound { .. }
+            | Self::BindFeePaid { .. } => None,
         }
     }
 
@@ -303,13 +399,13 @@ impl NamesEvent {
 }
 
 impl EscrowEvent {
-    /// The journal's `kind` discriminator.
-    pub fn kind(&self) -> &'static str {
+    /// Which event this is.
+    pub fn kind(&self) -> EventKind {
         match self {
-            Self::Deposited { .. } => "deposited",
-            Self::Forwarded { .. } => "forwarded",
-            Self::Claimed { .. } => "claimed",
-            Self::Refunded { .. } => "refunded",
+            Self::Deposited { .. } => EventKind::Deposited,
+            Self::Forwarded { .. } => EventKind::Forwarded,
+            Self::Claimed { .. } => EventKind::Claimed,
+            Self::Refunded { .. } => EventKind::Refunded,
         }
     }
 
@@ -635,7 +731,7 @@ mod tests {
             ),
             "{event:?}"
         );
-        assert_eq!(event.kind(), "handle_unpublished");
+        assert_eq!(event.kind(), EventKind::HandleUnpublished);
         assert_eq!((position.block_number, position.log_index), (7, 3));
         assert_eq!(position.block_time, 1_700_000_000);
     }
@@ -683,7 +779,7 @@ mod tests {
             .encode_log_data(),
         );
         let (event, _) = decode_escrow(&log).unwrap().expect("a known topic");
-        assert_eq!(event.kind(), "deposited");
+        assert_eq!(event.kind(), EventKind::Deposited);
         assert_eq!(event.parties(), [(payer, Role::Sender)]);
         assert!(matches!(
             event,
@@ -728,6 +824,7 @@ mod tests {
         ));
     }
 
+    /// Revealed text decodes only when it hashes to the node beside it.
     #[test]
     fn a_revealed_handle_keeps_its_text_only_when_it_hashes_to_the_node() {
         let x = KnownPlatform::X;

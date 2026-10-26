@@ -657,9 +657,9 @@ impl Position {
 pub struct Window {
     tx: Transaction<'static, Postgres>,
     chain_id: i64,
-    /// The last bind this window applied. A bind's `CeremonyBound` and
-    /// `BindFeePaid` follow its `IdentityBound` in the same transaction, and
-    /// a window holds whole blocks.
+    /// The last bind this window took up, applied or replayed. A bind's
+    /// `CeremonyBound` and `BindFeePaid` follow its `IdentityBound` in the
+    /// same transaction, and a window holds whole blocks.
     bind: Option<history::Bind>,
 }
 
@@ -689,7 +689,6 @@ impl Window {
     ) -> Result<bool, ApplyError> {
         let chain_id = self.chain_id;
         let at = Position::of(pos)?;
-        let (block, log_index) = (at.block, at.log_index);
 
         // Read before the projections move: a bind's previous holders are the
         // rows it is about to overwrite, and the journal row files the event
@@ -697,35 +696,7 @@ impl Window {
         let involvement = self.involvement(event, &at).await?;
 
         let row = EventColumns::of(event, involvement.handle_node)?;
-        let journaled = sqlx::query(sql::JOURNAL_EVENT)
-            .bind(chain_id)
-            .bind(block)
-            .bind(log_index)
-            .bind(pos.tx_hash)
-            .bind(at.block_time)
-            .bind(&row.kind)
-            .bind(row.handle_node)
-            .bind(row.platform_id)
-            .bind(row.holder)
-            .bind(row.id_node)
-            .bind(row.observed_at)
-            .bind(row.ceremony_version)
-            .bind(row.verifier)
-            .bind(row.authorization_digest)
-            .bind(&row.client_identifier)
-            .bind(row.receiver)
-            .bind(row.token)
-            .bind(row.sender)
-            .bind(row.claimer)
-            .bind(row.recipient)
-            .bind(&row.round)
-            .bind(&row.amount)
-            .bind(&row.released)
-            .bind(&row.received)
-            .bind(row.refundable_at)
-            .execute(&mut *self.tx)
-            .await?;
-        if journaled.rows_affected() == 0 {
+        if !row.journal(&mut self.tx, chain_id, &at).await? {
             // Running the projection writes again would double-count every
             // escrowed amount, so the journal's conflict is the one
             // idempotency gate for everything.
@@ -1451,7 +1422,6 @@ pub(crate) mod plan_tests {
                 "escrow_held",
                 "escrow_refundable",
                 "address_events",
-                "handle_events",
                 "handle_nodes",
             ] {
                 assert!(

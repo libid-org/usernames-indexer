@@ -10,21 +10,30 @@ use alloy::primitives::{
     U256,
 };
 
+use sqlx::{
+    Postgres,
+    Transaction,
+};
+
 use super::{
     as_i64,
+    sql,
     ApplyError,
+    Position,
 };
 use crate::events::{
     EscrowEvent,
+    EventKind,
     NamesEvent,
+    UnknownKind,
 };
 
 /// A journal row that does not read back as the event its kind names.
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
     /// A kind this build does not write.
-    #[error("unknown journal kind {0:?}")]
-    Kind(String),
+    #[error(transparent)]
+    Kind(#[from] UnknownKind),
     /// A column the kind carries is NULL.
     #[error("{kind} row without {field}")]
     Missing {
@@ -77,15 +86,17 @@ pub struct EventColumns {
 }
 
 impl EventColumns {
-    /// The columns `event` sets, filed under `handle_node`.
+    /// The columns `event` sets. An event that names a handle node is filed
+    /// under it; `concerned` files the others: a ceremony and a fee under
+    /// their bind's node, an unpublish under the name it withdrew.
     pub(crate) fn of(
         event: &NamesEvent,
-        handle_node: Option<B256>,
+        concerned: Option<B256>,
     ) -> Result<Self, ApplyError> {
         let text = |value: &U256| Some(value.to_string());
         let base = Self {
             kind: event.kind().to_string(),
-            handle_node,
+            handle_node: event.handle_node().or(concerned),
             ..Self::default()
         };
         Ok(match event {
@@ -219,6 +230,45 @@ impl EventColumns {
         })
     }
 
+    /// Write the row at `at`; `false` when the journal already holds the
+    /// log, which is what keeps a replayed window from applying twice.
+    pub(crate) async fn journal(
+        &self,
+        tx: &mut Transaction<'static, Postgres>,
+        chain_id: i64,
+        at: &Position,
+    ) -> Result<bool, sqlx::Error> {
+        let written = sqlx::query(sql::JOURNAL_EVENT)
+            .bind(chain_id)
+            .bind(at.block)
+            .bind(at.log_index)
+            .bind(at.tx_hash)
+            .bind(at.block_time)
+            .bind(&self.kind)
+            .bind(self.handle_node)
+            .bind(self.platform_id)
+            .bind(self.holder)
+            .bind(self.id_node)
+            .bind(self.observed_at)
+            .bind(self.ceremony_version)
+            .bind(self.verifier)
+            .bind(self.authorization_digest)
+            .bind(&self.client_identifier)
+            .bind(self.receiver)
+            .bind(self.token)
+            .bind(self.sender)
+            .bind(self.claimer)
+            .bind(self.recipient)
+            .bind(&self.round)
+            .bind(&self.amount)
+            .bind(&self.released)
+            .bind(&self.received)
+            .bind(self.refundable_at)
+            .execute(&mut **tx)
+            .await?;
+        Ok(written.rows_affected() == 1)
+    }
+
     /// A column the kind carries.
     fn need<T>(&self, value: Option<T>, field: &'static str) -> Result<T, JournalError> {
         value.ok_or_else(|| JournalError::Missing {
@@ -261,8 +311,8 @@ impl TryFrom<&EventColumns> for NamesEvent {
             let value = row.need(value, field)?;
             u64::try_from(value).map_err(|_| row.range(field))
         };
-        Ok(match row.kind.as_str() {
-            "identity_bound" => Self::IdentityBound {
+        Ok(match row.kind.parse::<EventKind>()? {
+            EventKind::IdentityBound => Self::IdentityBound {
                 holder: holder()?,
                 id_node: row.need(row.id_node, "id_node")?,
                 handle_node: handle_node()?,
@@ -273,26 +323,26 @@ impl TryFrom<&EventColumns> for NamesEvent {
                 )
                 .map_err(|_| row.range("ceremony_version"))?,
             },
-            "handle_revealed" => Self::HandleRevealed {
+            EventKind::HandleRevealed => Self::HandleRevealed {
                 platform_id: platform_id()?,
                 handle_node: handle_node()?,
                 handle: None,
             },
-            "handle_published" => Self::HandlePublished {
+            EventKind::HandlePublished => Self::HandlePublished {
                 holder: holder()?,
                 platform_id: platform_id()?,
                 handle_node: handle_node()?,
             },
-            "handle_retired" => Self::HandleRetired {
+            EventKind::HandleRetired => Self::HandleRetired {
                 platform_id: platform_id()?,
                 handle_node: handle_node()?,
                 holder: holder()?,
             },
-            "handle_unpublished" => Self::HandleUnpublished { holder: holder()? },
-            "proof_verifier_configured" => Self::ProofVerifierConfigured {
+            EventKind::HandleUnpublished => Self::HandleUnpublished { holder: holder()? },
+            EventKind::ProofVerifierConfigured => Self::ProofVerifierConfigured {
                 verifier: row.need(row.verifier, "verifier")?,
             },
-            "ceremony_bound" => Self::CeremonyBound {
+            EventKind::CeremonyBound => Self::CeremonyBound {
                 authorization_digest: row
                     .need(row.authorization_digest, "authorization_digest")?,
                 holder: holder()?,
@@ -301,13 +351,13 @@ impl TryFrom<&EventColumns> for NamesEvent {
                     row.need(row.client_identifier.as_deref(), "client_identifier")?,
                 ),
             },
-            "bind_fee_paid" => Self::BindFeePaid {
+            EventKind::BindFeePaid => Self::BindFeePaid {
                 authorization_digest: row
                     .need(row.authorization_digest, "authorization_digest")?,
                 receiver: row.need(row.receiver, "receiver")?,
                 amount: row.number(&row.amount, "amount")?,
             },
-            "deposited" => Self::Escrow(EscrowEvent::Deposited {
+            EventKind::Deposited => Self::Escrow(EscrowEvent::Deposited {
                 handle_node: handle_node()?,
                 token: token()?,
                 sender: sender()?,
@@ -315,7 +365,7 @@ impl TryFrom<&EventColumns> for NamesEvent {
                 amount: row.number(&row.amount, "amount")?,
                 refundable_at: unsigned(row.refundable_at, "refundable_at")?,
             }),
-            "forwarded" => Self::Escrow(EscrowEvent::Forwarded {
+            EventKind::Forwarded => Self::Escrow(EscrowEvent::Forwarded {
                 handle_node: handle_node()?,
                 token: token()?,
                 sender: sender()?,
@@ -323,7 +373,7 @@ impl TryFrom<&EventColumns> for NamesEvent {
                 amount: row.number(&row.amount, "amount")?,
                 received: row.number(&row.received, "received")?,
             }),
-            "claimed" => Self::Escrow(EscrowEvent::Claimed {
+            EventKind::Claimed => Self::Escrow(EscrowEvent::Claimed {
                 handle_node: handle_node()?,
                 token: token()?,
                 claimer: row.need(row.claimer, "claimer")?,
@@ -332,7 +382,7 @@ impl TryFrom<&EventColumns> for NamesEvent {
                 released: row.number(&row.released, "released")?,
                 received: row.number(&row.received, "received")?,
             }),
-            "refunded" => Self::Escrow(EscrowEvent::Refunded {
+            EventKind::Refunded => Self::Escrow(EscrowEvent::Refunded {
                 handle_node: handle_node()?,
                 token: token()?,
                 sender: sender()?,
@@ -341,7 +391,6 @@ impl TryFrom<&EventColumns> for NamesEvent {
                 released: row.number(&row.released, "released")?,
                 received: row.number(&row.received, "received")?,
             }),
-            other => return Err(JournalError::Kind(other.to_string())),
         })
     }
 }
