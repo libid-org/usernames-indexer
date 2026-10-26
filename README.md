@@ -58,9 +58,8 @@ indexer's settings.
 | `CHAIN_ID` | indexer | unset | Refuse to start unless the RPC reports this chain id. The API takes none: it serves every chain the store holds, and a request narrows with `?chain=` |
 | `CHAIN_NAMES` | indexer | — | Required. The names this chain goes by in an ENS name, comma-separated: the `base` in `alice.x.base.handles.link`. Labels only, never a platform key. Written to the store at every start for the gateway to read; a name belongs to one chain across the store, and declaring one another chain holds refuses to start |
 | `CONFIRMATIONS` | indexer | `5` | Blocks behind the head to stay (shallow-reorg protection). At least 1 with `LOG_SOURCE=subscribe` |
-| `LOG_SOURCE` | indexer | `subscribe` | How the indexer learns of new logs: `subscribe` holds an `eth_subscribe("logs")` stream on a WebSocket; `poll` asks with `eth_getLogs` every `POLL_INTERVAL`, for an endpoint without WebSocket. See [Log sources](#log-sources) |
-| `POLL_INTERVAL` | indexer | `5s` | The loop's cadence, and the retry delay after a failure: a poll cycle, or with a subscription a renewal of the report and, while pushed logs wait for their confirmations, a head read |
-| `HEAD_INTERVAL` | indexer | `1m` | With a subscription, how often an idle indexer reads the head; each read carries the cursor past blocks without events |
+| `LOG_SOURCE` | indexer | `subscribe` | How the indexer learns of new blocks and logs: `subscribe` holds `eth_subscribe` streams of heads and logs on a WebSocket; `poll` asks with `eth_getLogs` every `POLL_INTERVAL`, for an endpoint without WebSocket. See [Log sources](#log-sources) |
+| `POLL_INTERVAL` | indexer | `5s` | The loop's cadence, and the retry delay after a failure: a poll cycle, or with a subscription the renewal of the report while no head arrives |
 | `STALE_AFTER` | indexer | four poll intervals + 1m | How long readers may trust this indexer's last report; the ENS gateway refuses this chain once it expires. Must exceed `POLL_INTERVAL`, and at most a year |
 | `MAX_BLOCK_RANGE` | indexer | `10000` | Largest `eth_getLogs` window |
 | `START_BLOCK` | indexer | unset | Where a FRESH scan starts — consulted only when no cursor exists (new database, or right after a re-index). Unset means the deployment block is found by binary search over `eth_getCode`; only a successful detection is cached, and an RPC failure mid-search retries next cycle |
@@ -68,17 +67,18 @@ indexer's settings.
 
 ### Log sources
 
-**Subscribe** (the default) costs RPC calls per event rather than per
-block. A session subscribes to both contracts' logs, reads the head, and
-backfills from the cursor in `eth_getLogs` windows: the confirmed blocks
-commit, and the blocks above `CONFIRMATIONS` wait beside the pushed logs.
-Any socket drop, stream overflow or RPC error ends the session, and the
-next one backfills from the cursor, so nothing the socket missed is lost.
-A pushed log commits once its block is `CONFIRMATIONS` deep, after its
-block hash is compared with the canonical block at that height; a block a
-reorg replaced has its logs refetched by the new hash. Between events, a
-head read every `HEAD_INTERVAL` carries the cursor forward, and the report
-is renewed every `POLL_INTERVAL` from the database alone.
+**Subscribe** (the default) reacts as soon as a block is `CONFIRMATIONS`
+deep and costs `eth_getLogs` calls only for blocks with events. A session
+subscribes to new heads and to both contracts' logs, reads the head once,
+and catches up from the cursor in `eth_getLogs` windows. On each pushed
+head it commits through the head's confirmation depth: blocks a pushed log
+named, and on the first head every block the catch-up left, are fetched
+with `eth_getLogs`; the cursor passes any other block without a call. A
+reorg shallower than `CONFIRMATIONS` is settled by that fetch, as in
+polling. Any socket drop, stream overflow or RPC error ends the session,
+and the next one catches up from the cursor, so nothing the socket missed
+is lost. While no head arrives, the report is renewed every
+`POLL_INTERVAL`.
 
 **Poll** asks for every window with `eth_getLogs` and re-reads the head
 each `POLL_INTERVAL`, which costs RPC calls per block whether or not

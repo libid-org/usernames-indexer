@@ -1,9 +1,8 @@
 //! A WebSocket relay between the indexer and anvil: it records the JSON-RPC
-//! methods the indexer calls, and on demand cuts every connection, holds new
-//! ones until it reopens, or answers one head read from behind the chain.
+//! methods the indexer calls, and on demand cuts every connection and holds
+//! new ones until it reopens.
 
 use std::{
-    collections::HashMap,
     net::SocketAddr,
     sync::{
         Arc,
@@ -11,15 +10,11 @@ use std::{
     },
 };
 
-use alloy::primitives::U64;
 use futures_util::{
     SinkExt,
     StreamExt,
 };
-use serde::{
-    Deserialize,
-    Serialize,
-};
+use serde::Deserialize;
 use tokio::{
     net::{
         TcpListener,
@@ -48,23 +43,12 @@ pub struct Relay {
 struct Shared {
     /// Every method the indexer called, in order.
     calls: Mutex<Vec<String>>,
-    /// Blocks to take off the next `eth_blockNumber` answer.
-    head_lag: Mutex<Option<u64>>,
 }
 
 /// The part of a JSON-RPC request the relay reads.
 #[derive(Deserialize)]
 struct Call {
-    id: u64,
     method: String,
-}
-
-/// A JSON-RPC answer carrying a quantity, as `eth_blockNumber` answers.
-#[derive(Deserialize, Serialize)]
-struct Quantity {
-    jsonrpc: String,
-    id: u64,
-    result: U64,
 }
 
 impl Relay {
@@ -129,21 +113,14 @@ impl Relay {
         self.open.send_replace(true);
     }
 
-    /// Answer the next `eth_blockNumber` `blocks` short of the chain head, as
-    /// a node behind the rest of a balanced endpoint would.
-    pub fn lag_next_head(&self, blocks: u64) {
-        *self.shared.head_lag.lock().expect("the head lag") = Some(blocks);
-    }
-
     /// Every method the indexer called through the relay, in order.
     pub fn calls(&self) -> Vec<String> {
         self.shared.calls.lock().expect("the call log").clone()
     }
 }
 
-/// Relay one connection both ways, recording each request's method and
-/// lagging the head read it was told to, until either side closes or the
-/// relay is cut.
+/// Relay one connection both ways, recording each request's method, until
+/// either side closes or the relay is cut.
 async fn pipe(
     socket: TcpStream,
     upstream: Url,
@@ -158,8 +135,6 @@ async fn pipe(
     };
     let (mut to_client, mut from_client) = client.split();
     let (mut to_server, mut from_server) = server.split();
-    // Request ids whose answers are to be lagged, and by how much.
-    let mut lagged = HashMap::new();
     loop {
         tokio::select! {
             _ = async { open.wait_for(|open| !*open).await.map(drop) } => return,
@@ -167,10 +142,6 @@ async fn pipe(
                 let Some(Ok(message)) = message else { return };
                 if let Message::Text(text) = &message {
                     if let Ok(call) = serde_json::from_str::<Call>(text.as_str()) {
-                        let lag = shared.head_lag.lock().expect("the head lag").take_if(|_| call.method == "eth_blockNumber");
-                        if let Some(blocks) = lag {
-                            lagged.insert(call.id, blocks);
-                        }
                         shared.calls.lock().expect("the call log").push(call.method);
                     }
                 }
@@ -180,20 +151,6 @@ async fn pipe(
             }
             message = from_server.next() => {
                 let Some(Ok(message)) = message else { return };
-                let message = match &message {
-                    Message::Text(text) => match serde_json::from_str::<Quantity>(text.as_str()) {
-                        Ok(answer) if lagged.contains_key(&answer.id) => {
-                            let blocks = lagged.remove(&answer.id).unwrap_or_default();
-                            let behind = Quantity {
-                                result: answer.result.saturating_sub(U64::from(blocks)),
-                                ..answer
-                            };
-                            Message::text(serde_json::to_string(&behind).expect("an answer"))
-                        }
-                        _ => message,
-                    },
-                    _ => message,
-                };
                 if to_client.send(message).await.is_err() {
                     return;
                 }

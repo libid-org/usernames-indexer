@@ -111,7 +111,6 @@ impl Harness {
                     confirmations: 0,
                     source: indexer::LogSource::Poll,
                     poll_interval: Duration::from_millis(10),
-                    head_interval: Duration::from_millis(10),
                     max_block_range: 100,
                     start_block: None,
                     stale_after: Duration::from_secs(120),

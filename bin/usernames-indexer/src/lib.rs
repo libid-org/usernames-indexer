@@ -44,10 +44,10 @@ pub struct Config {
     #[arg(long, env = "RPC_URL", hide_env_values = true)]
     pub rpc_url: Url,
 
-    /// How the indexer learns of new logs: `subscribe` holds an
-    /// `eth_subscribe("logs")` stream on a WebSocket and reads the head once
-    /// per `HEAD_INTERVAL`; `poll` asks with `eth_getLogs` every
-    /// `POLL_INTERVAL`, for an endpoint that serves no WebSocket.
+    /// How the indexer learns of new blocks and logs: `subscribe` holds
+    /// `eth_subscribe` streams of heads and logs on a WebSocket; `poll` asks
+    /// with `eth_getLogs` every `POLL_INTERVAL`, for an endpoint that serves
+    /// no WebSocket.
     #[arg(long, env = "LOG_SOURCE", default_value = "subscribe")]
     pub log_source: LogSource,
 
@@ -87,12 +87,6 @@ pub struct Config {
     /// and a head read while pushed logs wait for their confirmations.
     #[arg(long, env = "POLL_INTERVAL", default_value = "5s", value_parser = humantime::parse_duration)]
     pub poll_interval: Duration,
-
-    /// With the `subscribe` log source, how often an idle indexer reads the
-    /// chain head, which carries the cursor past blocks without events:
-    /// `1m`, `30s`.
-    #[arg(long, env = "HEAD_INTERVAL", default_value = "1m", value_parser = humantime::parse_duration)]
-    pub head_interval: Duration,
 
     /// Largest eth_getLogs window, sized to the RPC provider's limits.
     #[arg(long, env = "MAX_BLOCK_RANGE", default_value_t = 10_000)]
@@ -225,7 +219,6 @@ pub async fn run() -> anyhow::Result<()> {
             confirmations,
             source: config.log_source,
             poll_interval: config.poll_interval,
-            head_interval: config.head_interval,
             max_block_range: config.max_block_range,
             start_block: config.start_block,
             stale_after,

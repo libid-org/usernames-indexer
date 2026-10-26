@@ -1,5 +1,6 @@
-//! Where the loop learns of new logs: an `eth_subscribe("logs")` stream on a
-//! WebSocket, or `eth_getLogs` windows polled on a timer.
+//! Where the loop learns of new blocks and logs: `eth_subscribe` streams of
+//! heads and of the watched contracts' logs on a WebSocket, or `eth_getLogs`
+//! windows polled on a timer.
 
 use std::{
     fmt,
@@ -21,6 +22,7 @@ use alloy::{
         client::ClientBuilder,
         types::{
             Filter,
+            Header,
             Log,
         },
     },
@@ -31,20 +33,18 @@ use alloy::{
     },
 };
 use anyhow::Context;
-use tokio::sync::broadcast::error::TryRecvError;
 use tokio_util::sync::CancellationToken;
 use url::Url;
-
-use super::unconfirmed::Unconfirmed;
 
 /// How the loop learns of new logs, configured as `subscribe` or `poll`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogSource {
-    /// An `eth_subscribe("logs")` stream on a WebSocket: the endpoint pushes
-    /// the watched contracts' logs as their blocks arrive, and the head is
-    /// read only to confirm them and to carry the cursor past blocks without
-    /// any. It needs at least one confirmation: a block's logs can still be
-    /// on their way when the head first reports it.
+    /// `eth_subscribe` streams on a WebSocket: the endpoint pushes every new
+    /// head and the watched contracts' logs as their blocks arrive. A block
+    /// is fetched once confirmed when a log was pushed for it; the cursor
+    /// passes any other block without a call. It needs at least one
+    /// confirmation: a block's logs can still be on their way when its
+    /// successor's head arrives.
     Subscribe,
     /// `eth_getLogs` windows every poll interval, for an endpoint that serves
     /// no WebSocket.
@@ -141,27 +141,41 @@ impl PubSubConnect for Unretried {
     }
 }
 
-/// What a session follows the chain with between head reads.
+/// What a session follows the chain with.
 pub(crate) enum Feed {
-    /// Nothing: each poll asks for the logs itself.
+    /// Nothing: each poll reads the head and asks for the logs itself.
     Poll,
-    /// The stream, and what it pushed that is not yet confirmed.
+    /// The streams the endpoint pushes.
     Subscribe {
-        /// The watched contracts' logs, as the endpoint pushes them.
+        /// Every new head.
+        heads: Subscription<Header>,
+        /// The watched contracts' logs.
         logs: Subscription<Log>,
-        /// Pushed logs whose blocks are not yet confirmed.
-        unconfirmed: Unconfirmed,
     },
 }
 
-/// Pushed logs the stream holds while the loop is busy fetching or
-/// committing. Past it the stream reports a lag, which ends the session, and
-/// the next one backfills what was dropped.
+/// What ended a [`Feed::wait`].
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Wake {
+    /// The loop was cancelled.
+    Cancelled,
+    /// The interval ran out.
+    Tick,
+    /// The endpoint pushed a head at this height.
+    Head(u64),
+    /// The endpoint pushed a log from this block, or withdrew one a reorg
+    /// removed.
+    Log(u64),
+}
+
+/// Pushes a stream holds while the loop is busy fetching or committing. Past
+/// it the stream reports a lag, which ends the session, and the next one
+/// backfills from the cursor.
 const STREAM_CAPACITY: usize = 1024;
 
 impl Feed {
-    /// Open what `source` follows the chain with. A subscription is live on
-    /// the endpoint when this returns, so every block from here on is pushed.
+    /// Open what `source` follows the chain with. The streams are live on the
+    /// endpoint when this returns, so every block from here on is pushed.
     pub(crate) async fn open(
         source: LogSource,
         provider: &RootProvider,
@@ -169,70 +183,56 @@ impl Feed {
     ) -> TransportResult<Self> {
         match source {
             LogSource::Poll => Ok(Self::Poll),
-            LogSource::Subscribe => Ok(Self::Subscribe {
-                logs: provider
+            LogSource::Subscribe => {
+                let logs = provider
                     .subscribe_logs(filter)
                     .channel_size(STREAM_CAPACITY)
-                    .await?,
-                unconfirmed: Unconfirmed::default(),
-            }),
-        }
-    }
-
-    /// The buffer of unconfirmed logs, which only a subscription keeps.
-    pub(crate) fn unconfirmed(&mut self) -> Option<&mut Unconfirmed> {
-        match self {
-            Self::Poll => None,
-            Self::Subscribe { unconfirmed, .. } => Some(unconfirmed),
-        }
-    }
-
-    /// Hold every log the stream has delivered, without waiting for more.
-    /// The endpoint pushes a block's logs as the block arrives, so after a
-    /// head read this holds every log of the blocks below that head.
-    pub(crate) fn take_delivered(&mut self) -> anyhow::Result<()> {
-        let Self::Subscribe { logs, unconfirmed } = self else {
-            return Ok(());
-        };
-        loop {
-            match logs.try_recv_result() {
-                Ok(pushed) => unconfirmed.push(pushed.context(
-                    "the log subscription pushed something that is not a log",
-                )?)?,
-                Err(TryRecvError::Empty) => return Ok(()),
-                Err(ended) => return Err(ended).context("the log subscription ended"),
+                    .await?;
+                let heads = provider
+                    .subscribe_blocks()
+                    .channel_size(STREAM_CAPACITY)
+                    .await?;
+                Ok(Self::Subscribe { heads, logs })
             }
         }
     }
 
-    /// Wait out `interval`, holding whatever the stream pushes meanwhile;
-    /// `Ok(false)` once cancelled. A stream that closed, overflowed or pushed
-    /// something unreadable is an error: logs may be lost, and only the next
-    /// session's backfill finds them.
+    /// Wait for the next push, or `interval`, or cancellation. A stream that
+    /// closed, overflowed or pushed something unreadable is an error: logs
+    /// may be lost, and only the next session's catch-up finds them.
     pub(crate) async fn wait(
         &mut self,
         interval: Duration,
         cancel: &CancellationToken,
-    ) -> anyhow::Result<bool> {
-        let deadline = tokio::time::sleep(interval);
-        tokio::pin!(deadline);
-        loop {
-            match self {
-                Self::Poll => tokio::select! {
-                    _ = cancel.cancelled() => return Ok(false),
-                    _ = &mut deadline => return Ok(true),
-                },
-                Self::Subscribe { logs, unconfirmed } => tokio::select! {
-                    _ = cancel.cancelled() => return Ok(false),
-                    _ = &mut deadline => return Ok(true),
-                    pushed = logs.recv_result() => {
-                        let log = pushed
-                            .context("the log subscription ended")?
-                            .context("the log subscription pushed something that is not a log")?;
-                        unconfirmed.push(log)?;
-                    }
-                },
-            }
+    ) -> anyhow::Result<Wake> {
+        match self {
+            Self::Poll => tokio::select! {
+                _ = cancel.cancelled() => Ok(Wake::Cancelled),
+                _ = tokio::time::sleep(interval) => Ok(Wake::Tick),
+            },
+            // In this order: a block's logs are pushed before the head that
+            // confirms it, and a head taken first would let the cursor pass a
+            // block whose logs wait in the other stream.
+            Self::Subscribe { heads, logs } => tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Ok(Wake::Cancelled),
+                log = logs.recv_result() => {
+                    let log = log
+                        .context("the log subscription ended")?
+                        .context("the log subscription pushed something that is not a log")?;
+                    let block = log
+                        .block_number
+                        .context("the log subscription pushed a log without its block")?;
+                    Ok(Wake::Log(block))
+                }
+                head = heads.recv_result() => {
+                    let head = head
+                        .context("the head subscription ended")?
+                        .context("the head subscription pushed something that is not a head")?;
+                    Ok(Wake::Head(head.number))
+                }
+                _ = tokio::time::sleep(interval) => Ok(Wake::Tick),
+            },
         }
     }
 }
@@ -257,23 +257,41 @@ mod tests {
 
     use super::*;
 
+    type Pushes = broadcast::Sender<Box<RawValue>>;
+
     /// A subscription fed by hand: what the test sends is what it pushes.
-    fn stream(capacity: usize) -> (broadcast::Sender<Box<RawValue>>, Feed) {
+    fn stream<T>(capacity: usize) -> (Pushes, Subscription<T>) {
         let (pushes, rx) = broadcast::channel(capacity);
-        let logs = RawSubscription {
+        let subscription = RawSubscription {
             rx,
             local_id: B256::ZERO,
         }
         .into_typed();
+        (pushes, subscription)
+    }
+
+    /// Head and log streams fed by hand.
+    fn streams(capacity: usize) -> (Pushes, Pushes, Feed) {
+        let (heads, head_stream) = stream(capacity);
+        let (logs, log_stream) = stream(capacity);
         let feed = Feed::Subscribe {
-            logs,
-            unconfirmed: Unconfirmed::default(),
+            heads: head_stream,
+            logs: log_stream,
         };
-        (pushes, feed)
+        (heads, logs, feed)
+    }
+
+    /// A head at `height`, as the endpoint pushes it.
+    fn head(height: u64) -> Box<RawValue> {
+        let head = Header::new(alloy::consensus::Header {
+            number: height,
+            ..Default::default()
+        });
+        to_raw_value(&head).unwrap()
     }
 
     /// A mined log at `height`, as the endpoint pushes it.
-    fn pushed(height: u64) -> Box<RawValue> {
+    fn log(height: u64) -> Box<RawValue> {
         let log = Log {
             inner: PrimitiveLog {
                 address: Address::repeat_byte(0xAA),
@@ -290,57 +308,52 @@ mod tests {
         to_raw_value(&log).unwrap()
     }
 
-    /// The heights the buffer holds at or below `target`.
-    fn held(feed: &mut Feed, target: u64) -> Vec<u64> {
-        let unconfirmed = feed.unconfirmed().unwrap();
-        unconfirmed.confirmed(target).into_keys().collect()
-    }
-
-    #[test]
-    fn delivered_logs_are_held_before_the_head_decides() {
-        let (pushes, mut feed) = stream(8);
-        pushes.send(pushed(10)).unwrap();
-        pushes.send(pushed(11)).unwrap();
-
-        feed.take_delivered().unwrap();
-        assert_eq!(held(&mut feed, 11), [10, 11]);
-    }
-
-    #[test]
-    fn a_stream_that_overflowed_ends_the_session() {
-        let (pushes, mut feed) = stream(1);
-        pushes.send(pushed(10)).unwrap();
-        pushes.send(pushed(11)).unwrap();
-
-        assert!(feed.take_delivered().is_err());
-    }
-
-    #[test]
-    fn a_closed_stream_ends_the_session() {
-        let (pushes, mut feed) = stream(8);
-        drop(pushes);
-
-        assert!(feed.take_delivered().is_err());
+    async fn wake(feed: &mut Feed) -> anyhow::Result<Wake> {
+        feed.wait(Duration::from_secs(60), &CancellationToken::new())
+            .await
     }
 
     #[tokio::test]
-    async fn waiting_holds_what_the_stream_pushes_until_the_interval_ends() {
-        let (pushes, mut feed) = stream(8);
-        pushes.send(pushed(10)).unwrap();
-        let cancel = CancellationToken::new();
-
-        let woke = feed.wait(Duration::from_millis(50), &cancel).await.unwrap();
-        assert!(woke);
-        assert_eq!(held(&mut feed, 10), [10]);
+    async fn a_pushed_head_or_log_wakes_the_loop_with_its_block() {
+        let (heads, logs, mut feed) = streams(8);
+        heads.send(head(12)).unwrap();
+        assert_eq!(wake(&mut feed).await.unwrap(), Wake::Head(12));
+        logs.send(log(11)).unwrap();
+        assert_eq!(wake(&mut feed).await.unwrap(), Wake::Log(11));
     }
 
     #[tokio::test]
-    async fn a_stream_closing_mid_wait_ends_the_session() {
-        let (pushes, mut feed) = stream(8);
-        drop(pushes);
-        let cancel = CancellationToken::new();
+    async fn a_log_waiting_beside_a_later_head_wakes_first() {
+        let (heads, logs, mut feed) = streams(8);
+        heads.send(head(13)).unwrap();
+        logs.send(log(11)).unwrap();
+        assert_eq!(wake(&mut feed).await.unwrap(), Wake::Log(11));
+        assert_eq!(wake(&mut feed).await.unwrap(), Wake::Head(13));
+    }
 
-        assert!(feed.wait(Duration::from_secs(60), &cancel).await.is_err());
+    #[tokio::test]
+    async fn a_stream_that_overflowed_ends_the_session() {
+        let (_heads, logs, mut feed) = streams(1);
+        logs.send(log(10)).unwrap();
+        logs.send(log(11)).unwrap();
+        assert!(wake(&mut feed).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_closed_stream_ends_the_session() {
+        let (heads, _logs, mut feed) = streams(8);
+        drop(heads);
+        assert!(wake(&mut feed).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_idle_feed_wakes_when_the_interval_ends() {
+        let (_heads, _logs, mut feed) = streams(8);
+        let woke = feed
+            .wait(Duration::from_millis(20), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(woke, Wake::Tick);
     }
 
     #[test]

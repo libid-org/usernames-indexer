@@ -36,7 +36,7 @@ url.workspace = true
 usernames-core = { workspace = true, features = ["test-seams"] }
 libid-contracts = { workspace = true, features = ["testing"] }
 libid-profiles.workspace = true
-alloy = { workspace = true, features = ["node-bindings", "rpc-types-anvil", "signer-local"] }
+alloy = { workspace = true, features = ["node-bindings", "signer-local"] }
 futures-util = { version = "0.3", features = ["sink"] }
 http-body-util = "0.1"
 tokio-tungstenite = "0.28"

@@ -203,7 +203,6 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
         confirmations: 1,
         source,
         poll_interval: Duration::from_millis(20),
-        head_interval: Duration::from_millis(100),
         max_block_range: 2,
         start_block: None,
         // A report good for two minutes; the loop renews it every cycle.

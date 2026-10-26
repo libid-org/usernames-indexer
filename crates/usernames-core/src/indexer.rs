@@ -1,5 +1,5 @@
 //! The indexing loop: catch up with `eth_getLogs` windows, then follow the
-//! chain, by polling or from a log subscription.
+//! chain, by polling or from pushed heads and logs.
 //!
 //! Each window commits through [`crate::db::Window`] — journal rows, projection
 //! writes and the cursor together — so a crash replays a whole window instead
@@ -7,12 +7,10 @@
 //! the replay converges.
 
 mod source;
-mod unconfirmed;
 
 use std::time::Duration;
 
 use alloy::{
-    eips::BlockNumberOrTag,
     primitives::Address,
     providers::{
         Provider,
@@ -24,18 +22,16 @@ use alloy::{
     },
 };
 use anyhow::Context;
-use futures_util::future::try_join_all;
-use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
+use self::source::{
+    Feed,
+    Wake,
+};
 pub use self::source::{
     LogSource,
     UnknownLogSource,
-};
-use self::{
-    source::Feed,
-    unconfirmed::Forks,
 };
 use crate::{
     chain,
@@ -67,15 +63,12 @@ pub struct IndexerConfig {
     /// least one with a subscription, whose logs for the head block may still
     /// be on their way.
     pub confirmations: u64,
-    /// How the loop learns of new logs.
+    /// How the loop learns of new blocks and logs.
     pub source: LogSource,
-    /// The loop's cadence: a poll cycle, or with a subscription a renewal of
-    /// the report and, while pushed logs wait for their confirmations, a
-    /// head read. Also the retry delay after a failure.
+    /// The loop's cadence: a poll cycle, or with a subscription the renewal
+    /// of the report while no head arrives. Also the retry delay after a
+    /// failure.
     pub poll_interval: Duration,
-    /// With a subscription, how often an idle loop reads the head to carry
-    /// the cursor past blocks that hold no event.
-    pub head_interval: Duration,
     /// Largest `eth_getLogs` window, sized to the RPC provider's limits.
     pub max_block_range: u64,
     /// Where a FRESH scan starts — used only when no cursor exists (a new
@@ -227,9 +220,6 @@ struct Session<'a> {
     indexer: &'a Indexer,
     provider: RootProvider,
     feed: Feed,
-    /// With a subscription, the head the last catch-up fetched through, until
-    /// the next settle fetches past it.
-    fetched_through: Option<u64>,
 }
 
 impl<'a> Session<'a> {
@@ -247,49 +237,57 @@ impl<'a> Session<'a> {
             indexer,
             provider,
             feed,
-            fetched_through: None,
         })
     }
 
-    /// Catch up, then wake every poll interval: a poll catches up again; a
-    /// subscription reads the head when one is due or pushed logs wait for
-    /// their confirmations, and otherwise only renews the report.
+    /// Catch up, then follow: a poll catches up again every interval; a
+    /// subscription commits through each pushed head's confirmation depth,
+    /// fetching only the blocks a pushed log or the catch-up left unread.
     async fn follow(mut self, cancel: &CancellationToken) -> anyhow::Result<()> {
-        let indexer = self.indexer;
-        let config = &indexer.config;
-        let mut vouched = self.catch_up(cancel).await?;
-        let mut head_read = Instant::now();
+        let config = &self.indexer.config;
+        let (mut vouched, caught_up_to) = self.catch_up(cancel).await?;
+        // Blocks up to here may hold logs nobody fetched: the catch-up stopped
+        // at its confirmation depth, and a block mined before the streams
+        // opened was never pushed. The first pushed head extends it, since an
+        // endpoint behind a load balancer may have read the catch-up's head
+        // from a lagging node.
+        let mut unread = Some(caught_up_to);
+        let mut first_head = true;
         loop {
-            if !self.feed.wait(config.poll_interval, cancel).await? {
-                return Ok(());
-            }
-            let head_due = head_read.elapsed() >= config.head_interval;
-            vouched = match &self.feed {
-                Feed::Poll => self.catch_up(cancel).await?,
-                Feed::Subscribe { unconfirmed, .. }
-                    if head_due || !unconfirmed.is_empty() =>
-                {
-                    head_read = Instant::now();
-                    self.settle().await?
-                }
-                // A renewal vouches only that the loop is alive and its stream
-                // open, and only for a target that landed.
-                Feed::Subscribe { .. } => {
-                    if vouched {
-                        indexer.store.touch_chain_target(config.stale_after).await;
+            match self.feed.wait(config.poll_interval, cancel).await? {
+                Wake::Cancelled => return Ok(()),
+                Wake::Tick => match self.feed {
+                    Feed::Poll => (vouched, _) = self.catch_up(cancel).await?,
+                    // No head in a whole interval: the stream is open, so the
+                    // loop vouches it is alive, for a target that landed.
+                    Feed::Subscribe { .. } => {
+                        if vouched {
+                            self.indexer
+                                .store
+                                .touch_chain_target(config.stale_after)
+                                .await;
+                        }
                     }
-                    vouched
+                },
+                Wake::Log(block) => unread = unread.max(Some(block)),
+                Wake::Head(head) => {
+                    if first_head {
+                        unread = unread.max(Some(head));
+                        first_head = false;
+                    }
+                    vouched = self.advance(head, &mut unread).await?;
                 }
-            };
+            }
         }
     }
 
     /// Read the head and commit every confirmed block past the cursor in
-    /// `eth_getLogs` windows. A subscription fetches on up to the head and
-    /// holds the unconfirmed tail, because its stream pushes only the blocks
-    /// that arrive after it opened. Returns whether the target write landed,
-    /// which is all a later renewal may vouch for.
-    async fn catch_up(&mut self, cancel: &CancellationToken) -> anyhow::Result<bool> {
+    /// `eth_getLogs` windows. Returns whether the target write landed, which
+    /// is all a later renewal may vouch for, and the head it read.
+    async fn catch_up(
+        &mut self,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<(bool, u64)> {
         let indexer = self.indexer;
         let config = &indexer.config;
         let (head, mut from) = tokio::try_join!(self.head(), self.next_block())?;
@@ -302,154 +300,76 @@ impl<'a> Session<'a> {
             indexer.store.set_chain_head(head),
             indexer.store.set_chain_target(target, config.stale_after)
         );
-        let through = match self.feed {
-            Feed::Poll => target,
-            Feed::Subscribe { .. } => {
-                self.fetched_through = Some(head);
-                head
-            }
-        };
 
         let mut total = 0usize;
-        while from <= through && !cancel.is_cancelled() {
-            let to = config.window_end(from, through);
+        while from <= target && !cancel.is_cancelled() {
+            let to = config.window_end(from, target);
             // Renewed before the fetch as well as after the commit: the fetch
             // is the slow part, and a report expiring during it would refuse
             // a loop that is busy catching up.
             if vouched {
                 indexer.store.touch_chain_target(config.stale_after).await;
             }
-            let logs = self.fetch(from, to).await?;
-            let (confirmed, held): (Vec<Log>, Vec<Log>) = logs
-                .into_iter()
-                .partition(|log| log.block_number.is_some_and(|block| block <= target));
-            if from <= target {
-                let committed = to.min(target);
-                total += indexer
-                    .commit(&confirmed, committed)
-                    .await
-                    .with_context(|| format!("blocks {from}..{committed}"))?;
-            }
-            if let Some(unconfirmed) = self.feed.unconfirmed() {
-                for log in held {
-                    unconfirmed.push(log)?;
-                }
-            }
-            // Each committed chunk is proof the loop is alive and the chain
-            // reachable.
-            if vouched {
-                indexer.store.touch_chain_target(config.stale_after).await;
-            }
+            total += self.commit_fetched(from, to).await?;
             from = to + 1;
         }
         indexer.store.set_window_error(None).await;
         if total > 0 {
-            tracing::info!(
-                events = total,
-                through_block = target.min(from.saturating_sub(1)),
-                "indexed"
-            );
+            tracing::info!(events = total, through_block = target, "indexed");
         }
-        Ok(vouched)
+        Ok((vouched, head))
     }
 
-    /// Read the head and commit through its confirmation depth from what the
-    /// stream pushed. Each height holding pushed logs is checked against the
-    /// canonical block there; heights without any cost nothing. Returns
-    /// whether the target write landed.
-    async fn settle(&mut self) -> anyhow::Result<bool> {
+    /// Commit through `head`'s confirmation depth. Blocks up to `unread` may
+    /// hold logs not yet fetched, so they are; the cursor passes any other
+    /// block without a call. Returns whether the target write landed.
+    async fn advance(
+        &mut self,
+        head: u64,
+        unread: &mut Option<u64>,
+    ) -> anyhow::Result<bool> {
         let indexer = self.indexer;
-        let (head, from) = tokio::try_join!(self.head(), self.next_block())?;
-        let target = head.saturating_sub(indexer.config.confirmations);
-        // Read after the head, so every log of a block below it is in hand,
-        // however long the loop took to come round to the stream.
-        self.feed.take_delivered()?;
-        // On an endpoint that balances requests, the catch-up's head may have
-        // come from a node behind the one streaming, and the blocks between
-        // were neither fetched nor pushed.
-        if let Some(fetched) = self.fetched_through.take() {
-            self.hold(fetched + 1, head).await?;
-        }
-        let confirmed = self
-            .feed
-            .unconfirmed()
-            .map(|unconfirmed| unconfirmed.confirmed(target))
-            .unwrap_or_default();
-
-        let blocks = confirmed
-            .into_iter()
-            .filter(|(height, _)| *height >= from)
-            .map(|(height, forks)| self.canonical(height, forks));
-        let ((), logs) =
-            tokio::join!(indexer.store.set_chain_head(head), try_join_all(blocks));
-        let logs: Vec<Log> = logs?.into_iter().flatten().collect();
+        let config = &indexer.config;
+        let target = head.saturating_sub(config.confirmations);
+        let from = self.next_block().await?;
         if from <= target {
-            let applied = indexer
-                .commit(&logs, target)
-                .await
-                .with_context(|| format!("blocks {from}..{target}"))?;
-            if applied > 0 {
-                tracing::info!(events = applied, through_block = target, "indexed");
+            if unread.is_some_and(|unread| unread >= from) {
+                let mut start = from;
+                let mut total = 0usize;
+                while start <= target {
+                    let to = config.window_end(start, target);
+                    total += self.commit_fetched(start, to).await?;
+                    start = to + 1;
+                }
+                if total > 0 {
+                    tracing::info!(events = total, through_block = target, "indexed");
+                }
+            } else {
+                indexer
+                    .commit(&[], target)
+                    .await
+                    .with_context(|| format!("blocks {from}..{target}"))?;
+            }
+            if unread.is_some_and(|unread| unread <= target) {
+                *unread = None;
             }
         }
-        // Written after the commit, unlike a catch-up's target: nothing is
-        // left to catch up, so no reader sees the target ahead of the cursor.
-        let (vouched, ()) = tokio::join!(
-            indexer
-                .store
-                .set_chain_target(target, indexer.config.stale_after),
-            indexer.store.set_window_error(None)
+        let ((), vouched, ()) = tokio::join!(
+            indexer.store.set_chain_head(head),
+            indexer.store.set_chain_target(target, config.stale_after),
+            indexer.store.set_window_error(None),
         );
         Ok(vouched)
     }
 
-    /// Fetch blocks `from..=to` in `eth_getLogs` windows and hold their logs
-    /// beside the pushed ones, for the canonical check to settle alike.
-    async fn hold(&mut self, from: u64, to: u64) -> anyhow::Result<()> {
-        let mut start = from;
-        while start <= to {
-            let end = self.indexer.config.window_end(start, to);
-            let logs = self.fetch(start, end).await?;
-            if let Some(unconfirmed) = self.feed.unconfirmed() {
-                for log in logs {
-                    unconfirmed.push(log)?;
-                }
-            }
-            start = end + 1;
-        }
-        Ok(())
-    }
-
-    /// The logs of the canonical block at `height`: the pushed ones when the
-    /// stream saw that block, or fetched by its hash when a reorg replaced
-    /// the one it saw.
-    async fn canonical(&self, height: u64, forks: Forks) -> anyhow::Result<Vec<Log>> {
-        let block = self
-            .provider
-            .get_block_by_number(BlockNumberOrTag::Number(height))
+    /// Fetch blocks `from..=to` and commit them with the cursor; how many
+    /// events were new.
+    async fn commit_fetched(&self, from: u64, to: u64) -> anyhow::Result<usize> {
+        let logs = self.fetch(from, to).await?;
+        self.indexer
+            .commit(&logs, to)
             .await
-            .with_context(|| format!("eth_getBlockByNumber {height}"))?
-            .with_context(|| format!("block {height} is confirmed but not served"))?;
-        let hash = block.header.hash;
-        if let Some(logs) = forks.into_canonical(hash) {
-            return Ok(logs);
-        }
-        tracing::info!(
-            height,
-            %hash,
-            "a reorg replaced the block the stream pushed logs from; refetching"
-        );
-        let mut logs = self
-            .provider
-            .get_logs(&self.indexer.filter.clone().at_block_hash(hash))
-            .await
-            .with_context(|| format!("eth_getLogs at block {hash}"))?;
-        anyhow::ensure!(
-            logs.iter().all(|log| log.block_number == Some(height)),
-            "eth_getLogs at block {hash} answered a log from another height"
-        );
-        logs.sort_by_key(|log| log.log_index);
-        Ok(logs)
+            .with_context(|| format!("blocks {from}..{to}"))
     }
 
     /// The chain head, as the endpoint reports it.
@@ -465,8 +385,7 @@ impl<'a> Session<'a> {
         let mut logs = chain::fetch_logs(&self.provider, &self.indexer.filter, from, to)
             .await
             .with_context(|| format!("eth_getLogs {from}..{to}"))?;
-        // Every log has to sit in the window: where it sits decides whether
-        // it commits now or waits for its confirmations.
+        // Every log has to sit in the window the cursor will pass.
         anyhow::ensure!(
             logs.iter().all(|log| log
                 .block_number
@@ -571,7 +490,6 @@ mod tests {
                 confirmations: 3,
                 source: LogSource::Subscribe,
                 poll_interval: Duration::from_secs(5),
-                head_interval: Duration::from_secs(60),
                 max_block_range: 10,
                 start_block: None,
                 stale_after: Duration::from_secs(80),

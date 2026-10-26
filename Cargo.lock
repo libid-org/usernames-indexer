@@ -521,7 +521,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e30da7fc40ff208becb4ebe462a149045c8613f60ee84f65731a522c67c351fd"
 dependencies = [
  "alloy-primitives",
- "alloy-rpc-types-anvil",
  "alloy-rpc-types-eth",
  "alloy-serde",
  "serde",
