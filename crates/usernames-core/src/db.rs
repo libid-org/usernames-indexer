@@ -14,6 +14,7 @@ use std::time::Duration;
 use alloy::primitives::{
     Address,
     B256,
+    U256,
 };
 use chrono::TimeDelta;
 use sqlx::{
@@ -235,6 +236,18 @@ pub enum ApplyError {
     /// The database refused or the connection failed.
     #[error("database: {0}")]
     Db(#[from] sqlx::Error),
+    /// A refund released less than the index had booked for its sender,
+    /// which the contract never does: the index's own books are wrong, and
+    /// applying the window would hide it.
+    #[error(
+        "a refund released {released}, but the index booked {booked} for its sender"
+    )]
+    Books {
+        /// What the index had booked, as stored.
+        booked: String,
+        /// What the refund released.
+        released: U256,
+    },
     /// A chain value does not fit the column that stores it.
     #[error("{what} {value} does not fit in a BIGINT")]
     OutOfRange {

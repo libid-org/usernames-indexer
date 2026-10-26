@@ -107,36 +107,60 @@ impl Window {
                 released,
                 ..
             } => {
-                let covered: Option<bool> = sqlx::query_scalar(sql::ESCROW_REFUND)
-                    .bind(chain_id)
-                    .bind(handle_node)
-                    .bind(token)
-                    .bind(released.to_string())
-                    .fetch_optional(&mut *self.tx)
-                    .await?;
-                match covered {
-                    Some(true) => {}
-                    Some(false) => tracing::error!(
-                        %handle_node,
-                        %token,
-                        block = at.block,
-                        "a refund released more than this index holds for the slot: \
-                         its deposit came before the index's start"
-                    ),
-                    None => tracing::error!(
-                        %handle_node,
-                        %token,
-                        block = at.block,
-                        "a refund from a slot this index never saw deposited"
-                    ),
+                // What the index booked for the sender: all of the refund,
+                // unless the sender deposited before the index started.
+                let booked: Option<String> =
+                    sqlx::query_scalar(sql::ESCROW_TAKE_REFUNDABLE)
+                        .bind(chain_id)
+                        .bind(handle_node)
+                        .bind(token)
+                        .bind(sender)
+                        .fetch_optional(&mut *self.tx)
+                        .await?;
+                let booked = match booked {
+                    Some(text) => {
+                        U256::from_str(&text).map_err(|_| ApplyError::Books {
+                            booked: text,
+                            released: *released,
+                        })?
+                    }
+                    None => U256::ZERO,
+                };
+                if booked > *released {
+                    return Err(ApplyError::Books {
+                        booked: booked.to_string(),
+                        released: *released,
+                    });
                 }
-                sqlx::query(sql::ESCROW_TAKE_REFUNDABLE)
-                    .bind(chain_id)
-                    .bind(handle_node)
-                    .bind(token)
-                    .bind(sender)
-                    .execute(&mut *self.tx)
-                    .await?;
+                if booked < *released {
+                    tracing::error!(
+                        %handle_node,
+                        %token,
+                        %sender,
+                        %booked,
+                        %released,
+                        block = at.block,
+                        "a refund released more than the index booked for its sender: \
+                         part of the contribution came before the index's start"
+                    );
+                }
+                if !booked.is_zero() {
+                    let moved: Option<B256> = sqlx::query_scalar(sql::ESCROW_REFUND)
+                        .bind(chain_id)
+                        .bind(handle_node)
+                        .bind(token)
+                        .bind(booked.to_string())
+                        .fetch_optional(&mut *self.tx)
+                        .await?;
+                    if moved.is_none() {
+                        tracing::error!(
+                            %handle_node,
+                            %token,
+                            block = at.block,
+                            "a refund from a slot this index never saw deposited"
+                        );
+                    }
+                }
             }
 
             // A forward pays the holder: nothing held moves.
@@ -682,7 +706,7 @@ pub(crate) mod plans {
             (
                 "a refund",
                 &["escrow_held_pkey"][..],
-                sqlx::query_scalar::<_, String>(&explain(sql::ESCROW_REFUND))
+                sqlx::query_scalar(&explain(sql::ESCROW_REFUND))
                     .bind(1i64)
                     .bind(node)
                     .bind(token)

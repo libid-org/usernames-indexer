@@ -46,6 +46,7 @@ use usernames_core::{
         Status,
         Unclaimed,
     },
+    db::ApplyError,
     events::{
         EscrowEvent,
         EventKind,
@@ -1185,61 +1186,99 @@ async fn a_claim_opens_the_next_round() {
     suite.done();
 }
 
-/// An index that starts late meets a slot first in a later round: the
-/// deposit's round is the slot's, and a refund of a deposit made before the
-/// index started empties the slot instead of driving it below zero.
+/// The slot's amounts, round included, as `/v1/escrow/node` serves them.
+async fn slot(suite: &Suite, handle: &str) -> Vec<(U256, U256)> {
+    let held: HandleAmounts = suite
+        .get(&format!("/v1/escrow/node/{}", node(handle)))
+        .await
+        .answer();
+    held.amounts.iter().map(|a| (a.amount, a.round)).collect()
+}
+
+/// A refund of `released` by `sender` from the native slot of `handle`.
+fn refunded(handle: &str, sender: Address, round: u64, released: u64) -> NamesEvent {
+    NamesEvent::Escrow(EscrowEvent::Refunded {
+        handle_node: node(handle),
+        token: NATIVE,
+        sender,
+        recipient: sender,
+        round: U256::from(round),
+        released: U256::from(released),
+        received: U256::from(released),
+    })
+}
+
+/// An index that starts after a slot's first claims meets it in a later
+/// round: the slot keeps the round its first deposit names.
 #[tokio::test]
-async fn a_late_start_keeps_the_round_and_never_holds_below_zero() {
+async fn a_late_start_keeps_the_round_its_first_deposit_names() {
     let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let (carol, dave) = (addr(0xC0), addr(0xD0));
     let late = NamesEvent::Escrow(EscrowEvent::Deposited {
         handle_node: node("late"),
         token: NATIVE,
-        sender: carol,
+        sender: addr(0xC0),
         round: U256::from(3u64),
         amount: U256::from(1u64),
         refundable_at: REFUNDABLE_AT,
     });
     suite.apply(1, late).await;
-    let held: HandleAmounts = suite
-        .get(&format!("/v1/escrow/node/{}", node("late")))
-        .await
-        .answer();
     assert_eq!(
-        held.amounts
-            .iter()
-            .map(|a| (a.amount, a.round))
-            .collect::<Vec<_>>(),
+        slot(&suite, "late").await,
         [(U256::from(1u64), U256::from(3u64))]
     );
+    suite.done();
+}
 
-    // Dave deposited 100 before the index started; his refund is the first
-    // the index hears of it.
-    let refund = NamesEvent::Escrow(EscrowEvent::Refunded {
-        handle_node: node("late"),
-        token: NATIVE,
-        sender: dave,
-        recipient: dave,
-        round: U256::from(3u64),
-        released: U256::from(100u64),
-        received: U256::from(100u64),
-    });
-    suite.apply(2, refund).await;
-    let held: HandleAmounts = suite
-        .get(&format!("/v1/escrow/node/{}", node("late")))
+/// A refund takes back the sender's contribution as the index booked it.
+/// Part of it came before the index started, so the refund releases more,
+/// and the slot keeps exactly what the other senders put in, as on chain.
+#[tokio::test]
+async fn a_refund_takes_back_only_what_the_index_booked_for_its_sender() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let (carol, dave) = (addr(0xC0), addr(0xD0));
+    suite.apply(1, deposited("early", NATIVE, carol, 50)).await;
+    suite.apply(2, deposited("early", NATIVE, dave, 5)).await;
+    // Dave also put in 10 before the index started: his refund releases 15.
+    suite.apply(3, refunded("early", dave, 0, 15)).await;
+    assert_eq!(
+        slot(&suite, "early").await,
+        [(U256::from(50u64), U256::ZERO)]
+    );
+    let daves: AddressContributions = suite
+        .get(&format!("/v1/escrow/refundable/{dave}"))
         .await
         .answer();
-    assert!(held.amounts.is_empty(), "{held:?}");
-    let unclaimed: Unclaimed = suite.get("/v1/escrow/unclaimed").await.answer();
+    assert!(daves.amounts.is_empty(), "{daves:?}");
+    suite.done();
+}
+
+/// A refund that releases less than the index booked for its sender is one
+/// the contract never makes: the window fails rather than hide it.
+#[tokio::test]
+async fn a_refund_releasing_less_than_was_booked_fails_the_window() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let dave = addr(0xD0);
+    suite.apply(1, deposited("short", NATIVE, dave, 10)).await;
+    let at = LogPosition {
+        block_number: 2,
+        log_index: 0,
+        tx_hash: B256::repeat_byte(0x02),
+        block_time: 1_700_000_002,
+    };
+    let mut window = suite.store.begin_window().await.expect("a window");
+    let refused = window.apply(&refunded("short", dave, 0, 5), &at).await;
     assert!(
-        unclaimed
-            .amounts
-            .iter()
-            .all(|a| a.handle.handle_node != node("late")),
-        "{unclaimed:?}"
+        matches!(refused, Err(ApplyError::Books { .. })),
+        "{refused:?}"
     );
     suite.done();
 }
