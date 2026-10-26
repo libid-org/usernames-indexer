@@ -35,16 +35,13 @@ pub struct Rows<R, C> {
 
 /// Where a list's page ends: the key of the last row it served, which the
 /// next page reads past.
-pub trait Cursor: Sized {
-    /// The row the cursor is read from.
-    type Row;
-
+pub trait Cursor<R>: Sized {
     /// The cursor after `row`; `None` only for a stored value its writer
     /// never writes.
-    fn after(row: &Self::Row) -> Option<Self>;
+    fn after(row: &R) -> Option<Self>;
 }
 
-impl<C: Cursor> Page<C> {
+impl<C> Page<C> {
     /// How many rows a lookup reads: one past the limit.
     pub(crate) fn fetch(&self) -> i64 {
         self.limit.saturating_add(1)
@@ -52,7 +49,10 @@ impl<C: Cursor> Page<C> {
 
     /// The page out of the rows its lookup read: at most `limit`, and the
     /// cursor after the last when the extra row proved more exist.
-    pub(crate) fn split(&self, mut rows: Vec<C::Row>) -> Rows<C::Row, C> {
+    pub(crate) fn split<R>(&self, mut rows: Vec<R>) -> Rows<R, C>
+    where
+        C: Cursor<R>,
+    {
         let limit = usize::try_from(self.limit).unwrap_or_default();
         let more = rows.len() > limit;
         rows.truncate(limit);

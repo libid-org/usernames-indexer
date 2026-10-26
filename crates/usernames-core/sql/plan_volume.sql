@@ -45,10 +45,10 @@ SELECT 1, sha256(('node' || i)::bytea),
        i, 0, i, 0
 FROM generate_series(1, 5000) i;
 INSERT INTO names.escrow_refundable
-    (sender, chain_id, handle_node, token, round, amount, refundable_at)
+    (sender, chain_id, handle_node, token, amount, refundable_at)
 SELECT substring(sha256(('address' || i % 1000)::bytea) FROM 1 FOR 20), 1,
        sha256(('node' || i)::bytea),
-       substring(sha256(('token' || i % 5)::bytea) FROM 1 FOR 20), 0, i, i
+       substring(sha256(('token' || i % 5)::bytea) FROM 1 FOR 20), i, i
 FROM generate_series(1, 5000) i;
 -- Vacuum moves a GIN index's pending entries into it; the rows above wait there.
 SELECT gin_clean_pending_list('names.handle_nodes_handle_trgm_idx');

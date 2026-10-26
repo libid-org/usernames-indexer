@@ -66,7 +66,6 @@ impl Window {
                     .bind(chain_id)
                     .bind(handle_node)
                     .bind(token)
-                    .bind(round.to_string())
                     .bind(sender)
                     .bind(amount.to_string())
                     .bind(as_i64(*refundable_at, "refundableAt")?)
@@ -101,7 +100,6 @@ impl Window {
                     .bind(chain_id)
                     .bind(handle_node)
                     .bind(token)
-                    .bind(round.to_string())
                     .execute(&mut *self.tx)
                     .await?;
             }
@@ -110,7 +108,6 @@ impl Window {
                 handle_node,
                 token,
                 sender,
-                round,
                 released,
                 ..
             } => {
@@ -135,7 +132,6 @@ impl Window {
                     .bind(chain_id)
                     .bind(handle_node)
                     .bind(token)
-                    .bind(round.to_string())
                     .bind(sender)
                     .execute(&mut *self.tx)
                     .await?;
@@ -235,9 +231,7 @@ impl fmt::Display for UnclaimedCursor {
     }
 }
 
-impl Cursor for UnclaimedCursor {
-    type Row = EscrowSlotRow;
-
+impl Cursor<EscrowSlotRow> for UnclaimedCursor {
     fn after(row: &EscrowSlotRow) -> Option<Self> {
         Some(Self {
             token: row.token,
@@ -281,9 +275,7 @@ impl fmt::Display for SlotCursor {
     }
 }
 
-impl Cursor for SlotCursor {
-    type Row = EscrowSlotRow;
-
+impl Cursor<EscrowSlotRow> for SlotCursor {
     fn after(row: &EscrowSlotRow) -> Option<Self> {
         Some(Self {
             chain_id: row.chain_id,
@@ -293,56 +285,9 @@ impl Cursor for SlotCursor {
     }
 }
 
-/// Where a page of an address's refundable contributions ends: by chain,
-/// node, token and round, descending. Its text is
-/// `chainId-node-token-round`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RefundCursor {
-    /// The contribution's chain.
-    pub chain_id: i64,
-    /// The node it was deposited for.
-    pub handle_node: B256,
-    /// Its token.
-    pub token: Address,
-    /// The round it was booked in.
-    pub round: U256,
-}
-
-impl FromStr for RefundCursor {
-    type Err = InvalidCursor;
-
-    fn from_str(raw: &str) -> Result<Self, InvalidCursor> {
-        let mut parts = CursorText::of(raw);
-        let cursor = Self {
-            chain_id: parts.next()?,
-            handle_node: parts.next()?,
-            token: parts.next()?,
-            round: parts.next()?,
-        };
-        parts.end(cursor)
-    }
-}
-
-impl fmt::Display for RefundCursor {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}-{}-{}-{}",
-            self.chain_id, self.handle_node, self.token, self.round
-        )
-    }
-}
-
-impl Cursor for RefundCursor {
-    type Row = ContributionRow;
-
-    fn after(ContributionRow { slot, .. }: &ContributionRow) -> Option<Self> {
-        Some(Self {
-            chain_id: slot.chain_id,
-            handle_node: slot.handle_node,
-            token: slot.token,
-            round: slot.round()?,
-        })
+impl Cursor<ContributionRow> for SlotCursor {
+    fn after(row: &ContributionRow) -> Option<Self> {
+        Self::after(&row.slot)
     }
 }
 
@@ -479,9 +424,9 @@ impl Page<SlotCursor> {
     }
 }
 
-impl Page<RefundCursor> {
-    /// What `sender` may take back: its contributions in their slots'
-    /// current rounds, in the order of the table's key.
+impl Page<SlotCursor> {
+    /// What `sender` may take back: its contributions, in the order of the
+    /// table's key.
     pub(crate) fn refundable_lookup(&self, prefix: &str, sender: Address) -> Statement {
         let mut statement = QueryBuilder::new(format!(
             "{prefix}{} WHERE r.sender = ",
@@ -493,35 +438,28 @@ impl Page<RefundCursor> {
                 statement.push(" AND r.chain_id = ").push_bind(chain);
                 if let Some(before) = self.before {
                     statement
-                        .push(" AND (r.handle_node, r.token, r.round) < (")
+                        .push(" AND (r.handle_node, r.token) < (")
                         .push_bind(before.handle_node)
                         .push(", ")
                         .push_bind(before.token)
-                        .push(", ")
-                        .push_bind(before.round.to_string())
-                        .push("::numeric)");
+                        .push(")");
                 }
             }
             None => {
                 if let Some(before) = self.before {
                     statement
-                        .push(" AND (r.chain_id, r.handle_node, r.token, r.round) < (")
+                        .push(" AND (r.chain_id, r.handle_node, r.token) < (")
                         .push_bind(before.chain_id)
                         .push(", ")
                         .push_bind(before.handle_node)
                         .push(", ")
                         .push_bind(before.token)
-                        .push(", ")
-                        .push_bind(before.round.to_string())
-                        .push("::numeric)");
+                        .push(")");
                 }
             }
         }
         statement
-            .push(
-                " ORDER BY r.chain_id DESC, r.handle_node DESC, r.token DESC, \
-                 r.round DESC LIMIT ",
-            )
+            .push(" ORDER BY r.chain_id DESC, r.handle_node DESC, r.token DESC LIMIT ")
             .push_bind(self.fetch());
         statement
     }
@@ -549,8 +487,8 @@ impl Store {
     pub async fn refundable(
         &self,
         sender: Address,
-        page: Page<RefundCursor>,
-    ) -> Result<Rows<ContributionRow, RefundCursor>, sqlx::Error> {
+        page: Page<SlotCursor>,
+    ) -> Result<Rows<ContributionRow, SlotCursor>, sqlx::Error> {
         let rows = page
             .refundable_lookup("", sender)
             .build_query_as()
@@ -618,12 +556,6 @@ pub(crate) mod plans {
             handle_node: node,
             token,
         });
-        let refund = Some(RefundCursor {
-            chain_id: 1,
-            handle_node: node,
-            token,
-            round: U256::ZERO,
-        });
         let unclaimed = Some(UnclaimedCursor {
             token,
             held: U256::from(10u64),
@@ -667,12 +599,12 @@ pub(crate) mod plans {
             (
                 "refundable, past a cursor",
                 refundable,
-                page(None, refund).refundable_lookup("EXPLAIN ", address),
+                page(None, slot).refundable_lookup("EXPLAIN ", address),
             ),
             (
                 "refundable, one chain, past a cursor",
                 refundable,
-                page(Some(1), refund).refundable_lookup("EXPLAIN ", address),
+                page(Some(1), slot).refundable_lookup("EXPLAIN ", address),
             ),
             (
                 "a node's slots",
@@ -739,12 +671,11 @@ pub(crate) mod plans {
             ),
             (
                 "a claim closing its round",
-                &["escrow_refundable_round_idx"][..],
+                &["escrow_refundable_slot_idx"][..],
                 sqlx::query_scalar(&explain(sql::ESCROW_CLOSE_ROUND))
                     .bind(1i64)
                     .bind(node)
                     .bind(token)
-                    .bind("0")
                     .fetch_all(&mut *conn)
                     .await,
             ),
@@ -763,12 +694,11 @@ pub(crate) mod plans {
             ),
             (
                 "a refund taking its contribution",
-                &["escrow_refundable_pkey|escrow_refundable_round_idx"][..],
+                &["escrow_refundable_pkey|escrow_refundable_slot_idx"][..],
                 sqlx::query_scalar(&explain(sql::ESCROW_TAKE_REFUNDABLE))
                     .bind(1i64)
                     .bind(node)
                     .bind(token)
-                    .bind("0")
                     .bind(address)
                     .fetch_all(&mut *conn)
                     .await,
@@ -795,7 +725,6 @@ mod tests {
     };
 
     use super::{
-        RefundCursor,
         SlotCursor,
         UnclaimedCursor,
     };
@@ -816,21 +745,10 @@ mod tests {
             token,
         };
         assert_eq!(slot.to_string().parse().ok(), Some(slot));
-        let refund = RefundCursor {
-            chain_id: 1,
-            handle_node: node,
-            token,
-            round: U256::from(7u64),
-        };
-        assert_eq!(refund.to_string().parse().ok(), Some(refund));
-
         let slot = slot.to_string();
         for garbage in ["", "1-0x0d", &format!("{slot}-1"), &format!("x{slot}")] {
             assert!(garbage.parse::<SlotCursor>().is_err(), "{garbage:?}");
         }
         assert!("1-2-3-4".parse::<UnclaimedCursor>().is_err());
-        assert!(format!("1-{node}-{token}-x")
-            .parse::<RefundCursor>()
-            .is_err());
     }
 }

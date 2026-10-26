@@ -177,16 +177,12 @@ impl Window {
             // A claim ends the refunds of everybody whose deposit it took:
             // the round's refundable rows, read before the claim deletes them.
             NamesEvent::Escrow(EscrowEvent::Claimed {
-                handle_node,
-                token,
-                round,
-                ..
+                handle_node, token, ..
             }) => {
                 let senders: Vec<Address> = sqlx::query_scalar(sql::CLAIMED_SENDERS)
                     .bind(chain_id)
                     .bind(handle_node)
                     .bind(token)
-                    .bind(round.to_string())
                     .fetch_all(&mut *self.tx)
                     .await?;
                 for sender in senders {
@@ -290,9 +286,7 @@ impl fmt::Display for HistoryCursor {
     }
 }
 
-impl Cursor for HistoryCursor {
-    type Row = HistoryRow;
-
+impl Cursor<HistoryRow> for HistoryCursor {
     fn after(row: &HistoryRow) -> Option<Self> {
         Some(Self {
             block_time: row.block_time,
@@ -530,12 +524,11 @@ pub(crate) mod plans {
             ),
             (
                 "the senders a claim takes from",
-                &["escrow_refundable_round_idx"][..],
+                &["escrow_refundable_slot_idx"][..],
                 sqlx::query_scalar(&explain(sql::CLAIMED_SENDERS))
                     .bind(1i64)
                     .bind(node)
                     .bind(address)
-                    .bind("0")
                     .fetch_all(&mut *conn)
                     .await,
             ),

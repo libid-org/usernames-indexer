@@ -162,24 +162,24 @@ CREATE INDEX IF NOT EXISTS escrow_held_chain_unclaimed_idx
 CREATE INDEX IF NOT EXISTS escrow_held_node_idx
     ON names.escrow_held (handle_node, chain_id, token) WHERE held > 0;
 
--- Mirrors `contribution`: what each sender may take back from a slot in its
--- current round, and from when. A refund deletes its row; a claim closes the
--- round and deletes all of them, the way it ends their refunds on chain.
--- Keyed by the address first, because that is how it is read.
+-- Mirrors `contribution`: what each sender may take back from a slot, and
+-- from when. A refund deletes its row; a claim closes the slot's round and
+-- deletes all of them, the way it ends their refunds on chain, so every row
+-- is in its slot's current round. Keyed by the address first, because that
+-- is how it is read.
 CREATE TABLE IF NOT EXISTS names.escrow_refundable (
     sender        BYTEA         NOT NULL,
     chain_id      BIGINT        NOT NULL,
     handle_node   BYTEA         NOT NULL,
     token         BYTEA         NOT NULL,
-    round         NUMERIC(78,0) NOT NULL,
     amount        NUMERIC(78,0) NOT NULL,
     refundable_at BIGINT        NOT NULL,   -- unix seconds; the sender's last deposit sets it
     updated_at    TIMESTAMPTZ   NOT NULL DEFAULT now(),
-    PRIMARY KEY (sender, chain_id, handle_node, token, round)
+    PRIMARY KEY (sender, chain_id, handle_node, token)
 );
 -- A claim closes one slot's round for every sender at once.
-CREATE INDEX IF NOT EXISTS escrow_refundable_round_idx
-    ON names.escrow_refundable (handle_node, chain_id, token, round);
+CREATE INDEX IF NOT EXISTS escrow_refundable_slot_idx
+    ON names.escrow_refundable (handle_node, chain_id, token);
 
 -- The addresses each journal row involves, one row per (event, address) with
 -- every role the address plays in it: what an address history lists, newest

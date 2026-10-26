@@ -41,7 +41,6 @@ pub use self::{
     escrow::{
         ContributionRow,
         EscrowSlotRow,
-        RefundCursor,
         SlotCursor,
         UnclaimedCursor,
     },
