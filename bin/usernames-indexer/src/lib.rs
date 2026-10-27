@@ -18,7 +18,6 @@ use anyhow::Context;
 use clap::Parser;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use url::Url;
 use usernames_core::{
     chain::Contracts,
     db::{
@@ -31,6 +30,7 @@ use usernames_core::{
     indexer::{
         Indexer,
         IndexerConfig,
+        RpcUrl,
     },
     stop::StopSignals,
 };
@@ -46,7 +46,7 @@ pub struct Config {
 
     /// JSON-RPC endpoint of the chain to follow, `http` or `https`.
     #[arg(long, env = "RPC_URL", hide_env_values = true)]
-    pub rpc_url: Url,
+    pub rpc_url: RpcUrl,
 
     /// The IdentityRegistry ERC1967 proxy address. Typed as an address so
     /// garbage is a usage error before anything connects, not a mid-startup
@@ -119,15 +119,13 @@ impl Config {
         let config = IndexerConfig {
             contracts,
             confirmations: self.confirmations,
-            poll_interval: self.poll_interval,
+            poll_interval: self.poll_interval()?,
             max_block_range: self.max_block_range,
             start_block: self.start_block,
             stale_after: self.report_validity()?,
         };
 
-        // The client the loop uses, so a URL it cannot call refuses here, at
-        // startup, instead of in every session.
-        let provider = config.connect(&self.rpc_url).context("RPC_URL")?;
+        let provider = config.connect(&self.rpc_url);
         let reported = provider.get_chain_id().await.context("eth_chainId")?;
         if let Some(expected) = self.chain_id {
             anyhow::ensure!(
@@ -172,6 +170,18 @@ impl Config {
             "indexing"
         );
         Ok((lease, indexer))
+    }
+
+    /// How long the loop waits between polls and before a retry:
+    /// `POLL_INTERVAL`, refused at zero, which would poll and retry back to
+    /// back.
+    fn poll_interval(&self) -> anyhow::Result<Duration> {
+        anyhow::ensure!(
+            !self.poll_interval.is_zero(),
+            "POLL_INTERVAL must be above zero, or the loop polls and retries \
+             back to back"
+        );
+        Ok(self.poll_interval)
     }
 
     /// How long readers may trust a report: `STALE_AFTER`, or four poll
@@ -332,6 +342,50 @@ mod help_tests {
         for bad in ["eden,x", "Eden", "eden,"] {
             assert!(args(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// The configuration of `rpc` and `poll_interval`, as clap reads it.
+    fn polling(rpc: &str, poll_interval: &str) -> Result<Config, clap::Error> {
+        Config::try_parse_from([
+            "usernames-indexer",
+            "--database-url",
+            "postgres://localhost/usernames",
+            "--rpc-url",
+            rpc,
+            "--identity-registry-address",
+            "0x0000000000000000000000000000000000000001",
+            "--chain-names",
+            "eden",
+            "--poll-interval",
+            poll_interval,
+        ])
+    }
+
+    /// The loop polls over HTTP, so a WebSocket URL is a usage error before
+    /// anything connects.
+    #[test]
+    fn a_websocket_rpc_url_is_refused_at_parse() {
+        assert!(polling("https://node.example/rpc", "5s").is_ok());
+        for rpc in ["wss://node.example/rpc", "ws://127.0.0.1:8546"] {
+            let refused = polling(rpc, "5s").expect_err(rpc);
+            assert_eq!(
+                refused.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{rpc}"
+            );
+        }
+    }
+
+    /// A zero interval would poll and retry back to back.
+    #[test]
+    fn a_zero_poll_interval_is_refused() {
+        let config =
+            |interval| polling("http://127.0.0.1:8545", interval).expect("parses");
+        assert!(config("0s").poll_interval().is_err());
+        assert_eq!(
+            config("1s").poll_interval().ok(),
+            Some(std::time::Duration::from_secs(1))
+        );
     }
 }
 

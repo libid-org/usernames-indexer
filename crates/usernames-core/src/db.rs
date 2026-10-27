@@ -791,14 +791,6 @@ impl ChainWriter {
     }
 }
 
-#[cfg(test)]
-impl ChainWriter {
-    /// A writer no chain's row names, so nothing it writes lands.
-    pub(crate) fn unprepared(store: ChainStore) -> Self {
-        Self { store, writer: 0 }
-    }
-}
-
 fn as_i64(value: u64, what: &'static str) -> Result<i64, ApplyError> {
     i64::try_from(value).map_err(|_| ApplyError::OutOfRange { what, value })
 }

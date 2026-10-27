@@ -105,7 +105,7 @@ impl Harness {
         let indexer = tokio::spawn(
             indexer::Indexer::new(
                 writer,
-                node.rpc(),
+                node.rpc().try_into().expect("anvil serves http"),
                 indexer::IndexerConfig {
                     contracts: libid.contracts(),
                     confirmations: 0,

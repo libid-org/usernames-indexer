@@ -7,6 +7,7 @@
 //! the replay converges.
 
 mod deadline;
+mod rpc;
 
 use std::time::Duration;
 
@@ -15,20 +16,15 @@ use alloy::{
         Provider,
         RootProvider,
     },
-    rpc::{
-        client::ClientBuilder,
-        types::Log,
-    },
-    transports::{
-        TransportErrorKind,
-        TransportResult,
-    },
+    rpc::types::Log,
 };
 use anyhow::Context;
 use tokio_util::sync::CancellationToken;
-use url::Url;
 
-use self::deadline::Deadline;
+pub use self::rpc::{
+    RpcUrl,
+    RpcUrlError,
+};
 use crate::{
     chain::Contracts,
     db::{
@@ -67,19 +63,10 @@ pub struct IndexerConfig {
 }
 
 impl IndexerConfig {
-    /// A client for the `http(s)` endpoint `rpc` as this loop uses it, each
-    /// call failing once unanswered for half of [`Self::stale_after`].
-    pub fn connect(&self, rpc: &Url) -> TransportResult<RootProvider> {
-        if !matches!(rpc.scheme(), "http" | "https") {
-            return Err(TransportErrorKind::custom_str(&format!(
-                "the RPC URL is {}, not http(s)",
-                rpc.scheme()
-            )));
-        }
-        let client = ClientBuilder::default()
-            .layer(Deadline(self.patience()))
-            .http(rpc.clone());
-        Ok(RootProvider::new(client))
+    /// A client for `rpc` as this loop uses it, each call failing once
+    /// unanswered for half of [`Self::stale_after`].
+    pub fn connect(&self, rpc: &RpcUrl) -> RootProvider {
+        rpc.provider(self.patience())
     }
 
     /// How long a call waits for an answer before it fails and the session
@@ -102,13 +89,13 @@ impl IndexerConfig {
 /// calls.
 pub struct Indexer {
     writer: ChainWriter,
-    rpc: Url,
+    rpc: RpcUrl,
     config: IndexerConfig,
 }
 
 impl Indexer {
     /// The indexer of `writer`'s chain over `rpc`.
-    pub fn new(writer: ChainWriter, rpc: Url, config: IndexerConfig) -> Self {
+    pub fn new(writer: ChainWriter, rpc: RpcUrl, config: IndexerConfig) -> Self {
         Self {
             writer,
             rpc,
@@ -152,14 +139,6 @@ impl Indexer {
         Ok(applied)
     }
 
-    /// `error` with the RPC endpoint named by its setting. An HTTP client's
-    /// error carries the URL it called, an endpoint's URL often holds its
-    /// API key, and `/v1/status` shows the stored error to anyone.
-    fn redacted(&self, error: String) -> String {
-        let endpoint = &self.rpc.as_str()[self.rpc.scheme().len()..];
-        error.replace(endpoint, "://<RPC_URL>")
-    }
-
     /// Run until cancelled, or until the chain is no longer this writer's.
     /// Never returns early on an RPC or database error: those end the
     /// session, which logs, sleeps one interval, and opens another that
@@ -174,12 +153,12 @@ impl Indexer {
         );
 
         while !cancel.is_cancelled() {
-            let session = async { Session::open(&self)?.follow(&cancel).await };
+            let session = Session::open(&self).follow(&cancel);
             if let Err(e) = session.await {
                 if let Some(WindowError::Superseded(superseded)) = e.downcast_ref() {
                     return Err(*superseded);
                 }
-                let error = self.redacted(e.one_line());
+                let error = self.rpc.redact(e.one_line());
                 tracing::warn!(%error, "indexing stopped; resuming from the cursor");
                 // Surfaced in /v1/status: a deterministic failure, an
                 // undecodable log say, stalls the cursor rather than skip
@@ -230,12 +209,9 @@ struct Session<'a> {
 
 impl<'a> Session<'a> {
     /// A session over `indexer`'s endpoint.
-    fn open(indexer: &'a Indexer) -> anyhow::Result<Self> {
-        let provider = indexer
-            .config
-            .connect(&indexer.rpc)
-            .context("connecting to the RPC")?;
-        Ok(Self { indexer, provider })
+    fn open(indexer: &'a Indexer) -> Self {
+        let provider = indexer.config.connect(&indexer.rpc);
+        Self { indexer, provider }
     }
 
     /// Catch up now and again every poll interval, until cancelled.
@@ -407,85 +383,7 @@ impl<'a> Session<'a> {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::Address;
-    use sqlx::PgPool;
-    use tokio::net::TcpListener;
-
     use super::*;
-    use crate::db::ChainStore;
-
-    /// The suite's knobs, a report good for `stale_after`.
-    fn config(stale_after: Duration) -> IndexerConfig {
-        IndexerConfig {
-            contracts: Contracts {
-                registry: Address::ZERO,
-                escrow: None,
-            },
-            confirmations: 3,
-            poll_interval: Duration::from_secs(5),
-            max_block_range: 10,
-            start_block: None,
-            stale_after,
-        }
-    }
-
-    /// An endpoint that takes the connection and never answers fails each
-    /// call once the patience runs out.
-    #[tokio::test]
-    async fn a_call_left_unanswered_fails_at_the_deadline() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("a local port");
-        let rpc: Url = format!("http://{}", listener.local_addr().expect("the address"))
-            .parse()
-            .expect("a URL");
-        let holding = tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((socket, _)) = listener.accept().await {
-                held.push(socket);
-            }
-        });
-        let provider = config(Duration::from_millis(400))
-            .connect(&rpc)
-            .expect("an http client");
-        let answered =
-            tokio::time::timeout(Duration::from_secs(10), provider.get_block_number())
-                .await
-                .expect("the call gave up at its deadline");
-        let Err(error) = answered else {
-            panic!("an endpoint that never answered answered");
-        };
-        assert!(error.to_string().contains("no answer within"), "{error}");
-        holding.abort();
-    }
-
-    #[test]
-    fn an_rpc_url_other_than_http_is_refused() {
-        let config = config(Duration::from_secs(80));
-        for rpc in ["wss://node.example/rpc", "file:///tmp/geth.ipc"] {
-            let rpc: Url = rpc.parse().expect("a URL");
-            assert!(config.connect(&rpc).is_err(), "{rpc}");
-        }
-        let http: Url = "https://node.example/rpc".parse().expect("a URL");
-        assert!(config.connect(&http).is_ok());
-    }
-
-    #[tokio::test]
-    async fn a_stored_error_names_the_rpc_url_by_its_setting() {
-        let pool = PgPool::connect_lazy("postgres://localhost/unused").unwrap();
-        let indexer = Indexer::new(
-            ChainWriter::unprepared(ChainStore::new(pool, 1)),
-            "https://eth-mainnet.g.alchemy.com/v2/secret"
-                .parse()
-                .unwrap(),
-            config(Duration::from_secs(80)),
-        );
-        let error = "eth_blockNumber: error sending request for url \
-                     (https://eth-mainnet.g.alchemy.com/v2/secret)";
-        let stored = indexer.redacted(error.to_string());
-        assert!(!stored.contains("secret"), "{stored}");
-        assert!(stored.contains("<RPC_URL>"), "{stored}");
-    }
 
     /// An error that prints its cause in its own message and returns it as
     /// its source, as sqlx's and alloy's do.

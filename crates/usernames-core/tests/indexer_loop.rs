@@ -8,7 +8,10 @@
 
 use std::{
     collections::BTreeSet,
-    time::Duration,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 use alloy::{
@@ -208,15 +211,6 @@ impl Chain {
         }
     }
 
-    /// How many times the indexer called `method` through the relay.
-    fn called(&self, method: &str) -> usize {
-        self.relay
-            .calls()
-            .iter()
-            .filter(|called| called.as_str() == method)
-            .count()
-    }
-
     /// Stop the indexer and give the writer lease back.
     async fn stop(self, running: Running) {
         running.cancel.cancel();
@@ -227,6 +221,87 @@ impl Chain {
             .expect("the indexer stops cleanly");
         self.lease.release().await.expect("the lease releases");
     }
+}
+
+/// Each of `times` comes at least most of `interval` after the one before:
+/// the loop waited between the calls rather than making them back to back.
+fn spaced(times: &[Instant], interval: Duration) {
+    for pair in times.windows(2) {
+        let gap = pair[1] - pair[0];
+        assert!(
+            gap >= interval * 9 / 10,
+            "{gap:?} between calls, interval {interval:?}"
+        );
+    }
+}
+
+/// An idle chain costs one head read per poll interval and no `eth_getLogs`:
+/// a poll whose head has not passed the cursor's confirmation depth asks for
+/// no logs.
+#[tokio::test]
+async fn an_idle_chain_is_polled_once_an_interval_without_logs() {
+    let Some(chain) = Chain::start(43151).await else {
+        return;
+    };
+    let interval = Duration::from_millis(200);
+    let running = chain.run(IndexerConfig {
+        poll_interval: interval,
+        ..chain.config(1)
+    });
+    chain.wait_for_index(chain.head().await - 1).await;
+
+    let (heads, logs) = (
+        chain.relay.count("eth_blockNumber"),
+        chain.relay.count("eth_getLogs"),
+    );
+    let polls = 5;
+    tokio::time::timeout(
+        PATIENCE,
+        chain.relay.called("eth_blockNumber", heads + polls),
+    )
+    .await
+    .expect("the loop kept polling");
+    spaced(
+        &chain.relay.times("eth_blockNumber")[heads..heads + polls],
+        interval,
+    );
+    assert_eq!(
+        chain.relay.count("eth_getLogs"),
+        logs,
+        "an idle poll asked for logs"
+    );
+    chain.stop(running).await;
+}
+
+/// An endpoint that refuses every call is retried once a poll interval, not
+/// in a tight loop.
+#[tokio::test]
+async fn a_refusing_endpoint_is_retried_once_an_interval() {
+    let Some(chain) = Chain::start(43152).await else {
+        return;
+    };
+    let interval = Duration::from_millis(200);
+    let running = chain.run(IndexerConfig {
+        poll_interval: interval,
+        ..chain.config(1)
+    });
+    chain.wait_for_index(chain.head().await - 1).await;
+
+    chain.relay.refuse(true);
+    let heads = chain.relay.count("eth_blockNumber");
+    let tries = 5;
+    tokio::time::timeout(
+        PATIENCE,
+        chain.relay.called("eth_blockNumber", heads + tries),
+    )
+    .await
+    .expect("the loop kept retrying");
+    spaced(
+        &chain.relay.times("eth_blockNumber")[heads..heads + tries],
+        interval,
+    );
+    chain.relay.refuse(false);
+    chain.stop(running).await;
 }
 
 /// An endpoint that takes calls but stops answering would hold the loop
@@ -349,7 +424,7 @@ async fn logs_without_block_times_take_their_blocks_time() {
         .into_iter()
         .filter_map(|log| log.block_hash)
         .collect();
-    assert_eq!(chain.called("eth_getBlockByHash"), logged.len());
+    assert_eq!(chain.relay.count("eth_getBlockByHash"), logged.len());
     assert!(
         times
             .iter()

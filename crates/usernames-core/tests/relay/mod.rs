@@ -1,10 +1,12 @@
 //! An HTTP relay between the indexer and anvil: it records the JSON-RPC
-//! methods the indexer calls, and on demand stops answering, or answers
-//! `eth_getLogs` without the logs' block times.
+//! methods the indexer calls and when, and on demand stops answering,
+//! refuses every call, or answers `eth_getLogs` without the logs' block
+//! times.
 
 use std::{
     net::SocketAddr,
     sync::Arc,
+    time::Instant,
 };
 
 use alloy::{
@@ -34,6 +36,7 @@ use tokio::{
     sync::watch,
 };
 use url::Url;
+use usernames_core::indexer::RpcUrl;
 
 /// The relay's listening end, its switches, and what it saw.
 pub struct Relay {
@@ -46,13 +49,24 @@ struct Shared {
     /// Where calls are relayed to.
     upstream: Url,
     client: reqwest::Client,
-    /// Every method the indexer called, in order.
-    calls: watch::Sender<Vec<String>>,
+    /// Every call the indexer made, in order.
+    calls: watch::Sender<Vec<Called>>,
     /// Whether `eth_getLogs` answers lose their `blockTimestamp`, as an
     /// endpoint that does not serve the field answers.
     timeless: watch::Sender<bool>,
     /// Whether calls go unanswered, held open until the relay hears again.
     deaf: watch::Sender<bool>,
+    /// Whether every call is answered `503 Service Unavailable`.
+    refused: watch::Sender<bool>,
+}
+
+/// One call the indexer made, and when the relay took it.
+#[derive(Clone, Debug)]
+pub struct Called {
+    /// The JSON-RPC method.
+    pub method: String,
+    /// When the relay took the call.
+    pub at: Instant,
 }
 
 /// A JSON-RPC answer carrying logs.
@@ -82,6 +96,7 @@ impl Relay {
             calls: watch::Sender::new(Vec::new()),
             timeless: watch::Sender::new(false),
             deaf: watch::Sender::new(false),
+            refused: watch::Sender::new(false),
         });
         let app = Router::new()
             .route("/", post(Shared::relay))
@@ -91,13 +106,21 @@ impl Relay {
     }
 
     /// The endpoint the indexer is given.
-    pub fn url(&self) -> Url {
-        format!("http://{}", self.addr).parse().expect("a URL")
+    pub fn url(&self) -> RpcUrl {
+        format!("http://{}", self.addr)
+            .parse()
+            .expect("an http URL")
     }
 
     /// Leave every call unanswered from now on, or answer again.
     pub fn deafen(&self, deaf: bool) {
         self.shared.deaf.send_replace(deaf);
+    }
+
+    /// Answer every call `503 Service Unavailable` from now on, or relay
+    /// again.
+    pub fn refuse(&self, refused: bool) {
+        self.shared.refused.send_replace(refused);
     }
 
     /// Answer `eth_getLogs` without `blockTimestamp` from now on, or with
@@ -106,9 +129,37 @@ impl Relay {
         self.shared.timeless.send_replace(strip);
     }
 
-    /// Every method the indexer called through the relay, in order.
-    pub fn calls(&self) -> Vec<String> {
-        self.shared.calls.borrow().clone()
+    /// How many times the indexer has called `method` through the relay.
+    pub fn count(&self, method: &str) -> usize {
+        self.times(method).len()
+    }
+
+    /// When the relay took each call of `method`, in order.
+    pub fn times(&self, method: &str) -> Vec<Instant> {
+        self.shared
+            .calls
+            .borrow()
+            .iter()
+            .filter(|called| called.method == method)
+            .map(|called| called.at)
+            .collect()
+    }
+
+    /// Return once the indexer has called `method` `times` times.
+    pub async fn called(&self, method: &str, times: usize) {
+        self.shared
+            .calls
+            .subscribe()
+            .wait_for(|calls| {
+                calls
+                    .iter()
+                    .filter(|called| called.method == method)
+                    .count()
+                    >= times
+            })
+            .await
+            .map(drop)
+            .expect("the relay outlives its calls");
     }
 }
 
@@ -117,7 +168,13 @@ impl Shared {
     /// until it hears again, and the caller gives up first.
     async fn relay(State(shared): State<Arc<Self>>, call: Bytes) -> Response {
         if let Ok(Call { method }) = serde_json::from_slice(&call) {
-            shared.calls.send_modify(|calls| calls.push(method));
+            let at = Instant::now();
+            shared
+                .calls
+                .send_modify(|calls| calls.push(Called { method, at }));
+        }
+        if *shared.refused.borrow() {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
         if *shared.deaf.borrow() {
             shared

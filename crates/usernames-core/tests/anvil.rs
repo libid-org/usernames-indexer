@@ -202,7 +202,12 @@ async fn indexes_a_real_chain_end_to_end() {
         stale_after: Duration::from_secs(120),
     };
     let task = tokio::spawn(
-        indexer::Indexer::new(writer, node.rpc(), config).run(cancel.clone()),
+        indexer::Indexer::new(
+            writer,
+            node.rpc().try_into().expect("anvil serves http"),
+            config,
+        )
+        .run(cancel.clone()),
     );
 
     ChainWatch::new(&pool, &store).await.cursor_at(latest).await;
