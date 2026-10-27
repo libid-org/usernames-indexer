@@ -204,7 +204,7 @@ impl Service {
             app = app.nest(ens::ROUTE_PREFIX, ens::GatewayState::new(gateway).router());
         }
         // ONE layer, over the whole router, after every route is on it. A `layer`
-        // wraps only what is already mounted, so applying it inside `api::router`
+        // wraps only what is already mounted, so applying it inside `AppState::router`
         // both missed the gateway route — a browser ERC-3668 client would get no
         // `Access-Control-Allow-Origin` while `/v1/*` worked from the same page —
         // and, once a second layer was added to cover it, ran the CORS middleware

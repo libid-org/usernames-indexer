@@ -217,40 +217,31 @@ impl Shape for AddressHistory {
         self.entries
             .iter()
             .map(|e| {
+                let kind = match &e.event {
+                    HistoryEvent::IdentityBound { .. } => EventKind::IdentityBound,
+                    HistoryEvent::HandlePublished { .. } => EventKind::HandlePublished,
+                    HistoryEvent::HandleRetired { .. } => EventKind::HandleRetired,
+                    HistoryEvent::HandleUnpublished { .. } => {
+                        EventKind::HandleUnpublished
+                    }
+                    HistoryEvent::ProofVerifierConfigured { .. } => {
+                        EventKind::ProofVerifierConfigured
+                    }
+                    HistoryEvent::CeremonyBound { .. } => EventKind::CeremonyBound,
+                    HistoryEvent::BindFeePaid { .. } => EventKind::BindFeePaid,
+                    HistoryEvent::Deposited { .. } => EventKind::Deposited,
+                    HistoryEvent::HandleRevealed { .. } => EventKind::HandleRevealed,
+                    HistoryEvent::Forwarded { .. } => EventKind::Forwarded,
+                    HistoryEvent::Claimed { .. } => EventKind::Claimed,
+                    HistoryEvent::Refunded { .. } => EventKind::Refunded,
+                };
                 (
-                    e.event.kind(),
+                    kind,
                     e.roles.clone(),
                     e.handle.as_ref().map(|h| h.handle_node),
                 )
             })
             .collect()
-    }
-}
-
-/// A served event's kind, as the journal names it.
-trait Kind {
-    /// The kind the journal files this event under.
-    fn kind(&self) -> EventKind;
-}
-
-impl Kind for HistoryEvent {
-    fn kind(&self) -> EventKind {
-        match self {
-            HistoryEvent::IdentityBound { .. } => EventKind::IdentityBound,
-            HistoryEvent::HandlePublished { .. } => EventKind::HandlePublished,
-            HistoryEvent::HandleRetired { .. } => EventKind::HandleRetired,
-            HistoryEvent::HandleUnpublished { .. } => EventKind::HandleUnpublished,
-            HistoryEvent::ProofVerifierConfigured { .. } => {
-                EventKind::ProofVerifierConfigured
-            }
-            HistoryEvent::CeremonyBound { .. } => EventKind::CeremonyBound,
-            HistoryEvent::BindFeePaid { .. } => EventKind::BindFeePaid,
-            HistoryEvent::Deposited { .. } => EventKind::Deposited,
-            HistoryEvent::HandleRevealed { .. } => EventKind::HandleRevealed,
-            HistoryEvent::Forwarded { .. } => EventKind::Forwarded,
-            HistoryEvent::Claimed { .. } => EventKind::Claimed,
-            HistoryEvent::Refunded { .. } => EventKind::Refunded,
-        }
     }
 }
 

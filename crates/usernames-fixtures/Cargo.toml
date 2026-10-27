@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Builders for the ENS gateway requests and store bindings the usernames-api integration suites send."
+description = "Fixtures the usernames integration suites share: ENS gateway requests, chains seeded the way the indexer writes them, and waits on the database."
 publish = false
 
 [dependencies]

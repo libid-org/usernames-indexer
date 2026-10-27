@@ -58,6 +58,7 @@ use common::{
         Libid,
         Node,
         Proof,
+        Transacts,
         CEREMONY_VERSION,
     },
     Entries,
@@ -492,9 +493,9 @@ async fn an_escrow_of_another_registry_is_refused() {
     }
     let node = Node::spawn(POLLED);
     let (provider, owner) = (&node.provider, node.accounts()[0]);
-    let indexed = Libid::registry(provider, owner).await;
-    let other = Libid::registry(provider, owner).await;
-    let escrow = Libid::escrow(provider, owner, other).await;
+    let indexed = provider.deploy_registry(owner).await;
+    let other = provider.deploy_registry(owner).await;
+    let escrow = provider.deploy_escrow(owner, other).await;
 
     let refused = Contracts {
         registry: indexed,

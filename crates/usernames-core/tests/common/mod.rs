@@ -94,7 +94,7 @@ pub fn anvil_available() -> bool {
 /// an earlier run left there, and held under the suite's lock until
 /// [`Suite::done`].
 pub struct Suite {
-    /// The right to write the suite's chain, from [`writer`].
+    /// The right to write the suite's chain, from [`Seed::writer`].
     pub writer: ChainWriter,
     pub pool: PgPool,
     lock: MutexGuard<'static, ()>,

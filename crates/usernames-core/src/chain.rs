@@ -77,7 +77,7 @@ impl Contracts {
     /// fact.
     ///
     /// Cost: about log2(latest_block) RPC calls (~26 for 50M blocks).
-    pub async fn deployment_block(
+    pub async fn registry_deployment_block(
         &self,
         provider: &impl Provider,
         latest_block: u64,

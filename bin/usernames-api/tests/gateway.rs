@@ -1106,8 +1106,8 @@ async fn the_merged_router_keeps_both_halves_intact() {
     );
 
     // And the gateway answers under its prefix — with the CORS header, on the
-    // answer and on a refusal alike. This is the regression `build_router`
-    // exists to prevent: a layer applied inside `api::router` leaves the
+    // answer and on a refusal alike. This is the regression `Service::router`
+    // exists to prevent: a layer applied inside `AppState::router` leaves the
     // gateway route without `Access-Control-Allow-Origin`, and a browser
     // running the batch gateway in the page never sees the answer.
     let call = resolve_call(

@@ -157,7 +157,7 @@ impl Libid {
     /// verified by a stub.
     pub async fn deploy(provider: &DynProvider, owner: Address) -> Self {
         let registry = IdentityRegistry::new(
-            Self::registry(provider, owner).await,
+            provider.deploy_registry(owner).await,
             provider.clone(),
         );
         let deployed_at = provider.get_block_number().await.expect("block");
@@ -197,7 +197,7 @@ impl Libid {
         }
 
         let escrow = HandleEscrow::new(
-            Self::escrow(provider, owner, *registry.address()).await,
+            provider.deploy_escrow(owner, *registry.address()).await,
             provider.clone(),
         );
         let native = escrow.NATIVE().call().await.expect("the native token");
@@ -210,39 +210,6 @@ impl Libid {
             stubs,
             proofs: 0,
         }
-    }
-
-    /// A registry behind its proxy.
-    pub async fn registry(provider: &DynProvider, owner: Address) -> Address {
-        deploy_behind_proxy(
-            provider,
-            &ARTIFACTS,
-            "IdentityRegistry",
-            &IdentityRegistry::initializeCall { owner_: owner },
-            None,
-        )
-        .await
-        .expect("deploy the registry")
-    }
-
-    /// An escrow behind its proxy, resolving holders through `registry`.
-    pub async fn escrow(
-        provider: &DynProvider,
-        owner: Address,
-        registry: Address,
-    ) -> Address {
-        deploy_behind_proxy(
-            provider,
-            &ARTIFACTS,
-            "HandleEscrow",
-            &HandleEscrow::initializeCall {
-                owner_: owner,
-                registry_: registry,
-            },
-            None,
-        )
-        .await
-        .expect("deploy the escrow")
     }
 
     /// Point the platform's stub at what `proof` reports; the payload of
@@ -439,13 +406,47 @@ impl Libid {
     }
 }
 
-/// Transactions a suite sends.
-pub trait Mined {
+/// What a suite sends to its chain.
+pub trait Transacts {
     /// Send a transaction and wait for its block; a revert fails the test.
     async fn mined(&self, request: TransactionRequest) -> TransactionReceipt;
+
+    /// A registry behind its proxy, owned by `owner`.
+    async fn deploy_registry(&self, owner: Address) -> Address;
+
+    /// An escrow behind its proxy, owned by `owner` and resolving holders
+    /// through `registry`.
+    async fn deploy_escrow(&self, owner: Address, registry: Address) -> Address;
 }
 
-impl Mined for DynProvider {
+impl Transacts for DynProvider {
+    async fn deploy_registry(&self, owner: Address) -> Address {
+        deploy_behind_proxy(
+            self,
+            &ARTIFACTS,
+            "IdentityRegistry",
+            &IdentityRegistry::initializeCall { owner_: owner },
+            None,
+        )
+        .await
+        .expect("deploy the registry")
+    }
+
+    async fn deploy_escrow(&self, owner: Address, registry: Address) -> Address {
+        deploy_behind_proxy(
+            self,
+            &ARTIFACTS,
+            "HandleEscrow",
+            &HandleEscrow::initializeCall {
+                owner_: owner,
+                registry_: registry,
+            },
+            None,
+        )
+        .await
+        .expect("deploy the escrow")
+    }
+
     async fn mined(&self, request: TransactionRequest) -> TransactionReceipt {
         let receipt = self
             .send_transaction(request)

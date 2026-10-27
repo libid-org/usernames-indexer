@@ -1,4 +1,4 @@
-//! Request fixtures for the `usernames-api` integration suites.
+//! Fixtures the usernames integration suites share.
 //!
 //! A wallet resolving `alice.x.handles.link` through ENS does not send that
 //! text. It sends the name in DNS wire form and its namehash, plus an
@@ -19,7 +19,8 @@
 //!
 //! `gateway.rs` drives the router in process with these; `end_to_end.rs`
 //! deploys the real `HandleResolver` on anvil and walks the protocol with
-//! them. Neither needs ENS or a network. It is a crate rather than a
+//! them. Neither needs ENS or a network. The core and indexer suites share
+//! the seeding and the waits. It is a crate rather than a
 //! `tests/common` module because each test binary compiles such a module on
 //! its own, and a helper one of them does not call reads as dead code there;
 //! a library's public items never do.

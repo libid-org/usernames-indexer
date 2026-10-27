@@ -157,7 +157,8 @@ impl Indexer {
     /// resumes from the cursor.
     pub async fn run(self, cancel: CancellationToken) -> Result<(), Superseded> {
         tracing::info!(
-            contracts = ?self.config.contracts,
+            contract = %self.config.contracts.registry,
+            escrow = ?self.config.contracts.escrow,
             chain_id = self.writer.store().chain_id(),
             confirmations = self.config.confirmations,
             source = %self.config.source,
@@ -377,7 +378,10 @@ impl<'a> Session<'a> {
 
     /// One `eth_getLogs` window, inclusive on both ends, in chain order.
     async fn fetch(&self, from: u64, to: u64) -> anyhow::Result<Vec<Log>> {
-        let mut logs = (self.indexer.config.contracts)
+        let mut logs = self
+            .indexer
+            .config
+            .contracts
             .logs(&self.provider, from, to)
             .await
             .with_context(|| format!("eth_getLogs {from}..{to}"))?;
@@ -439,7 +443,10 @@ impl<'a> Session<'a> {
                 return None;
             }
         };
-        match contracts.deployment_block(&self.provider, latest).await {
+        match contracts
+            .registry_deployment_block(&self.provider, latest)
+            .await
+        {
             Ok(Some(block)) => {
                 tracing::info!(block, "detected contract deployment block");
                 if let Err(e) = indexer.writer.set_deploy_block(block).await {

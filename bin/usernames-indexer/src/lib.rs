@@ -184,7 +184,12 @@ impl Config {
                 stale_after,
             },
         );
-        tracing::info!(chain_id, ?contracts, "indexing");
+        tracing::info!(
+            chain_id,
+            contract = %contracts.registry,
+            escrow = ?contracts.escrow,
+            "indexing"
+        );
         Ok((lease, indexer))
     }
 
