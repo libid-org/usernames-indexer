@@ -1291,6 +1291,28 @@ async fn a_writer_whose_chain_was_prepared_again_writes_nothing() {
     drop(guard);
 }
 
+/// A chain whose row was deleted and prepared again names a writer no
+/// earlier writer could hold, so one from before the delete stays shut out.
+#[tokio::test]
+async fn a_writer_from_before_its_chain_row_was_deleted_writes_nothing() {
+    let Some((store, _pool, guard)) = test_store_with(2).await else {
+        return;
+    };
+    let stale = common::writer(&store).await;
+    store.forget().await;
+    common::writer(&store).await;
+
+    let refused = stale.begin_window().await.err();
+    assert!(
+        matches!(
+            refused,
+            Some(WindowError::Superseded(Superseded { chain_id })) if chain_id == CHAIN
+        ),
+        "{refused:?}"
+    );
+    drop(guard);
+}
+
 /// A replay waits for a window the writer before it still has open, then
 /// clears what that window committed: it starts from nothing even when the
 /// instance it replaced was mid-window.

@@ -4,8 +4,9 @@
 //! no call site can pass the wrong chain id or forget it. [`ChainWriter`] is
 //! the right to write one chain, which only a prepare under the writer lease
 //! hands out. [`Window`] is an open window: applying events and
-//! committing-with-cursor are its only operations, which makes "the cursor and the writes it stands for commit
-//! together or not at all" a fact of the type rather than caller discipline.
+//! committing-with-cursor are its only operations, which makes "the cursor
+//! and the writes it stands for commit together or not at all" a fact of the
+//! type rather than caller discipline.
 //! The journal's `(chain, block, log)` conflict gates every write in
 //! [`Window::apply`], so replaying a window — after a crash, or after a
 //! version-bump re-index — converges instead of counting an event twice.
@@ -447,9 +448,10 @@ impl ChainStore {
     ///
     /// The lease parameter is the safety argument in the signature: without
     /// the chain's writer lock, the check-clear-stamp sequence could race a
-    /// still-running older instance. The writer it returns is the next
-    /// generation in the chain's row, so whatever an earlier writer still
-    /// tries to write after its lease was lost lands nowhere.
+    /// still-running older instance. The writer it returns carries a new
+    /// generation, which the chain's row names from then on, so whatever an
+    /// earlier writer still tries to write after its lease was lost lands
+    /// nowhere.
     ///
     /// A lease for a DIFFERENT chain is a hard panic, not a debug assert:
     /// proceeding would clear this chain's rows without the lock that makes
