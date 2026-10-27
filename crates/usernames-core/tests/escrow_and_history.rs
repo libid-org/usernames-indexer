@@ -1280,5 +1280,6 @@ async fn a_refund_releasing_less_than_was_booked_fails_the_window() {
         matches!(refused, Err(ApplyError::Books { .. })),
         "{refused:?}"
     );
+    drop(window);
     suite.done();
 }

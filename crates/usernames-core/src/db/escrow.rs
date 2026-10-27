@@ -145,21 +145,13 @@ impl Window {
                     );
                 }
                 if !booked.is_zero() {
-                    let moved: Option<B256> = sqlx::query_scalar(sql::ESCROW_REFUND)
+                    sqlx::query(sql::ESCROW_REFUND)
                         .bind(chain_id)
                         .bind(handle_node)
                         .bind(token)
                         .bind(booked.to_string())
-                        .fetch_optional(&mut *self.tx)
+                        .execute(&mut *self.tx)
                         .await?;
-                    if moved.is_none() {
-                        tracing::error!(
-                            %handle_node,
-                            %token,
-                            block = at.block,
-                            "a refund from a slot this index never saw deposited"
-                        );
-                    }
                 }
             }
 

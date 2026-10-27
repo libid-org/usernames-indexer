@@ -255,8 +255,9 @@ pub enum ApplyError {
     #[error("database: {0}")]
     Db(#[from] sqlx::Error),
     /// A refund released less than the index had booked for its sender,
-    /// which the contract never does: the index's own books are wrong, and
-    /// applying the window would hide it.
+    /// which the contract never does, or the booked amount is no `uint256`:
+    /// the index's own books are wrong, and applying the window would hide
+    /// it.
     #[error(
         "a refund released {released}, but the index booked {booked} for its sender"
     )]
