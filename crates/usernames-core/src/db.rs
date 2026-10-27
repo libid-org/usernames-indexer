@@ -641,6 +641,24 @@ impl ChainStore {
         Ok(self.state().await?.position().cursor)
     }
 
+    /// Whether the journal holds the log at `log_index` of `block`.
+    pub async fn journaled(
+        &self,
+        block: u64,
+        log_index: u64,
+    ) -> Result<bool, sqlx::Error> {
+        let (Ok(block), Ok(log_index)) = (i64::try_from(block), i64::try_from(log_index))
+        else {
+            return Ok(false);
+        };
+        sqlx::query_scalar(sql::JOURNALED)
+            .bind(self.chain_id)
+            .bind(block)
+            .bind(log_index)
+            .fetch_one(&self.pool)
+            .await
+    }
+
     /// The cached deployment block of `contract` on this chain, if detected
     /// for it before.
     pub async fn deploy_block(

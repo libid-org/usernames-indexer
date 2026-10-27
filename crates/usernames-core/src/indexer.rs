@@ -1,5 +1,5 @@
 //! The indexing loop: catch up with `eth_getLogs` windows, then follow the
-//! chain, by polling or from pushed heads.
+//! chain, by polling or from pushed logs.
 //!
 //! Each window commits through [`crate::db::Window`] — journal rows, projection
 //! writes and the cursor together — so a crash replays a whole window instead
@@ -7,7 +7,7 @@
 //! the replay converges.
 
 mod deadline;
-mod heads;
+mod pushed;
 mod source;
 
 use std::time::Duration;
@@ -31,14 +31,17 @@ pub use self::source::{
     UnknownLogSource,
 };
 use self::{
-    heads::Heads,
+    pushed::Pushed,
     source::{
         Feed,
         Wake,
     },
 };
 use crate::{
-    chain::Contracts,
+    chain::{
+        Contracts,
+        Timed,
+    },
     db::{
         ChainWriter,
         Superseded,
@@ -56,14 +59,12 @@ pub struct IndexerConfig {
     pub contracts: Contracts,
     /// Blocks behind the head this indexer stays. The loop never commits past
     /// `latest - confirmations`, so a reorg shallower than this cannot leave
-    /// the read model holding events the canonical chain never emitted. At
-    /// least one with a subscription, whose logs for the head block may still
-    /// be on their way.
+    /// the read model holding events the canonical chain never emitted.
     pub confirmations: u64,
     /// How the loop learns of new blocks.
     pub source: LogSource,
-    /// The retry delay after a failure, and with [`LogSource::Poll`] the poll
-    /// cycle.
+    /// The retry delay after a failure, and the cycle of the head read that
+    /// moves the cursor, in either mode.
     pub poll_interval: Duration,
     /// Largest `eth_getLogs` window, sized to the RPC provider's limits.
     pub max_block_range: u64,
@@ -87,9 +88,9 @@ impl IndexerConfig {
         self.source.connect(rpc, self.patience()).await
     }
 
-    /// How long a session waits on its endpoint, for an answer or for the
-    /// next pushed head, before the session ends and the next one
-    /// reconnects: half the report's life.
+    /// How long a session waits on its endpoint, for an answer or for its
+    /// head to move, before the session ends and the next one reconnects:
+    /// half the report's life.
     fn patience(&self) -> Duration {
         self.stale_after / 2
     }
@@ -184,14 +185,11 @@ impl Indexer {
             let session = async { Session::open(&self).await?.follow(&cancel).await };
             match session.await {
                 Ok(Ended::Cancelled) => {}
-                Ok(Ended::Quiet { silent, grown: 0 }) => {
-                    tracing::info!(?silent, "no head pushed; reconnecting");
-                }
-                Ok(Ended::Quiet { silent, grown }) => {
+                Ok(Ended::Still { still, head }) => {
                     tracing::warn!(
-                        ?silent,
-                        grown,
-                        "the chain grew while the endpoint pushed no head; reconnecting"
+                        ?still,
+                        head,
+                        "the chain head has not moved; reconnecting"
                     );
                 }
                 Err(e) => {
@@ -246,22 +244,29 @@ impl OneLine for anyhow::Error {
 enum Ended {
     /// The indexer was cancelled.
     Cancelled,
-    /// No head was pushed for half the report's life: the next session
-    /// reconnects and catches up.
-    Quiet {
-        /// How long the session heard no head.
-        silent: Duration,
-        /// Blocks the endpoint's head grew past the last head the session
-        /// saw: some when the endpoint stopped pushing, none on an idle chain
-        /// or when the endpoint's node stopped following the chain.
-        grown: u64,
+    /// The endpoint reported the same head for the loop's patience: an idle
+    /// chain, or a node that stopped following it. The next session
+    /// reconnects, maybe to a backend that follows the chain.
+    Still {
+        /// How long the head stood still.
+        still: Duration,
+        /// The head it stood at.
+        head: u64,
     },
 }
 
+/// Where a pass over the chain left the index.
+struct Reached {
+    /// The chain head the pass read.
+    head: u64,
+    /// The first block past the cursor.
+    next: u64,
+}
+
 /// One connection to the RPC, from the catch-up that opens it to the
-/// cancellation, quiet stretch or first error that ends it. Whatever a
-/// dropped socket or an overflowing stream skipped, the next session's
-/// catch-up fetches.
+/// cancellation, still head or first error that ends it. Whatever a dropped
+/// socket or an overflowing stream skipped, the next session's catch-up
+/// fetches.
 struct Session<'a> {
     indexer: &'a Indexer,
     provider: RootProvider,
@@ -269,15 +274,16 @@ struct Session<'a> {
 }
 
 impl<'a> Session<'a> {
-    /// Connect, and open what the configured source follows the chain with.
+    /// Connect, and open what the configured source follows the chain with:
+    /// before the catch-up, so a log emitted past the catch-up's last block
+    /// is pushed.
     async fn open(indexer: &'a Indexer) -> anyhow::Result<Self> {
-        let source = indexer.config.source;
-        let provider = indexer
-            .config
+        let config = &indexer.config;
+        let provider = config
             .connect(&indexer.rpc)
             .await
             .context("connecting to the RPC")?;
-        let feed = Feed::open(source, &provider)
+        let feed = Feed::open(config.source, &provider, &config.contracts.filter())
             .await
             .context("eth_subscribe")?;
         Ok(Self {
@@ -287,50 +293,57 @@ impl<'a> Session<'a> {
         })
     }
 
-    /// Catch up, then follow: a poll catches up again every interval; a
-    /// subscription commits through each pushed head's confirmation depth,
-    /// fetching only the blocks its heads cannot vouch are free of watched
-    /// logs. A subscription that hears no head for the loop's patience ends
-    /// the session, so the next one reconnects and catches up: an open but
-    /// silent socket would otherwise leave the index frozen and the report
-    /// never renewed.
+    /// Catch up, then follow, reading the head every poll interval. A poll
+    /// catches up to it again. A subscription commits the logs it was pushed
+    /// through the target the PREVIOUS tick read, so a log that a lagging
+    /// backend pushes after another backend answered the head still has a
+    /// whole interval to arrive; that interval also covers the logs of the
+    /// head block itself, so a subscription needs no confirmation depth of
+    /// its own. The catch-up stops `confirmations` short of the head it read,
+    /// and the blocks in between may predate the subscription, whose logs are
+    /// never pushed: they are fetched once confirmed. A head that stands
+    /// still for the loop's patience ends the session, and the next one
+    /// reconnects.
     async fn follow(mut self, cancel: &CancellationToken) -> anyhow::Result<Ended> {
         let config = &self.indexer.config;
-        let watched = config.contracts.watched();
-        let quiet = config.patience();
-        let mut seen = self.catch_up(cancel).await?;
-        let mut heads = Heads::default();
-        let mut heard = Instant::now();
+        let patience = config.patience();
+        let Reached { mut head, mut next } = self.catch_up(cancel).await?;
+        let unpushed = head;
+        let mut ready = head.saturating_sub(config.confirmations);
+        let mut pushed = Pushed::default();
+        let mut moved = Instant::now();
+        let mut tick = Instant::now() + config.poll_interval;
         loop {
-            let until = match self.feed {
-                Feed::Poll => Instant::now() + config.poll_interval,
-                Feed::Subscribe(_) => heard + quiet,
-            };
-            match self.feed.wait(until, cancel).await? {
+            match self.feed.wait(tick, cancel).await? {
                 Wake::Cancelled => return Ok(Ended::Cancelled),
-                Wake::Tick => match self.feed {
-                    Feed::Poll => {
-                        self.catch_up(cancel).await?;
+                Wake::Log(log) => self.take(*log, next, &mut pushed).await?,
+                Wake::Tick => {
+                    let reached = match self.feed {
+                        Feed::Poll => self.catch_up(cancel).await?,
+                        Feed::Subscribe(_) => {
+                            self.settle(&mut pushed, ready, unpushed).await?
+                        }
+                    };
+                    if reached.head > head {
+                        head = reached.head;
+                        moved = Instant::now();
+                    } else if moved.elapsed() >= patience {
+                        return Ok(Ended::Still {
+                            still: moved.elapsed(),
+                            head,
+                        });
                     }
-                    Feed::Subscribe(_) => {
-                        let silent = heard.elapsed();
-                        let grown = self.head().await?.saturating_sub(seen);
-                        return Ok(Ended::Quiet { silent, grown });
-                    }
-                },
-                Wake::Head(head) => {
-                    heard = Instant::now();
-                    seen = head.number;
-                    heads.push(&head, &watched);
-                    self.advance(head.number, &mut heads).await?;
+                    next = reached.next;
+                    ready = ready.max(reached.head.saturating_sub(config.confirmations));
+                    tick = Instant::now() + config.poll_interval;
                 }
             }
         }
     }
 
     /// Read the head and commit every confirmed block past the cursor in
-    /// `eth_getLogs` windows; the head it read.
-    async fn catch_up(&mut self, cancel: &CancellationToken) -> anyhow::Result<u64> {
+    /// `eth_getLogs` windows.
+    async fn catch_up(&mut self, cancel: &CancellationToken) -> anyhow::Result<Reached> {
         let indexer = self.indexer;
         let config = &indexer.config;
         let (head, mut from) = tokio::try_join!(self.head(), self.next_block())?;
@@ -360,42 +373,107 @@ impl<'a> Session<'a> {
         if total > 0 {
             tracing::info!(events = total, through_block = target, "indexed");
         }
-        Ok(head)
+        Ok(Reached { head, next: from })
     }
 
-    /// Commit through `head`'s confirmation depth: fetched when the heads
-    /// say a block there may hold a watched log, passed without a call
-    /// otherwise.
-    async fn advance(&mut self, head: u64, heads: &mut Heads) -> anyhow::Result<()> {
+    /// Take in a pushed log. One past the cursor is held for the tick that
+    /// commits its block. One behind it came twice when the journal holds it
+    /// already, as the catch-up's logs do; otherwise the cursor passed its
+    /// block before it arrived, and a warning names what the read model
+    /// misses until a re-index. A reorg taking back a log the journal holds
+    /// is warned of the same way: there is no rollback.
+    async fn take(&self, log: Log, next: u64, pushed: &mut Pushed) -> anyhow::Result<()> {
+        let (Some(block), Some(log_index)) = (log.block_number, log.log_index) else {
+            anyhow::bail!(
+                "the log subscription pushed a log without its block and index"
+            );
+        };
+        if block >= next {
+            pushed.take(block, log_index, log);
+            return Ok(());
+        }
+        let journaled = self
+            .indexer
+            .writer
+            .store()
+            .journaled(block, log_index)
+            .await
+            .context("reading the journal")?;
+        let (emitter, tx) = (log.address(), log.transaction_hash);
+        if log.removed && journaled {
+            tracing::warn!(
+                block,
+                log_index,
+                %emitter,
+                ?tx,
+                "a reorg removed a log the read model holds; it stays until a re-index"
+            );
+        } else if !log.removed
+            && !journaled
+            && !matches!(self.indexer.config.contracts.decode(&log), Ok(None))
+        {
+            tracing::warn!(
+                block,
+                log_index,
+                %emitter,
+                ?tx,
+                "a log arrived after the cursor passed its block; it is missing until a re-index"
+            );
+        }
+        Ok(())
+    }
+
+    /// Commit the logs pushed for the blocks past the cursor through
+    /// `ready`, read the head, and record both, with `ready` as the target.
+    /// Blocks through `unpushed` may predate the subscription, so their logs
+    /// are fetched too, one log per position whether it came both ways or
+    /// one; past it the pushed logs are all the commit takes.
+    async fn settle(
+        &mut self,
+        pushed: &mut Pushed,
+        ready: u64,
+        unpushed: u64,
+    ) -> anyhow::Result<Reached> {
         let indexer = self.indexer;
         let config = &indexer.config;
-        let target = head.saturating_sub(config.confirmations);
-        let from = self.next_block().await?;
-        if from <= target {
-            if heads.settle(from, target) {
-                let mut start = from;
-                let mut total = 0usize;
-                while start <= target {
-                    let to = config.window_end(start, target);
-                    total += self.commit_fetched(start, to).await?;
-                    start = to + 1;
+        let mut next = self.next_block().await?;
+        if next <= ready {
+            let (mut from, through) = (next, ready.min(unpushed));
+            while from <= through {
+                let to = config.window_end(from, through);
+                for log in self.fetch(from, to).await? {
+                    let (Some(block), Some(log_index)) =
+                        (log.block_number, log.log_index)
+                    else {
+                        anyhow::bail!(
+                            "eth_getLogs {from}..{to} answered a log without its block and index"
+                        );
+                    };
+                    pushed.take(block, log_index, log);
                 }
-                if total > 0 {
-                    tracing::info!(events = total, through_block = target, "indexed");
-                }
-            } else {
-                indexer
-                    .commit(&[], target)
-                    .await
-                    .with_context(|| format!("blocks {from}..{target}"))?;
+                from = to + 1;
             }
+            let logs = pushed
+                .settle(ready)
+                .timed(&self.provider)
+                .await
+                .context("the block times of the pushed logs")?;
+            let total = indexer
+                .commit(&logs, ready)
+                .await
+                .with_context(|| format!("blocks {next}..{ready}"))?;
+            if total > 0 {
+                tracing::info!(events = total, through_block = ready, "indexed");
+            }
+            next = ready.saturating_add(1);
         }
+        let head = self.head().await?;
         tokio::join!(
             indexer.writer.set_chain_head(head),
-            indexer.writer.set_chain_target(target, config.stale_after),
+            indexer.writer.set_chain_target(ready, config.stale_after),
             indexer.writer.set_window_error(None),
         );
-        Ok(())
+        Ok(Reached { head, next })
     }
 
     /// Fetch blocks `from..=to` and commit them with the cursor; how many

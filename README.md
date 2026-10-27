@@ -5,7 +5,7 @@ and [`HandleEscrow`](https://github.com/libid-org/libid-contracts/blob/main/soli
 events into Postgres and serves resolution and search over the claimed
 handles, the history of every address and handle, and what the escrow holds.
 **Two binaries over one read model**: `usernames-indexer`, a loop that
-follows the contracts' events — from pushed heads, or polled —
+follows the contracts' events — pushed over a subscription, or polled —
 and indexes their storage from those events alone, and `usernames-api`,
 which serves what the loop wrote. They are separate because
 they scale and fail differently — one writer per chain holds a Postgres
@@ -53,36 +53,39 @@ indexer's settings.
 | Variable | Used by | Default | Meaning |
 |---|---|---|---|
 | `DATABASE_URL` | both | — | Postgres connection string |
-| `RPC_URL` | indexer | — | JSON-RPC endpoint of the chain to follow. With `LOG_SOURCE=subscribe` an `http(s)` URL is dialled as `ws(s)` on the same host and path, which is where Alchemy serves its WebSocket; geth and reth listen on another port and Infura under `/ws/`, so give those a `ws(s)://` URL. When its `eth_getLogs` leaves out `blockTimestamp` (a field outside the method's standard answer), the indexer reads each such block's header, one call per block with logs. Prefer a single node or a sticky endpoint: a load balancer that mixes lagged replicas can answer `eth_getLogs` for blocks a backend has not seen, and events dropped that way past the confirmation margin are gone until a re-index. |
+| `RPC_URL` | indexer | — | JSON-RPC endpoint of the chain to follow. With `LOG_SOURCE=subscribe` an `http(s)` URL is dialled as `ws(s)` on the same host and path, which is where Alchemy serves its WebSocket; geth and reth listen on another port and Infura under `/ws/`, so give those a `ws(s)://` URL. When its logs leave out `blockTimestamp` (a field outside the standard answer of `eth_getLogs` and of a logs subscription), the indexer reads each such block's header, one call per block with logs. Prefer a single node or a sticky endpoint: a load balancer that mixes lagged replicas can answer `eth_getLogs` for blocks a backend has not seen, and events dropped that way past the confirmation margin are gone until a re-index. |
 | `IDENTITY_REGISTRY_ADDRESS` | indexer | — | The IdentityRegistry **ERC1967 proxy** (the implementation changes on upgrade; the proxy is the one that emits). The indexer records it per chain, and `/v1/status` reports it from there |
 | `HANDLE_ESCROW_ADDRESS` | indexer | unset | The HandleEscrow **ERC1967 proxy**, when the chain has one. The indexer refuses to start unless its `registry()` is `IDENTITY_REGISTRY_ADDRESS`. Its events share the registry's windows and cursor; setting, changing or unsetting it replays the chain. `/v1/status` reports it as `escrow` |
 | `CHAIN_ID` | indexer | unset | Refuse to start unless the RPC reports this chain id. The API takes none: it serves every chain the store holds, and a request narrows with `?chain=` |
 | `CHAIN_NAMES` | indexer | — | Required. The names this chain goes by in an ENS name, comma-separated: the `base` in `alice.x.base.handles.link`. Labels only, never a platform key. Written to the store at every start for the gateway to read; a name belongs to one chain across the store, and declaring one another chain holds refuses to start |
-| `CONFIRMATIONS` | indexer | `5` | Blocks behind the head to stay (shallow-reorg protection). At least 1 with `LOG_SOURCE=subscribe` |
-| `LOG_SOURCE` | indexer | `subscribe` | How the indexer learns of new blocks: `subscribe` holds an `eth_subscribe("newHeads")` stream on a WebSocket; `poll` reads the head and asks with `eth_getLogs` every `POLL_INTERVAL`, for an endpoint without WebSocket. See [Log sources](#log-sources) |
-| `POLL_INTERVAL` | indexer | `5s` | The retry delay after a failure, and with `LOG_SOURCE=poll` the poll cycle |
-| `STALE_AFTER` | indexer | four poll intervals + 1m | How long readers may trust this indexer's last report; the ENS gateway refuses this chain once it expires. Must exceed `POLL_INTERVAL`, and at most a year. With a subscription, keep it above twice the chain's block time: the report renews on pushed heads, and a session that hears none for half of it reconnects. Half of it also bounds every RPC call, in either mode |
+| `CONFIRMATIONS` | indexer | `5` | Blocks behind the head to stay (shallow-reorg protection) |
+| `LOG_SOURCE` | indexer | `subscribe` | How the indexer learns of new logs: `subscribe` holds an `eth_subscribe("logs")` stream for the two contracts on a WebSocket and reads the head every `POLL_INTERVAL`; `poll` reads the head and asks with `eth_getLogs` every `POLL_INTERVAL`, for an endpoint without WebSocket. See [Log sources](#log-sources) |
+| `POLL_INTERVAL` | indexer | `5s` | The retry delay after a failure, and the cycle of the head read that moves the cursor |
+| `STALE_AFTER` | indexer | four poll intervals + 1m | How long readers may trust this indexer's last report; the ENS gateway refuses this chain once it expires. Must exceed `POLL_INTERVAL`, and at most a year. Half of it bounds every RPC call, and a head that stands still for half of it ends the session, so keep it above twice the chain's block time |
 | `MAX_BLOCK_RANGE` | indexer | `10000` | Largest `eth_getLogs` window |
 | `START_BLOCK` | indexer | unset | Where a FRESH scan starts — consulted only when no cursor exists (new database, or right after a re-index). Unset means the deployment block is found by binary search over `eth_getCode`; only a successful detection is cached, and an RPC failure mid-search retries next cycle |
 | `LISTEN_ADDR` | api | `127.0.0.1:8080` | Read-API listen address |
 
 ### Log sources
 
-**Subscribe** (the default) reacts as soon as a block is `CONFIRMATIONS`
-deep and costs `eth_getLogs` calls only for blocks that may hold events. A
-session subscribes to new heads, reads the head once, and catches up from
-the cursor in `eth_getLogs` windows. On each pushed head it commits through
-the head's confirmation depth. A block is fetched when its head's bloom
-admits either contract, or when the heads up to it did not arrive as one
-unbroken line (the first head, a gap, a reorg); the cursor passes any other
-block without a call. A reorg shallower than `CONFIRMATIONS` is settled by
-that fetch, as in polling. Any socket drop, stream overflow or RPC error
+**Subscribe** (the default) costs one `eth_blockNumber` per `POLL_INTERVAL`
+and nothing per block: the endpoint pushes only the two contracts' logs. A
+session subscribes first, then reads the head and catches up from the
+cursor in `eth_getLogs` windows, so a log emitted past the catch-up is
+pushed; the `CONFIRMATIONS` blocks the catch-up stops short of may predate
+the subscription, and are fetched once, when confirmed. Every
+`POLL_INTERVAL` it reads the head and commits the pushed logs through the
+target the previous read set, `CONFIRMATIONS` behind that head: a log a
+lagging backend pushes after another answered the head has a whole
+interval to arrive. A reorg's removal drops the pushed log it names
+before its block commits. Any socket drop, stream overflow or RPC error
 ends the session, and the next one catches up from the cursor, so nothing
-the socket missed is lost. A socket that pushes no head for half of
-`STALE_AFTER` is left the same way; the report is renewed only by pushed
-heads, so a silent socket cannot keep a frozen index looking fresh. In
-either mode, a call left unanswered for half of `STALE_AFTER` is an RPC
-error.
+the socket missed is lost. A head that stands still for half of
+`STALE_AFTER` ends the session the same way. In either mode, a call left
+unanswered for half of `STALE_AFTER` is an RPC error.
+
+A provider that bills a subscription by the bytes it pushes, as Alchemy
+does, charges for the two contracts' logs alone.
 
 **Poll** asks for every window with `eth_getLogs` and re-reads the head
 each `POLL_INTERVAL`, which costs RPC calls per block whether or not
@@ -385,9 +388,10 @@ compose Postgres — set `RPC_URL` and `IDENTITY_REGISTRY_ADDRESS` in
   `libid-identity` carries. A platform this build does not know is reachable
   by node only.
 - **Reorgs**: the loop commits nothing above `CONFIRMATIONS` blocks behind
-  the head, and a subscription checks each block it pushed logs from against
-  the canonical chain before committing it; there is no rollback. On a chain
-  with deeper reorgs, raise the setting.
+  the head, and a subscription drops a pushed log the reorg's removal names
+  before its block commits; there is no rollback. A removal or a log that
+  arrives after its block committed is logged as a warning and missed until
+  a re-index. On a chain with deeper reorgs, raise the setting.
 - **A subscription trusts its stream**: a head read proves the chain grew,
   not that the endpoint pushed every log of the blocks it covers. A log an
   endpoint drops on a live socket is missed until a re-index; a dropped

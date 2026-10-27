@@ -1,6 +1,6 @@
 //! The contracts an indexer follows, and what it reads of them from the
-//! chain: their checks at startup, the registry's deployment block, and
-//! their logs window by window.
+//! chain: their checks at startup, the registry's deployment block, their
+//! logs window by window, and the time of the block each log is in.
 
 use std::collections::{
     BTreeSet,
@@ -42,8 +42,8 @@ use crate::events::{
     NamesEvent,
 };
 
-/// How many block headers a window asks for at once, when its endpoint
-/// leaves the block times out of the logs.
+/// How many block headers are asked for at once, when an endpoint leaves the
+/// block times out of the logs.
 const HEADERS_AT_ONCE: usize = 8;
 
 /// The libid contracts one indexer follows on its chain: the registry, and
@@ -61,6 +61,11 @@ impl Contracts {
     /// Every contract whose logs the indexer reads.
     pub fn watched(&self) -> Vec<Address> {
         std::iter::once(self.registry).chain(self.escrow).collect()
+    }
+
+    /// The filter that admits every watched contract's logs, at any block.
+    pub fn filter(&self) -> Filter {
+        Filter::new().address(self.watched())
     }
 
     /// Decode a log by the contract that emitted it: each contract's topics
@@ -135,46 +140,17 @@ impl Contracts {
     /// on both ends, each with its block's time. The caller sizes windows
     /// with its `max_block_range`; a failure fails the window so the cursor
     /// stays put and the same blocks are retried next cycle.
-    ///
-    /// `blockTimestamp` is not part of `eth_getLogs`'s standard answer, and
-    /// an endpoint that omits it is asked for the block's header instead:
-    /// once per block, by hash so the time is the logged block's, a few
-    /// blocks at a time.
     pub async fn logs(
         &self,
         provider: &impl Provider,
         from: u64,
         to: u64,
     ) -> Result<Vec<Log>, TransportError> {
-        let filter = Filter::new()
-            .address(self.watched())
+        let filter = self
+            .filter()
             .from_block(BlockNumberOrTag::Number(from))
             .to_block(BlockNumberOrTag::Number(to));
-        let mut logs = provider.get_logs(&filter).await?;
-        let untimed: BTreeSet<B256> = logs
-            .iter()
-            .filter(|log| log.block_timestamp.is_none())
-            .filter_map(|log| log.block_hash)
-            .collect();
-        let times: HashMap<B256, u64> = stream::iter(untimed)
-            .map(|hash| async move {
-                let block = provider.get_block_by_hash(hash).await?.ok_or_else(|| {
-                    TransportErrorKind::custom_str(&format!(
-                        "no block {hash} for the logs logged in it"
-                    ))
-                })?;
-                Ok::<_, TransportError>((hash, block.header().timestamp()))
-            })
-            .buffer_unordered(HEADERS_AT_ONCE)
-            .try_collect()
-            .await?;
-        for log in &mut logs {
-            if log.block_timestamp.is_none() {
-                log.block_timestamp =
-                    log.block_hash.and_then(|hash| times.get(&hash).copied());
-            }
-        }
-        Ok(logs)
+        provider.get_logs(&filter).await?.timed(provider).await
     }
 
     /// Refuse a registry whose events this build would misread: one not
@@ -222,6 +198,48 @@ impl Contracts {
                 indexed: self.registry,
             })
         }
+    }
+}
+
+/// Logs and the times of the blocks they are in.
+pub(crate) trait Timed {
+    /// Each log with its block's time. `blockTimestamp` is outside the
+    /// standard answer of `eth_getLogs` and of a logs subscription, and a
+    /// log an endpoint sends without it takes its block's header time
+    /// instead: one header per block, read by hash so the time is the logged
+    /// block's, a few blocks at a time.
+    async fn timed(self, provider: &impl Provider) -> Result<Vec<Log>, TransportError>;
+}
+
+impl Timed for Vec<Log> {
+    async fn timed(
+        mut self,
+        provider: &impl Provider,
+    ) -> Result<Vec<Log>, TransportError> {
+        let untimed: BTreeSet<B256> = self
+            .iter()
+            .filter(|log| log.block_timestamp.is_none())
+            .filter_map(|log| log.block_hash)
+            .collect();
+        let times: HashMap<B256, u64> = stream::iter(untimed)
+            .map(|hash| async move {
+                let block = provider.get_block_by_hash(hash).await?.ok_or_else(|| {
+                    TransportErrorKind::custom_str(&format!(
+                        "no block {hash} for the logs logged in it"
+                    ))
+                })?;
+                Ok::<_, TransportError>((hash, block.header().timestamp()))
+            })
+            .buffer_unordered(HEADERS_AT_ONCE)
+            .try_collect()
+            .await?;
+        for log in &mut self {
+            if log.block_timestamp.is_none() {
+                log.block_timestamp =
+                    log.block_hash.and_then(|hash| times.get(&hash).copied());
+            }
+        }
+        Ok(self)
     }
 }
 

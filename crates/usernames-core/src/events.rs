@@ -511,9 +511,9 @@ impl NamesEvent {
 
 impl LogPosition {
     /// Where a mined log sat. A log still without its block's time, which
-    /// [`crate::chain::Contracts::logs`] reads from the header when an
-    /// endpoint leaves it out, fails the window rather than writing a
-    /// history with no time in it.
+    /// [`crate::chain::Timed`] reads from the header when an endpoint
+    /// leaves it out, fails the window rather than writing a history with no
+    /// time in it.
     fn of(log: &Log) -> Result<Self, DecodeError> {
         Ok(Self {
             block_number: log

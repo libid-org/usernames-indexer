@@ -30,6 +30,7 @@ pub const WRITER_ALIVE: &str = include_str!("../../sql/writer_alive.sql");
 pub const SET_CHAIN_TARGET: &str = include_str!("../../sql/set_chain_target.sql");
 pub const TOUCH_CHAIN_TARGET: &str = include_str!("../../sql/touch_chain_target.sql");
 pub const JOURNAL_EVENT: &str = include_str!("../../sql/journal_event.sql");
+pub const JOURNALED: &str = include_str!("../../sql/journaled.sql");
 pub const UPSERT_ID: &str = include_str!("../../sql/upsert_id.sql");
 pub const UPSERT_HANDLE: &str = include_str!("../../sql/upsert_handle.sql");
 pub const PUBLISH: &str = include_str!("../../sql/publish.sql");
