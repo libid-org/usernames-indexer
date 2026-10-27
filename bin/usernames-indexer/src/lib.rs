@@ -16,11 +16,15 @@ use alloy::{
 };
 use anyhow::Context;
 use clap::Parser;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use usernames_core::{
     chain,
-    db,
+    db::{
+        self,
+        Superseded,
+    },
     ens::ChainName,
     indexer::{
         self,
@@ -233,8 +237,7 @@ pub async fn run() -> anyhow::Result<()> {
     let stopped = tokio::select! {
         r = tokio::signal::ctrl_c() => {
             tracing::info!("shutting down");
-            cancel.cancel();
-            let _ = task.await;
+            stop(&cancel, &mut task, LEASE_CHECK).await;
             r.map_err(anyhow::Error::from)
         }
         r = &mut task => match r {
@@ -247,14 +250,28 @@ pub async fn run() -> anyhow::Result<()> {
         // Another instance may take the chain once the lock is gone, so this
         // one stops writing and exits for its supervisor to restart.
         lost = lease.lost(LEASE_CHECK) => {
-            cancel.cancel();
-            let _ = task.await;
+            stop(&cancel, &mut task, LEASE_CHECK).await;
             return Err(anyhow::Error::new(lost).context("the writer lease was lost"));
         }
     };
     // The loop no longer writes: the chain is the next instance's.
     lease.release().await?;
     stopped
+}
+
+/// Cancel the loop and give it `within` to finish its window. A loop stuck in
+/// a write to a silent database is aborted: its transaction never commits,
+/// and the writer generation keeps any later write from landing.
+async fn stop(
+    cancel: &CancellationToken,
+    task: &mut JoinHandle<Result<(), Superseded>>,
+    within: Duration,
+) {
+    cancel.cancel();
+    if tokio::time::timeout(within, &mut *task).await.is_err() {
+        tracing::warn!("the indexer did not stop within a lease check; aborting it");
+        task.abort();
+    }
 }
 
 #[cfg(test)]
@@ -369,5 +386,32 @@ mod help_tests {
             args(&["--log-source", "poll"]).confirmations().ok(),
             Some(0)
         );
+    }
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use std::time::Duration;
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::stop;
+
+    /// A loop that never reaches its next cancellation check is aborted
+    /// once its time is up, so the process can exit.
+    #[tokio::test]
+    async fn a_loop_that_does_not_stop_is_aborted() {
+        let cancel = CancellationToken::new();
+        let mut task = tokio::spawn(std::future::pending());
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            stop(&cancel, &mut task, Duration::from_millis(50)),
+        )
+        .await
+        .expect("stop returns");
+        let ended = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("the loop ended");
+        assert!(ended.unwrap_err().is_cancelled());
     }
 }

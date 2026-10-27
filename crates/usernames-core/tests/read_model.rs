@@ -1178,11 +1178,13 @@ async fn a_lease_whose_session_ends_reports_itself_lost() {
         return;
     };
     let mut lease = store.acquire_writer().await.expect("lease");
-    let every = Duration::from_millis(20);
     assert!(
-        tokio::time::timeout(every * 10, lease.lost(every))
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            lease.lost(Duration::from_millis(200))
+        )
+        .await
+        .is_err(),
         "a live session's lease is held"
     );
     sqlx::query(include_str!("common/end_writer_session.sql"))
@@ -1190,9 +1192,12 @@ async fn a_lease_whose_session_ends_reports_itself_lost() {
         .execute(&pool)
         .await
         .expect("the lease's session ends");
-    let lost = tokio::time::timeout(Duration::from_secs(5), lease.lost(every))
-        .await
-        .expect("the lease reports itself lost");
+    let lost = tokio::time::timeout(
+        Duration::from_secs(5),
+        lease.lost(Duration::from_millis(20)),
+    )
+    .await
+    .expect("the lease reports itself lost");
     assert!(matches!(lost, LeaseLost::Ended(_)), "{lost:?}");
     drop(guard);
 }
