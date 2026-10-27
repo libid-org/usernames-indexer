@@ -81,8 +81,8 @@ pub struct IndexerConfig {
 
 impl IndexerConfig {
     /// A connection to `rpc` as this loop's sessions use it: over the
-    /// configured source, each call failing once unanswered for
-    /// [`Self::patience`].
+    /// configured source, the connection and each call failing once
+    /// unanswered for half of [`Self::stale_after`].
     pub async fn connect(&self, rpc: &Url) -> TransportResult<RootProvider> {
         self.source.connect(rpc, self.patience()).await
     }
