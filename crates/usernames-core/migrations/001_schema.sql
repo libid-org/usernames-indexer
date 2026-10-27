@@ -34,6 +34,20 @@ CREATE TABLE IF NOT EXISTS names.chains (
 -- Writer generations, unique across every chain and every replay.
 CREATE SEQUENCE IF NOT EXISTS names.chain_writers;
 
+-- Every change to a chain's row is announced on the channel `names_chains`,
+-- with the chain's id, once its transaction commits: a reader that follows
+-- the index waits on it instead of polling the row.
+CREATE OR REPLACE FUNCTION names.announce_chain() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM pg_notify('names_chains', NEW.chain_id::text);
+    RETURN NULL;
+END
+$$;
+CREATE OR REPLACE TRIGGER chains_announced
+    AFTER INSERT OR UPDATE ON names.chains
+    FOR EACH ROW EXECUTE FUNCTION names.announce_chain();
+
 -- Append-only journal of every decoded contract event, in chain order. The
 -- projections below are derived state; this is the audit trail that says why
 -- they hold what they hold, and its primary key is the idempotency gate for

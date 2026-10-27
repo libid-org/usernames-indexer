@@ -21,17 +21,17 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use serde::de::DeserializeOwned;
-use sqlx::PgPool;
+use sqlx::{
+    postgres::PgListener,
+    PgPool,
+};
 use std::{
     fmt::Debug,
     time::Duration,
 };
-use tokio::{
-    sync::{
-        Mutex,
-        MutexGuard,
-    },
-    time::Instant,
+use tokio::sync::{
+    Mutex,
+    MutexGuard,
 };
 use tower::ServiceExt;
 use usernames_core::{
@@ -46,6 +46,7 @@ use usernames_core::{
     },
     db::{
         self,
+        ChainState,
         ChainStore,
         ChainWriter,
         Store,
@@ -269,19 +270,63 @@ pub fn unpublish(holder: Address) -> NamesEvent {
     NamesEvent::HandleUnpublished { holder }
 }
 
-/// Wait until the indexer has committed through `block`; fail after 30s.
-pub async fn wait_for_cursor(store: &ChainStore, block: u64) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let cursor = store.cursor().await.expect("cursor");
-        if cursor.is_some_and(|c| c >= block) {
-            return;
+/// How long a suite waits for the indexer to do something.
+pub const PATIENCE: Duration = Duration::from_secs(30);
+
+/// One chain's row, followed through the notices of its changes.
+pub struct ChainWatch {
+    listener: PgListener,
+    store: ChainStore,
+}
+
+impl ChainWatch {
+    /// Follow `store`'s chain from now on.
+    pub async fn new(pool: &PgPool, store: &ChainStore) -> Self {
+        let mut listener = PgListener::connect_with(pool).await.expect("a listener");
+        listener
+            .listen(db::CHAIN_CHANNEL)
+            .await
+            .expect("the chain channel");
+        Self {
+            listener,
+            store: store.clone(),
         }
-        assert!(
-            Instant::now() < deadline,
-            "the indexer did not reach block {block}; cursor {cursor:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    /// The chain's row after its next change.
+    pub async fn next(&mut self) -> ChainState {
+        let chain = self.store.chain_id().to_string();
+        loop {
+            let notice = self.listener.recv().await.expect("a notice");
+            if notice.payload() == chain {
+                return self.store.state().await.expect("the chain's row");
+            }
+        }
+    }
+
+    /// The chain's row once `reached` holds of it: read now, then after
+    /// each change, for at most [`PATIENCE`].
+    pub async fn until(&mut self, reached: impl Fn(&ChainState) -> bool) -> ChainState {
+        tokio::time::timeout(PATIENCE, async {
+            let mut state = self.store.state().await.expect("the chain's row");
+            while !reached(&state) {
+                state = self.next().await;
+            }
+            state
+        })
+        .await
+        .expect("the chain's row got there in time")
+    }
+
+    /// The chain's row once a window committed through `block`.
+    pub async fn cursor_at(&mut self, block: u64) -> ChainState {
+        self.until(|state| {
+            state
+                .position()
+                .cursor
+                .is_some_and(|cursor| cursor >= block)
+        })
+        .await
     }
 }
 

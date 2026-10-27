@@ -4,10 +4,7 @@
 
 use std::{
     net::SocketAddr,
-    sync::{
-        Arc,
-        Mutex,
-    },
+    sync::Arc,
 };
 
 use futures_util::{
@@ -41,10 +38,9 @@ pub struct Relay {
 }
 
 /// What every relayed connection reads and writes.
-#[derive(Default)]
 struct Shared {
-    /// Every method the indexer called, in order.
-    calls: Mutex<Vec<String>>,
+    /// Every method the indexer called, in order, announced as it grows.
+    calls: watch::Sender<Vec<String>>,
 }
 
 /// The part of a JSON-RPC message the relay reads: a request's method, or
@@ -61,7 +57,9 @@ impl Relay {
             .await
             .expect("a local port");
         let addr = listener.local_addr().expect("the bound address");
-        let shared = Arc::new(Shared::default());
+        let shared = Arc::new(Shared {
+            calls: watch::Sender::new(Vec::new()),
+        });
         let (open, _) = watch::channel(true);
         let (live, _) = watch::channel(0);
         let (silent, _) = watch::channel(false);
@@ -127,7 +125,20 @@ impl Relay {
 
     /// Every method the indexer called through the relay, in order.
     pub fn calls(&self) -> Vec<String> {
-        self.shared.calls.lock().expect("the call log").clone()
+        self.shared.calls.borrow().clone()
+    }
+
+    /// Return once the indexer has called `method` `times` times.
+    pub async fn called(&self, method: &str, times: usize) {
+        self.shared
+            .calls
+            .subscribe()
+            .wait_for(|calls| {
+                calls.iter().filter(|called| *called == method).count() >= times
+            })
+            .await
+            .map(drop)
+            .expect("the relay outlives its calls");
     }
 }
 
@@ -156,7 +167,7 @@ async fn pipe(
                 let Some(Ok(message)) = message else { return };
                 if let Message::Text(text) = &message {
                     if let Ok(call) = serde_json::from_str::<Call>(text.as_str()) {
-                        shared.calls.lock().expect("the call log").push(call.method);
+                        shared.calls.send_modify(|calls| calls.push(call.method));
                     }
                 }
                 if to_server.send(message).await.is_err() {

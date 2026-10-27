@@ -213,7 +213,10 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
         indexer::Indexer::new(writer, node.rpc(), config).run(cancel.clone()),
     );
 
-    common::wait_for_cursor(&store, latest).await;
+    common::ChainWatch::new(&pool, &store)
+        .await
+        .cursor_at(latest)
+        .await;
     cancel.cancel();
     let _ = task.await;
     lease.release().await.expect("the lease releases");

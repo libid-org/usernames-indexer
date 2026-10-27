@@ -15,7 +15,6 @@ use std::{
 };
 
 use chrono::TimeDelta;
-use tokio::time::Instant;
 
 use alloy::primitives::{
     Address,
@@ -1339,42 +1338,33 @@ async fn a_replay_waits_for_the_window_in_flight_and_clears_it() {
         window.apply(event, &at).await.expect("apply");
     }
 
+    // While the window is open the replay waits for it: one that may wait
+    // only a moment for a lock gives up instead.
     let lease = store.acquire_writer().await.expect("lease");
-    let replay = tokio::spawn({
-        let store = store.clone();
-        async move {
-            store
-                .prepare(&lease, OTHER_CONTRACT, None)
-                .await
-                .expect("the replay is prepared");
-            lease
-        }
-    });
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        assert!(
-            !replay.is_finished(),
-            "the replay did not wait for the window"
-        );
-        let waiting: bool =
-            sqlx::query_scalar(include_str!("common/waiting_on_a_row_lock.sql"))
-                .fetch_one(&pool)
-                .await
-                .expect("the lock waits");
-        if waiting {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the replay never reached the row"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    let hurried = PgPool::connect_with(
+        (*pool.connect_options())
+            .clone()
+            .options([("lock_timeout", "200ms")]),
+    )
+    .await
+    .expect("a pool that waits a moment for a lock");
+    let refused = ChainStore::new(hurried, CHAIN)
+        .prepare(&lease, OTHER_CONTRACT, None)
+        .await
+        .err();
+    assert!(
+        matches!(&refused, Some(sqlx::Error::Database(e)) if e.code().as_deref() == Some("55P03")),
+        "{refused:?}"
+    );
+
     window
         .commit(1)
         .await
         .expect("the window in flight commits");
-    let lease = replay.await.expect("the replay task");
+    store
+        .prepare(&lease, OTHER_CONTRACT, None)
+        .await
+        .expect("the replay is prepared");
 
     assert_eq!(
         store.cursor().await.unwrap(),
@@ -1407,16 +1397,19 @@ async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
         writer.set_chain_target(5, Duration::from_secs(1)).await,
         "the target write landed"
     );
-    // The report expires on the database's clock, a second from now.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let position = loop {
-        let position = store.state().await.expect("the chain's row").position();
-        if position.valid_for.is_some_and(|d| d < TimeDelta::zero()) {
-            break position;
-        }
-        assert!(Instant::now() < deadline, "never expired: {position:?}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+    // The report expires on the database's clock, which counts in whole
+    // seconds: past what it says is left, and a second more.
+    let left = store.state().await.expect("the chain's row").position();
+    let left = left
+        .valid_for
+        .and_then(|d| d.to_std().ok())
+        .unwrap_or_default();
+    tokio::time::sleep(left + Duration::from_secs(1)).await;
+    let position = store.state().await.expect("the chain's row").position();
+    assert!(
+        position.valid_for.is_some_and(|d| d < TimeDelta::zero()),
+        "{position:?}"
+    );
     assert_eq!(position.target, Some(5));
 
     writer.touch_chain_target(Duration::from_secs(120)).await;

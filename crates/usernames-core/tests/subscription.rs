@@ -32,7 +32,6 @@ use usernames_core::{
         self,
         ChainStore,
         ChainWriter,
-        IndexPosition,
         Superseded,
         WriterLease,
     },
@@ -46,17 +45,18 @@ use usernames_core::{
 
 mod common;
 mod relay;
-use common::libid::{
-    Disclose,
-    Handle,
-    Libid,
-    Node,
-    Proof,
+use common::{
+    libid::{
+        Disclose,
+        Handle,
+        Libid,
+        Node,
+        Proof,
+    },
+    ChainWatch,
+    PATIENCE,
 };
 use relay::Relay;
-
-/// How long any wait on the indexer may take before the test fails.
-const PATIENCE: Duration = Duration::from_secs(30);
 
 /// One test's chain: anvil with the libid contracts deployed, the relay the
 /// indexer dials, and the store it writes under the chain's writer lease.
@@ -186,42 +186,17 @@ impl Chain {
             .await
     }
 
-    /// The last window failure the indexer recorded, while it stands.
-    async fn window_error(&self) -> Option<String> {
-        self.writer
-            .store()
-            .state()
-            .await
-            .expect("the chain's row")
-            .window_error
-    }
-
-    /// Where the index stands.
-    async fn position(&self) -> IndexPosition {
-        self.writer
-            .store()
-            .state()
-            .await
-            .expect("the chain's row")
-            .position()
-    }
-
     /// Wait until the index stands at `block` or past it: the cursor
     /// committed through it, and the target reported beside it.
     async fn wait_for_index(&self, block: u64) {
-        let deadline = tokio::time::Instant::now() + PATIENCE;
-        loop {
-            let position = self.position().await;
-            let reached = |at: Option<u64>| at.is_some_and(|at| at >= block);
-            if reached(position.cursor) && reached(position.target) {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the index did not reach block {block}: {position:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        let reached = |at: Option<u64>| at.is_some_and(|at| at >= block);
+        ChainWatch::new(&self.pool, self.writer.store())
+            .await
+            .until(|state| {
+                let position = state.position();
+                reached(position.cursor) && reached(position.target)
+            })
+            .await;
     }
 
     /// Who `handle` on X resolves to, or the refusal's status.
@@ -390,16 +365,23 @@ async fn a_silent_socket_is_left_and_the_next_session_catches_up() {
 
     // The quiet session ends and the next one opens; neither is a failure
     // a monitor should see.
+    let mut watch = ChainWatch::new(&chain.pool, chain.writer.store()).await;
     chain.relay.silence(true);
-    let deadline = tokio::time::Instant::now() + PATIENCE;
-    while chain.called("eth_subscribe") < 2 {
-        assert_eq!(chain.window_error().await, None);
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the silent session was never left"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let stored = async {
+        loop {
+            if let Some(error) = watch.next().await.window_error {
+                return error;
+            }
+        }
+    };
+    tokio::time::timeout(PATIENCE, async {
+        tokio::select! {
+            () = chain.relay.called("eth_subscribe", 2) => {}
+            error = stored => panic!("a quiet reconnect stored a window error: {error}"),
+        }
+    })
+    .await
+    .expect("the silent session was left");
     let holder = chain.accounts()[0];
     let bound = chain.bind("silenced_1", holder).await;
     chain.mine(3).await;
