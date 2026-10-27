@@ -62,11 +62,11 @@ pub struct Config {
     /// The IdentityRegistry ERC1967 proxy address. Typed as an address so
     /// garbage is a usage error before anything connects, not a mid-startup
     /// failure.
-    #[arg(long, env = "IDENTITY_NAMES_ADDRESS")]
-    pub identity_names_address: Address,
+    #[arg(long, env = "IDENTITY_REGISTRY_ADDRESS")]
+    pub identity_registry_address: Address,
 
     /// The HandleEscrow ERC1967 proxy, when the chain has one. Its `registry`
-    /// must be `IDENTITY_NAMES_ADDRESS`: the escrow pays whoever that registry
+    /// must be `IDENTITY_REGISTRY_ADDRESS`: the escrow pays whoever that registry
     /// says holds a handle, and the index joins the two on that. Setting it,
     /// changing it or unsetting it replays the chain.
     #[arg(long, env = "HANDLE_ESCROW_ADDRESS")]
@@ -116,7 +116,7 @@ impl Config {
     /// The contracts this indexer follows.
     fn contracts(&self) -> Contracts {
         Contracts {
-            registry: self.identity_names_address,
+            registry: self.identity_registry_address,
             escrow: self.handle_escrow_address,
         }
     }
@@ -158,7 +158,7 @@ impl Config {
         contracts
             .check_registry(&provider)
             .await
-            .context("IDENTITY_NAMES_ADDRESS")?;
+            .context("IDENTITY_REGISTRY_ADDRESS")?;
         // Before `prepare`, which clears the chain when the escrow changes: a
         // misconfiguration refuses without touching the rows.
         contracts

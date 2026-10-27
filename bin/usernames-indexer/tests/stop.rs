@@ -87,7 +87,7 @@ impl Chain {
             .env("RPC_URL", self.node.rpc().as_str())
             .env("LOG_SOURCE", "poll")
             .env(
-                "IDENTITY_NAMES_ADDRESS",
+                "IDENTITY_REGISTRY_ADDRESS",
                 self.libid.registry.address().to_string(),
             )
             .env(
