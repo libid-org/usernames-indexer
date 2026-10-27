@@ -4,6 +4,14 @@
 -- address, node and handle nowhere. A probe's chain and platform then select
 -- little and its address or node select almost nothing, the way they do in
 -- production. The test loads it in a transaction that rolls back.
+--
+-- Held for that transaction: autovacuum, which every rolled-back load gives
+-- work, cannot rewrite these tables' statistics under the plans. Other
+-- sessions still read and write them.
+LOCK TABLE names.handles, names.ids, names.published, names.events,
+           names.address_events, names.handle_nodes,
+           names.escrow_held, names.escrow_refundable
+    IN SHARE UPDATE EXCLUSIVE MODE;
 INSERT INTO names.handles
     (chain_id, handle_node, platform_id, owner,
      observed_at, ceremony_version, id_node)
