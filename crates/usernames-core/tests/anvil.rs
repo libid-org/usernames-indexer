@@ -351,21 +351,19 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
     // disclosing ones with their reveal and name, the first with its fee and
     // the rename with its retirement and withdrawal; the withdrawal; six
     // escrow moves and the claim.
-    let journal: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM names.events WHERE chain_id = $1")
+    let journal: i64 = sqlx::query_scalar(include_str!("sql/journal_count.sql"))
+        .bind(chain_id as i64)
+        .fetch_one(&pool)
+        .await
+        .expect("journal count");
+    assert_eq!(journal, 26);
+    let fee_kinds: i64 =
+        sqlx::query_scalar(include_str!("sql/journal_count_of_kind.sql"))
             .bind(chain_id as i64)
+            .bind(EventKind::BindFeePaid.as_str())
             .fetch_one(&pool)
             .await
-            .expect("journal count");
-    assert_eq!(journal, 26);
-    let fee_kinds: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM names.events WHERE chain_id = $1 AND kind = $2",
-    )
-    .bind(chain_id as i64)
-    .bind(EventKind::BindFeePaid.as_str())
-    .fetch_one(&pool)
-    .await
-    .expect("fee count");
+            .expect("fee count");
     assert_eq!(fee_kinds, 1);
 
     // Both emitters' logs, in one history: the handle's from the deposit made

@@ -161,22 +161,14 @@ impl Harness {
     /// Every column holding text, bytes or JSON on this chain where `needle`
     /// is found: what a privacy scan reads.
     async fn where_found(&self, needle: &str) -> Vec<String> {
-        let columns: Vec<(String, String, String, bool)> = sqlx::query_as(
-            "SELECT c.table_name, c.column_name, c.data_type,
-                    EXISTS (SELECT 1 FROM information_schema.columns k
-                            WHERE k.table_schema = 'names'
-                              AND k.table_name = c.table_name
-                              AND k.column_name = 'chain_id')
-             FROM information_schema.columns c
-             JOIN information_schema.tables t
-               ON t.table_schema = c.table_schema AND t.table_name = c.table_name
-             WHERE c.table_schema = 'names' AND t.table_type = 'BASE TABLE'
-               AND c.data_type IN ('text', 'bytea', 'jsonb', 'ARRAY')",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .expect("columns");
+        let columns: Vec<(String, String, String, bool)> =
+            sqlx::query_as(include_str!("sql/text_columns.sql"))
+                .fetch_all(&self.pool)
+                .await
+                .expect("columns");
         let mut found = Vec::new();
+        // A table or column name cannot be bound, so each column's scan is
+        // composed from the catalog's names.
         for (table, column, kind, chained) in columns {
             let test = if kind == "bytea" {
                 format!(

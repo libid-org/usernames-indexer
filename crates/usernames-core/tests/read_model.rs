@@ -321,14 +321,12 @@ async fn rename_retires_the_previous_handle() {
 
     // The retired node keeps its watermark, mirroring the contract's
     // stale-proof gate.
-    let watermark: i64 = sqlx::query_scalar(
-        "SELECT observed_at FROM names.handles WHERE chain_id = $1 AND handle_node = $2",
-    )
-    .bind(CHAIN)
-    .bind(x.handle_node("alice_1").unwrap())
-    .fetch_one(&chains.pool)
-    .await
-    .expect("watermark row");
+    let watermark: i64 = sqlx::query_scalar(include_str!("sql/handle_watermark.sql"))
+        .bind(CHAIN)
+        .bind(x.handle_node("alice_1").unwrap())
+        .fetch_one(&chains.pool)
+        .await
+        .expect("watermark row");
     assert_eq!(watermark, 1000);
     chains.done();
 }
@@ -941,12 +939,11 @@ async fn replay_converges_instead_of_duplicating() {
     writer.apply_tx(1, events.clone()).await;
     writer.apply_tx(1, events).await;
 
-    let journal: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM names.events WHERE chain_id = $1")
-            .bind(CHAIN)
-            .fetch_one(&chains.pool)
-            .await
-            .expect("count");
+    let journal: i64 = sqlx::query_scalar(include_str!("sql/journal_count.sql"))
+        .bind(CHAIN)
+        .fetch_one(&chains.pool)
+        .await
+        .expect("count");
     // The bind, its reveal and its name.
     assert_eq!(journal, 3);
     let resolved: HandleResolution = chains
@@ -956,12 +953,11 @@ async fn replay_converges_instead_of_duplicating() {
         .answer();
     assert_eq!(resolved.bindings.only().owner, alice);
 
-    let disclosures: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM names.handle_nodes WHERE chain_id = $1 AND handle IS NOT NULL")
-            .bind(CHAIN)
-            .fetch_one(&chains.pool)
-            .await
-            .expect("count");
+    let disclosures: i64 = sqlx::query_scalar(include_str!("sql/disclosed_count.sql"))
+        .bind(CHAIN)
+        .fetch_one(&chains.pool)
+        .await
+        .expect("count");
     assert_eq!(disclosures, 1);
     chains.done();
 }
@@ -1169,12 +1165,11 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
             amount: U256::from(1_000u64),
         }
     );
-    let bound: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM names.ids WHERE chain_id = $1")
-            .bind(CHAIN)
-            .fetch_one(&chains.pool)
-            .await
-            .expect("ids count");
+    let bound: i64 = sqlx::query_scalar(include_str!("sql/ids_count.sql"))
+        .bind(CHAIN)
+        .fetch_one(&chains.pool)
+        .await
+        .expect("ids count");
     assert_eq!(bound, 0, "a ceremony event alone binds nothing");
     chains.done();
 }
