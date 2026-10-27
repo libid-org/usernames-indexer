@@ -231,15 +231,14 @@ impl ChainStatus {
     fn of(row: ChainStatusRow) -> Self {
         let ChainStatusRow { state, names } = row;
         let position = state.position();
-        let head = state.head();
         Self {
             chain_id: state.chain_id,
             names,
             contract: state.contract,
             escrow: state.escrow,
             last_indexed_block: position.cursor,
-            chain_head_block: head,
-            lag_blocks: head.map(|h| h.saturating_sub(position.cursor.unwrap_or(0))),
+            chain_head_block: state.head(),
+            lag_blocks: position.lag_blocks(),
             indexer_reported_at: position.reported_at,
             report_valid_for: position.valid_for_seconds(),
             last_window_error: state.window_error,

@@ -209,8 +209,8 @@ expires that chain alone, and the others keep answering.
 
 `GET /ens/status` lists every served chain with its position and whether it
 would be refused right now; `/v1/status` lists them as the indexers left
-them. Both are
-for alerting. A readiness probe may look at the STATUS CODE of `/v1/status`,
+them. `lagBlocks` is one number in both: the blocks the cursor trails the
+target, which `ENS_MAX_LAG_BLOCKS` bounds. Both are for alerting. A readiness probe may look at the STATUS CODE of `/v1/status`,
 which is 200 whenever the database answers, but never at a chain's `stale`,
 `reportValidFor` or `lagBlocks`: one stopped indexer would take every chain
 out of rotation, when the gate already refuses that chain alone. And the

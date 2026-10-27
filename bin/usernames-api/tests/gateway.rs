@@ -49,7 +49,10 @@ use usernames_api::ens::{
     ROUTE_PREFIX,
 };
 use usernames_core::{
-    api::AppState,
+    api::{
+        model::Status,
+        AppState,
+    },
     db::{
         self,
         ChainStore,
@@ -63,6 +66,7 @@ use usernames_fixtures::{
     resolve_call,
     Labels,
     LockWaits,
+    Reads,
     Seed,
 };
 
@@ -188,9 +192,12 @@ impl DeclareNames for ChainStore {
     }
 }
 
-/// One forwarded call to the gateway.
+/// One forwarded call to the gateway, and its status beside it.
 trait Ask {
     async fn ask(&self, sender: Address, call: &[u8]) -> (StatusCode, Reply);
+
+    /// `GET /status`, the way supervision reads it.
+    async fn status(&self) -> GatewayStatus;
 }
 
 impl Ask for Router {
@@ -204,6 +211,22 @@ impl Ask for Router {
         let status = response.status();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         (status, Reply(body.into()))
+    }
+
+    async fn status(&self) -> GatewayStatus {
+        let response = self
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&body).expect("a gateway status")
     }
 }
 
@@ -825,19 +848,7 @@ async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body.verify(&alive), Some(here));
 
-    let response = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/status")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .expect("router");
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    let status: GatewayStatus = serde_json::from_slice(&body).expect("a gateway status");
+    let status = router.status().await;
     let other = status.row(OTHER);
     let chain = status.row(CHAIN);
     assert!(other.stale, "{status:?}");
@@ -918,6 +929,36 @@ async fn a_chain_that_appears_in_the_store_is_served_without_a_restart() {
     gateway.done();
 }
 
+/// Both statuses report one lag, the blocks the cursor trails the target the
+/// gate measures, and not the head, which runs `CONFIRMATIONS` ahead of it.
+#[tokio::test]
+async fn both_statuses_report_the_lag_the_gate_measures() {
+    let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
+        return;
+    };
+    let writer = gateway.store.writer().await;
+    writer
+        .begin_window()
+        .await
+        .expect("begin")
+        .commit(40)
+        .await
+        .expect("commit");
+    writer.set_chain_head(50).await;
+    writer.set_chain_target(45, Duration::from_secs(120)).await;
+
+    let served = gateway.router().status().await;
+    let indexed: Status = gateway.pool.get("/v1/status").await.answer();
+    let indexed = indexed
+        .chains
+        .iter()
+        .find(|row| row.chain_id == CHAIN)
+        .expect("the chain is listed");
+    assert_eq!(served.row(CHAIN).lag_blocks, Some(5), "{served:?}");
+    assert_eq!(indexed.lag_blocks, Some(5), "{indexed:?}");
+    gateway.done();
+}
+
 /// Two indexed chains that share one coin type cannot be told apart by a
 /// query, so neither is answered: an unsigned refusal keeps the wallet
 /// walking, where a guess would sign the wrong chain's address. Decided per
@@ -939,18 +980,7 @@ async fn two_indexed_chains_on_one_coin_type_are_refused_unsigned() {
     assert!(body.refused().contains("share"), "{body}");
 
     // And supervision sees the same verdict, on both halves of the pair.
-    let response = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/status")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .expect("router");
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    let status: GatewayStatus = serde_json::from_slice(&body).expect("a gateway status");
+    let status = router.status().await;
     for id in [EDEN, TWIN] {
         let row = status.row(id);
         assert!(row.ambiguous && row.stale, "{status:?}");

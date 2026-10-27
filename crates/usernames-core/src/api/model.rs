@@ -101,9 +101,11 @@ pub struct ChainStatus {
     pub last_indexed_block: Option<u64>,
     /// The chain head as the indexer last saw it.
     pub chain_head_block: Option<u64>,
-    /// Blocks between the head the loop last saw and the cursor. Small and
+    /// Blocks the cursor trails the target, the block the indexer last set
+    /// out to reach, `CONFIRMATIONS` behind the head it saw; the number
+    /// `/ens/status` reports and `ENS_MAX_LAG_BLOCKS` bounds. Small and
     /// steady is healthy; growing means the loop is stalled or starved —
-    /// `last_window_error` says which.
+    /// `last_window_error` says which. Absent before the first window.
     pub lag_blocks: Option<u64>,
     /// Unix seconds at which the indexer last reported. `lag_blocks` cannot
     /// show a stopped loop — its two terms are both that loop's writes and

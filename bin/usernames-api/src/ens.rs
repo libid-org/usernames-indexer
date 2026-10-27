@@ -443,16 +443,8 @@ impl Lag {
     /// up signing authoritative nulls off a wiped database — a chain still
     /// in its first window, or one a replay reset, produces it.
     fn of(position: Option<IndexPosition>) -> Self {
-        match position {
-            Some(IndexPosition {
-                target: Some(target),
-                cursor: Some(cursor),
-                valid_for: Some(valid_for),
-                ..
-            }) => Self::Indexed {
-                blocks: target.saturating_sub(cursor),
-                valid_for,
-            },
+        match position.map(|position| (position.lag_blocks(), position.valid_for)) {
+            Some((Some(blocks), Some(valid_for))) => Self::Indexed { blocks, valid_for },
             _ => Self::Unknown,
         }
     }
@@ -611,7 +603,8 @@ pub struct ServedChain {
     pub chain_id: u64,
     /// The names the chain goes by in a name, as its indexer declared them.
     pub names: Vec<String>,
-    /// Blocks between the indexer's target and its cursor.
+    /// Blocks the cursor trails the indexer's target, as `/v1/status`
+    /// reports them.
     pub lag_blocks: Option<u64>,
     /// Unix seconds at which the indexer last reported.
     pub indexer_reported_at: Option<u64>,

@@ -170,6 +170,11 @@ pub struct IndexPosition {
 }
 
 impl IndexPosition {
+    /// Blocks the cursor trails the target by; absent until both exist.
+    pub fn lag_blocks(&self) -> Option<u64> {
+        Some(self.target?.saturating_sub(self.cursor?))
+    }
+
     /// Whole seconds until the last report expires, negative once it has.
     pub fn valid_for_seconds(&self) -> Option<i64> {
         self.valid_for.map(|valid_for| valid_for.num_seconds())
