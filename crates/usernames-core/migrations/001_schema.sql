@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS names.chains (
     window_error    TEXT,
     proof_verifier  BYTEA
 );
+-- Writer generations, unique across every chain and every replay.
+CREATE SEQUENCE IF NOT EXISTS names.chain_writers;
 
 -- Append-only journal of every decoded contract event, in chain order. The
 -- projections below are derived state; this is the audit trail that says why

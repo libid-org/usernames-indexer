@@ -240,9 +240,9 @@ them from `CHAIN_NAMES` at every start, replacing what it declared before, and
 the gateway reads them per request. A name belongs to one chain across the
 store — an indexer declaring a name another chain holds refuses to start — and
 is never a platform key, so the parse stays unambiguous. A label naming no
-chain in the store is a name nobody holds. To stop serving a chain, delete its
-`names.chains` and `names.chain_names` rows (and its projection rows);
-the gateway stops listing it on the next request. A database shared by
+chain in the store is a name nobody holds. To stop serving a chain, stop its
+indexer, then delete its `names.chains` and `names.chain_names` rows (and its
+projection rows); the gateway stops listing it on the next request. A database shared by
 deployments is a served set shared by their gateways — give a gateway its own
 database to narrow it.
 

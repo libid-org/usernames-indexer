@@ -238,7 +238,8 @@ pub async fn run() -> anyhow::Result<()> {
             r.map_err(anyhow::Error::from)
         }
         r = &mut task => match r {
-            Ok(()) => Err(anyhow::anyhow!("indexer task exited unexpectedly")),
+            Ok(Ok(())) => Err(anyhow::anyhow!("indexer task exited unexpectedly")),
+            Ok(Err(superseded)) => Err(superseded.into()),
             Err(e) => Err(anyhow::anyhow!("indexer task died: {e}")),
         },
         // Another instance may take the chain once the lock is gone, so this

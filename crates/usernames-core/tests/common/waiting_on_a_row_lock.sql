@@ -1,7 +1,9 @@
--- Whether another session waits for a row a FOR UPDATE asked for.
+-- Whether another session in this database waits to lock a chain's row for
+-- a prepare.
 SELECT EXISTS (
     SELECT 1 FROM pg_stat_activity
     WHERE wait_event_type = 'Lock'
-      AND query LIKE '%FOR UPDATE%'
+      AND datname = current_database()
+      AND query LIKE '%names.chains%FOR UPDATE%'
       AND pid <> pg_backend_pid()
 )

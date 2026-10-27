@@ -3,8 +3,8 @@
 //! [`ChainStore`] fuses the pool with the chain it scopes every query to, so
 //! no call site can pass the wrong chain id or forget it. [`ChainWriter`] is
 //! the right to write one chain, which only a prepare under the writer lease
-//! hands out. [`Window`] is an open window: applying events and committing-with-cursor are its only
-//! operations, which makes "the cursor and the writes it stands for commit
+//! hands out. [`Window`] is an open window: applying events and
+//! committing-with-cursor are its only operations, which makes "the cursor and the writes it stands for commit
 //! together or not at all" a fact of the type rather than caller discipline.
 //! The journal's `(chain, block, log)` conflict gates every write in
 //! [`Window::apply`], so replaying a window — after a crash, or after a
@@ -295,16 +295,21 @@ pub enum ChainNamesError {
     Db(#[from] sqlx::Error),
 }
 
+/// The chain's row no longer names this writer: a later prepare took the
+/// chain, or the row is gone. Either way the writer's lease was lost.
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+#[error("chain {chain_id} is no longer this writer's to write")]
+pub struct Superseded {
+    /// The chain.
+    pub chain_id: i64,
+}
+
 /// Why a window could not open.
 #[derive(Debug, thiserror::Error)]
 pub enum WindowError {
-    /// A later prepare named another writer in the chain's row: this one's
-    /// lease was lost, and the chain is the other writer's.
-    #[error("chain {chain_id} was prepared by a newer writer")]
-    Superseded {
-        /// The chain.
-        chain_id: i64,
-    },
+    /// This writer may no longer write the chain.
+    #[error(transparent)]
+    Superseded(#[from] Superseded),
     /// The database refused or the connection failed.
     #[error(transparent)]
     Db(#[from] sqlx::Error),
@@ -463,14 +468,10 @@ impl ChainStore {
             lease.chain_id, self.chain_id
         );
         let mut tx = self.pool.begin().await?;
-        let previous: Option<i64> = sqlx::query_scalar(sql::LOCK_CHAIN)
+        sqlx::query(sql::LOCK_CHAIN)
             .bind(self.chain_id)
-            .fetch_optional(&mut *tx)
+            .execute(&mut *tx)
             .await?;
-        let writer = ChainWriter {
-            store: self.clone(),
-            writer: previous.map_or(1, |previous| previous + 1),
-        };
         let known: ChainState = sqlx::query_as(sql::CHAIN_STATE)
             .bind(self.chain_id)
             .fetch_optional(&mut *tx)
@@ -480,13 +481,15 @@ impl ChainStore {
             && known.contract == Some(contract)
             && known.escrow == escrow
         {
-            sqlx::query(sql::CLAIM_CHAIN)
+            let writer = sqlx::query_scalar(sql::CLAIM_CHAIN)
                 .bind(self.chain_id)
-                .bind(writer.writer)
-                .execute(&mut *tx)
+                .fetch_one(&mut *tx)
                 .await?;
             tx.commit().await?;
-            return Ok(writer);
+            return Ok(ChainWriter {
+                store: self.clone(),
+                writer,
+            });
         }
         tracing::warn!(
             chain_id = self.chain_id,
@@ -509,14 +512,13 @@ impl ChainStore {
             .execute(&mut *tx)
             .await?;
         let deploy_block = known.deploy_block_of(contract);
-        sqlx::query(sql::RESET_CHAIN)
+        let writer = sqlx::query_scalar(sql::RESET_CHAIN)
             .bind(self.chain_id)
-            .bind(writer.writer)
             .bind(INDEXER_VERSION)
             .bind(contract)
             .bind(escrow)
             .bind(deploy_block)
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await?;
         tx.commit().await?;
         tracing::info!(
@@ -524,7 +526,10 @@ impl ChainStore {
             version = INDEXER_VERSION,
             "replay armed; starts next cycle"
         );
-        Ok(writer)
+        Ok(ChainWriter {
+            store: self.clone(),
+            writer,
+        })
     }
 
     /// Declare the names this chain goes by in an ENS name, replacing whatever
@@ -772,7 +777,7 @@ impl ChainWriter {
             .fetch_optional(&mut *tx)
             .await?;
         if held.is_none() {
-            return Err(WindowError::Superseded { chain_id });
+            return Err(Superseded { chain_id }.into());
         }
         Ok(Window {
             tx,

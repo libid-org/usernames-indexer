@@ -41,7 +41,11 @@ use self::{
 };
 use crate::{
     chain,
-    db::ChainWriter,
+    db::{
+        ChainWriter,
+        Superseded,
+        WindowError,
+    },
     events::{
         self,
         DecodeError,
@@ -192,10 +196,11 @@ impl Indexer {
         error.replace(endpoint, "://<RPC_URL>")
     }
 
-    /// Run until cancelled. Never returns early on an RPC or database error:
-    /// those end the session, which logs, sleeps one interval, and opens
-    /// another that resumes from the cursor.
-    pub async fn run(self, cancel: CancellationToken) {
+    /// Run until cancelled, or until the chain is no longer this writer's.
+    /// Never returns early on an RPC or database error: those end the
+    /// session, which logs, sleeps one interval, and opens another that
+    /// resumes from the cursor.
+    pub async fn run(self, cancel: CancellationToken) -> Result<(), Superseded> {
         tracing::info!(
             contract = %self.config.contract,
             escrow = ?self.config.escrow,
@@ -213,6 +218,9 @@ impl Indexer {
                     tracing::info!(?quiet, "no head pushed; reconnecting");
                 }
                 Err(e) => {
+                    if let Some(WindowError::Superseded(superseded)) = e.downcast_ref() {
+                        return Err(*superseded);
+                    }
                     let error = self.redacted(format!("{e:#}"));
                     tracing::warn!(%error, "indexing stopped; resuming from the cursor");
                     // Surfaced in /v1/status: a deterministic failure (an
@@ -225,6 +233,7 @@ impl Indexer {
             }
         }
         tracing::info!("usernames indexer shutting down");
+        Ok(())
     }
 }
 

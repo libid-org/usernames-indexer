@@ -33,6 +33,7 @@ use usernames_core::{
         ChainStore,
         ChainWriter,
         IndexPosition,
+        Superseded,
         WriterLease,
     },
     indexer::{
@@ -73,7 +74,7 @@ struct Chain {
 /// The indexer task a test runs, and the token that stops it.
 struct Running {
     cancel: CancellationToken,
-    task: JoinHandle<()>,
+    task: JoinHandle<Result<(), Superseded>>,
 }
 
 /// What a proof that `handle` on X is held reports: the handle doubles as
@@ -266,7 +267,11 @@ impl Chain {
     /// Stop the indexer and give the writer lease back.
     async fn stop(self, running: Running) {
         running.cancel.cancel();
-        running.task.await.expect("the indexer stops cleanly");
+        running
+            .task
+            .await
+            .expect("the indexer task")
+            .expect("the indexer stops cleanly");
         self.lease.release().await.expect("the lease releases");
     }
 }
@@ -406,4 +411,35 @@ async fn a_silent_socket_is_left_and_the_next_session_catches_up() {
         chain.relay.calls()
     );
     chain.stop(running).await;
+}
+
+/// An indexer whose chain another instance took stops at its next window,
+/// rather than retrying a chain that is no longer its to write.
+#[tokio::test]
+async fn an_indexer_whose_chain_was_taken_stops() {
+    let Some(chain) = Chain::start(43127).await else {
+        return;
+    };
+    let running = chain.run(chain.config(1));
+    chain.wait_for_index(chain.head().await - 1).await;
+
+    // Another instance takes the chain: this lease's session ends, and the
+    // next holder's prepare names a new writer.
+    let store = chain.writer.store();
+    sqlx::query(include_str!("common/end_writer_session.sql"))
+        .bind(store.chain_id())
+        .execute(&chain.pool)
+        .await
+        .expect("the lease's session ends");
+    common::writer(store).await;
+    chain.mine(2).await;
+
+    let stopped = tokio::time::timeout(PATIENCE, running.task)
+        .await
+        .expect("the indexer stops")
+        .expect("the indexer task");
+    assert!(
+        matches!(stopped, Err(Superseded { chain_id }) if chain_id == store.chain_id()),
+        "{stopped:?}"
+    );
 }

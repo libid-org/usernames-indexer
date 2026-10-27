@@ -61,6 +61,7 @@ use usernames_core::{
         ChainStore,
         ChainWriter,
         LeaseLost,
+        Superseded,
         WindowError,
     },
     ens,
@@ -1265,7 +1266,10 @@ async fn a_writer_whose_chain_was_prepared_again_writes_nothing() {
 
     let refused = stale.begin_window().await.err();
     assert!(
-        matches!(refused, Some(WindowError::Superseded { chain_id }) if chain_id == CHAIN),
+        matches!(
+            refused,
+            Some(WindowError::Superseded(Superseded { chain_id })) if chain_id == CHAIN
+        ),
         "{refused:?}"
     );
     assert!(

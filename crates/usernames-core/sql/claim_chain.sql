@@ -1,2 +1,4 @@
 -- A new writer for a chain whose rows it keeps.
-UPDATE names.chains SET writer = $2 WHERE chain_id = $1
+UPDATE names.chains SET writer = nextval('names.chain_writers')
+WHERE chain_id = $1
+RETURNING writer

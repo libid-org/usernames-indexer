@@ -48,6 +48,7 @@ use usernames_core::{
     db::{
         self,
         ChainStore,
+        Superseded,
         WriterLease,
     },
     indexer,
@@ -72,7 +73,7 @@ struct Harness {
     node: Node,
     libid: Libid,
     cancel: CancellationToken,
-    indexer: JoinHandle<()>,
+    indexer: JoinHandle<Result<(), Superseded>>,
     lease: WriterLease,
 }
 
