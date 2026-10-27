@@ -1,5 +1,5 @@
-//! The indexing loop: catch up with `eth_getLogs` windows, then follow the
-//! chain, by polling or from pushed heads.
+//! The indexing loop: read the head every poll interval and commit the
+//! blocks it confirmed in `eth_getLogs` windows.
 //!
 //! Each window commits through [`crate::db::Window`] — journal rows, projection
 //! writes and the cursor together — so a crash replays a whole window instead
@@ -7,36 +7,28 @@
 //! the replay converges.
 
 mod deadline;
-mod heads;
-mod source;
 
 use std::time::Duration;
-
-use tokio::time::Instant;
 
 use alloy::{
     providers::{
         Provider,
         RootProvider,
     },
-    rpc::types::Log,
-    transports::TransportResult,
+    rpc::{
+        client::ClientBuilder,
+        types::Log,
+    },
+    transports::{
+        TransportErrorKind,
+        TransportResult,
+    },
 };
 use anyhow::Context;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-pub use self::source::{
-    LogSource,
-    UnknownLogSource,
-};
-use self::{
-    heads::Heads,
-    source::{
-        Feed,
-        Wake,
-    },
-};
+use self::deadline::Deadline;
 use crate::{
     chain::Contracts,
     db::{
@@ -56,14 +48,9 @@ pub struct IndexerConfig {
     pub contracts: Contracts,
     /// Blocks behind the head this indexer stays. The loop never commits past
     /// `latest - confirmations`, so a reorg shallower than this cannot leave
-    /// the read model holding events the canonical chain never emitted. At
-    /// least one with a subscription, whose logs for the head block may still
-    /// be on their way.
+    /// the read model holding events the canonical chain never emitted.
     pub confirmations: u64,
-    /// How the loop learns of new blocks.
-    pub source: LogSource,
-    /// The retry delay after a failure, and with [`LogSource::Poll`] the poll
-    /// cycle.
+    /// The poll cycle, and the retry delay after a failure.
     pub poll_interval: Duration,
     /// Largest `eth_getLogs` window, sized to the RPC provider's limits.
     pub max_block_range: u64,
@@ -80,16 +67,24 @@ pub struct IndexerConfig {
 }
 
 impl IndexerConfig {
-    /// A connection to `rpc` as this loop's sessions use it: over the
-    /// configured source, the connection and each call failing once
-    /// unanswered for half of [`Self::stale_after`].
-    pub async fn connect(&self, rpc: &Url) -> TransportResult<RootProvider> {
-        self.source.connect(rpc, self.patience()).await
+    /// A client for the `http(s)` endpoint `rpc` as this loop uses it, each
+    /// call failing once unanswered for half of [`Self::stale_after`].
+    pub fn connect(&self, rpc: &Url) -> TransportResult<RootProvider> {
+        if !matches!(rpc.scheme(), "http" | "https") {
+            return Err(TransportErrorKind::custom_str(&format!(
+                "the RPC URL is {}, not http(s)",
+                rpc.scheme()
+            )));
+        }
+        let client = ClientBuilder::default()
+            .layer(Deadline(self.patience()))
+            .http(rpc.clone());
+        Ok(RootProvider::new(client))
     }
 
-    /// How long a session waits on its endpoint, for an answer or for the
-    /// next pushed head, before the session ends and the next one
-    /// reconnects: half the report's life.
+    /// How long a call waits for an answer before it fails and the session
+    /// ends: half the report's life, so a stuck endpoint is left and its
+    /// error stored while the report still holds.
     fn patience(&self) -> Duration {
         self.stale_after / 2
     }
@@ -159,8 +154,7 @@ impl Indexer {
 
     /// `error` with the RPC endpoint named by its setting. An HTTP client's
     /// error carries the URL it called, an endpoint's URL often holds its
-    /// API key, and `/v1/status` shows the stored error to anyone. Matched
-    /// past the scheme, so the WebSocket twin is caught too.
+    /// API key, and `/v1/status` shows the stored error to anyone.
     fn redacted(&self, error: String) -> String {
         let endpoint = &self.rpc.as_str()[self.rpc.scheme().len()..];
         error.replace(endpoint, "://<RPC_URL>")
@@ -176,40 +170,24 @@ impl Indexer {
             escrow = ?self.config.contracts.escrow,
             chain_id = self.writer.store().chain_id(),
             confirmations = self.config.confirmations,
-            source = %self.config.source,
             "usernames indexer starting"
         );
 
         while !cancel.is_cancelled() {
-            let session = async { Session::open(&self).await?.follow(&cancel).await };
-            match session.await {
-                Ok(Ended::Cancelled) => {}
-                Ok(Ended::Quiet { silent, grown: 0 }) => {
-                    tracing::info!(?silent, "no head pushed; reconnecting");
+            let session = async { Session::open(&self)?.follow(&cancel).await };
+            if let Err(e) = session.await {
+                if let Some(WindowError::Superseded(superseded)) = e.downcast_ref() {
+                    return Err(*superseded);
                 }
-                Ok(Ended::Quiet { silent, grown }) => {
-                    tracing::warn!(
-                        ?silent,
-                        grown,
-                        "the chain grew while the endpoint pushed no head; reconnecting"
-                    );
-                }
-                Err(e) => {
-                    if let Some(WindowError::Superseded(superseded)) = e.downcast_ref() {
-                        return Err(*superseded);
-                    }
-                    let error = self.redacted(e.one_line());
-                    tracing::warn!(%error, "indexing stopped; resuming from the cursor");
-                    // Surfaced in /v1/status: a deterministic failure, an
-                    // undecodable log say, stalls the cursor rather than skip
-                    // the log, and a monitor has to see the stall.
-                    self.writer.set_window_error(Some(&error)).await;
-                    cancel
-                        .run_until_cancelled(tokio::time::sleep(
-                            self.config.poll_interval,
-                        ))
-                        .await;
-                }
+                let error = self.redacted(e.one_line());
+                tracing::warn!(%error, "indexing stopped; resuming from the cursor");
+                // Surfaced in /v1/status: a deterministic failure, an
+                // undecodable log say, stalls the cursor rather than skip
+                // the log, and a monitor has to see the stall.
+                self.writer.set_window_error(Some(&error)).await;
+                cancel
+                    .run_until_cancelled(tokio::time::sleep(self.config.poll_interval))
+                    .await;
             }
         }
         tracing::info!("usernames indexer shutting down");
@@ -242,95 +220,43 @@ impl OneLine for anyhow::Error {
     }
 }
 
-/// How a session that did not fail ended.
-enum Ended {
-    /// The indexer was cancelled.
-    Cancelled,
-    /// No head was pushed for half the report's life: the next session
-    /// reconnects and catches up.
-    Quiet {
-        /// How long the session heard no head.
-        silent: Duration,
-        /// Blocks the endpoint's head grew past the last head the session
-        /// saw: some when the endpoint stopped pushing, none on an idle chain
-        /// or when the endpoint's node stopped following the chain.
-        grown: u64,
-    },
-}
-
-/// One connection to the RPC, from the catch-up that opens it to the
-/// cancellation, quiet stretch or first error that ends it. Whatever a
-/// dropped socket or an overflowing stream skipped, the next session's
-/// catch-up fetches.
+/// One run of the loop over its own RPC client, from its first catch-up to
+/// the cancellation or first error that ends it; the next session resumes
+/// from the cursor.
 struct Session<'a> {
     indexer: &'a Indexer,
     provider: RootProvider,
-    feed: Feed,
 }
 
 impl<'a> Session<'a> {
-    /// Connect, and open what the configured source follows the chain with.
-    async fn open(indexer: &'a Indexer) -> anyhow::Result<Self> {
-        let source = indexer.config.source;
+    /// A session over `indexer`'s endpoint.
+    fn open(indexer: &'a Indexer) -> anyhow::Result<Self> {
         let provider = indexer
             .config
             .connect(&indexer.rpc)
-            .await
             .context("connecting to the RPC")?;
-        let feed = Feed::open(source, &provider)
-            .await
-            .context("eth_subscribe")?;
-        Ok(Self {
-            indexer,
-            provider,
-            feed,
-        })
+        Ok(Self { indexer, provider })
     }
 
-    /// Catch up, then follow: a poll catches up again every interval; a
-    /// subscription commits through each pushed head's confirmation depth,
-    /// fetching only the blocks its heads cannot vouch are free of watched
-    /// logs. A subscription that hears no head for the loop's patience ends
-    /// the session, so the next one reconnects and catches up: an open but
-    /// silent socket would otherwise leave the index frozen and the report
-    /// never renewed.
-    async fn follow(mut self, cancel: &CancellationToken) -> anyhow::Result<Ended> {
-        let config = &self.indexer.config;
-        let watched = config.contracts.watched();
-        let quiet = config.patience();
-        let mut seen = self.catch_up(cancel).await?;
-        let mut heads = Heads::default();
-        let mut heard = Instant::now();
+    /// Catch up now and again every poll interval, until cancelled.
+    async fn follow(self, cancel: &CancellationToken) -> anyhow::Result<()> {
+        let interval = self.indexer.config.poll_interval;
         loop {
-            let until = match self.feed {
-                Feed::Poll => Instant::now() + config.poll_interval,
-                Feed::Subscribe(_) => heard + quiet,
-            };
-            match self.feed.wait(until, cancel).await? {
-                Wake::Cancelled => return Ok(Ended::Cancelled),
-                Wake::Tick => match self.feed {
-                    Feed::Poll => {
-                        self.catch_up(cancel).await?;
-                    }
-                    Feed::Subscribe(_) => {
-                        let silent = heard.elapsed();
-                        let grown = self.head().await?.saturating_sub(seen);
-                        return Ok(Ended::Quiet { silent, grown });
-                    }
-                },
-                Wake::Head(head) => {
-                    heard = Instant::now();
-                    seen = head.number;
-                    heads.push(&head, &watched);
-                    self.advance(head.number, &mut heads).await?;
-                }
+            self.catch_up(cancel).await?;
+            if cancel
+                .run_until_cancelled(tokio::time::sleep(interval))
+                .await
+                .is_none()
+            {
+                return Ok(());
             }
         }
     }
 
     /// Read the head and commit every confirmed block past the cursor in
-    /// `eth_getLogs` windows; the head it read.
-    async fn catch_up(&mut self, cancel: &CancellationToken) -> anyhow::Result<u64> {
+    /// `eth_getLogs` windows. A head that has not passed the cursor's
+    /// confirmation depth costs no `eth_getLogs` call.
+    async fn catch_up(&self, cancel: &CancellationToken) -> anyhow::Result<()> {
         let indexer = self.indexer;
         let config = &indexer.config;
         let (head, mut from) = tokio::try_join!(self.head(), self.next_block())?;
@@ -360,41 +286,6 @@ impl<'a> Session<'a> {
         if total > 0 {
             tracing::info!(events = total, through_block = target, "indexed");
         }
-        Ok(head)
-    }
-
-    /// Commit through `head`'s confirmation depth: fetched when the heads
-    /// say a block there may hold a watched log, passed without a call
-    /// otherwise.
-    async fn advance(&mut self, head: u64, heads: &mut Heads) -> anyhow::Result<()> {
-        let indexer = self.indexer;
-        let config = &indexer.config;
-        let target = head.saturating_sub(config.confirmations);
-        let from = self.next_block().await?;
-        if from <= target {
-            if heads.settle(from, target) {
-                let mut start = from;
-                let mut total = 0usize;
-                while start <= target {
-                    let to = config.window_end(start, target);
-                    total += self.commit_fetched(start, to).await?;
-                    start = to + 1;
-                }
-                if total > 0 {
-                    tracing::info!(events = total, through_block = target, "indexed");
-                }
-            } else {
-                indexer
-                    .commit(&[], target)
-                    .await
-                    .with_context(|| format!("blocks {from}..{target}"))?;
-            }
-        }
-        tokio::join!(
-            indexer.writer.set_chain_head(head),
-            indexer.writer.set_chain_target(target, config.stale_after),
-            indexer.writer.set_window_error(None),
-        );
         Ok(())
     }
 
@@ -518,9 +409,66 @@ impl<'a> Session<'a> {
 mod tests {
     use alloy::primitives::Address;
     use sqlx::PgPool;
+    use tokio::net::TcpListener;
 
     use super::*;
     use crate::db::ChainStore;
+
+    /// The suite's knobs, a report good for `stale_after`.
+    fn config(stale_after: Duration) -> IndexerConfig {
+        IndexerConfig {
+            contracts: Contracts {
+                registry: Address::ZERO,
+                escrow: None,
+            },
+            confirmations: 3,
+            poll_interval: Duration::from_secs(5),
+            max_block_range: 10,
+            start_block: None,
+            stale_after,
+        }
+    }
+
+    /// An endpoint that takes the connection and never answers fails each
+    /// call once the patience runs out.
+    #[tokio::test]
+    async fn a_call_left_unanswered_fails_at_the_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a local port");
+        let rpc: Url = format!("http://{}", listener.local_addr().expect("the address"))
+            .parse()
+            .expect("a URL");
+        let holding = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let provider = config(Duration::from_millis(400))
+            .connect(&rpc)
+            .expect("an http client");
+        let answered =
+            tokio::time::timeout(Duration::from_secs(10), provider.get_block_number())
+                .await
+                .expect("the call gave up at its deadline");
+        let Err(error) = answered else {
+            panic!("an endpoint that never answered answered");
+        };
+        assert!(error.to_string().contains("no answer within"), "{error}");
+        holding.abort();
+    }
+
+    #[test]
+    fn an_rpc_url_other_than_http_is_refused() {
+        let config = config(Duration::from_secs(80));
+        for rpc in ["wss://node.example/rpc", "file:///tmp/geth.ipc"] {
+            let rpc: Url = rpc.parse().expect("a URL");
+            assert!(config.connect(&rpc).is_err(), "{rpc}");
+        }
+        let http: Url = "https://node.example/rpc".parse().expect("a URL");
+        assert!(config.connect(&http).is_ok());
+    }
 
     #[tokio::test]
     async fn a_stored_error_names_the_rpc_url_by_its_setting() {
@@ -530,29 +478,13 @@ mod tests {
             "https://eth-mainnet.g.alchemy.com/v2/secret"
                 .parse()
                 .unwrap(),
-            IndexerConfig {
-                contracts: Contracts {
-                    registry: Address::ZERO,
-                    escrow: None,
-                },
-                confirmations: 3,
-                source: LogSource::Subscribe,
-                poll_interval: Duration::from_secs(5),
-                max_block_range: 10,
-                start_block: None,
-                stale_after: Duration::from_secs(80),
-            },
+            config(Duration::from_secs(80)),
         );
-        for called in [
-            "https://eth-mainnet.g.alchemy.com/v2/secret",
-            "wss://eth-mainnet.g.alchemy.com/v2/secret",
-        ] {
-            let error =
-                format!("eth_blockNumber: error sending request for url ({called})");
-            let stored = indexer.redacted(error);
-            assert!(!stored.contains("secret"), "{stored}");
-            assert!(stored.contains("<RPC_URL>"), "{stored}");
-        }
+        let error = "eth_blockNumber: error sending request for url \
+                     (https://eth-mainnet.g.alchemy.com/v2/secret)";
+        let stored = indexer.redacted(error.to_string());
+        assert!(!stored.contains("secret"), "{stored}");
+        assert!(stored.contains("<RPC_URL>"), "{stored}");
     }
 
     /// An error that prints its cause in its own message and returns it as

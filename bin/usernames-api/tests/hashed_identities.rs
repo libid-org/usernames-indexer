@@ -109,7 +109,6 @@ impl Harness {
                 indexer::IndexerConfig {
                     contracts: libid.contracts(),
                     confirmations: 0,
-                    source: indexer::LogSource::Poll,
                     poll_interval: Duration::from_millis(10),
                     max_block_range: 100,
                     start_block: None,

@@ -2,7 +2,7 @@
 //! deployment runs, with a stub in place of each platform's proof check (see
 //! `usernames_fixtures::libid`). The indexer's own loop, deployment-block detection
 //! included, indexes the registry and the escrow into Postgres, where the API
-//! answers. The scenario runs once per log source, each on a chain of its own.
+//! answers.
 //!
 //! Skips without `DATABASE_URL` or `anvil`, unless `CI` is set: there a
 //! missing one fails. Everything past those checks panics on failure.
@@ -43,10 +43,7 @@ use usernames_core::{
         ChainStore,
     },
     events::EventKind,
-    indexer::{
-        self,
-        LogSource,
-    },
+    indexer,
     nodes::KnownPlatform,
 };
 
@@ -68,30 +65,19 @@ use usernames_fixtures::{
     Reads,
 };
 
-/// The polled chain. Not 31337: the read-model tests use anvil's default id
+/// The indexed chain. Not 31337: the read-model tests use anvil's default id
 /// against the same database, and chain_id keying is the isolation this
 /// exercises.
-const POLLED: u64 = 43117;
-
-/// The subscribed chain, apart from the polled one so both run at once.
-const SUBSCRIBED: u64 = 43119;
+const CHAIN: u64 = 43117;
 
 /// A Google account id as the platform issues it: the OIDC `sub`.
 const GOOGLE_USER_ID: &str = "123456789012345678901";
 
+/// The scenario, sent before the indexer starts: deployment detection,
+/// catch-up and the API's answers.
 #[tokio::test]
-async fn indexes_a_real_chain_end_to_end_by_polling() {
-    indexes_a_real_chain_end_to_end(LogSource::Poll, POLLED).await;
-}
-
-#[tokio::test]
-async fn indexes_a_real_chain_end_to_end_from_a_subscription() {
-    indexes_a_real_chain_end_to_end(LogSource::Subscribe, SUBSCRIBED).await;
-}
-
-/// The scenario, sent before the indexer starts and indexed through
-/// `source`: deployment detection, catch-up and the API's answers.
-async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
+async fn indexes_a_real_chain_end_to_end() {
+    let chain_id = CHAIN;
     let Some(url) = database_url() else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
@@ -203,13 +189,12 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
     let writer = store.prepare(&lease, contracts).await.expect("prepare");
 
     // Run the real loop: no start override (detection must find the deploy
-    // block), a tiny window so catch-up spans several chunks, and the one
-    // confirmation a subscription needs.
+    // block), a tiny window so catch-up spans several chunks, and one
+    // confirmation.
     let cancel = CancellationToken::new();
     let config = indexer::IndexerConfig {
         contracts,
         confirmations: 1,
-        source,
         poll_interval: Duration::from_millis(20),
         max_block_range: 2,
         start_block: None,
@@ -488,7 +473,7 @@ async fn an_escrow_of_another_registry_is_refused() {
         eprintln!("skipping: anvil not on PATH");
         return;
     }
-    let node = Node::spawn(POLLED);
+    let node = Node::spawn(CHAIN);
     let (provider, owner) = (&node.provider, node.accounts()[0]);
     let indexed = provider.deploy_registry(owner).await;
     let other = provider.deploy_registry(owner).await;

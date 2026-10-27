@@ -3,7 +3,7 @@
 //! Two binaries stand on this crate and neither contains logic of its own:
 //! `usernames-indexer` runs [`indexer`], the loop that indexes
 //! `IdentityRegistry` and `HandleEscrow` storage into Postgres from their
-//! events alone, followed from pushed heads or polled, and
+//! events alone, polled from the chain, and
 //! `usernames-api` serves [`api`], which answers resolution (handle ->
 //! wallet, account id -> wallet, wallet -> identities), partial-handle
 //! search, the histories of addresses and handles, and what the escrow

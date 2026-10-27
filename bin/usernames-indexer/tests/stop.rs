@@ -85,7 +85,6 @@ impl Chain {
         let mut child = Command::new(env!("CARGO_BIN_EXE_usernames-indexer"))
             .env("DATABASE_URL", &self.database)
             .env("RPC_URL", self.node.rpc().as_str())
-            .env("LOG_SOURCE", "poll")
             .env(
                 "IDENTITY_REGISTRY_ADDRESS",
                 self.libid.registry.address().to_string(),

@@ -1,7 +1,7 @@
-//! The subscription source against a real chain. anvil pushes heads over a
-//! WebSocket, through a relay that can drop the socket or silence it and
-//! records every call the indexer makes, so each test checks what the
-//! indexer committed and what the RPC was asked for it.
+//! The polling loop against a real chain. anvil answers through a relay that
+//! records every call the indexer makes and can stop answering or drop the
+//! logs' block times, so each test checks what the indexer committed and what
+//! the RPC was asked for it.
 //!
 //! Skips without `DATABASE_URL` or `anvil`, unless `CI` is set: there a
 //! missing one fails. Everything past those checks panics on failure.
@@ -30,7 +30,6 @@ use usernames_core::{
     api::model::{
         HandleHistory,
         HandleResolution,
-        HistoryEvent,
     },
     db::{
         self,
@@ -42,7 +41,6 @@ use usernames_core::{
     indexer::{
         Indexer,
         IndexerConfig,
-        LogSource,
     },
     nodes::KnownPlatform,
 };
@@ -117,7 +115,7 @@ impl Chain {
         let libid = Libid::deploy(&node.provider, node.accounts()[0]).await;
         // A few blocks of history, so the catch-up spans more than a window.
         node.provider.anvil_mine(Some(8), None).await.expect("mine");
-        let relay = Relay::start(node.ws()).await;
+        let relay = Relay::start(node.rpc()).await;
 
         let lease = store.acquire_writer().await.expect("writer lease");
         let writer = store
@@ -134,13 +132,12 @@ impl Chain {
         })
     }
 
-    /// The suite's indexer settings: a head subscription over the relay,
+    /// The suite's indexer settings: polling through the relay,
     /// `confirmations` behind the head, on short intervals.
     fn config(&self, confirmations: u64) -> IndexerConfig {
         IndexerConfig {
             contracts: self.libid.contracts(),
             confirmations,
-            source: LogSource::Subscribe,
             poll_interval: Duration::from_millis(100),
             max_block_range: 5,
             start_block: Some(0),
@@ -182,14 +179,6 @@ impl Chain {
             .await
     }
 
-    /// `payer` escrows a native deposit for `handle` on X, which nobody
-    /// holds yet; the block it landed in.
-    async fn deposit(&self, handle: &'static str, payer: Address) -> u64 {
-        self.libid
-            .deposit(payer, Handle(KnownPlatform::X, handle), 100)
-            .await
-    }
-
     /// Wait until the index stands at `block` or past it: the cursor
     /// committed through it, and the target reported beside it.
     async fn wait_for_index(&self, block: u64) {
@@ -219,24 +208,6 @@ impl Chain {
         }
     }
 
-    /// The events of `handle` on X, oldest first, each with its block.
-    async fn history(&self, handle: &str) -> Vec<(u64, HistoryEvent)> {
-        let history: HandleHistory = self
-            .pool
-            .get_on(
-                self.writer.store().chain_id(),
-                &format!("/v1/history/handle/x/{handle}"),
-            )
-            .await
-            .answer();
-        history
-            .entries
-            .into_iter()
-            .rev()
-            .map(|entry| (entry.block_number as u64, entry.event))
-            .collect()
-    }
-
     /// How many times the indexer called `method` through the relay.
     fn called(&self, method: &str) -> usize {
         self.relay
@@ -258,158 +229,10 @@ impl Chain {
     }
 }
 
-/// A pushed event commits once its block is confirmed, both watched
-/// contracts' alike; blocks without events move the cursor on their pushed
-/// heads alone, with nothing fetched.
-#[tokio::test]
-async fn pushed_events_commit_once_confirmed_and_empty_blocks_cost_no_fetch() {
-    let Some(mut chain) = Chain::start(43121).await else {
-        return;
-    };
-    let running = chain.run(chain.config(2));
-    chain.wait_for_index(chain.head().await - 2).await;
-
-    let (holder, payer) = (chain.accounts()[0], chain.accounts()[1]);
-    let bound = chain.bind("pushed_1", holder).await;
-    let deposited = chain.deposit("deposited_1", payer).await;
-    chain.mine(2).await;
-    chain.wait_for_index(deposited).await;
-
-    assert_eq!(chain.resolve("pushed_1").await, Ok(holder));
-    let history = chain.history("pushed_1").await;
-    assert!(
-        matches!(
-            history[..],
-            [
-                (bound_at, HistoryEvent::IdentityBound { .. }),
-                (ceremony_at, HistoryEvent::CeremonyBound { .. }),
-            ] if bound_at == bound && ceremony_at == bound
-        ),
-        "{history:?}"
-    );
-    let history = chain.history("deposited_1").await;
-    assert!(
-        matches!(
-            history[..],
-            [(block, HistoryEvent::Deposited { .. })] if block == deposited
-        ),
-        "{history:?}"
-    );
-
-    let windows = chain.called("eth_getLogs");
-    chain.mine(5).await;
-    chain.wait_for_index(chain.head().await - 2).await;
-    assert_eq!(
-        chain.called("eth_getLogs"),
-        windows,
-        "{:?}",
-        chain.relay.calls()
-    );
-    // The endpoint serves the logs' block times: no header is asked for.
-    assert_eq!(chain.called("eth_getBlockByHash"), 0);
-    chain.stop(running).await;
-}
-
-/// Logs emitted while the socket is down are never pushed; the next session
-/// fetches them from the cursor, once. The relay holds the reconnect until
-/// it reopens, so a client that reconnected and re-subscribed on its own,
-/// skipping the gap, would fail here.
-#[tokio::test]
-async fn a_dropped_socket_is_backfilled_from_the_cursor_on_reconnect() {
-    let Some(mut chain) = Chain::start(43122).await else {
-        return;
-    };
-    let running = chain.run(chain.config(2));
-    // Past the first pushed head, whose fetch from the cursor would find the
-    // gap too.
-    chain.mine(1).await;
-    chain.wait_for_index(chain.head().await - 2).await;
-
-    // The stream is gone before the event is emitted, so only the next
-    // session's catch-up can find it.
-    chain.relay.cut().await;
-    let holder = chain.accounts()[0];
-    let bound = chain.bind("backfilled_1", holder).await;
-    chain.mine(3).await;
-    chain.relay.reopen();
-    chain.wait_for_index(bound).await;
-
-    assert_eq!(chain.resolve("backfilled_1").await, Ok(holder));
-    let history = chain.history("backfilled_1").await;
-    assert!(
-        matches!(
-            history[..],
-            [
-                (bound_at, HistoryEvent::IdentityBound { .. }),
-                (ceremony_at, HistoryEvent::CeremonyBound { .. }),
-            ] if bound_at == bound && ceremony_at == bound
-        ),
-        "{history:?}"
-    );
-    // Heads, once per session.
-    assert_eq!(
-        chain.called("eth_subscribe"),
-        2,
-        "{:?}",
-        chain.relay.calls()
-    );
-    chain.stop(running).await;
-}
-
-/// A socket that stays open but pushes nothing would leave the index frozen
-/// behind the chain; once no head arrives for half the report's life, the
-/// session ends, and the next one catches up from the cursor.
-#[tokio::test]
-async fn a_silent_socket_is_left_and_the_next_session_catches_up() {
-    let Some(mut chain) = Chain::start(43126).await else {
-        return;
-    };
-    // A poll interval past the suite's patience: only the quiet deadline
-    // can end the silent session in time.
-    let running = chain.run(IndexerConfig {
-        stale_after: Duration::from_secs(2),
-        poll_interval: PATIENCE * 2,
-        ..chain.config(2)
-    });
-    chain.wait_for_index(chain.head().await - 2).await;
-
-    // The quiet session ends and the next one opens; neither is a failure
-    // a monitor should see.
-    let mut watch = ChainWatch::new(&chain.pool, chain.writer.store()).await;
-    chain.relay.silence(true);
-    let stored = async {
-        loop {
-            if let Some(error) = watch.next().await.window_error {
-                return error;
-            }
-        }
-    };
-    tokio::time::timeout(PATIENCE, async {
-        tokio::select! {
-            () = chain.relay.called("eth_subscribe", 2) => {}
-            error = stored => panic!("a quiet reconnect stored a window error: {error}"),
-        }
-    })
-    .await
-    .expect("the silent session was left");
-    let holder = chain.accounts()[0];
-    let bound = chain.bind("silenced_1", holder).await;
-    chain.mine(3).await;
-    chain.wait_for_index(bound).await;
-
-    assert_eq!(chain.resolve("silenced_1").await, Ok(holder));
-    assert!(
-        chain.called("eth_subscribe") >= 2,
-        "{:?}",
-        chain.relay.calls()
-    );
-    chain.stop(running).await;
-}
-
-/// An endpoint that keeps its socket open but stops answering would hold a
-/// session forever; a call left unanswered for the loop's patience fails,
-/// the failure is stored where a monitor looks, and once the endpoint
-/// answers again the next session catches up from the cursor.
+/// An endpoint that takes calls but stops answering would hold the loop
+/// forever; a call left unanswered for the loop's patience fails, the
+/// failure is stored where a monitor looks, and once the endpoint answers
+/// again the next session catches up from the cursor.
 #[tokio::test]
 async fn a_deaf_endpoint_is_left_and_the_next_session_catches_up() {
     let Some(mut chain) = Chain::start(43141).await else {
@@ -422,8 +245,7 @@ async fn a_deaf_endpoint_is_left_and_the_next_session_catches_up() {
     chain.wait_for_index(chain.head().await - 2).await;
 
     let mut watch = ChainWatch::new(&chain.pool, chain.writer.store()).await;
-    // No head arrives, so the session asks for the head at its quiet
-    // deadline, and nothing answers.
+    // The next poll asks for the head, and nothing answers.
     chain.relay.deafen(true);
     let stored = tokio::time::timeout(PATIENCE, async {
         loop {
