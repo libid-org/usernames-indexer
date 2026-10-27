@@ -6,19 +6,32 @@ mod common;
 
 use std::{
     process::{
-        Child,
-        Command,
         ExitStatus,
+        Stdio,
     },
     time::Duration,
 };
 
-use common::libid::{
-    Libid,
-    Node,
+use common::{
+    libid::{
+        Libid,
+        Node,
+    },
+    ChainWatch,
+    PATIENCE,
 };
 use sqlx::PgPool;
-use tokio::time::Instant;
+use tokio::{
+    io::{
+        AsyncBufReadExt,
+        BufReader,
+    },
+    process::{
+        Child,
+        Command,
+    },
+    sync::watch,
+};
 use usernames_core::db::{
     self,
     ChainStore,
@@ -37,6 +50,13 @@ struct Chain {
     database: String,
 }
 
+/// An indexer process, killed if the test ends before it does, and what it
+/// logged so far.
+struct Running {
+    child: Child,
+    log: watch::Receiver<Vec<String>>,
+}
+
 impl Chain {
     /// `chain` on a fresh anvil; `None` when the suite skips.
     async fn start(chain: u64) -> Option<Self> {
@@ -49,7 +69,7 @@ impl Chain {
             return None;
         }
         let pool = db::connect_and_migrate(&database).await.expect("database");
-        common::clear_chain(&pool, chain as i64).await;
+        ChainStore::new(pool.clone(), chain as i64).forget().await;
         let node = Node::spawn(chain);
         let libid = Libid::deploy(&node.provider, node.accounts()[0]).await;
         Some(Self {
@@ -62,8 +82,8 @@ impl Chain {
     }
 
     /// The indexer binary for this chain, polling.
-    fn indexer(&self) -> Child {
-        Command::new(env!("CARGO_BIN_EXE_usernames-indexer"))
+    fn indexer(&self) -> Running {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_usernames-indexer"))
             .env("DATABASE_URL", &self.database)
             .env("RPC_URL", self.node.rpc().as_str())
             .env("LOG_SOURCE", "poll")
@@ -79,25 +99,49 @@ impl Chain {
             .env("CONFIRMATIONS", "0")
             .env("POLL_INTERVAL", "100ms")
             .env("START_BLOCK", "0")
+            .env("NO_COLOR", "1")
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
-            .expect("the indexer starts")
+            .expect("the indexer starts");
+        let mut lines = BufReader::new(child.stdout.take().expect("its log")).lines();
+        let (logged, log) = watch::channel(Vec::new());
+        tokio::spawn(async move {
+            while let Ok(Some(line)) = lines.next_line().await {
+                logged.send_modify(|log| log.push(line));
+            }
+        });
+        Running { child, log }
     }
 }
 
-/// SIGTERM `child`, as a supervisor stops it, and its exit status.
-async fn terminate(child: &mut Child) -> ExitStatus {
-    let sent = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status()
-        .expect("kill runs");
-    assert!(sent.success());
-    let deadline = Instant::now() + EXIT_WITHIN;
-    loop {
-        if let Some(status) = child.try_wait().expect("the indexer's status") {
-            return status;
-        }
-        assert!(Instant::now() < deadline, "the indexer did not stop");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+impl Running {
+    /// Return once the indexer has logged a line holding `text`.
+    async fn logged(&mut self, text: &str) {
+        tokio::time::timeout(
+            PATIENCE,
+            self.log
+                .wait_for(|log| log.iter().any(|line| line.contains(text))),
+        )
+        .await
+        .expect("logged in time")
+        .map(drop)
+        .unwrap_or_else(|_| panic!("the indexer exited without logging {text:?}"));
+    }
+
+    /// SIGTERM the indexer, as a supervisor stops it, and its exit status.
+    async fn terminate(mut self) -> ExitStatus {
+        let pid = self.child.id().expect("a running indexer");
+        let sent = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .await
+            .expect("kill runs");
+        assert!(sent.success());
+        tokio::time::timeout(EXIT_WITHIN, self.child.wait())
+            .await
+            .expect("the indexer stops in time")
+            .expect("its exit status")
     }
 }
 
@@ -110,20 +154,11 @@ async fn an_indexer_waiting_for_the_lease_stops_on_sigterm() {
     };
     let held = chain.store.acquire_writer().await.expect("the lease");
     let mut indexer = chain.indexer();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !sqlx::query_scalar::<_, bool>(include_str!("sql/waiting_for_the_lease.sql"))
-        .fetch_one(&chain.pool)
-        .await
-        .expect("the waits")
-    {
-        assert!(
-            Instant::now() < deadline,
-            "the indexer never waited for the lease"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    indexer
+        .logged("another indexer holds this chain's writer lock; waiting")
+        .await;
 
-    assert!(terminate(&mut indexer).await.success());
+    assert!(indexer.terminate().await.success());
     held.release().await.expect("the lease goes back");
 }
 
@@ -134,10 +169,11 @@ async fn an_indexing_indexer_stops_on_sigterm_and_frees_the_chain() {
     let Some(chain) = Chain::start(43130).await else {
         return;
     };
-    let mut indexer = chain.indexer();
-    common::wait_for_cursor(&chain.store, 1).await;
+    let mut watch = ChainWatch::new(&chain.pool, &chain.store).await;
+    let indexer = chain.indexer();
+    watch.cursor_at(1).await;
 
-    assert!(terminate(&mut indexer).await.success());
+    assert!(indexer.terminate().await.success());
     let next = tokio::time::timeout(Duration::from_secs(1), chain.store.acquire_writer())
         .await
         .expect("the chain's lease is free")

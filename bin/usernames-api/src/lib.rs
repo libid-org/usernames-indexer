@@ -111,6 +111,10 @@ pub struct Config {
     pub ens_max_lag_blocks: u64,
 }
 
+/// How long a stopping API keeps answering the requests in flight: well
+/// inside the grace period a supervisor gives before it kills the process.
+const DRAIN: Duration = Duration::from_secs(10);
+
 /// Parse the environment, connect, and serve until ctrl-c or SIGTERM.
 pub async fn run() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
@@ -127,9 +131,9 @@ pub async fn run() -> anyhow::Result<()> {
     let mut signals = StopSignals::listen()?;
     let (listener, app) = tokio::select! {
         started = config.start() => started?,
-        r = signals.received() => {
+        () = signals.received() => {
             tracing::info!("stopped before serving");
-            return r.map_err(anyhow::Error::from);
+            return Ok(());
         }
     };
 
@@ -143,11 +147,13 @@ pub async fn run() -> anyhow::Result<()> {
     });
 
     tokio::select! {
-        r = signals.received() => {
+        () = signals.received() => {
             tracing::info!("shutting down");
             cancel.cancel();
-            let _ = task.await;
-            r?;
+            if tokio::time::timeout(DRAIN, &mut task).await.is_err() {
+                tracing::warn!(within = ?DRAIN, "requests still in flight; dropping them");
+                task.abort();
+            }
             Ok(())
         }
         r = &mut task => match r {

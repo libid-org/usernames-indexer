@@ -243,19 +243,19 @@ pub async fn run() -> anyhow::Result<()> {
     let mut signals = StopSignals::listen()?;
     let (mut lease, indexer) = tokio::select! {
         started = config.start() => started?,
-        r = signals.received() => {
+        () = signals.received() => {
             tracing::info!("stopped before indexing");
-            return r.map_err(anyhow::Error::from);
+            return Ok(());
         }
     };
     let cancel = CancellationToken::new();
     let mut task = tokio::spawn(indexer.run(cancel.clone()));
 
     let stopped = tokio::select! {
-        r = signals.received() => {
+        () = signals.received() => {
             tracing::info!("shutting down");
             stop(&cancel, &mut task, LEASE_CHECK).await;
-            r.map_err(anyhow::Error::from)
+            Ok(())
         }
         r = &mut task => match r {
             Ok(Ok(())) => Err(anyhow::anyhow!("indexer task exited unexpectedly")),

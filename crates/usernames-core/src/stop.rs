@@ -8,26 +8,29 @@ use tokio::signal::unix::{
     SignalKind,
 };
 
-/// The stop signals, listened for from the moment they are taken.
+/// The stop signals, each listened for from the moment they are taken
+/// until this is dropped, so none sent in between is lost.
 pub struct StopSignals {
+    interrupt: Signal,
     terminate: Signal,
 }
 
 impl StopSignals {
     /// Listen for ctrl-c and SIGTERM from now on. A process running as a
-    /// container's PID 1 is not stopped by a SIGTERM nobody listens for, so
-    /// a service takes these once it can stop cleanly.
+    /// container's PID 1 ignores a SIGTERM nobody listens for, so a service
+    /// takes these before anything else.
     pub fn listen() -> std::io::Result<Self> {
         Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
             terminate: signal(SignalKind::terminate())?,
         })
     }
 
     /// Wait for ctrl-c or SIGTERM.
-    pub async fn received(&mut self) -> std::io::Result<()> {
+    pub async fn received(&mut self) {
         tokio::select! {
-            r = tokio::signal::ctrl_c() => r,
-            _ = self.terminate.recv() => Ok(()),
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
         }
     }
 }
@@ -51,7 +54,6 @@ mod tests {
         assert!(sent.success());
         tokio::time::timeout(Duration::from_secs(5), signals.received())
             .await
-            .expect("the SIGTERM is received")
-            .unwrap();
+            .expect("the SIGTERM is received");
     }
 }
