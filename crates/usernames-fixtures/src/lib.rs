@@ -8,9 +8,9 @@
 //! this crate holds one builder per piece, and every suite sends the bytes a
 //! wallet would:
 //!
-//! - [`wire_name`]: the name as the wire carries it.
-//! - [`addr_call`] and [`legacy_addr_call`]: the record request, in the
-//!   ENSIP-11 multichain form and in the older form that means coin type 60.
+//! - [`Labels`]: a name by its labels, as the wire carries it, and the
+//!   record requests for it, in the ENSIP-11 multichain form and in the
+//!   older form that means coin type 60.
 //! - [`resolve_call`]: the wrapped call the gateway receives.
 //! - [`Seed`]: a chain's store seeded the way its indexer writes it — the
 //!   right to write it, and one binding with the chain marked synced.
@@ -87,22 +87,53 @@ use calls::{
     resolveCall,
 };
 
-/// `alice.x` becomes `alice.x.handles.link`, in DNS wire format.
-pub fn wire_name(labels: &[&str]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for label in labels.iter().chain(["handles", "link"].iter()) {
-        out.push(label.len() as u8);
-        out.extend_from_slice(label.as_bytes());
-    }
-    out.push(0);
-    out
+/// A name under `handles.link`, by its labels before the domain:
+/// `["alice", "x"]` spells `alice.x.handles.link`.
+pub trait Labels {
+    /// The name in DNS wire format.
+    fn wire_name(&self) -> Vec<u8>;
+
+    /// The name's namehash, as a wallet sends it beside the wire form.
+    fn namehash(&self) -> B256;
+
+    /// `addr(node, coinType)` for the name.
+    fn addr_call(&self, coin: u64) -> Vec<u8>;
+
+    /// `addr(node)` for the name: the legacy shape, which means coin type 60.
+    fn legacy_addr_call(&self) -> Vec<u8>;
 }
 
-/// The namehash of the same name, as a wallet sends it beside the wire form.
-fn namehash_of(labels: &[&str]) -> B256 {
-    Name::parse(&wire_name(labels))
-        .expect("a name in wire format")
-        .node()
+impl Labels for [&str] {
+    fn wire_name(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for label in self.iter().chain(["handles", "link"].iter()) {
+            out.push(label.len() as u8);
+            out.extend_from_slice(label.as_bytes());
+        }
+        out.push(0);
+        out
+    }
+
+    fn namehash(&self) -> B256 {
+        Name::parse(&self.wire_name())
+            .expect("a name in wire format")
+            .node()
+    }
+
+    fn addr_call(&self, coin: u64) -> Vec<u8> {
+        addr_0Call {
+            node: self.namehash(),
+            coinType: U256::from(coin),
+        }
+        .abi_encode()
+    }
+
+    fn legacy_addr_call(&self) -> Vec<u8> {
+        addr_1Call {
+            node: self.namehash(),
+        }
+        .abi_encode()
+    }
 }
 
 /// `resolve(name, data)`, encoded by the same codec the gateway decodes with.
@@ -110,23 +141,6 @@ pub fn resolve_call(name: &[u8], inner: &[u8]) -> Vec<u8> {
     resolveCall {
         name: name.to_vec().into(),
         data: inner.to_vec().into(),
-    }
-    .abi_encode()
-}
-
-/// `addr(node, coinType)` for the name the labels spell.
-pub fn addr_call(labels: &[&str], coin: u64) -> Vec<u8> {
-    addr_0Call {
-        node: namehash_of(labels),
-        coinType: U256::from(coin),
-    }
-    .abi_encode()
-}
-
-/// `addr(node)` — the legacy shape, which means coin type 60.
-pub fn legacy_addr_call(labels: &[&str]) -> Vec<u8> {
-    addr_1Call {
-        node: namehash_of(labels),
     }
     .abi_encode()
 }

@@ -69,7 +69,10 @@ use usernames_core::{
     ens::DEFAULT_DOMAIN,
 };
 
-use usernames_fixtures::*;
+use usernames_fixtures::{
+    Labels,
+    Seed,
+};
 
 sol! {
     /// ERC-3668. The resolver reverts with this rather than returning, which
@@ -247,11 +250,10 @@ impl WhoSigns {
         .router();
 
         // ── 1. the wallet asks the resolver, and is told where to look ───
-        let name = Bytes::from(wire_name(&["alice", "x"]));
+        let name = Bytes::from(["alice", "x"].wire_name());
         // The namehash of the same name rides inside, as a wallet sends it: the
         // gateway checks that the request's two halves describe one name.
-        let inner =
-            Bytes::from(addr_call(&["alice", "x"], 0x8000_0000u64 | CHAIN as u64));
+        let inner = Bytes::from(["alice", "x"].addr_call(0x8000_0000u64 | CHAIN as u64));
         let err = client
             .resolve(name.clone(), inner.clone())
             .call()

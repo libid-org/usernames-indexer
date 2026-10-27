@@ -16,15 +16,14 @@ use std::{
 use alloy::{
     primitives::{
         Address,
+        Bytes,
         Signature,
     },
     signers::local::PrivateKeySigner,
+    sol_types::SolValue,
 };
 use axum::{
-    body::{
-        Body,
-        Bytes,
-    },
+    body::Body,
     http::{
         Request,
         StatusCode,
@@ -59,7 +58,13 @@ use usernames_core::{
     ens,
 };
 
-use usernames_fixtures::*;
+use usernames_fixtures::{
+    database_url,
+    resolve_call,
+    Labels,
+    LockWaits,
+    Seed,
+};
 
 /// This suite's own chain, so it does not collide with the others.
 const CHAIN: i64 = 31341;
@@ -198,7 +203,7 @@ impl Ask for Router {
             .expect("router");
         let status = response.status();
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        (status, Reply(body))
+        (status, Reply(body.into()))
     }
 }
 
@@ -245,28 +250,16 @@ impl Reply {
     /// to be one the resolver would accept. These are the bytes the callback
     /// returns to the wallet, in whatever shape the record call asked for.
     fn signed_result(&self, call: &[u8]) -> Vec<u8> {
-        let data = self.answer().data;
-
-        // (bytes result, uint64 expires, bytes signature), by hand.
-        let word = |at: usize| -> u64 {
-            let mut n = [0u8; 8];
-            n.copy_from_slice(&data[at + 24..at + 32]);
-            u64::from_be_bytes(n)
-        };
-        let result_at = word(0) as usize;
-        let expires = word(32);
-        let sig_at = word(64) as usize;
-        let result_len = word(result_at) as usize;
-        let result = &data[result_at + 32..result_at + 32 + result_len];
-        let sig_len = word(sig_at) as usize;
-        let signature = &data[sig_at + 32..sig_at + 32 + sig_len];
+        let (result, expires, signature) =
+            <(Bytes, u64, Bytes)>::abi_decode_params(&self.answer().data)
+                .expect("(bytes result, uint64 expires, bytes signature)");
 
         let digest = ens::Reply {
             result: result.to_vec(),
             expires,
         }
         .digest(RESOLVER, call);
-        let recovered = Signature::try_from(signature)
+        let recovered = Signature::try_from(signature.as_ref())
             .expect("65-byte signature")
             .recover_address_from_prehash(&digest)
             .expect("recover");
@@ -313,8 +306,8 @@ async fn a_bound_handle_resolves_and_the_signature_verifies() {
     gateway.store.bind("alice", owner).await;
 
     let call = resolve_call(
-        &wire_name(&["alice", "x"]),
-        &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
+        &["alice", "x"].wire_name(),
+        &["alice", "x"].addr_call(0x8000_0000 | CHAIN as u64),
     );
     let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -333,8 +326,8 @@ async fn a_private_binding_resolves() {
     gateway.store.bind_private("alice", owner).await;
 
     let call = resolve_call(
-        &wire_name(&["alice", "x"]),
-        &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
+        &["alice", "x"].wire_name(),
+        &["alice", "x"].addr_call(0x8000_0000 | CHAIN as u64),
     );
     let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -351,8 +344,8 @@ async fn a_name_nobody_holds_gets_a_signed_null() {
     };
     let router = gateway.router();
     let call = resolve_call(
-        &wire_name(&["nobody", "x"]),
-        &addr_call(&["nobody", "x"], 0x8000_0000 | CHAIN as u64),
+        &["nobody", "x"].wire_name(),
+        &["nobody", "x"].addr_call(0x8000_0000 | CHAIN as u64),
     );
     let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -378,8 +371,8 @@ async fn a_chain_this_gateway_does_not_serve_is_refused_not_signed() {
 
     // Base, while this gateway serves only the test chain.
     let call = resolve_call(
-        &wire_name(&["alice", "x"]),
-        &addr_call(&["alice", "x"], 0x8000_2105),
+        &["alice", "x"].wire_name(),
+        &["alice", "x"].addr_call(0x8000_2105),
     );
     let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
@@ -397,7 +390,7 @@ async fn a_non_evm_coin_type_is_answered_null() {
     let router = gateway.router();
     gateway.store.bind("alice", Address::from([0xbe; 20])).await;
 
-    let call = resolve_call(&wire_name(&["alice", "x"]), &addr_call(&["alice", "x"], 0));
+    let call = resolve_call(&["alice", "x"].wire_name(), &["alice", "x"].addr_call(0));
     let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body.verify(&call), None);
@@ -416,16 +409,16 @@ async fn a_chain_label_narrows_and_never_widens() {
 
     // Our label: answered.
     let ours = resolve_call(
-        &wire_name(&["alice", "x", "eden"]),
-        &addr_call(&["alice", "x", "eden"], coin),
+        &["alice", "x", "eden"].wire_name(),
+        &["alice", "x", "eden"].addr_call(coin),
     );
     let (_, body) = router.ask(RESOLVER, &ours).await;
     assert!(body.verify(&ours).is_some());
 
     // Another chain's label, same coin type: not this gateway's name.
     let theirs = resolve_call(
-        &wire_name(&["alice", "x", "base"]),
-        &addr_call(&["alice", "x", "base"], coin),
+        &["alice", "x", "base"].wire_name(),
+        &["alice", "x", "base"].addr_call(coin),
     );
     let (_, body) = router.ask(RESOLVER, &theirs).await;
     assert_eq!(body.verify(&theirs), None);
@@ -450,7 +443,7 @@ async fn every_name_a_chain_declares_resolves_it() {
         ["alice", "x", "eden"].as_slice(),
         ["alice", "x", "eden-testnet"].as_slice(),
     ] {
-        let call = resolve_call(&wire_name(labels), &addr_call(labels, coin));
+        let call = resolve_call(&labels.wire_name(), &labels.addr_call(coin));
         let (status, body) = router.ask(RESOLVER, &call).await;
         assert_eq!(status, StatusCode::OK, "{labels:?}: {body}");
         assert_eq!(body.verify(&call), Some(owner), "{labels:?}");
@@ -468,7 +461,7 @@ async fn a_record_that_is_not_addr_degrades_to_null() {
     let router = gateway.router();
     gateway.store.bind("alice", Address::from([0xbe; 20])).await;
 
-    let call = resolve_call(&wire_name(&["alice", "x"]), &[0xaa, 0xbb, 0xcc, 0xdd]);
+    let call = resolve_call(&["alice", "x"].wire_name(), &[0xaa, 0xbb, 0xcc, 0xdd]);
     let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body.verify(&call), None);
@@ -486,7 +479,7 @@ async fn a_name_this_build_cannot_read_is_null_rather_than_an_error() {
         ["alice", "myspace"].as_slice(), // a platform nobody knows
         ["alice", "x", "toolong"].as_slice(), // a chain label that is not ours
     ] {
-        let call = resolve_call(&wire_name(labels), &addr_call(labels, coin));
+        let call = resolve_call(&labels.wire_name(), &labels.addr_call(coin));
         let (status, body) = router.ask(RESOLVER, &call).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body.verify(&call), None);
@@ -509,7 +502,7 @@ async fn an_unreadable_name_is_null_in_the_shape_the_caller_asked_in() {
     };
     let router = gateway.router();
     let labels = ["alice", "myspace"];
-    let call = resolve_call(&wire_name(&labels), &legacy_addr_call(&labels));
+    let call = resolve_call(&labels.wire_name(), &labels.legacy_addr_call());
     let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
@@ -531,7 +524,7 @@ async fn an_unreadable_name_off_our_chains_is_still_refused_unsigned() {
     };
     let router = gateway.router();
     let labels = ["alice", "myspace"];
-    let call = resolve_call(&wire_name(&labels), &addr_call(&labels, 0x8000_2105));
+    let call = resolve_call(&labels.wire_name(), &labels.addr_call(0x8000_2105));
     let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     body.refused();
@@ -547,8 +540,8 @@ async fn a_request_for_another_resolver_is_refused_not_signed() {
     };
     let router = gateway.router();
     let call = resolve_call(
-        &wire_name(&["alice", "x"]),
-        &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
+        &["alice", "x"].wire_name(),
+        &["alice", "x"].addr_call(0x8000_0000 | CHAIN as u64),
     );
     let (status, _) = router.ask(Address::from([0xcc; 20]), &call).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -570,17 +563,15 @@ async fn a_gateway_under_a_subname_answers_its_names_and_refuses_the_parents() {
 
     // `wire_name` appends `handles.link`, so the subname rides as a label.
     let ours = resolve_call(
-        &wire_name(&["alice", "x", "testnet"]),
-        &addr_call(&["alice", "x", "testnet"], coin),
+        &["alice", "x", "testnet"].wire_name(),
+        &["alice", "x", "testnet"].addr_call(coin),
     );
     let (status, body) = router.ask(RESOLVER, &ours).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body.verify(&ours), Some(owner));
 
-    let parents = resolve_call(
-        &wire_name(&["alice", "x"]),
-        &addr_call(&["alice", "x"], coin),
-    );
+    let parents =
+        resolve_call(&["alice", "x"].wire_name(), &["alice", "x"].addr_call(coin));
     let (status, body) = router.ask(RESOLVER, &parents).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     gateway.done();
@@ -605,8 +596,8 @@ async fn a_stale_index_refuses_rather_than_signing_a_null() {
         .await;
 
     let call = resolve_call(
-        &wire_name(&["alice", "x"]),
-        &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
+        &["alice", "x"].wire_name(),
+        &["alice", "x"].addr_call(0x8000_0000 | CHAIN as u64),
     );
     let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
@@ -640,18 +631,13 @@ async fn one_gateway_answers_for_every_chain_it_serves() {
     gateway.store.bind("alice", here).await;
 
     // The same handle, bound to a different wallet on the other chain.
-    let other_store = ChainStore::new(
-        sqlx::PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
-            .await
-            .unwrap(),
-        OTHER,
-    );
+    let other_store = ChainStore::new(gateway.pool.clone(), OTHER);
     other_store.bind("alice", there).await;
 
     for (chain, expected) in [(CHAIN, here), (OTHER, there)] {
         let call = resolve_call(
-            &wire_name(&["alice", "x"]),
-            &addr_call(&["alice", "x"], 0x8000_0000 | chain as u64),
+            &["alice", "x"].wire_name(),
+            &["alice", "x"].addr_call(0x8000_0000 | chain as u64),
         );
         let (status, body) = router.ask(RESOLVER, &call).await;
         assert_eq!(status, StatusCode::OK, "chain {chain}: {body}");
@@ -685,8 +671,8 @@ async fn an_index_that_cannot_report_its_position_refuses() {
     gateway.store.forget_progress().await;
 
     let call = resolve_call(
-        &wire_name(&["alice", "x"]),
-        &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
+        &["alice", "x"].wire_name(),
+        &["alice", "x"].addr_call(0x8000_0000 | CHAIN as u64),
     );
     let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
@@ -726,8 +712,8 @@ async fn a_replay_while_the_gateway_reads_is_refused() {
         .await
         .expect("the handles are held");
     let call = resolve_call(
-        &wire_name(&["alice", "x"]),
-        &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
+        &["alice", "x"].wire_name(),
+        &["alice", "x"].addr_call(0x8000_0000 | CHAIN as u64),
     );
     let asking = tokio::spawn({
         let (router, call) = (router.clone(), call.clone());
@@ -767,8 +753,8 @@ async fn an_expired_report_is_too_stale_however_small_the_lag() {
     gateway.store.set_chain_target_valid_until(1).await;
 
     let call = resolve_call(
-        &wire_name(&["alice", "x"]),
-        &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
+        &["alice", "x"].wire_name(),
+        &["alice", "x"].addr_call(0x8000_0000 | CHAIN as u64),
     );
     let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
@@ -791,8 +777,8 @@ async fn a_report_expiring_out_of_range_is_refused() {
         .await;
 
     let call = resolve_call(
-        &wire_name(&["alice", "x"]),
-        &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
+        &["alice", "x"].wire_name(),
+        &["alice", "x"].addr_call(0x8000_0000 | CHAIN as u64),
     );
     let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
@@ -821,8 +807,8 @@ async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
     other_store.set_chain_target_valid_until(1).await;
 
     let dead = resolve_call(
-        &wire_name(&["alice", "x"]),
-        &addr_call(&["alice", "x"], 0x8000_0000 | OTHER as u64),
+        &["alice", "x"].wire_name(),
+        &["alice", "x"].addr_call(0x8000_0000 | OTHER as u64),
     );
     let (status, body) = router.ask(RESOLVER, &dead).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
@@ -832,8 +818,8 @@ async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
     );
 
     let alive = resolve_call(
-        &wire_name(&["alice", "x"]),
-        &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
+        &["alice", "x"].wire_name(),
+        &["alice", "x"].addr_call(0x8000_0000 | CHAIN as u64),
     );
     let (status, body) = router.ask(RESOLVER, &alive).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -874,16 +860,14 @@ async fn a_chain_with_no_declared_name_answers_only_the_unlabelled_name() {
     gateway.store.bind("alice", here).await;
     let coin = 0x8000_0000 | CHAIN as u64;
 
-    let plain = resolve_call(
-        &wire_name(&["alice", "x"]),
-        &addr_call(&["alice", "x"], coin),
-    );
+    let plain =
+        resolve_call(&["alice", "x"].wire_name(), &["alice", "x"].addr_call(coin));
     let (_, body) = router.ask(RESOLVER, &plain).await;
     assert_eq!(body.verify(&plain), Some(here));
 
     let labelled = resolve_call(
-        &wire_name(&["alice", "x", "local"]),
-        &addr_call(&["alice", "x", "local"], coin),
+        &["alice", "x", "local"].wire_name(),
+        &["alice", "x", "local"].addr_call(coin),
     );
     let (status, body) = router.ask(RESOLVER, &labelled).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -901,8 +885,8 @@ async fn a_chain_that_appears_in_the_store_is_served_without_a_restart() {
     };
     let router = gateway.router();
     let call = resolve_call(
-        &wire_name(&["alice", "x"]),
-        &addr_call(&["alice", "x"], 0x8000_0000 | OTHER as u64),
+        &["alice", "x"].wire_name(),
+        &["alice", "x"].addr_call(0x8000_0000 | OTHER as u64),
     );
 
     // Not in the store yet: refused unsigned, so a wallet walks on.
@@ -947,8 +931,8 @@ async fn two_indexed_chains_on_one_coin_type_are_refused_unsigned() {
     let router = gateway.router();
     gateway.store.bind("alice", Address::from([0xed; 20])).await;
     let call = resolve_call(
-        &wire_name(&["alice", "x"]),
-        &addr_call(&["alice", "x"], 0x8000_0000u64 | EDEN as u64),
+        &["alice", "x"].wire_name(),
+        &["alice", "x"].addr_call(0x8000_0000u64 | EDEN as u64),
     );
     let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
@@ -986,8 +970,8 @@ async fn a_label_on_a_chain_without_a_cursor_refuses() {
     gateway.store.bind("alice", Address::from([0xed; 20])).await;
     gateway.store.forget_progress().await;
     let call = resolve_call(
-        &wire_name(&["alice", "x", "eden"]),
-        &addr_call(&["alice", "x", "eden"], 0x8000_0000u64 | EDEN as u64),
+        &["alice", "x", "eden"].wire_name(),
+        &["alice", "x", "eden"].addr_call(0x8000_0000u64 | EDEN as u64),
     );
     let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
@@ -1012,8 +996,8 @@ async fn a_twin_without_a_cursor_still_makes_the_coin_type_ambiguous() {
         .forget_progress()
         .await;
     let call = resolve_call(
-        &wire_name(&["alice", "x"]),
-        &addr_call(&["alice", "x"], 0x8000_0000u64 | EDEN as u64),
+        &["alice", "x"].wire_name(),
+        &["alice", "x"].addr_call(0x8000_0000u64 | EDEN as u64),
     );
     let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
@@ -1043,8 +1027,8 @@ async fn the_eden_testnet_resolves_despite_its_chain_id() {
     // Exactly what a wallet on eden sends: `0x80000000 | 3735928814`, which is
     // 3735928814 itself.
     let call = resolve_call(
-        &wire_name(&["alice", "x", "eden"]),
-        &addr_call(&["alice", "x", "eden"], 0x8000_0000u64 | EDEN as u64),
+        &["alice", "x", "eden"].wire_name(),
+        &["alice", "x", "eden"].addr_call(0x8000_0000u64 | EDEN as u64),
     );
     let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "eden must resolve: {body}");
@@ -1069,8 +1053,8 @@ async fn the_legacy_addr_shape_is_refused_unsigned_off_mainnet() {
     gateway.store.bind("alice", Address::from([0xbe; 20])).await;
 
     let call = resolve_call(
-        &wire_name(&["alice", "x"]),
-        &legacy_addr_call(&["alice", "x"]),
+        &["alice", "x"].wire_name(),
+        &["alice", "x"].legacy_addr_call(),
     );
     let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(
@@ -1103,8 +1087,8 @@ async fn bare_addr_asks_for_the_chain_of_the_gateways_registry() {
     gateway.store.bind("alice", owner).await;
 
     let call = resolve_call(
-        &wire_name(&["alice", "x"]),
-        &legacy_addr_call(&["alice", "x"]),
+        &["alice", "x"].wire_name(),
+        &["alice", "x"].legacy_addr_call(),
     );
     let (status, body) = in_our_chains_registry.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -1143,7 +1127,7 @@ async fn the_merged_router_keeps_both_halves_intact() {
             app.oneshot(
                 Request::builder()
                     .uri(uri)
-                    .header("origin", "https://handle.link")
+                    .header("origin", "https://handles.link")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1175,8 +1159,8 @@ async fn the_merged_router_keeps_both_halves_intact() {
     // a browser running the batch gateway in the page would never see the
     // answer.
     let call = resolve_call(
-        &wire_name(&["alice", "x"]),
-        &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
+        &["alice", "x"].wire_name(),
+        &["alice", "x"].addr_call(0x8000_0000 | CHAIN as u64),
     );
     let uri = format!(
         "{}/{RESOLVER:?}/0x{}.json",
@@ -1220,19 +1204,16 @@ async fn a_node_that_is_not_this_name_is_refused() {
 
     let coin = 0x8000_0000 | CHAIN as u64;
     let call = resolve_call(
-        &wire_name(&["alice", "x"]),
+        &["alice", "x"].wire_name(),
         // The namehash of a different name entirely.
-        &addr_call(&["bob", "x"], coin),
+        &["bob", "x"].addr_call(coin),
     );
     let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
     // And the well-formed request it differs from still answers, so the
     // refusal is about the disagreement rather than about the name.
-    let ok = resolve_call(
-        &wire_name(&["alice", "x"]),
-        &addr_call(&["alice", "x"], coin),
-    );
+    let ok = resolve_call(&["alice", "x"].wire_name(), &["alice", "x"].addr_call(coin));
     let (status, body) = router.ask(RESOLVER, &ok).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.verify(&ok).is_some());
