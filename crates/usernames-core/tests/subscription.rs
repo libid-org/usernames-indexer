@@ -434,7 +434,7 @@ async fn a_deaf_endpoint_is_left_and_the_next_session_catches_up() {
     })
     .await
     .expect("the unanswered call failed and its error was stored");
-    assert!(stored.contains("no answer within"), "{stored}");
+    assert_eq!(stored.matches("no answer within").count(), 1, "{stored}");
 
     chain.relay.deafen(false);
     let holder = chain.accounts()[0];

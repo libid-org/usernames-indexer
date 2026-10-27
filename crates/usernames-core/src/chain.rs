@@ -230,7 +230,7 @@ impl Contracts {
 pub enum RegistryRefused {
     /// `nodeKeyed()` could not be read: not a node-keyed registry.
     #[error(
-        "registry {registry}: nodeKeyed(): {source}; point it at a libID-contracts 0.21 IdentityRegistry"
+        "registry {registry}: nodeKeyed() could not be read; point it at a libID-contracts 0.21 IdentityRegistry"
     )]
     Unread {
         /// The registry asked.
@@ -251,7 +251,7 @@ pub enum RegistryRefused {
 #[derive(Debug, thiserror::Error)]
 pub enum EscrowRefused {
     /// The escrow's `registry()` could not be read.
-    #[error("escrow {escrow}: registry(): {source}")]
+    #[error("escrow {escrow}: registry() could not be read")]
     Unread {
         /// The escrow asked.
         escrow: Address,

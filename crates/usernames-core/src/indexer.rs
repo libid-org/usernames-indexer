@@ -198,7 +198,7 @@ impl Indexer {
                     if let Some(WindowError::Superseded(superseded)) = e.downcast_ref() {
                         return Err(*superseded);
                     }
-                    let error = self.redacted(format!("{e:#}"));
+                    let error = self.redacted(e.one_line());
                     tracing::warn!(%error, "indexing stopped; resuming from the cursor");
                     // Surfaced in /v1/status: a deterministic failure, an
                     // undecodable log say, stalls the cursor rather than skip
@@ -214,6 +214,31 @@ impl Indexer {
         }
         tracing::info!("usernames indexer shutting down");
         Ok(())
+    }
+}
+
+/// An error and its causes as one line.
+trait OneLine {
+    /// Each cause once: a cause is left out when the line already ends with
+    /// it, as it does after an error that prints its cause in its own
+    /// message and also returns it as its source.
+    fn one_line(&self) -> String;
+}
+
+impl OneLine for anyhow::Error {
+    fn one_line(&self) -> String {
+        let mut line = String::new();
+        for cause in self.chain() {
+            let text = cause.to_string();
+            if line.ends_with(&text) {
+                continue;
+            }
+            if !line.is_empty() {
+                line.push_str(": ");
+            }
+            line.push_str(&text);
+        }
+        line
     }
 }
 
@@ -528,5 +553,21 @@ mod tests {
             assert!(!stored.contains("secret"), "{stored}");
             assert!(stored.contains("<RPC_URL>"), "{stored}");
         }
+    }
+
+    /// An error that prints its cause in its own message and returns it as
+    /// its source, as sqlx's and alloy's do.
+    #[derive(Debug, thiserror::Error)]
+    #[error("answer lost: {0}")]
+    struct Repeats(#[source] std::io::Error);
+
+    #[test]
+    fn a_stored_error_names_each_cause_once() {
+        let error = anyhow::Error::new(Repeats(std::io::Error::other("socket closed")))
+            .context("eth_blockNumber");
+        assert_eq!(
+            error.one_line(),
+            "eth_blockNumber: answer lost: socket closed"
+        );
     }
 }

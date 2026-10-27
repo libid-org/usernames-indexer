@@ -243,7 +243,10 @@ mod tests {
         to_raw_value,
         RawValue,
     };
-    use tokio::sync::broadcast;
+    use tokio::{
+        net::TcpListener,
+        sync::broadcast,
+    };
 
     use std::time::Duration;
 
@@ -255,7 +258,7 @@ mod tests {
     /// the patience runs out, over either source.
     #[tokio::test]
     async fn a_connection_left_unanswered_fails_at_the_deadline() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("a local port");
         let rpc: Url = format!("ws://{}", listener.local_addr().expect("the address"))
