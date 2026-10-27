@@ -3,10 +3,6 @@
 # Pick one with `--target`:
 #   docker build --target indexer -t usernames-indexer .
 #   docker build --target api     -t usernames-api     .
-#
-# There is deliberately no image carrying both. A single entrypoint would have
-# to default to one of them, and a deployment that pulled it expecting the
-# other would run a container that looks healthy while doing half the job.
 
 # === Builder ===
 # Pin the builder to bookworm so its glibc matches the bookworm-slim runtime
@@ -26,13 +22,15 @@ COPY crates/usernames-core/Cargo.toml crates/usernames-core/
 COPY crates/usernames-fixtures/Cargo.toml crates/usernames-fixtures/
 COPY bin/usernames-indexer/Cargo.toml bin/usernames-indexer/
 COPY bin/usernames-api/Cargo.toml bin/usernames-api/
+# Both builds name the binaries: the whole workspace would compile the test
+# fixtures, and the test features they turn on, into the core both link.
 RUN mkdir -p crates/usernames-core/src crates/usernames-fixtures/src bin/usernames-indexer/src bin/usernames-api/src \
     && touch crates/usernames-core/src/lib.rs crates/usernames-fixtures/src/lib.rs \
     && for b in usernames-indexer usernames-api; do \
          echo 'fn main() {}' > "bin/$b/src/main.rs"; \
          touch "bin/$b/src/lib.rs"; \
        done \
-    && cargo build --release --workspace \
+    && cargo build --release -p usernames-indexer -p usernames-api \
     && rm -rf crates/usernames-core/src crates/usernames-fixtures/src bin/usernames-indexer/src bin/usernames-api/src
 
 # ── Layer 2: the real build ──────────────────────────────────────────────────
@@ -46,7 +44,7 @@ COPY crates/usernames-fixtures/src crates/usernames-fixtures/src
 COPY bin/usernames-indexer/src bin/usernames-indexer/src
 COPY bin/usernames-api/src bin/usernames-api/src
 RUN find crates bin -name '*.rs' -exec touch {} + \
-    && cargo build --release --workspace
+    && cargo build --release -p usernames-indexer -p usernames-api
 
 # === Runtime base ===
 FROM debian:bookworm-slim AS runtime
@@ -67,6 +65,6 @@ COPY --from=builder /app/target/release/usernames-api /usr/local/bin/usernames-a
 # Inside a container the API must bind the container interface, not loopback.
 ENV LISTEN_ADDR=0.0.0.0:8080
 EXPOSE 8080
-# Liveness: GET /health. Readiness for resolution: GET /v1/status (503s from
-# the resolve endpoints until the first window lands are by design).
+# Liveness: GET /health. Readiness for resolution: GET /v1/status; the resolve
+# endpoints answer 503 until the first window lands.
 ENTRYPOINT ["/usr/local/bin/usernames-api"]

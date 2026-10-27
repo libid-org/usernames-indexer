@@ -5,21 +5,22 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Serves handle, id and address resolution, search, and the ENS gateway over the indexed read model."
+description = "Serves resolution, search, address and handle histories, escrow balances, and the ENS gateway over the indexed read model."
 publish = false
 
 [dependencies]
 usernames-core.workspace = true
 
-alloy = { workspace = true, features = ["signer-local"] }
+alloy.workspace = true
 anyhow.workspace = true
 axum.workspace = true
-hex = "0.4"
+chrono.workspace = true
+hex.workspace = true
 libid-signer.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 clap.workspace = true
 dotenvy.workspace = true
+humantime.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
@@ -28,8 +29,11 @@ sqlx.workspace = true
 tower-http.workspace = true
 
 [dev-dependencies]
+usernames-core = { workspace = true, features = ["test-helpers"] }
 usernames-fixtures.workspace = true
 libid-contracts.workspace = true
 alloy = { workspace = true, features = ["signer-local", "node-bindings"] }
-http-body-util = "0.1"
-tower = { version = "0.5", features = ["util"] }
+http-body-util.workspace = true
+serde_json.workspace = true
+tower = { workspace = true, features = ["util"] }
+url.workspace = true

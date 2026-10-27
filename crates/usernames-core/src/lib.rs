@@ -1,15 +1,17 @@
 //! The read model behind the usernames indexer and its read API.
 //!
 //! Two binaries stand on this crate and neither contains logic of its own:
-//! `usernames-indexer` runs [`indexer`], the polling loop that indexes
-//! `IdentityRegistry` storage into Postgres from its events alone, and
+//! `usernames-indexer` runs [`indexer`], the loop that indexes
+//! `IdentityRegistry` and `HandleEscrow` storage into Postgres from their
+//! events alone, followed from pushed heads or polled, and
 //! `usernames-api` serves [`api`], which answers resolution (handle ->
-//! wallet, account id -> wallet, wallet -> identities) and partial-handle
-//! search over what the loop wrote.
+//! wallet, account id -> wallet, wallet -> identities), partial-handle
+//! search, the histories of addresses and handles, and what the escrow
+//! holds, over what the loop wrote.
 //!
 //! They are separated because they scale and fail differently: one writer per
-//! chain holds a lease, while readers are stateless and horizontal. The halves
-//! stay here together because they share the read model and because the
+//! chain holds a lease, while readers are stateless and horizontal. The indexer
+//! and the API stay here together because they share the read model and the
 //! end-to-end test drives both — the split is a deployment boundary, not a
 //! dependency one.
 
@@ -23,3 +25,4 @@ pub mod ens;
 pub mod events;
 pub mod indexer;
 pub mod nodes;
+pub mod stop;

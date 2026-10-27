@@ -1,0 +1,5 @@
+-- Mirrors refund(): the slot holds the sender's contribution less, as the
+-- index booked it, so the slot always holds what its senders could take
+-- back. The deposit that booked the contribution made the slot.
+UPDATE names.escrow_held SET held = held - $4::numeric
+WHERE chain_id = $1 AND handle_node = $2 AND token = $3

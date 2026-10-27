@@ -41,14 +41,24 @@
 //! that indexer last committed — which is what [`Config::max_lag_blocks`] and
 //! the indexer's own report guard.
 
-use std::sync::Arc;
+use std::{
+    fmt,
+    sync::Arc,
+    time::{
+        Duration,
+        SystemTime,
+        UNIX_EPOCH,
+    },
+};
 
 use alloy::primitives::{
     Address,
+    Bytes,
     B256,
 };
 use axum::{
     extract::{
+        rejection::PathRejection,
         Path,
         State,
     },
@@ -61,15 +71,17 @@ use axum::{
     Json,
     Router,
 };
+use chrono::TimeDelta;
 use libid_signer::ManagedSigner;
-use serde::Serialize;
-use tracing::{
-    error,
-    warn,
+use serde::{
+    Deserialize,
+    Serialize,
 };
 use usernames_core::{
     db::{
+        ChainStatusRow,
         ChainStore,
+        EnsAnswer,
         IndexPosition,
         Store,
     },
@@ -84,7 +96,6 @@ use usernames_core::{
         ResolveCall,
         Subject,
     },
-    nodes::NormalizedHandle,
 };
 
 /// What the gateway needs: the store it reads, and the identity it signs with.
@@ -114,7 +125,7 @@ pub struct Config {
     /// another endpoint was there to finish.
     pub store: Store,
     /// How long an answer stays good. The resolver enforces it on chain.
-    pub ttl_secs: u64,
+    pub ttl: Duration,
     /// How far behind the chain an index may be and still assert anything.
     pub max_lag_blocks: u64,
     /// What signs an answer, pinned by the resolver's signer set; rotating it
@@ -131,7 +142,7 @@ impl Config {
         // below is signed, and a signature makes it an assertion about a name
         // — so the name has to be one this resolver has standing to speak
         // about, whatever record was asked of it.
-        let name = Name::parse(&call.name).map_err(GatewayError::bad_request)?;
+        let name = Name::decode(&call.name).map_err(GatewayError::bad_request)?;
         let query = name.query(&self.domain);
         // Not a name under this resolver's domain. Refused rather than
         // answered: a signed null is an authoritative "nobody holds this", and
@@ -148,13 +159,10 @@ impl Config {
         // than to an error, so a name that resolves fine for addresses does
         // not look broken.
         //
-        // Settled before any null is built, because a null has the shape of
-        // the record it answers: `addr(bytes32)` returns an `address` and its
-        // null is 32 zero bytes, while ENSIP-11's `addr(bytes32,uint256)`
-        // returns `bytes` and its null is the empty string. A null built
-        // before the record was read hard-coded the second shape, and a wallet
-        // decoding the first read the `bytes` offset word as the address
-        // 0x…0020 — signed.
+        // Read before any null is built: a null has the shape of the record
+        // it answers. `addr(bytes32)` returns an `address`, whose null is 32
+        // zero bytes; ENSIP-11's `addr(bytes32,uint256)` returns `bytes`,
+        // whose null is the empty string.
         let Record::Addr {
             node,
             coin_type,
@@ -208,42 +216,38 @@ impl Config {
             return Ok(null);
         };
 
+        let handle_node = match query.subject {
+            Subject::Handle { platform, handle } => {
+                // The chain's node for the handle: what `resolveHandle`
+                // keys by. Text no node can hold is nobody's.
+                let Ok(handle_node) = platform.handle_node(&handle) else {
+                    return Ok(null);
+                };
+                handle_node
+            }
+        };
+
+        // Only now, with an answer actually owed, is staleness worth asking
+        // about: in the same read as the holder, so a replay between the two
+        // cannot have the gateway sign for emptied tables.
+        let read = indexed.answer(handle_node).await?;
+        if let Some(why) = Lag::of(read.position).staleness(self.max_lag_blocks) {
+            return Ok(Answer::TooStale(why));
+        }
+
         // A chain label narrows and never widens: a label naming another
         // chain, or no chain any indexer declared, is simply not this chain's
-        // name.
+        // name. Past the freshness check, so an indexer that has not yet
+        // declared its names refuses instead.
         if let Some(label) = &query.chain_label {
-            let named = self
-                .store
-                .chain_named(label)
-                .await
-                .map_err(GatewayError::internal)?;
+            let named = self.store.chain_named(label).await?;
             if named != Some(indexed.chain_id()) {
                 return Ok(null);
             }
         }
 
-        // Only now, with an answer actually owed, is staleness worth asking
-        // about.
-        if let Some(why) = indexed.lag().await.staleness(self.max_lag_blocks) {
-            return Ok(Answer::TooStale(why));
-        }
-
-        let owner = match query.subject {
-            Subject::Handle { platform, handle } => {
-                // The inverse transform yields what `HandleNormalizer`
-                // produced, so running the chain's rules over it again is
-                // idempotent — and it is the only way to a `NormalizedHandle`,
-                // which is what keeps a raw string from ever being hashed into
-                // a key nobody finds.
-                let Ok(normalized) = platform.normalize_query(&handle) else {
-                    return Ok(null);
-                };
-                indexed.owner_of(platform.id(), &normalized).await?
-            }
-        };
-
         Ok(Answer::Addr {
-            address: owner,
+            address: read.holder,
             shape,
         })
     }
@@ -252,56 +256,52 @@ impl Config {
     /// gateway's registry, if there is exactly one.
     ///
     /// Matched against the chains the STORE holds — whatever indexers have
-    /// written — never decoded back into a chain id. `0x80000000 | chainId`
+    /// prepared — never decoded back into a chain id. `0x80000000 | chainId`
     /// is not injective past 2^31 (the eden testnet's 3735928814 is such a
     /// chain), so decoding would answer for a different chain, silently.
     /// Forwards the map is exact. Read per request, so a new indexer is served
-    /// the first time it commits, and refused per request when two indexed
-    /// chains share one coin type: answering either would be a guess, and a
-    /// label does not rescue the pair — the coin type is what the wallet
-    /// sends, and it is the coin type that is ambiguous.
+    /// the first time it commits, and refused per request when two chains
+    /// share one coin type, one still in its first window included: answering
+    /// either would be a guess, and a label does not rescue the pair — the
+    /// coin type is what the wallet sends, and it is the coin type that is
+    /// ambiguous.
     async fn indexed_chain_for(
         &self,
         coin_type: CoinType,
     ) -> Result<ChainMatch, GatewayError> {
-        let candidates: Vec<u64> = self
-            .indexed_chains()
+        let mut candidates: Vec<(u64, IndexedChain)> = self
+            .chains()
             .await?
             .into_iter()
-            .filter(|id| coin_type.names_chain(*id, self.ens_chain))
+            .filter(|(id, _)| coin_type.names_chain(*id, self.ens_chain))
             .collect();
-        Ok(match candidates.as_slice() {
-            [chain_id] => ChainMatch::One(self.indexed_chain(*chain_id)),
-            [] => ChainMatch::None,
-            both => {
-                warn!(
-                    chains = ?both,
+        let ids: Vec<u64> = candidates.iter().map(|(id, _)| *id).collect();
+        Ok(match candidates.pop() {
+            Some((_, chain)) if candidates.is_empty() => ChainMatch::One(chain),
+            None => ChainMatch::None,
+            Some(_) => {
+                tracing::warn!(
+                    chains = ?ids,
                     %coin_type,
-                    "two indexed chains share one coin type"
+                    "two chains in the store share one coin type"
                 );
                 ChainMatch::Ambiguous
             }
         })
     }
 
-    /// Every chain an indexer has written into the store.
-    async fn indexed_chains(&self) -> Result<Vec<u64>, GatewayError> {
+    /// Every chain an indexer has prepared in the store, by the id a coin
+    /// type names it with, beside its index.
+    async fn chains(&self) -> Result<Vec<(u64, IndexedChain)>, GatewayError> {
         Ok(self
             .store
-            .indexed_chains()
-            .await
-            .map_err(GatewayError::internal)?
+            .chains()
+            .await?
             .into_iter()
-            .filter_map(|id| u64::try_from(id).ok())
+            .filter_map(|id| {
+                Some((u64::try_from(id).ok()?, IndexedChain(self.store.chain(id))))
+            })
             .collect())
-    }
-
-    /// One chain's index.
-    fn indexed_chain(&self, chain_id: u64) -> IndexedChain {
-        IndexedChain(
-            self.store
-                .chain(i64::try_from(chain_id).expect("came from an i64")),
-        )
     }
 
     /// Sign a result for one request, and encode what the resolver's callback
@@ -313,7 +313,7 @@ impl Config {
     ) -> Result<GatewayResponse, GatewayError> {
         let reply = Reply {
             result,
-            expires: Self::now().saturating_add(self.ttl_secs),
+            expires: Self::now().saturating_add(self.ttl.as_secs()),
         };
         // The digest is already the resolver's `makeSignatureHash`; no
         // EIP-191 prefix goes on top of it.
@@ -321,12 +321,9 @@ impl Config {
             .signer
             .sign_prehash(&reply.digest(self.resolver, request).0)
             .await
-            // Through `internal`, like every other failure here: the raw
-            // error went to an anonymous caller while the operator got no log
-            // line — exactly inverted.
             .map_err(GatewayError::internal)?;
         Ok(GatewayResponse {
-            data: format!("0x{}", hex::encode(reply.encode(&signature))),
+            data: Bytes::from(reply.encode(&signature)),
         })
     }
 
@@ -334,15 +331,15 @@ impl Config {
     /// stays pure. Saturating, so an absurd TTL cannot wrap it — the startup
     /// ceiling rules one out anyway.
     fn now() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or_default()
     }
 
     /// Refuse a request that names another resolver.
     ///
-    /// Bound to one resolver on purpose. The digest names the configured
+    /// Bound to one resolver. The digest names the configured
     /// target, never `sender`, so this check adds no authority — what it adds
     /// is a visible error. Logged, because a 4xx is terminal for an ERC-3668
     /// client (it ends the walk of the resolver's `urls`) and a line here is
@@ -353,7 +350,7 @@ impl Config {
             .parse()
             .map_err(|_| GatewayError::bad_request("sender is not an address"))?;
         if sender != self.resolver {
-            warn!(
+            tracing::warn!(
                 %sender,
                 resolver = %self.resolver,
                 "refusing a request that names another resolver"
@@ -365,35 +362,29 @@ impl Config {
         Ok(())
     }
 
-    /// One row per chain the store holds, as supervision should see it.
+    /// One row per chain the store holds, as supervision should see it, read
+    /// in one statement.
     async fn status(&self) -> Result<GatewayStatus, GatewayError> {
-        let indexed = self.indexed_chains().await?;
-        let mut chains = Vec::with_capacity(indexed.len());
-        for &chain_id in &indexed {
-            let chain = self.indexed_chain(chain_id);
-            let position = chain.position().await;
-            let names = chain
-                .0
-                .chain_names()
-                .await
-                .map_err(GatewayError::internal)?;
-            let lag = Lag::of(position);
-            // What the gate sees: a chain sharing its coin type with another
-            // in the store is refused for that coin type however fresh either
-            // is.
-            let ambiguous = indexed
-                .iter()
-                .any(|other| CoinType::shared_by(chain_id, *other));
-            chains.push(ChainStatus {
-                chain_id,
-                names,
-                lag_blocks: lag.blocks(),
-                indexer_reported_at: position.and_then(|p| p.reported_at),
-                report_valid_for: position.and_then(|p| p.valid_for),
-                ambiguous,
-                stale: ambiguous || lag.staleness(self.max_lag_blocks).is_some(),
-            });
-        }
+        let rows: Vec<(u64, ChainStatusRow)> = self
+            .store
+            .chain_statuses()
+            .await?
+            .into_iter()
+            .filter_map(|row| Some((u64::try_from(row.state.chain_id).ok()?, row)))
+            .collect();
+        let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
+        let chains = rows
+            .into_iter()
+            .map(|(chain_id, row)| {
+                // What the gate sees: a chain sharing its coin type with
+                // another in the store is refused for that coin type however
+                // fresh either is.
+                let ambiguous = ids
+                    .iter()
+                    .any(|other| CoinType::shared_by(chain_id, *other));
+                ServedChain::of(chain_id, row, ambiguous, self.max_lag_blocks)
+            })
+            .collect();
         Ok(GatewayStatus { chains })
     }
 }
@@ -418,53 +409,28 @@ impl IndexedChain {
         self.0.chain_id()
     }
 
-    /// The owner a name resolves to, as of whatever block this chain's
-    /// indexer last committed. `None` is the null answer — a name nobody
-    /// holds.
-    async fn owner_of(
-        &self,
-        platform: B256,
-        handle: &NormalizedHandle,
-    ) -> Result<Option<Address>, GatewayError> {
-        Ok(self
-            .0
-            .resolve_handle(platform, handle)
-            .await
-            .map_err(GatewayError::internal)?
-            .and_then(|row| row.owner_address()))
-    }
-
-    /// Where this index stands, or nothing if the store cannot say.
-    async fn position(&self) -> Option<IndexPosition> {
-        self.0.index_position().await.ok()
-    }
-
-    /// How far this index trails the chain.
-    ///
-    /// The position in one read, because this is the hot path and because the
-    /// values must be a snapshot: the target, the cursor, and whether the
-    /// indexer's report is still good — by the database's clock, the same one
-    /// that stamped it.
-    ///
-    /// Against the TARGET, not the chain head: the indexer only ever advances
-    /// the cursor to `head - CONFIRMATIONS`, so a caught-up index sits
-    /// permanently that far behind the head, and measured that way a healthy
-    /// deployment would refuse forever. And WHETHER the report is still good,
-    /// because the target is the indexer's own claim: a loop that stopped
-    /// leaves target and cursor frozen together, so by blocks alone a dead
-    /// indexer reads as caught up for as long as it stays dead. The report it
-    /// makes beside the target expires on its own schedule, and that notices.
-    async fn lag(&self) -> Lag {
-        Lag::of(self.position().await)
+    /// Where this index stands and who holds `handle_node` there, read
+    /// together.
+    async fn answer(&self, handle_node: B256) -> Result<EnsAnswer, sqlx::Error> {
+        self.0.ens_answer(handle_node).await
     }
 }
 
 /// How far behind the chain an answer would be.
+///
+/// Against the TARGET, not the chain head: the indexer only ever advances
+/// the cursor to `head - CONFIRMATIONS`, so a caught-up index sits
+/// permanently that far behind the head, and measured that way a healthy
+/// deployment would refuse forever. And WHETHER the report is still good,
+/// because the target is the indexer's own claim: a loop that stopped
+/// leaves target and cursor frozen together, so by blocks alone a dead
+/// indexer reads as caught up for as long as it stays dead. The report it
+/// makes beside the target expires on its own schedule, and that notices.
 enum Lag {
     /// Read from an index: this many blocks behind the target its indexer
-    /// last set, and this many seconds before that indexer's report expires
-    /// — negative once it has.
-    Indexed { blocks: u64, valid_for: i64 },
+    /// last set, and this long before that indexer's report expires —
+    /// negative once it has.
+    Indexed { blocks: u64, valid_for: TimeDelta },
     /// An index that cannot say. Treated as too stale, because a source that
     /// does not know its own position has not earned the right to deny a
     /// binding.
@@ -474,30 +440,12 @@ enum Lag {
 impl Lag {
     /// The lag an index position amounts to. Missing pieces are `Unknown`,
     /// and unknown is refused: folding it into "no lag" is how a gateway ends
-    /// up signing authoritative nulls off a wiped or unreachable database — a
-    /// fresh deployment, a version-bump replay clearing
-    /// `names.chain_metadata`, a chain nobody indexed yet, or Postgres simply
-    /// being down all produce it.
+    /// up signing authoritative nulls off a wiped database — a chain still
+    /// in its first window, or one a replay reset, produces it.
     fn of(position: Option<IndexPosition>) -> Self {
-        match position {
-            Some(IndexPosition {
-                target: Some(target),
-                cursor: Some(cursor),
-                valid_for: Some(valid_for),
-                ..
-            }) => Self::Indexed {
-                blocks: target.saturating_sub(cursor),
-                valid_for,
-            },
+        match position.map(|position| (position.lag_blocks(), position.valid_for)) {
+            Some((Some(blocks), Some(valid_for))) => Self::Indexed { blocks, valid_for },
             _ => Self::Unknown,
-        }
-    }
-
-    /// Blocks behind the target, when the store could say.
-    fn blocks(&self) -> Option<u64> {
-        match self {
-            Self::Indexed { blocks, .. } => Some(*blocks),
-            Self::Unknown => None,
         }
     }
 
@@ -506,9 +454,9 @@ impl Lag {
     /// sees.
     fn staleness(&self, max_lag_blocks: u64) -> Option<Staleness> {
         match *self {
-            Self::Indexed { valid_for, .. } if valid_for < 0 => {
-                Some(Staleness::Expired(valid_for.unsigned_abs()))
-            }
+            Self::Indexed { valid_for, .. } if valid_for < TimeDelta::zero() => Some(
+                Staleness::Expired(valid_for.abs().to_std().unwrap_or_default()),
+            ),
             Self::Indexed { blocks, .. } if blocks > max_lag_blocks => {
                 Some(Staleness::Behind(blocks))
             }
@@ -523,8 +471,8 @@ impl Lag {
 enum Staleness {
     /// The cursor trails the target by this many blocks.
     Behind(u64),
-    /// The indexer's last report expired this many seconds ago.
-    Expired(u64),
+    /// The indexer's last report expired this long ago.
+    Expired(Duration),
     /// The index cannot report its position at all.
     Unknown,
 }
@@ -536,8 +484,11 @@ impl Staleness {
             Self::Behind(lag) => {
                 format!("read model is {lag} blocks behind; not answering")
             }
-            Self::Expired(secs) => {
-                format!("the indexer's last report expired {secs}s ago; not answering")
+            Self::Expired(ago) => {
+                format!(
+                    "the indexer's last report expired {}s ago; not answering",
+                    ago.as_secs()
+                )
             }
             Self::Unknown => {
                 "read model cannot report its position; not answering".into()
@@ -572,7 +523,7 @@ enum Answer {
 impl Answer {
     /// The bytes to sign, or the refusal to send instead.
     ///
-    /// The refusals are unsigned on purpose: a signature would make the answer
+    /// The refusals are unsigned: a signature would make the answer
     /// an assertion, and none of them has earned one. Unsigned lets the client
     /// fall through to the next endpoint in `urls`.
     fn into_result(self) -> Result<Vec<u8>, GatewayError> {
@@ -588,10 +539,10 @@ impl Answer {
                 "this gateway serves no chain for coin type {coin_type}"
             ))),
             Self::Ambiguous(coin_type) => Err(GatewayError::unavailable(format!(
-                "two indexed chains share coin type {coin_type}; not answering"
+                "two chains in the store share coin type {coin_type}; not answering"
             ))),
             Self::TooStale(why) => {
-                warn!(?why, "refusing to answer from a stale index");
+                tracing::warn!(?why, "refusing to answer from a stale index");
                 Err(GatewayError::unavailable(why.message()))
             }
         }
@@ -624,41 +575,70 @@ impl GatewayState {
 /// silently swallows any future two-segment API route.
 pub const ROUTE_PREFIX: &str = "/ens";
 
-/// The ERC-3668 route, and the status beside it. `{sender}` and `{data}` are
-/// the placeholders the resolver's `urls` carry; the `.json` suffix is
-/// conventional and tolerated either way.
-pub fn router(state: GatewayState) -> Router {
-    Router::new()
-        .route("/{sender}/{data}", get(resolve))
-        .route("/status", get(status))
-        .with_state(state)
+impl GatewayState {
+    /// The ERC-3668 route, and the status beside it. `{sender}` and `{data}` are
+    /// the placeholders the resolver's `urls` carry; the `.json` suffix is
+    /// conventional and tolerated either way.
+    pub fn router(self) -> Router {
+        Router::new()
+            .route("/{sender}/{data}", get(resolve))
+            .route("/status", get(status))
+            .with_state(self)
+    }
 }
 
 /// One served chain, as supervision should see it.
-#[derive(Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ChainStatus {
-    chain_id: u64,
+pub struct ServedChain {
+    /// The chain.
+    pub chain_id: u64,
     /// The names the chain goes by in a name, as its indexer declared them.
-    names: Vec<String>,
-    /// Blocks between the indexer's target and its cursor.
-    lag_blocks: Option<u64>,
+    pub names: Vec<String>,
+    /// Blocks the cursor trails the indexer's target, as `/v1/status`
+    /// reports them.
+    pub lag_blocks: Option<u64>,
     /// Unix seconds at which the indexer last reported.
-    indexer_reported_at: Option<u64>,
-    /// Seconds until the indexer's last report expires, negative once it has.
-    report_valid_for: Option<i64>,
+    pub indexer_reported_at: Option<u64>,
+    /// Seconds until the indexer's last report expires, negative once it has;
+    /// absent before its first report.
+    pub report_valid_for: Option<i64>,
     /// Whether another chain in the store shares this chain's coin type, in
     /// which case queries for that coin type are refused however fresh either
     /// is: the store cannot say which was meant.
-    ambiguous: bool,
+    pub ambiguous: bool,
     /// Whether a query for this chain would be refused right now, for any of
     /// the reasons above.
-    stale: bool,
+    pub stale: bool,
 }
 
-#[derive(Serialize)]
-struct GatewayStatus {
-    chains: Vec<ChainStatus>,
+impl ServedChain {
+    /// A chain's status from its row, as the gate decides on it.
+    fn of(
+        chain_id: u64,
+        row: ChainStatusRow,
+        ambiguous: bool,
+        max_lag_blocks: u64,
+    ) -> Self {
+        let position = row.state.position();
+        let lag = Lag::of(Some(position));
+        Self {
+            chain_id,
+            names: row.names,
+            lag_blocks: position.lag_blocks(),
+            indexer_reported_at: position.reported_at,
+            report_valid_for: position.valid_for_seconds(),
+            ambiguous,
+            stale: ambiguous || lag.staleness(max_lag_blocks).is_some(),
+        }
+    }
+}
+
+/// `GET /ens/status`: every chain the gateway serves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayStatus {
+    /// One row per chain the store holds.
+    pub chains: Vec<ServedChain>,
 }
 
 /// `GET /status`: one row per chain the store holds. For alerting, never for
@@ -671,10 +651,12 @@ async fn status(
     Ok(Json(state.config.status().await?))
 }
 
-/// What ERC-3668 hands back: one hex blob the resolver's callback decodes.
-#[derive(Serialize)]
-struct GatewayResponse {
-    data: String,
+/// What ERC-3668 hands back: one blob the resolver's callback decodes,
+/// 0x-hex on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayResponse {
+    /// `abi.encode(result, expires, signature)`.
+    pub data: Bytes,
 }
 
 /// Why an answer could not be given at all — as opposed to given as null.
@@ -702,16 +684,11 @@ impl GatewayError {
         }
     }
 
-    /// A failure of ours. The cause is LOGGED, never serialized — the same
-    /// split `api.rs` makes.
-    ///
-    /// A `sqlx` error carries schema names and connection strings, and this
-    /// route is unauthenticated. Returning it would tell a caller things the
-    /// REST half of the same process deliberately withholds, and returning it
-    /// INSTEAD of logging it — which is what this used to do — leaves the
-    /// operator with nothing while the caller has everything.
-    fn internal(e: impl std::fmt::Display) -> Self {
-        error!(cause = %e, "gateway lookup failed");
+    /// A failure of ours: the cause is logged, never served, since a `sqlx`
+    /// error carries schema names and connection strings and this route is
+    /// unauthenticated.
+    fn internal(e: impl fmt::Display) -> Self {
+        tracing::error!(cause = %e, "gateway lookup failed");
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: "lookup failed".into(),
@@ -719,14 +696,37 @@ impl GatewayError {
     }
 }
 
+impl From<sqlx::Error> for GatewayError {
+    fn from(e: sqlx::Error) -> Self {
+        Self::internal(e)
+    }
+}
+
+/// A path axum could not take apart, such as invalid UTF-8.
+impl From<PathRejection> for GatewayError {
+    fn from(rejection: PathRejection) -> Self {
+        if rejection.status().is_server_error() {
+            Self::internal(rejection.body_text())
+        } else {
+            Self::bad_request(rejection.body_text())
+        }
+    }
+}
+
 impl IntoResponse for GatewayError {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(serde_json::json!({ "message": self.message })),
-        )
-            .into_response()
+        let refusal = GatewayRefusal {
+            message: self.message,
+        };
+        (self.status, Json(refusal)).into_response()
     }
+}
+
+/// The body of a refusal, the shape ERC-3668 clients read an error in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayRefusal {
+    /// Why, for humans.
+    pub message: String,
 }
 
 /// One request's calldata, as the path carried it and as it decodes.
@@ -756,8 +756,9 @@ impl Request {
 /// The ERC-3668 route: accept the sender, decode the call, answer, sign.
 async fn resolve(
     State(state): State<GatewayState>,
-    Path((sender, data)): Path<(String, String)>,
+    path: Result<Path<(String, String)>, PathRejection>,
 ) -> Result<Json<GatewayResponse>, GatewayError> {
+    let Path((sender, data)) = path?;
     let config = &state.config;
     config.accept(&sender)?;
     let request = Request::from_path(&data)?;

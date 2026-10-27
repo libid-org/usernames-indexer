@@ -7,14 +7,27 @@
 
 use alloy::primitives::{
     Address,
+    Bytes,
     B256,
+    U256,
 };
 use serde::{
     Deserialize,
     Serialize,
 };
+use serde_with::{
+    serde_as,
+    DisplayFromStr,
+};
 
-use crate::nodes::KnownPlatform;
+pub use crate::events::Role;
+use crate::{
+    events::{
+        EscrowEvent,
+        NamesEvent,
+    },
+    nodes::KnownPlatform,
+};
 
 /// One error shape for the whole API, beside the HTTP status: a stable code
 /// and prose. The code is the machine-readable half of the contract — a UI
@@ -26,11 +39,46 @@ pub struct ErrorBody {
     pub error: ErrorDetail,
 }
 
+/// Why a request was refused, stable and machine-readable: a UI branches on
+/// it, never on the prose beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    /// No chain in scope binds the handle.
+    HandleNotBound,
+    /// The handle was bound and retired: it no longer resolves.
+    HandleRetired,
+    /// No chain in scope binds the account.
+    IdNotBound,
+    /// Text the platform could never hold as a handle.
+    HandleImpossible,
+    /// No indexer has committed a first window for the chains in scope.
+    NotSynced,
+    /// Neither a known platform key nor a 0x-hex platform id.
+    InvalidPlatform,
+    /// Not an address.
+    InvalidAddress,
+    /// Not a 0x-hex 32-byte handle node.
+    InvalidNode,
+    /// Not a chain id.
+    InvalidChain,
+    /// Not a cursor the list handed out.
+    InvalidCursor,
+    /// A query value the route refuses.
+    InvalidArgument,
+    /// A path that does not parse.
+    InvalidPath,
+    /// A query string that does not parse.
+    InvalidQuery,
+    /// A failure of the service, whatever the request.
+    Internal,
+}
+
 /// The two halves of an error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorDetail {
     /// Stable and machine-readable.
-    pub code: String,
+    pub code: ErrorCode,
     /// For humans; may be reworded.
     pub message: String,
 }
@@ -46,20 +94,27 @@ pub struct ChainStatus {
     pub names: Vec<String>,
     /// The contract the rows were indexed from, as the indexer recorded it.
     pub contract: Option<Address>,
+    /// The HandleEscrow the escrow rows were indexed from, when the indexer
+    /// watches one.
+    pub escrow: Option<Address>,
     /// The cursor: the last block whose window committed.
     pub last_indexed_block: Option<u64>,
     /// The chain head as the indexer last saw it.
     pub chain_head_block: Option<u64>,
-    /// Blocks between the head the loop last saw and the cursor. Small and
+    /// Blocks the cursor trails the target, the block the indexer last set
+    /// out to reach, `CONFIRMATIONS` behind the head it saw; the number
+    /// `/ens/status` reports and `ENS_MAX_LAG_BLOCKS` bounds. Small and
     /// steady is healthy; growing means the loop is stalled or starved —
-    /// `last_window_error` says which.
+    /// `last_window_error` says which. Absent before the first window.
     pub lag_blocks: Option<u64>,
     /// Unix seconds at which the indexer last reported. `lag_blocks` cannot
     /// show a stopped loop — its two terms are both that loop's writes and
     /// freeze together — so watch this and `report_valid_for` too.
     pub indexer_reported_at: Option<u64>,
     /// Seconds until the indexer's last report expires, negative once it
-    /// has: past zero the ENS gateway refuses this chain's index.
+    /// has: past zero the ENS gateway refuses this chain's index. Absent
+    /// before a report, or when the stored expiry is out of range, which the
+    /// gateway refuses too.
     pub report_valid_for: Option<i64>,
     /// The last window failure, while the most recent window failed.
     pub last_window_error: Option<String>,
@@ -87,21 +142,20 @@ pub struct Status {
 pub struct HandleBinding {
     /// The chain the handle is bound on.
     pub chain_id: i64,
-    /// The storage key the chain filed the handle under.
-    pub handle_node: B256,
     /// The wallet the handle resolves to.
     pub owner: Address,
     /// The proof-freshness watermark.
     pub observed_at: i64,
     /// The ceremony version that proved the binding.
     pub ceremony_version: i64,
-    /// The plaintext account id the handle points back at, when ever bound.
-    pub user_id: Option<String>,
     /// The account id node the handle points back at (`idNodeByHandle`).
     pub id_node: B256,
+    /// The handle's text, once this chain disclosed it.
+    pub handle: Option<String>,
 }
 
-/// `GET /v1/resolve/handle/{platform}/{handle}`: the handle and the wallet it
+/// `GET /v1/resolve/handle/{platform}/{handle}` and
+/// `GET /v1/resolve/handle-node/{handleNode}`: the wallet a handle node
 /// resolves to on each chain it is bound on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -110,8 +164,8 @@ pub struct HandleResolution {
     pub platform: Option<KnownPlatform>,
     /// The platform id the chain keys by.
     pub platform_id: B256,
-    /// The handle as the chain keyed it: normalized.
-    pub handle: String,
+    /// The node the chain filed the handle under.
+    pub handle_node: B256,
     /// One per chain, in chain order; never empty.
     pub bindings: Vec<HandleBinding>,
 }
@@ -122,26 +176,23 @@ pub struct HandleResolution {
 pub struct IdBinding {
     /// The chain the account is bound on.
     pub chain_id: i64,
-    /// The storage key the chain filed the account under.
-    pub id_node: B256,
     /// The wallet that proved the account.
     pub owner: Address,
     /// The proof-freshness watermark.
     pub observed_at: i64,
     /// The ceremony version that proved the binding.
     pub ceremony_version: i64,
-    /// The handle this account last proved, when the node it points at is
-    /// still the account's — the `handleNodeById`/`idNodeByHandle` round
-    /// trip.
+    /// The handle's text, once disclosed and while still the account's — the
+    /// `handleNodeById`/`idNodeByHandle` round trip.
     pub handle: Option<String>,
     /// The handle node this account last proved (`handleNodeById`).
     pub handle_node: B256,
-    /// Whether the handle is the wallet's displayed name on the platform.
+    /// Whether the handle is the wallet's name.
     pub published: bool,
 }
 
-/// `GET /v1/resolve/id/{platform}/{userId}`: an account id and the wallet it
-/// resolves to on each chain it is bound on.
+/// `GET /v1/resolve/id-node/{idNode}`: the wallet an id node resolves to on
+/// each chain it is bound on. The user id never reaches the server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdResolution {
@@ -149,8 +200,8 @@ pub struct IdResolution {
     pub platform: Option<KnownPlatform>,
     /// The platform id the chain keys by.
     pub platform_id: B256,
-    /// The account id, byte-verbatim as the chain keys it.
-    pub user_id: String,
+    /// The node the chain filed the account under.
+    pub id_node: B256,
     /// One per chain, in chain order; never empty.
     pub bindings: Vec<IdBinding>,
 }
@@ -166,9 +217,9 @@ pub struct AddressIdentity {
     pub platform: Option<KnownPlatform>,
     /// The platform id the chain keys by.
     pub platform_id: B256,
-    /// The account id, byte-verbatim.
-    pub user_id: String,
-    /// The handle the account holds, while it is still the account's.
+    /// The node the chain filed the account under.
+    pub id_node: B256,
+    /// The handle's text, once disclosed and while still the account's.
     pub handle: Option<String>,
     /// The handle node the account last proved.
     pub handle_node: B256,
@@ -178,7 +229,7 @@ pub struct AddressIdentity {
     pub ceremony_version: i64,
     /// Whether the handle still resolves to this wallet.
     pub resolves: bool,
-    /// Whether this is the wallet's displayed name on the platform.
+    /// Whether this is the wallet's name.
     pub published: bool,
 }
 
@@ -188,11 +239,12 @@ pub struct AddressIdentity {
 pub struct AddressResolution {
     /// The wallet asked about.
     pub address: Address,
-    /// In chain, platform, account-id order.
+    /// In chain, platform, id-node order.
     pub identities: Vec<AddressIdentity>,
 }
 
-/// One search hit: a live handle, its owner, and the id it pairs with.
+/// One search hit: a live, disclosed handle, its owner, and the id node it
+/// pairs with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchHit {
@@ -202,13 +254,15 @@ pub struct SearchHit {
     pub platform: Option<KnownPlatform>,
     /// The platform id the chain keys by.
     pub platform_id: B256,
-    /// The normalized handle.
+    /// The handle's text.
     pub handle: String,
+    /// The node the chain filed the handle under.
+    pub handle_node: B256,
     /// The wallet it resolves to.
     pub owner: Address,
-    /// The account id behind it, when bound.
-    pub user_id: Option<String>,
-    /// Whether the owner displays this handle.
+    /// The account id node behind it.
+    pub id_node: B256,
+    /// Whether this handle is the owner's name.
     pub published: bool,
 }
 
@@ -226,4 +280,400 @@ pub struct SearchResults {
     pub offset: i64,
     /// Ranked: exact, prefix, substring, fuzzy; then handle and chain.
     pub hits: Vec<SearchHit>,
+}
+
+/// The handle an event, an amount or a request concerns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandleRef {
+    /// The platform's short key, when known.
+    pub platform: Option<KnownPlatform>,
+    /// The platform id, once a request or an event named it (a bind, a
+    /// reveal, a publish or a retire): a deposit names only the node.
+    pub platform_id: Option<B256>,
+    /// The node the chain filed the handle under.
+    pub handle_node: B256,
+    /// The handle's text, once the chain disclosed it.
+    pub handle: Option<String>,
+}
+
+/// One event, typed by its `kind`: the journal kinds, with each event's
+/// fields named the way the contract names them. A `uint256` is a decimal
+/// string, as in the journal: token amounts do not fit a JSON number.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+#[allow(missing_docs)]
+pub enum HistoryEvent {
+    IdentityBound {
+        holder: Address,
+        id_node: B256,
+        handle_node: B256,
+        platform_id: B256,
+        observed_at: u64,
+        ceremony_version: u16,
+    },
+    HandleRevealed {
+        platform_id: B256,
+        handle_node: B256,
+    },
+    HandlePublished {
+        holder: Address,
+        platform_id: B256,
+        handle_node: B256,
+    },
+    HandleRetired {
+        platform_id: B256,
+        handle_node: B256,
+        holder: Address,
+    },
+    HandleUnpublished {
+        holder: Address,
+    },
+    ProofVerifierConfigured {
+        verifier: Address,
+    },
+    CeremonyBound {
+        authorization_digest: B256,
+        holder: Address,
+        platform_id: B256,
+        client_identifier: Bytes,
+    },
+    BindFeePaid {
+        authorization_digest: B256,
+        receiver: Address,
+        #[serde_as(as = "DisplayFromStr")]
+        amount: U256,
+    },
+    Deposited {
+        handle_node: B256,
+        token: Address,
+        sender: Address,
+        #[serde_as(as = "DisplayFromStr")]
+        round: U256,
+        #[serde_as(as = "DisplayFromStr")]
+        amount: U256,
+        refundable_at: u64,
+    },
+    Forwarded {
+        handle_node: B256,
+        token: Address,
+        sender: Address,
+        holder: Address,
+        #[serde_as(as = "DisplayFromStr")]
+        amount: U256,
+        #[serde_as(as = "DisplayFromStr")]
+        received: U256,
+    },
+    Claimed {
+        handle_node: B256,
+        token: Address,
+        claimer: Address,
+        recipient: Address,
+        #[serde_as(as = "DisplayFromStr")]
+        round: U256,
+        #[serde_as(as = "DisplayFromStr")]
+        released: U256,
+        #[serde_as(as = "DisplayFromStr")]
+        received: U256,
+    },
+    Refunded {
+        handle_node: B256,
+        token: Address,
+        sender: Address,
+        recipient: Address,
+        #[serde_as(as = "DisplayFromStr")]
+        round: U256,
+        #[serde_as(as = "DisplayFromStr")]
+        released: U256,
+        #[serde_as(as = "DisplayFromStr")]
+        received: U256,
+    },
+}
+
+/// The wire's copy of a journaled event: the same fields, so a client reads
+/// what the chain emitted, in a type the journal's format does not bind.
+/// Disclosed text is the entry's [`HandleRef`], shown under the visibility
+/// policy.
+impl From<NamesEvent> for HistoryEvent {
+    fn from(event: NamesEvent) -> Self {
+        match event {
+            NamesEvent::IdentityBound {
+                holder,
+                id_node,
+                handle_node,
+                platform_id,
+                observed_at,
+                ceremony_version,
+            } => Self::IdentityBound {
+                holder,
+                id_node,
+                handle_node,
+                platform_id,
+                observed_at,
+                ceremony_version,
+            },
+            NamesEvent::HandleRevealed {
+                platform_id,
+                handle_node,
+                handle: _,
+            } => Self::HandleRevealed {
+                platform_id,
+                handle_node,
+            },
+            NamesEvent::HandlePublished {
+                holder,
+                platform_id,
+                handle_node,
+            } => Self::HandlePublished {
+                holder,
+                platform_id,
+                handle_node,
+            },
+            NamesEvent::HandleRetired {
+                platform_id,
+                handle_node,
+                holder,
+            } => Self::HandleRetired {
+                platform_id,
+                handle_node,
+                holder,
+            },
+            NamesEvent::HandleUnpublished { holder } => {
+                Self::HandleUnpublished { holder }
+            }
+            NamesEvent::ProofVerifierConfigured { verifier } => {
+                Self::ProofVerifierConfigured { verifier }
+            }
+            NamesEvent::CeremonyBound {
+                authorization_digest,
+                holder,
+                platform_id,
+                client_identifier,
+            } => Self::CeremonyBound {
+                authorization_digest,
+                holder,
+                platform_id,
+                client_identifier,
+            },
+            NamesEvent::BindFeePaid {
+                authorization_digest,
+                receiver,
+                amount,
+            } => Self::BindFeePaid {
+                authorization_digest,
+                receiver,
+                amount,
+            },
+            NamesEvent::Escrow(EscrowEvent::Deposited {
+                handle_node,
+                token,
+                sender,
+                round,
+                amount,
+                refundable_at,
+            }) => Self::Deposited {
+                handle_node,
+                token,
+                sender,
+                round,
+                amount,
+                refundable_at,
+            },
+            NamesEvent::Escrow(EscrowEvent::Forwarded {
+                handle_node,
+                token,
+                sender,
+                holder,
+                amount,
+                received,
+            }) => Self::Forwarded {
+                handle_node,
+                token,
+                sender,
+                holder,
+                amount,
+                received,
+            },
+            NamesEvent::Escrow(EscrowEvent::Claimed {
+                handle_node,
+                token,
+                claimer,
+                recipient,
+                round,
+                released,
+                received,
+            }) => Self::Claimed {
+                handle_node,
+                token,
+                claimer,
+                recipient,
+                round,
+                released,
+                received,
+            },
+            NamesEvent::Escrow(EscrowEvent::Refunded {
+                handle_node,
+                token,
+                sender,
+                recipient,
+                round,
+                released,
+                received,
+            }) => Self::Refunded {
+                handle_node,
+                token,
+                sender,
+                recipient,
+                round,
+                released,
+                received,
+            },
+        }
+    }
+}
+
+/// One entry in a history: an event, where and when it happened, and the
+/// handle it concerns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryEntry {
+    /// The chain it happened on.
+    pub chain_id: i64,
+    /// Its block.
+    pub block_number: i64,
+    /// Its index in the block.
+    pub log_index: i64,
+    /// The transaction that emitted it.
+    pub tx_hash: B256,
+    /// Its block's time, in unix seconds.
+    pub block_time: i64,
+    /// In an address history, every part the address plays in the event.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<Role>,
+    /// The handle the event concerns, when it concerns one.
+    pub handle: Option<HandleRef>,
+    /// The event itself.
+    pub event: HistoryEvent,
+}
+
+/// `GET /v1/history/address/{address}`: what an address took part in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddressHistory {
+    /// The address asked about.
+    pub address: Address,
+    /// Newest first: by block time, then chain, block and log index.
+    pub entries: Vec<HistoryEntry>,
+    /// Pass as `before` for the next page; absent on the last one.
+    pub next: Option<String>,
+}
+
+/// `GET /v1/history/handle/{platform}/{handle}` and
+/// `GET /v1/history/node/{node}`: everything that happened to one handle,
+/// from deposits made while nobody held it through every bind and claim
+/// after.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandleHistory {
+    /// The handle, as far as the store knows it: always its node.
+    pub handle: HandleRef,
+    /// Newest first: by block time, then chain, block and log index.
+    pub entries: Vec<HistoryEntry>,
+    /// Pass as `before` for the next page; absent on the last one.
+    pub next: Option<String>,
+}
+
+/// One amount waiting in the escrow, and what it waits for.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EscrowAmount {
+    /// The chain the escrow holds it on.
+    pub chain_id: i64,
+    /// The handle it is held against.
+    pub handle: HandleRef,
+    /// Who holds the handle now and may claim it; absent while nobody does.
+    pub holder: Option<Address>,
+    /// The token; EIP-7528 `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE` is
+    /// the chain's own coin. Anybody can deposit a token they wrote: show
+    /// the ones you recognize.
+    pub token: Address,
+    /// Token units, as a decimal string.
+    #[serde_as(as = "DisplayFromStr")]
+    pub amount: U256,
+    /// The slot's current round: how many claims it has seen.
+    #[serde_as(as = "DisplayFromStr")]
+    pub round: U256,
+}
+
+/// `GET /v1/escrow/claimable/{address}`: held for the handles the address
+/// holds now, which `claim` pays it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddressAmounts {
+    /// The address asked about.
+    pub address: Address,
+    /// By chain, node and token, descending.
+    pub amounts: Vec<EscrowAmount>,
+    /// Pass as `before` for the next page; absent on the last one.
+    pub next: Option<String>,
+}
+
+/// One sender's contribution to a slot: what `refund` pays it, and from when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Contribution {
+    /// The amount, its slot and the slot's round.
+    #[serde(flatten)]
+    pub amount: EscrowAmount,
+    /// When `refund` opens for it, in unix seconds: `REFUND_GRACE` after the
+    /// sender's last deposit to the slot. Until then only the holder's claim
+    /// moves it.
+    pub refundable_at: i64,
+}
+
+/// `GET /v1/escrow/refundable/{address}`: what the address sent to handles
+/// nobody has claimed yet, whether or not the handle has a holder, which
+/// `refund` pays back from each contribution's date.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddressContributions {
+    /// The address asked about.
+    pub address: Address,
+    /// By chain, node and token, descending.
+    pub amounts: Vec<Contribution>,
+    /// Pass as `before` for the next page; absent on the last one.
+    pub next: Option<String>,
+}
+
+/// `GET /v1/escrow/handle/{platform}/{handle}` and `GET /v1/escrow/node/{node}`:
+/// what one handle holds, token by token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandleAmounts {
+    /// The handle, as far as the store knows it.
+    pub handle: HandleRef,
+    /// One per chain and token still holding something, descending.
+    pub amounts: Vec<EscrowAmount>,
+    /// Pass as `before` for the next page; absent on the last one.
+    pub next: Option<String>,
+}
+
+/// `GET /v1/escrow/unclaimed`: every slot still holding something.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Unclaimed {
+    /// The token the list was narrowed to, when one was asked for.
+    pub token: Option<Address>,
+    /// The page size served.
+    pub limit: i64,
+    /// Token by token, descending, the largest amount first within each.
+    pub amounts: Vec<EscrowAmount>,
+    /// Pass as `before` for the next page; absent on the last one.
+    pub next: Option<String>,
 }

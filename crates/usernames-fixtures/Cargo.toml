@@ -5,9 +5,19 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Builders for the ENS gateway requests and store bindings the usernames-api integration suites send."
+description = "Fixtures the usernames integration suites share: ENS gateway requests, a suite's chain written and read the way the services do, the libid contracts on anvil, and waits on the database."
 publish = false
 
 [dependencies]
-alloy.workspace = true
-usernames-core.workspace = true
+alloy = { workspace = true, features = ["node-bindings", "signer-local"] }
+axum.workspace = true
+http-body-util.workspace = true
+libid-contracts = { workspace = true, features = ["testing"] }
+libid-identity.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio = { workspace = true, features = ["time"] }
+tower = { workspace = true, features = ["util"] }
+url.workspace = true
+usernames-core = { workspace = true, features = ["test-helpers"] }

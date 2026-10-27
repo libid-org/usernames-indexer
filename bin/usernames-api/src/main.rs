@@ -1,4 +1,16 @@
+//! Serves the read API the environment configures until stopped.
+
+use clap::Parser;
+use tracing_subscriber::EnvFilter;
+use usernames_api::Config;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    usernames_api::run().await
+    let _ = dotenvy::dotenv();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+    Config::parse().run().await
 }

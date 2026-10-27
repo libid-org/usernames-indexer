@@ -1,4 +1,4 @@
-//! Request fixtures for the `usernames-api` integration suites.
+//! Fixtures the usernames integration suites share.
 //!
 //! A wallet resolving `alice.x.handles.link` through ENS does not send that
 //! text. It sends the name in DNS wire form and its namehash, plus an
@@ -8,46 +8,65 @@
 //! this crate holds one builder per piece, and every suite sends the bytes a
 //! wallet would:
 //!
-//! - [`wire_name`] and [`namehash_of`]: the name as the wire and the resolver
-//!   carry it.
-//! - [`addr_call`] and [`legacy_addr_call`]: the record request, in the
-//!   ENSIP-11 multichain form and in the older form that means coin type 60.
+//! - [`Labels`]: a name by its labels, as the wire carries it, and the
+//!   record requests for it, in the ENSIP-11 multichain form and in the
+//!   older form that means coin type 60.
 //! - [`resolve_call`]: the wrapped call the gateway receives.
-//! - [`bind`]: one binding written into the store the gateway answers from,
-//!   with its chain marked synced.
+//! - [`Seed`]: a chain's store seeded the way its indexer writes it — the
+//!   right to write it, and one binding with the chain marked synced.
+//! - [`IdNode`]: a user id's node, as the chain keys it.
+//! - [`LockWaits`]: a session of the database caught waiting on a lock.
 //!
 //! `gateway.rs` drives the router in process with these; `end_to_end.rs`
 //! deploys the real `HandleResolver` on anvil and walks the protocol with
-//! them. Neither needs ENS or a network. It is a dev-dependency of
-//! `usernames-api` and nothing else links it. It is a crate rather than a
-//! `tests/common` module because each test binary compiles such a module on
-//! its own, and a helper one of them does not call reads as dead code there;
-//! a library's public items never do.
+//! them. Neither needs ENS or a network.
 //!
-//! To test against a real wallet instead of these suites, the resolver ENS
-//! holds for `handles.link` must name your gateway. On Sepolia that resolver
-//! is a `HandleResolver` whose URL is
-//! `http://127.0.0.1:8080/ens/{sender}/{data}.json`: a `usernames-api`
-//! running locally, with a signer the resolver trusts (`setSigner`), answers
-//! it. `setUrls` repoints it; both are calls by the resolver's owner.
+//! The suites that write a chain share the rest:
+//!
+//! - [`Suite`]: a suite's chain in the database the suites share, written
+//!   through the indexer's own window ([`Writes`]) and read through the real
+//!   router ([`Reads`]), its answers typed ([`Reply`]).
+//! - [`Events`]: the events the contracts emit, as the suites write them.
+//! - [`ChainWatch`]: a chain's row, followed through the notices of its
+//!   changes.
+//! - [`libid`]: the libid contracts deployed on anvil, and the calls a
+//!   holder or a payer makes to them.
 
 #![deny(missing_docs)]
 #![deny(dead_code)]
+
+pub mod libid;
+mod suite;
+
+use std::{
+    future::Future,
+    time::Duration,
+};
 
 use alloy::{
     primitives::{
         Address,
         B256,
+        U256,
     },
     sol_types::SolCall,
 };
+use sqlx::PgPool;
 use usernames_core::{
-    db::ChainStore,
+    chain::Contracts,
+    db::{
+        ChainStore,
+        ChainWriter,
+    },
+    ens::Name,
     events::{
         LogPosition,
         NamesEvent,
     },
-    nodes,
+    nodes::{
+        DisclosedHandle,
+        KnownPlatform,
+    },
 };
 
 mod calls {
@@ -68,25 +87,53 @@ use calls::{
     resolveCall,
 };
 
-/// `alice.x` becomes `alice.x.handles.link`, in DNS wire format.
-pub fn wire_name(labels: &[&str]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for label in labels.iter().chain(["handles", "link"].iter()) {
-        out.push(label.len() as u8);
-        out.extend_from_slice(label.as_bytes());
-    }
-    out.push(0);
-    out
+/// A name under `handles.link`, by its labels before the domain:
+/// `["alice", "x"]` spells `alice.x.handles.link`.
+pub trait Labels {
+    /// The name in DNS wire format.
+    fn wire_name(&self) -> Vec<u8>;
+
+    /// The name's namehash, as a wallet sends it beside the wire form.
+    fn namehash(&self) -> B256;
+
+    /// `addr(node, coinType)` for the name.
+    fn addr_call(&self, coin: u64) -> Vec<u8>;
+
+    /// `addr(node)` for the name: the legacy shape, which means coin type 60.
+    fn legacy_addr_call(&self) -> Vec<u8>;
 }
 
-/// The namehash of the same name, as a wallet sends it beside the wire form.
-pub fn namehash_of(labels: &[&str]) -> B256 {
-    let full: Vec<String> = labels
-        .iter()
-        .map(|l| (*l).to_string())
-        .chain(["handles".to_string(), "link".to_string()])
-        .collect();
-    usernames_core::ens::Name::from_labels(full).node()
+impl Labels for [&str] {
+    fn wire_name(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for label in self.iter().chain(["handles", "link"].iter()) {
+            out.push(label.len() as u8);
+            out.extend_from_slice(label.as_bytes());
+        }
+        out.push(0);
+        out
+    }
+
+    fn namehash(&self) -> B256 {
+        Name::decode(&self.wire_name())
+            .expect("a name in wire format")
+            .node()
+    }
+
+    fn addr_call(&self, coin: u64) -> Vec<u8> {
+        addr_0Call {
+            node: self.namehash(),
+            coinType: U256::from(coin),
+        }
+        .abi_encode()
+    }
+
+    fn legacy_addr_call(&self) -> Vec<u8> {
+        addr_1Call {
+            node: self.namehash(),
+        }
+        .abi_encode()
+    }
 }
 
 /// `resolve(name, data)`, encoded by the same codec the gateway decodes with.
@@ -98,57 +145,161 @@ pub fn resolve_call(name: &[u8], inner: &[u8]) -> Vec<u8> {
     .abi_encode()
 }
 
-/// `addr(node, coinType)` for the name the labels spell.
-pub fn addr_call(labels: &[&str], coin: u64) -> Vec<u8> {
-    addr_0Call {
-        node: namehash_of(labels),
-        coinType: alloy::primitives::U256::from(coin),
-    }
-    .abi_encode()
+pub use suite::{
+    anvil_available,
+    database_url,
+    ChainWatch,
+    Entries,
+    Events,
+    Reads,
+    Reply,
+    Suite,
+    Writes,
+    PATIENCE,
+};
+
+/// The registry a chain these fixtures write is prepared for.
+const REGISTRY: Address = Address::repeat_byte(0x1D);
+
+/// A user id's node on a platform.
+pub trait IdNode {
+    /// The node `id` is bound under, as libid-identity derives it.
+    fn id_node(self, id: &str) -> B256;
 }
 
-/// `addr(node)` — the legacy shape, which means coin type 60.
-pub fn legacy_addr_call(labels: &[&str]) -> Vec<u8> {
-    addr_1Call {
-        node: namehash_of(labels),
+impl IdNode for KnownPlatform {
+    fn id_node(self, id: &str) -> B256 {
+        let spec =
+            libid_identity::platforms::platform(self.key()).expect("a libid platform");
+        B256::from(spec.id_node(id).expect("an id"))
     }
-    .abi_encode()
 }
 
-/// Seed one binding into the read model the gateway answers from.
-pub async fn bind(store: &ChainStore, handle: &str, holder: Address) {
-    let platform = nodes::Platform::from_key("x").unwrap().id();
-    let event = NamesEvent::IdentityBound {
-        holder,
-        id_node: nodes::id_node(platform, "42"),
-        handle_node: nodes::handle_node(
-            platform,
-            &nodes::NormalizedHandle::from_chain(handle),
-        ),
-        platform_id: platform,
-        id: "42".into(),
-        handle: handle.into(),
-        observed_at: 1_700_000_000,
-        ceremony_version: 1,
-        published: true,
-    };
-    let mut window = store.begin_window().await.expect("begin");
-    window
-        .apply(
-            &event,
-            &LogPosition {
-                block_number: 1,
-                log_index: 0,
-                tx_hash: B256::from([1u8; 32]),
-            },
-        )
-        .await
-        .expect("apply");
-    window.commit(1).await.expect("commit");
-    // The indexer records both every cycle, and the gateway refuses to answer
-    // from an index that cannot say how far behind it is. Staleness is measured
-    // against the TARGET — the block the cursor chases — so that is the one a
-    // fixture must record.
-    store.set_chain_head(1).await;
-    store.set_chain_target(1, 120).await;
+/// The sessions of a database, as the suites watch them.
+pub trait LockWaits {
+    /// Return once a session of this database named `application` waits on
+    /// a lock. Postgres announces no lock wait, so this reads
+    /// `pg_stat_activity` every few milliseconds, for at most five seconds.
+    fn waits_on_a_lock(&self, application: &str) -> impl Future<Output = ()> + Send;
+}
+
+impl LockWaits for PgPool {
+    async fn waits_on_a_lock(&self, application: &str) {
+        let waiting = async {
+            while !sqlx::query_scalar::<_, bool>(include_str!("waiting_on_a_lock.sql"))
+                .bind(application)
+                .fetch_one(self)
+                .await
+                .expect("the sessions")
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap_or_else(|_| panic!("{application} never waited on a lock"));
+    }
+}
+
+/// A chain's store, seeded the way its indexer writes it.
+pub trait Seed {
+    /// The right to write the chain, taken the way an indexer takes it at
+    /// startup: under the chain's lease, prepared for one registry. The
+    /// lease goes back at once; the writer stays good until the chain is
+    /// prepared again.
+    fn writer(&self) -> impl Future<Output = ChainWriter> + Send;
+
+    /// One disclosing X binding: its `IdentityBound`, `HandleRevealed` and
+    /// `HandlePublished`, in one transaction, with the chain marked synced.
+    fn bind(&self, handle: &str, holder: Address) -> impl Future<Output = ()> + Send;
+
+    /// [`Seed::bind`] without the `HandleRevealed` and `HandlePublished`:
+    /// an unlisted binding.
+    fn bind_private(
+        &self,
+        handle: &str,
+        holder: Address,
+    ) -> impl Future<Output = ()> + Send;
+}
+
+impl Seed for ChainStore {
+    async fn writer(&self) -> ChainWriter {
+        let lease = self.acquire_writer().await.expect("the writer lease");
+        let writer = self
+            .prepare(
+                &lease,
+                Contracts {
+                    registry: REGISTRY,
+                    escrow: None,
+                },
+            )
+            .await
+            .expect("the chain is prepared");
+        lease.release().await.expect("the lease goes back");
+        writer
+    }
+
+    async fn bind(&self, handle: &str, holder: Address) {
+        self.writer().await.seed(handle, holder, true).await;
+    }
+
+    async fn bind_private(&self, handle: &str, holder: Address) {
+        self.writer().await.seed(handle, holder, false).await;
+    }
+}
+
+/// A binding written the way the indexer writes one.
+trait Binding {
+    /// An X binding of `handle` to `holder` at block 1, disclosed or not,
+    /// and the chain's head and target there.
+    async fn seed(&self, handle: &str, holder: Address, disclosed: bool);
+}
+
+impl Binding for ChainWriter {
+    async fn seed(&self, handle: &str, holder: Address, disclosed: bool) {
+        let x = KnownPlatform::X;
+        let handle_node = x.handle_node(handle).expect("an X handle");
+        let mut events = vec![NamesEvent::IdentityBound {
+            holder,
+            id_node: x.id_node("42"),
+            handle_node,
+            platform_id: x.id(),
+            observed_at: 1_700_000_000,
+            ceremony_version: 1,
+        }];
+        if disclosed {
+            events.push(NamesEvent::HandleRevealed {
+                platform_id: x.id(),
+                handle_node,
+                handle: DisclosedHandle::verify(x, handle_node, handle),
+            });
+            events.push(NamesEvent::HandlePublished {
+                holder,
+                platform_id: x.id(),
+                handle_node,
+            });
+        }
+        let mut window = self.begin_window().await.expect("begin");
+        for (log_index, event) in (0u64..).zip(&events) {
+            window
+                .apply(
+                    event,
+                    &LogPosition {
+                        block_number: 1,
+                        log_index,
+                        tx_hash: B256::from([1u8; 32]),
+                        block_time: 1_700_000_000,
+                    },
+                )
+                .await
+                .expect("apply");
+        }
+        window.commit(1).await.expect("commit");
+        // The indexer records both every cycle, and the gateway refuses to
+        // answer from an index that cannot say how far behind it is.
+        // Staleness is measured against the TARGET — the block the cursor
+        // chases — so that is the one a fixture must record.
+        self.set_chain_head(1).await;
+        self.set_chain_target(1, Duration::from_secs(120)).await;
+    }
 }

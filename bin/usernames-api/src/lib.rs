@@ -1,10 +1,10 @@
-//! The read API: resolution, search and the ENS gateway over the indexed
-//! read model.
+//! The read API: resolution, search, histories, escrow balances and the ENS
+//! gateway over the indexed read model.
 //!
 //! Stateless and horizontal: it reads the database the indexer writes and
-//! nothing else, so several of these may serve one database. Both halves serve
-//! every chain the store holds, read per request: `/v1` takes an optional
-//! `?chain=`, the ENS gateway is asked by coin type.
+//! nothing else, so several of these may serve one database. The `/v1` routes
+//! and the gateway serve every chain the store holds, read per request: `/v1`
+//! takes an optional `?chain=`, the ENS gateway is asked by coin type.
 //!
 //! It answers `503 not_synced` for a chain until its first window is
 //! committed, which is why readiness must gate on `/v1/status` rather than
@@ -16,12 +16,21 @@
 pub mod ens;
 
 use std::{
+    io,
     net::SocketAddr,
     sync::Arc,
+    time::Duration,
+};
+use tokio::{
+    net::TcpListener,
+    task::JoinHandle,
 };
 
 use alloy::primitives::Address;
-use axum::Router;
+use axum::{
+    http::Method,
+    Router,
+};
 use clap::Parser;
 use libid_signer::{
     ManagedSigner,
@@ -32,18 +41,24 @@ use tower_http::cors::{
     Any,
     CorsLayer,
 };
-use tracing::info;
 use usernames_core::{
     api,
-    db,
-    ens::Domain,
+    db::{
+        self,
+        Store,
+    },
+    ens::{
+        Domain,
+        DEFAULT_DOMAIN,
+    },
+    stop::StopSignals,
 };
 
 /// Everything comes from flags or the environment; a `.env` file is read
 /// first so local runs need no exports.
 ///
 /// No `RPC_URL`: this process never talks to a chain. No `CONFIRMATIONS`,
-/// `POLL_INTERVAL_SECS`, `MAX_BLOCK_RANGE` or `START_BLOCK` either — those are
+/// `POLL_INTERVAL`, `MAX_BLOCK_RANGE` or `START_BLOCK` either — those are
 /// the indexer's, and accepting them here would suggest they did something.
 #[derive(Debug, Parser)]
 #[command(name = "usernames-api", about)]
@@ -87,13 +102,13 @@ pub struct Config {
     /// The domain this gateway's names sit under: `handles.link`, or
     /// `testnet.handles.link` for a deployment that answers under a subname.
     /// A name outside it is refused.
-    #[arg(long, env = "ENS_DOMAIN", default_value = "handles.link")]
+    #[arg(long, env = "ENS_DOMAIN", default_value = DEFAULT_DOMAIN)]
     pub ens_domain: Domain,
 
-    /// How long a signed answer stays good, in seconds. The resolver enforces
-    /// it on chain.
-    #[arg(long, env = "ENS_TTL_SECS", default_value_t = 300)]
-    pub ens_ttl_secs: u64,
+    /// How long a signed answer stays good: `5m`, `300s`. The resolver
+    /// enforces it on chain.
+    #[arg(long, env = "ENS_TTL", default_value = "5m", value_parser = humantime::parse_duration)]
+    pub ens_ttl: Duration,
 
     /// How far behind the chain the index may be and still assert anything.
     /// Past it the gateway refuses UNSIGNED rather than signing a null: a
@@ -103,100 +118,74 @@ pub struct Config {
     pub ens_max_lag_blocks: u64,
 }
 
-/// Parse the environment, connect, and serve until ctrl-c.
-pub async fn run() -> anyhow::Result<()> {
-    let _ = dotenvy::dotenv();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+/// The API serving as a task, and the token that stops it.
+struct Serving {
+    cancel: CancellationToken,
+    task: JoinHandle<io::Result<()>>,
+}
 
-    let config = Config::parse();
-
-    // `connect`, not `connect_and_migrate`: the schema belongs to the writer.
-    let pool = db::connect(&config.database_url).await?;
-    let store = db::Store::new(pool.clone());
-
-    let cancel = CancellationToken::new();
-
-    // Configured BEFORE the port opens: it can refuse to start, and binding
-    // first would accept connections the process is not yet able to serve.
-    let gateway = config.gateway(pool).await?;
-    match &gateway {
-        Some(g) => info!(
-            domain = %g.domain,
-            resolver = %g.resolver,
-            ens_chain = g.ens_chain,
-            route = %format!("{}/{{sender}}/{{data}}", ens::ROUTE_PREFIX),
-            "ENS gateway configured"
-        ),
-        None => info!("ENS gateway not configured; the CCIP-Read route is absent"),
+impl Serving {
+    /// Serve `app` on `listener` until stopped.
+    fn start(listener: TcpListener, app: Router) -> Self {
+        let cancel = CancellationToken::new();
+        let shutdown = cancel.clone();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { shutdown.cancelled().await })
+                .await
+        });
+        Self { cancel, task }
     }
-    let app = build_router(api::AppState::new(store), gateway);
 
-    let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
-    info!(addr = %config.listen_addr, "read API listening");
-
-    let shutdown = cancel.clone();
-    let mut task = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move { shutdown.cancelled().await })
-            .await
-    });
-
-    tokio::select! {
-        r = tokio::signal::ctrl_c() => {
-            info!("shutting down");
-            cancel.cancel();
-            let _ = task.await;
-            r?;
-            Ok(())
+    /// Stop accepting, and give the requests in flight `within` to be
+    /// answered; the ones still open then are dropped.
+    async fn stop(&mut self, within: Duration) {
+        self.cancel.cancel();
+        if tokio::time::timeout(within, &mut self.task).await.is_err() {
+            tracing::warn!(?within, "requests still in flight; dropping them");
+            self.task.abort();
         }
-        r = &mut task => match r {
-            Ok(Ok(())) => Err(anyhow::anyhow!("API task exited unexpectedly")),
-            Ok(Err(e)) => Err(anyhow::anyhow!("API server failed: {e}")),
-            Err(e) => Err(anyhow::anyhow!("API task died: {e}")),
-        },
     }
 }
 
-/// Every route the binary serves, with the middleware over the whole of it.
-///
-/// Separate from [`run`] so a test can exercise what is actually served. The
-/// halves were only ever built apart — `api::router` in one suite,
-/// `ens::router` in another — so the merge itself, and the layering over it,
-/// had no coverage at all.
-pub fn build_router(state: api::AppState, gateway: Option<ens::Config>) -> Router {
-    let mut app = api::router(state);
-    if let Some(gateway) = gateway {
-        app = app.nest(
-            ens::ROUTE_PREFIX,
-            ens::router(ens::GatewayState::new(gateway)),
-        );
-    }
-    // ONE layer, over the whole router, after every route is on it. A `layer`
-    // wraps only what is already mounted, so applying it inside `api::router`
-    // both missed the gateway route — a browser ERC-3668 client would get no
-    // `Access-Control-Allow-Origin` while `/v1/*` worked from the same page —
-    // and, once a second layer was added to cover it, ran the CORS middleware
-    // twice on every `/v1` response.
-    //
-    // A read-only public resolver: any origin may GET. This is what lets a
-    // browser UI (handle.link) call the API cross-origin at all.
-    app.layer(
-        CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods([axum::http::Method::GET]),
-    )
+/// How long a stopping API keeps answering the requests in flight: well
+/// inside the grace period a supervisor gives before it kills the process.
+const DRAIN: Duration = Duration::from_secs(10);
+
+/// Everything the binary serves: the read API, and the ENS gateway when one
+/// is configured.
+pub struct Service {
+    /// The read API's state.
+    pub api: api::AppState,
+    /// The gateway's configuration, when this deployment runs one.
+    pub gateway: Option<ens::Config>,
 }
 
-/// The resolver's `MAX_LIFETIME`, in seconds. It rejects any `expires` further
-/// out than this, so a longer TTL here would have the gateway sign answers the
-/// contract reverts — every one of them, and only in production, since nothing
-/// off chain looks at the deadline.
-const RESOLVER_MAX_LIFETIME_SECS: u64 = 3600;
+impl Service {
+    /// Every route, with the middleware over the whole of it: what a test
+    /// exercises to see what is actually served, the merge and the layering
+    /// included.
+    pub fn router(self) -> Router {
+        let mut app = self.api.router();
+        if let Some(gateway) = self.gateway {
+            app = app.nest(ens::ROUTE_PREFIX, ens::GatewayState::new(gateway).router());
+        }
+        // One layer over the whole router, after every route is on it: a
+        // `layer` wraps only what is already mounted. Any origin may GET, so a
+        // browser UI or ERC-3668 client calls the API cross-origin.
+        app.layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([Method::GET]),
+        )
+    }
+}
+
+/// The resolver's `MAX_LIFETIME`. It rejects any `expires` further out than
+/// this, so a longer TTL here would have the gateway sign answers the contract
+/// reverts — every one of them, and only in production, since nothing off
+/// chain looks at the deadline.
+const RESOLVER_MAX_LIFETIME: Duration = Duration::from_secs(3600);
 
 /// How far a block timestamp may trail the wall clock this process reads.
 ///
@@ -205,14 +194,49 @@ const RESOLVER_MAX_LIFETIME_SECS: u64 = 3600;
 /// lands on. That block is always at least a little behind now, so a TTL equal
 /// to `MAX_LIFETIME` puts `expires` past the ceiling by exactly the amount the
 /// chain trails — and every answer reverts, in production only, with nothing
-/// off chain the wiser. The room is generous on purpose: shortening a TTL costs
-/// a caller nothing, and guessing this too small costs every answer.
-const BLOCK_TIMESTAMP_SLACK_SECS: u64 = 300;
+/// off chain the wiser. The room is generous: shortening a TTL costs a caller
+/// nothing, and guessing this too small costs every answer.
+const BLOCK_TIMESTAMP_SLACK: Duration = Duration::from_secs(300);
 
 /// The longest TTL a gateway may be configured with.
-const MAX_TTL_SECS: u64 = RESOLVER_MAX_LIFETIME_SECS - BLOCK_TIMESTAMP_SLACK_SECS;
+const MAX_TTL: Duration = RESOLVER_MAX_LIFETIME.saturating_sub(BLOCK_TIMESTAMP_SLACK);
 
 impl Config {
+    /// The socket and the routes this configuration serves: the store
+    /// connected, the gateway configured, the port bound.
+    async fn start(self) -> anyhow::Result<(TcpListener, Router)> {
+        // `connect`, not `connect_and_migrate`: the schema belongs to the writer.
+        let pool = db::connect(&self.database_url).await?;
+        let store = Store::new(pool.clone());
+
+        // Configured BEFORE the port opens: it can refuse to start, and binding
+        // first would accept connections the process is not yet able to serve.
+        let gateway = self.gateway(pool).await?;
+        match &gateway {
+            Some(g) => tracing::info!(
+                domain = %g.domain,
+                resolver = %g.resolver,
+                ens_chain = g.ens_chain,
+                route = %format!("{}/{{sender}}/{{data}}", ens::ROUTE_PREFIX),
+                "ENS gateway configured"
+            ),
+            None => {
+                tracing::info!(
+                    "ENS gateway not configured; the CCIP-Read route is absent"
+                )
+            }
+        }
+        let app = Service {
+            api: api::AppState::new(store),
+            gateway,
+        }
+        .router();
+
+        let listener = TcpListener::bind(self.listen_addr).await?;
+        tracing::info!(addr = %self.listen_addr, "read API listening");
+        Ok((listener, app))
+    }
+
     /// Where the gateway's key lives, and the resolver it signs for.
     ///
     /// `None` when no gateway runs: the key is what turns the route on. A key
@@ -242,15 +266,15 @@ impl Config {
 
         // The resolver enforces this on chain; refuse at startup rather than
         // let a deployment sign answers that always revert.
-        if self.ens_ttl_secs > MAX_TTL_SECS {
+        if self.ens_ttl > MAX_TTL {
             anyhow::bail!(
-                "ENS_TTL_SECS is {}, but the resolver's MAX_LIFETIME is {}s and it \
-                 measures from the block's timestamp, not from now — leave {}s for \
+                "ENS_TTL is {}, but the resolver's MAX_LIFETIME is {} and it \
+                 measures from the block's timestamp, not from now — leave {} for \
                  the chain to trail, so at most {}",
-                self.ens_ttl_secs,
-                RESOLVER_MAX_LIFETIME_SECS,
-                BLOCK_TIMESTAMP_SLACK_SECS,
-                MAX_TTL_SECS
+                humantime::format_duration(self.ens_ttl),
+                humantime::format_duration(RESOLVER_MAX_LIFETIME),
+                humantime::format_duration(BLOCK_TIMESTAMP_SLACK),
+                humantime::format_duration(MAX_TTL)
             );
         }
 
@@ -260,7 +284,7 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("ENS_SIGNER_KEY: {e}"))?;
         // The address is what the resolver's signer set must hold, and with
         // KMS nothing but this line tells an operator what it is.
-        info!(
+        tracing::info!(
             signer = %signer.address(),
             via = %signer.describe(),
             %resolver,
@@ -270,24 +294,52 @@ impl Config {
             domain: self.ens_domain.clone(),
             resolver,
             ens_chain: self.ens_chain_id,
-            store: db::Store::new(pool),
-            ttl_secs: self.ens_ttl_secs,
+            store: Store::new(pool),
+            ttl: self.ens_ttl,
             max_lag_blocks: self.ens_max_lag_blocks,
             signer: Arc::new(signer),
         }))
+    }
+
+    /// Connect, and serve until ctrl-c or SIGTERM.
+    pub async fn run(self) -> anyhow::Result<()> {
+        // From the start, so a stop request during startup ends the process.
+        let mut signals = StopSignals::listen()?;
+        let (listener, app) = tokio::select! {
+            started = self.start() => started?,
+            () = signals.received() => {
+                tracing::info!("stopped before serving");
+                return Ok(());
+            }
+        };
+
+        let mut serving = Serving::start(listener, app);
+        tokio::select! {
+            () = signals.received() => {
+                tracing::info!("shutting down");
+                serving.stop(DRAIN).await;
+                Ok(())
+            }
+            r = &mut serving.task => match r {
+                Ok(Ok(())) => Err(anyhow::anyhow!("API task exited unexpectedly")),
+                Ok(Err(e)) => Err(anyhow::anyhow!("API server failed: {e}")),
+                Err(e) => Err(anyhow::anyhow!("API task died: {e}")),
+            },
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::postgres::PgPoolOptions;
 
     /// A pool that never dials. Every case below is refused before any query
     /// runs, which is the point: these are startup checks, so they must not
     /// need a database to reject a configuration that cannot work. It still
     /// wants a runtime to be built in, which is why the cases are async.
     fn lazy_pool() -> sqlx::PgPool {
-        sqlx::postgres::PgPoolOptions::new()
+        PgPoolOptions::new()
             .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
             .expect("lazy pool")
     }
@@ -356,7 +408,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_ttl_the_resolver_would_reject_is_refused() {
-        let message = refusal(&["--ens-ttl-secs", "7200"]).await;
+        let message = refusal(&["--ens-ttl", "2h"]).await;
         assert!(message.contains("MAX_LIFETIME"), "{message}");
     }
 
@@ -366,11 +418,14 @@ mod tests {
     /// is every block.
     #[tokio::test]
     async fn the_ttl_ceiling_leaves_the_chain_room_to_trail() {
-        let at_ceiling = config(&["--ens-ttl-secs", &MAX_TTL_SECS.to_string()]);
+        let at_ceiling = config(&[
+            "--ens-ttl",
+            &humantime::format_duration(MAX_TTL).to_string(),
+        ]);
         assert!(at_ceiling.gateway(lazy_pool()).await.is_ok());
 
-        let message =
-            refusal(&["--ens-ttl-secs", &RESOLVER_MAX_LIFETIME_SECS.to_string()]).await;
+        let ceiling = humantime::format_duration(RESOLVER_MAX_LIFETIME).to_string();
+        let message = refusal(&["--ens-ttl", &ceiling]).await;
         assert!(message.contains("trail"), "{message}");
     }
 }
@@ -397,5 +452,67 @@ mod help_tests {
                 "{secret} shows its value in --help"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod serving_tests {
+    use std::{
+        sync::Arc,
+        time::Duration,
+    };
+
+    use axum::{
+        routing::get,
+        Router,
+    };
+    use tokio::{
+        io::AsyncWriteExt,
+        net::{
+            TcpListener,
+            TcpStream,
+        },
+        sync::Notify,
+    };
+
+    use super::Serving;
+
+    /// A request that is never answered is dropped once its time is up, so
+    /// the process can exit.
+    #[tokio::test]
+    async fn a_request_that_is_never_answered_is_dropped_in_time() {
+        let entered = Arc::new(Notify::new());
+        let app = Router::new().route(
+            "/never",
+            get({
+                let entered = entered.clone();
+                move || async move {
+                    entered.notify_one();
+                    std::future::pending::<()>().await
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+        let addr = listener.local_addr().expect("the port");
+        let mut serving = Serving::start(listener, app);
+        let mut client = TcpStream::connect(addr).await.expect("a connection");
+        client
+            .write_all(b"GET /never HTTP/1.1\r\nHost: test\r\n\r\n")
+            .await
+            .expect("the request");
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the request reached its handler");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            serving.stop(Duration::from_millis(50)),
+        )
+        .await
+        .expect("stop returns");
+        let ended = tokio::time::timeout(Duration::from_secs(1), serving.task)
+            .await
+            .expect("the server ended");
+        assert!(ended.unwrap_err().is_cancelled());
     }
 }
