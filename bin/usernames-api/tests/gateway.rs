@@ -640,8 +640,19 @@ async fn an_index_that_cannot_report_its_position_refuses() {
 /// signing a null over the emptied tables.
 #[tokio::test]
 async fn a_replay_while_the_gateway_reads_is_refused() {
-    let (router, store, pool, guard) = gateway_or_skip!(32);
+    let Some((mut config, store, pool, guard)) = gateway_parts(&[CHAIN], 32).await else {
+        return;
+    };
     bind(&store, "alice", Address::from([0xbe; 20])).await;
+    // The gateway reads on sessions of its own name, so the wait below is
+    // its wait and no other session's.
+    const GATEWAY: &str = "gateway under test";
+    let gateway_pool =
+        PgPool::connect_with((*pool.connect_options()).clone().application_name(GATEWAY))
+            .await
+            .expect("the gateway's pool");
+    config.store = db::Store::new(gateway_pool);
+    let router = usernames_api::ens::router(GatewayState::new(config));
     // The replay holds the handles, and commits once the gateway waits on
     // them.
     let mut replay = pool.begin().await.expect("a transaction");
@@ -659,6 +670,7 @@ async fn a_replay_while_the_gateway_reads_is_refused() {
     });
     let deadline = Instant::now() + Duration::from_secs(5);
     while !sqlx::query_scalar::<_, bool>(include_str!("sql/waiting_on_a_lock.sql"))
+        .bind(GATEWAY)
         .fetch_one(&pool)
         .await
         .expect("the waits")
@@ -901,6 +913,29 @@ async fn two_indexed_chains_on_one_coin_type_are_refused_unsigned() {
         let row = row_of(&status, id);
         assert!(row.ambiguous && row.stale, "{status:?}");
     }
+    drop(guard);
+}
+
+/// An indexer declares its chain's names before its first window commits,
+/// so a labelled query to a chain without a cursor refuses rather than
+/// signing a null for a label not declared yet.
+#[tokio::test]
+async fn a_label_on_a_chain_without_a_cursor_refuses() {
+    let Some((router, store, _pool, guard)) = gateway_over(&[EDEN], 32).await else {
+        return;
+    };
+    bind(&store, "alice", Address::from([0xed; 20])).await;
+    store.forget_progress().await;
+    let call = resolve_call(
+        &wire_name(&["alice", "x", "eden"]),
+        &addr_call(&["alice", "x", "eden"], 0x8000_0000u64 | EDEN as u64),
+    );
+    let (status, body) = ask(&router, RESOLVER, &call).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        body.refused().contains("cannot report its position"),
+        "{body}"
+    );
     drop(guard);
 }
 

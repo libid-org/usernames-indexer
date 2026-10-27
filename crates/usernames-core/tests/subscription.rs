@@ -200,9 +200,10 @@ impl Chain {
     async fn position(&self) -> IndexPosition {
         self.writer
             .store()
-            .index_position()
+            .state()
             .await
-            .expect("position")
+            .expect("the chain's row")
+            .position()
     }
 
     /// Wait until the index stands at `block` or past it: the cursor

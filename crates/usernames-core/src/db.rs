@@ -156,8 +156,8 @@ pub struct ChainStatusRow {
     pub names: Vec<String>,
 }
 
-/// The index's standing, as [`ChainStore::index_position`] reads it, every
-/// moment by the database's clock.
+/// The index's standing, as [`ChainState::position`] reads it, every moment
+/// by the database's clock.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IndexPosition {
     /// The block the indexer last set out to reach.
@@ -622,14 +622,6 @@ impl ChainStore {
             .execute(&self.pool)
             .await
             .expect("the chain's cursor is dropped");
-    }
-
-    /// Where the index stands, in one read: the target, the cursor, when the
-    /// indexer last reported and how long that report is still good — the
-    /// last by the database's clock, the same one that stamped it. One
-    /// statement, so the four are a snapshot.
-    pub async fn index_position(&self) -> Result<IndexPosition, sqlx::Error> {
-        Ok(self.state().await?.position())
     }
 
     /// The last fully-processed block, if any window ever committed.

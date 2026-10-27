@@ -79,6 +79,7 @@ use serde::{
 };
 use usernames_core::{
     db::{
+        ChainStatusRow,
         ChainStore,
         EnsAnswer,
         IndexPosition,
@@ -218,16 +219,6 @@ impl Config {
             return Ok(null);
         };
 
-        // A chain label narrows and never widens: a label naming another
-        // chain, or no chain any indexer declared, is simply not this chain's
-        // name.
-        if let Some(label) = &query.chain_label {
-            let named = self.store.chain_named(label).await?;
-            if named != Some(indexed.chain_id()) {
-                return Ok(null);
-            }
-        }
-
         let handle_node = match query.subject {
             Subject::Handle { platform, handle } => {
                 // The chain's node for the handle: what `resolveHandle`
@@ -245,6 +236,17 @@ impl Config {
         let read = indexed.answer(handle_node).await?;
         if let Some(why) = Lag::of(read.position).staleness(self.max_lag_blocks) {
             return Ok(Answer::TooStale(why));
+        }
+
+        // A chain label narrows and never widens: a label naming another
+        // chain, or no chain any indexer declared, is simply not this chain's
+        // name. Past the freshness check, so an indexer that has not yet
+        // declared its names refuses instead.
+        if let Some(label) = &query.chain_label {
+            let named = self.store.chain_named(label).await?;
+            if named != Some(indexed.chain_id()) {
+                return Ok(null);
+            }
         }
 
         Ok(Answer::Addr {
@@ -284,7 +286,7 @@ impl Config {
                 tracing::warn!(
                     chains = ?ids,
                     %coin_type,
-                    "two indexed chains share one coin type"
+                    "two chains in the store share one coin type"
                 );
                 ChainMatch::Ambiguous
             }
@@ -366,31 +368,39 @@ impl Config {
         Ok(())
     }
 
-    /// One row per chain the store holds, as supervision should see it.
+    /// One row per chain the store holds, as supervision should see it, read
+    /// in one statement.
     async fn status(&self) -> Result<GatewayStatus, GatewayError> {
-        let indexed = self.chains().await?;
-        let ids: Vec<u64> = indexed.iter().map(|(id, _)| *id).collect();
-        let mut chains = Vec::with_capacity(indexed.len());
-        for (chain_id, chain) in indexed {
-            let position = chain.position().await;
-            let names = chain.names().await?;
-            let lag = Lag::of(position);
-            // What the gate sees: a chain sharing its coin type with another
-            // in the store is refused for that coin type however fresh either
-            // is.
-            let ambiguous = ids
-                .iter()
-                .any(|other| CoinType::shared_by(chain_id, *other));
-            chains.push(ChainStatus {
-                chain_id,
-                names,
-                lag_blocks: lag.blocks(),
-                indexer_reported_at: position.and_then(|p| p.reported_at),
-                report_valid_for: position.and_then(|p| p.valid_for_seconds()),
-                ambiguous,
-                stale: ambiguous || lag.staleness(self.max_lag_blocks).is_some(),
-            });
-        }
+        let rows: Vec<(u64, ChainStatusRow)> = self
+            .store
+            .chain_statuses()
+            .await?
+            .into_iter()
+            .filter_map(|row| Some((u64::try_from(row.state.chain_id).ok()?, row)))
+            .collect();
+        let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
+        let chains = rows
+            .into_iter()
+            .map(|(chain_id, row)| {
+                let position = row.state.position();
+                let lag = Lag::of(Some(position));
+                // What the gate sees: a chain sharing its coin type with
+                // another in the store is refused for that coin type however
+                // fresh either is.
+                let ambiguous = ids
+                    .iter()
+                    .any(|other| CoinType::shared_by(chain_id, *other));
+                ChainStatus {
+                    chain_id,
+                    names: row.names,
+                    lag_blocks: lag.blocks(),
+                    indexer_reported_at: position.reported_at,
+                    report_valid_for: position.valid_for_seconds(),
+                    ambiguous,
+                    stale: ambiguous || lag.staleness(self.max_lag_blocks).is_some(),
+                }
+            })
+            .collect();
         Ok(GatewayStatus { chains })
     }
 }
@@ -415,20 +425,10 @@ impl IndexedChain {
         self.0.chain_id()
     }
 
-    /// Where this index stands, or nothing if the store cannot say.
-    async fn position(&self) -> Option<IndexPosition> {
-        self.0.index_position().await.ok()
-    }
-
     /// Where this index stands and who holds `handle_node` there, read
     /// together.
     async fn answer(&self, handle_node: B256) -> Result<EnsAnswer, sqlx::Error> {
         self.0.ens_answer(handle_node).await
-    }
-
-    /// The names the chain goes by, as its indexer declared them.
-    async fn names(&self) -> Result<Vec<String>, sqlx::Error> {
-        self.0.chain_names().await
     }
 }
 
@@ -456,10 +456,8 @@ enum Lag {
 impl Lag {
     /// The lag an index position amounts to. Missing pieces are `Unknown`,
     /// and unknown is refused: folding it into "no lag" is how a gateway ends
-    /// up signing authoritative nulls off a wiped database — a fresh
-    /// deployment, a replay that reset the chain's row, or a chain still in
-    /// its first window all produce it, and so does a status read the store
-    /// failed.
+    /// up signing authoritative nulls off a wiped database — a chain still
+    /// in its first window, or one a replay reset, produces it.
     fn of(position: Option<IndexPosition>) -> Self {
         match position {
             Some(IndexPosition {
@@ -573,7 +571,7 @@ impl Answer {
                 "this gateway serves no chain for coin type {coin_type}"
             ))),
             Self::Ambiguous(coin_type) => Err(GatewayError::unavailable(format!(
-                "two indexed chains share coin type {coin_type}; not answering"
+                "two chains in the store share coin type {coin_type}; not answering"
             ))),
             Self::TooStale(why) => {
                 tracing::warn!(?why, "refusing to answer from a stale index");
@@ -632,7 +630,7 @@ pub struct ChainStatus {
     /// Unix seconds at which the indexer last reported.
     pub indexer_reported_at: Option<u64>,
     /// Seconds until the indexer's last report expires, negative once it has;
-    /// absent before its first report, or when the store cannot say.
+    /// absent before its first report.
     pub report_valid_for: Option<i64>,
     /// Whether another chain in the store shares this chain's coin type, in
     /// which case queries for that coin type are refused however fresh either

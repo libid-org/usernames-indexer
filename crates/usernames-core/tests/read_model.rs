@@ -1383,7 +1383,7 @@ async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
     // The report expires on the database's clock, a second from now.
     let deadline = Instant::now() + Duration::from_secs(10);
     let position = loop {
-        let position = store.index_position().await.expect("position");
+        let position = store.state().await.expect("the chain's row").position();
         if position.valid_for.is_some_and(|d| d < TimeDelta::zero()) {
             break position;
         }
@@ -1393,7 +1393,7 @@ async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
     assert_eq!(position.target, Some(5));
 
     writer.touch_chain_target(Duration::from_secs(120)).await;
-    let position = store.index_position().await.expect("position");
+    let position = store.state().await.expect("the chain's row").position();
     assert_eq!(
         position.target,
         Some(5),
