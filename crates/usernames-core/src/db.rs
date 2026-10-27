@@ -234,11 +234,11 @@ pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
     /// The database refused the connection.
-    #[error("connecting to the database: {0}")]
+    #[error("connecting to the database")]
     Connect(#[from] sqlx::Error),
     /// The schema could not be brought current, or was migrated by another
     /// release.
-    #[error("migrating the schema: {0}")]
+    #[error("migrating the schema")]
     Migrate(#[from] MigrateError),
 }
 
@@ -267,7 +267,7 @@ pub async fn connect(database_url: &str) -> Result<PgPool, sqlx::Error> {
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
     /// The database refused or the connection failed.
-    #[error("database: {0}")]
+    #[error(transparent)]
     Db(#[from] sqlx::Error),
     /// A refund released less than the index had booked for its sender,
     /// which the contract never does, or the booked amount is no `uint256`:

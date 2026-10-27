@@ -251,6 +251,40 @@ mod tests {
 
     type Pushes = broadcast::Sender<Box<RawValue>>;
 
+    /// An endpoint that takes the connection and never answers is left once
+    /// the patience runs out, over either source.
+    #[tokio::test]
+    async fn a_connection_left_unanswered_fails_at_the_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a local port");
+        let rpc: Url = format!("ws://{}", listener.local_addr().expect("the address"))
+            .parse()
+            .expect("a URL");
+        let holding = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        for source in [LogSource::Poll, LogSource::Subscribe] {
+            let connected = tokio::time::timeout(
+                Duration::from_secs(10),
+                source.connect(&rpc, Duration::from_millis(200)),
+            )
+            .await
+            .expect("connecting gave up at its deadline");
+            let Err(error) = connected else {
+                panic!("{source}: connected to an endpoint that never answered");
+            };
+            assert!(
+                error.to_string().contains("no connection within"),
+                "{source}: {error}"
+            );
+        }
+        holding.abort();
+    }
+
     /// A head stream fed by hand: what the test sends is what it pushes.
     fn heads(capacity: usize) -> (Pushes, Feed) {
         let (pushes, rx) = broadcast::channel(capacity);

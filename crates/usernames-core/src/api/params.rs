@@ -1,4 +1,5 @@
-//! What a request names, from its path and query string.
+//! What a request names, from its path and query string, and the page it
+//! is answered with.
 
 use std::{
     fmt::Display,
