@@ -20,7 +20,10 @@ use alloy::primitives::{
 };
 use chrono::TimeDelta;
 use sqlx::{
-    migrate::Migrator,
+    migrate::{
+        MigrateError,
+        Migrator,
+    },
     Connection,
     PgPool,
     Postgres,
@@ -227,8 +230,20 @@ impl Store {
 /// the layout moves.
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
+/// Why the store could not be opened.
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectError {
+    /// The database refused the connection.
+    #[error("connecting to the database: {0}")]
+    Connect(#[from] sqlx::Error),
+    /// The schema could not be brought current, or was migrated by another
+    /// release.
+    #[error("migrating the schema: {0}")]
+    Migrate(#[from] MigrateError),
+}
+
 /// Connect and bring the schema current.
-pub async fn connect_and_migrate(database_url: &str) -> anyhow::Result<PgPool> {
+pub async fn connect_and_migrate(database_url: &str) -> Result<PgPool, ConnectError> {
     let pool = PgPool::connect(database_url).await?;
     MIGRATOR.run(&pool).await?;
     Ok(pool)
@@ -241,8 +256,8 @@ pub async fn connect_and_migrate(database_url: &str) -> anyhow::Result<PgPool> {
 /// database is a deadlock waiting to be reported as a startup flake. A reader
 /// that starts before the schema exists fails its first query and gets
 /// restarted, which is the right outcome and a visible one.
-pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
-    Ok(PgPool::connect(database_url).await?)
+pub async fn connect(database_url: &str) -> Result<PgPool, sqlx::Error> {
+    PgPool::connect(database_url).await
 }
 
 /// Why applying an event failed. Distinct from [`sqlx::Error`] because not
