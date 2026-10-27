@@ -253,8 +253,9 @@ enum Ended {
     Quiet {
         /// How long the session heard no head.
         silent: Duration,
-        /// Blocks the chain grew past the last head the session saw: none on
-        /// an idle chain, some when the endpoint stopped pushing.
+        /// Blocks the endpoint's head grew past the last head the session
+        /// saw: some when the endpoint stopped pushing, none on an idle chain
+        /// or when the endpoint's node stopped following the chain.
         grown: u64,
     },
 }
@@ -305,7 +306,9 @@ impl<'a> Session<'a> {
             match self.feed.wait(config.poll_interval, cancel).await? {
                 Wake::Cancelled => return Ok(Ended::Cancelled),
                 Wake::Tick => match self.feed {
-                    Feed::Poll => seen = self.catch_up(cancel).await?,
+                    Feed::Poll => {
+                        self.catch_up(cancel).await?;
+                    }
                     Feed::Subscribe(_) if heard.elapsed() >= quiet => {
                         let silent = heard.elapsed();
                         let grown = self.head().await?.saturating_sub(seen);

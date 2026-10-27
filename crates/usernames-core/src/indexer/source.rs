@@ -177,9 +177,11 @@ impl Feed {
         }
     }
 
-    /// Wait for the next head, or `interval`, or cancellation. A stream that
-    /// closed, overflowed or pushed something unreadable is an error: heads
-    /// may be lost, and only the next session's catch-up covers them.
+    /// Wait for the next head, or `interval`, or cancellation, in that
+    /// order when more than one is ready: a head already pushed is never
+    /// taken for a quiet tick. A stream that closed, overflowed or pushed
+    /// something unreadable is an error: heads may be lost, and only the next
+    /// session's catch-up covers them.
     pub(crate) async fn wait(
         &mut self,
         interval: Duration,
@@ -191,6 +193,7 @@ impl Feed {
                 _ = tokio::time::sleep(interval) => Ok(Wake::Tick),
             },
             Self::Subscribe(heads) => tokio::select! {
+                biased;
                 _ = cancel.cancelled() => Ok(Wake::Cancelled),
                 head = heads.recv_result() => {
                     let head = head
@@ -252,6 +255,25 @@ mod tests {
         assert!(
             matches!(wake(&mut feed).await.unwrap(), Wake::Head(head) if head.number == 12)
         );
+    }
+
+    /// A head and the end of the interval ready at once: the head wins, so
+    /// a pushed head is never taken for a quiet tick.
+    #[tokio::test(start_paused = true)]
+    async fn a_pushed_head_wakes_before_an_interval_that_ended_with_it() {
+        let (pushes, mut feed) = heads(8);
+        let cancel = CancellationToken::new();
+        for height in 0..32 {
+            let mut wait = std::pin::pin!(feed.wait(Duration::from_secs(1), &cancel));
+            assert!(futures_util::poll!(&mut wait).is_pending());
+            pushes.send(head(height)).unwrap();
+            tokio::time::advance(Duration::from_secs(2)).await;
+            let woke = wait.await.unwrap();
+            assert!(
+                matches!(woke, Wake::Head(ref head) if head.number == height),
+                "{woke:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -39,5 +39,6 @@ libid-profiles.workspace = true
 alloy = { workspace = true, features = ["node-bindings", "signer-local"] }
 futures-util = { version = "0.3", features = ["sink"] }
 http-body-util = "0.1"
+tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = "0.28"
 tower = { version = "0.5", features = ["util"] }
