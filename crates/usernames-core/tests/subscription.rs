@@ -6,9 +6,10 @@
 //! Skips without `DATABASE_URL` or `anvil`, unless `CI` is set: there a
 //! missing one fails. Everything past those checks panics on failure.
 
-use std::time::Duration;
-
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    time::Duration,
+};
 
 use alloy::{
     primitives::{

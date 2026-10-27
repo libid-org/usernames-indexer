@@ -384,7 +384,7 @@ impl<'a> Session<'a> {
             .contracts
             .logs(&self.provider, from, to)
             .await
-            .with_context(|| format!("eth_getLogs {from}..{to}"))?;
+            .with_context(|| format!("the logs of blocks {from}..{to}"))?;
         // Every log has to sit in the window the cursor will pass.
         anyhow::ensure!(
             logs.iter().all(|log| log
