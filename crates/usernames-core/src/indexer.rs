@@ -214,8 +214,15 @@ impl Indexer {
             let session = async { Session::open(&self).await?.follow(&cancel).await };
             match session.await {
                 Ok(Ended::Cancelled) => {}
-                Ok(Ended::Quiet(quiet)) => {
-                    tracing::info!(?quiet, "no head pushed; reconnecting");
+                Ok(Ended::Quiet { silent, grown: 0 }) => {
+                    tracing::info!(?silent, "no head pushed; reconnecting");
+                }
+                Ok(Ended::Quiet { silent, grown }) => {
+                    tracing::warn!(
+                        ?silent,
+                        grown,
+                        "the chain grew while the endpoint pushed no head; reconnecting"
+                    );
                 }
                 Err(e) => {
                     if let Some(WindowError::Superseded(superseded)) = e.downcast_ref() {
@@ -241,14 +248,21 @@ impl Indexer {
 enum Ended {
     /// The indexer was cancelled.
     Cancelled,
-    /// No head was pushed for this long, half the report's life: the next
-    /// session reconnects and catches up.
-    Quiet(Duration),
+    /// No head was pushed for half the report's life: the next session
+    /// reconnects and catches up.
+    Quiet {
+        /// How long the session heard no head.
+        silent: Duration,
+        /// Blocks the chain grew past the last head the session saw: none on
+        /// an idle chain, some when the endpoint stopped pushing.
+        grown: u64,
+    },
 }
 
 /// One connection to the RPC, from the catch-up that opens it to the
-/// cancellation or first error that ends it. Whatever a dropped socket or an
-/// overflowing stream skipped, the next session's catch-up fetches.
+/// cancellation, quiet stretch or first error that ends it. Whatever a
+/// dropped socket or an overflowing stream skipped, the next session's
+/// catch-up fetches.
 struct Session<'a> {
     indexer: &'a Indexer,
     provider: RootProvider,
@@ -284,21 +298,24 @@ impl<'a> Session<'a> {
         let config = &self.indexer.config;
         let watched = config.watched();
         let quiet = config.stale_after / 2;
-        self.catch_up(cancel).await?;
+        let mut seen = self.catch_up(cancel).await?;
         let mut heads = Heads::default();
         let mut heard = Instant::now();
         loop {
             match self.feed.wait(config.poll_interval, cancel).await? {
                 Wake::Cancelled => return Ok(Ended::Cancelled),
                 Wake::Tick => match self.feed {
-                    Feed::Poll => self.catch_up(cancel).await?,
+                    Feed::Poll => seen = self.catch_up(cancel).await?,
                     Feed::Subscribe(_) if heard.elapsed() >= quiet => {
-                        return Ok(Ended::Quiet(quiet));
+                        let silent = heard.elapsed();
+                        let grown = self.head().await?.saturating_sub(seen);
+                        return Ok(Ended::Quiet { silent, grown });
                     }
                     Feed::Subscribe(_) => {}
                 },
                 Wake::Head(head) => {
                     heard = Instant::now();
+                    seen = head.number;
                     heads.push(&head, &watched);
                     self.advance(head.number, &mut heads).await?;
                 }
@@ -307,8 +324,8 @@ impl<'a> Session<'a> {
     }
 
     /// Read the head and commit every confirmed block past the cursor in
-    /// `eth_getLogs` windows.
-    async fn catch_up(&mut self, cancel: &CancellationToken) -> anyhow::Result<()> {
+    /// `eth_getLogs` windows; the head it read.
+    async fn catch_up(&mut self, cancel: &CancellationToken) -> anyhow::Result<u64> {
         let indexer = self.indexer;
         let config = &indexer.config;
         let (head, mut from) = tokio::try_join!(self.head(), self.next_block())?;
@@ -338,7 +355,7 @@ impl<'a> Session<'a> {
         if total > 0 {
             tracing::info!(events = total, through_block = target, "indexed");
         }
-        Ok(())
+        Ok(head)
     }
 
     /// Commit through `head`'s confirmation depth: fetched when the heads
