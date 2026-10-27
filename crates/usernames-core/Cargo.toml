@@ -11,15 +11,15 @@ publish = false
 [features]
 # What the suites outside this crate use to stand up states the indexer
 # would reach only over time, such as a report that has expired.
-test-seams = []
+test-helpers = []
 
 [dependencies]
 alloy = { workspace = true, features = ["json-rpc", "provider-ws"] }
 alloy-primitives.workspace = true
 anyhow.workspace = true
 axum.workspace = true
-chrono = "0.4"
-futures-util = "0.3"
+chrono.workspace = true
+futures-util.workspace = true
 libid-contracts.workspace = true
 libid-identity.workspace = true
 serde.workspace = true
@@ -27,18 +27,18 @@ serde_with.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-tower = "0.5"
-thiserror = "2"
+tower.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
-usernames-core = { workspace = true, features = ["test-seams"] }
+usernames-core = { workspace = true, features = ["test-helpers"] }
 usernames-fixtures.workspace = true
 libid-profiles.workspace = true
-futures-util = { version = "0.3", features = ["sink"] }
-http-body-util = "0.1"
+futures-util = { workspace = true, features = ["sink"] }
+http-body-util.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
-tokio-tungstenite = "0.28"
-tower = { version = "0.5", features = ["util"] }
+tokio-tungstenite.workspace = true
+tower = { workspace = true, features = ["util"] }

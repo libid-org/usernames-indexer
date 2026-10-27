@@ -15,9 +15,9 @@ pub const SET_CHAIN_HEAD: &str = include_str!("../../sql/set_chain_head.sql");
 pub const SET_DEPLOY_BLOCK: &str = include_str!("../../sql/set_deploy_block.sql");
 pub const SET_PROOF_VERIFIER: &str = include_str!("../../sql/set_proof_verifier.sql");
 pub const SET_WINDOW_ERROR: &str = include_str!("../../sql/set_window_error.sql");
-#[cfg(feature = "test-seams")]
+#[cfg(feature = "test-helpers")]
 pub const SET_VALID_UNTIL: &str = include_str!("../../sql/set_valid_until.sql");
-#[cfg(feature = "test-seams")]
+#[cfg(feature = "test-helpers")]
 pub const FORGET_CURSOR: &str = include_str!("../../sql/forget_cursor.sql");
 pub const FORGET_CHAIN: &str = include_str!("../../sql/forget_chain.sql");
 /// Every row an indexer wrote for one chain into the read model: what a

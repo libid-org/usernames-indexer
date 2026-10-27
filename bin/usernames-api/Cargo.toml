@@ -11,11 +11,11 @@ publish = false
 [dependencies]
 usernames-core.workspace = true
 
-chrono = "0.4"
 alloy.workspace = true
 anyhow.workspace = true
 axum.workspace = true
-hex = "0.4"
+chrono.workspace = true
+hex.workspace = true
 libid-signer.workspace = true
 serde.workspace = true
 clap.workspace = true
@@ -29,11 +29,11 @@ sqlx.workspace = true
 tower-http.workspace = true
 
 [dev-dependencies]
-usernames-core = { workspace = true, features = ["test-seams"] }
+usernames-core = { workspace = true, features = ["test-helpers"] }
 usernames-fixtures.workspace = true
 libid-contracts.workspace = true
 alloy = { workspace = true, features = ["signer-local", "node-bindings"] }
-http-body-util = "0.1"
+http-body-util.workspace = true
 serde_json.workspace = true
-tower = { version = "0.5", features = ["util"] }
+tower = { workspace = true, features = ["util"] }
 url.workspace = true

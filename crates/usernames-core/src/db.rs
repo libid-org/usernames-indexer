@@ -178,7 +178,7 @@ impl IndexPosition {
 
 /// The channel every change to a chain's row is announced on, with the
 /// chain's id as the payload, once the change commits.
-#[cfg(feature = "test-seams")]
+#[cfg(feature = "test-helpers")]
 pub const CHAIN_CHANNEL: &str = "names_chains";
 
 /// The longest a report may be trusted: a year. The indexer refuses a longer
@@ -595,7 +595,7 @@ impl ChainStore {
     /// stands up an indexer that stopped reporting. Production writes
     /// validity through [`ChainWriter::set_chain_target`] and
     /// [`ChainWriter::touch_chain_target`], relative to the database's clock.
-    #[cfg(feature = "test-seams")]
+    #[cfg(feature = "test-helpers")]
     pub async fn set_chain_target_valid_until(&self, secs: u64) {
         sqlx::query(sql::SET_VALID_UNTIL)
             .bind(self.chain_id)
@@ -607,7 +607,7 @@ impl ChainStore {
 
     /// Delete every row this chain has: the read model, the chain's row and
     /// its names. How a suite starts its chain from nothing.
-    #[cfg(feature = "test-seams")]
+    #[cfg(feature = "test-helpers")]
     pub async fn forget(&self) {
         let mut tx = self.pool.begin().await.expect("a transaction");
         for statement in [sql::CLEAR_CHAIN, sql::FORGET_CHAIN, sql::CLEAR_CHAIN_NAMES] {
@@ -622,7 +622,7 @@ impl ChainStore {
 
     /// Drop the chain's cursor and keep everything else: an index that
     /// cannot say how far it got.
-    #[cfg(feature = "test-seams")]
+    #[cfg(feature = "test-helpers")]
     pub async fn forget_progress(&self) {
         sqlx::query(sql::FORGET_CURSOR)
             .bind(self.chain_id)

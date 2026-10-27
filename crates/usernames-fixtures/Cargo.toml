@@ -11,13 +11,13 @@ publish = false
 [dependencies]
 alloy = { workspace = true, features = ["node-bindings", "signer-local"] }
 axum.workspace = true
-http-body-util = "0.1"
+http-body-util.workspace = true
 libid-contracts = { workspace = true, features = ["testing"] }
 libid-identity.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 tokio = { workspace = true, features = ["time"] }
-tower = { version = "0.5", features = ["util"] }
+tower = { workspace = true, features = ["util"] }
 url.workspace = true
-usernames-core = { workspace = true, features = ["test-seams"] }
+usernames-core = { workspace = true, features = ["test-helpers"] }
