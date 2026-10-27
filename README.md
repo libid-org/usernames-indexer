@@ -218,11 +218,6 @@ report says only that the loop is alive and can see the head. Progress is
 still what `ENS_MAX_LAG_BLOCKS` measures, and `lastWindowError` is the alert
 for a loop that is up but failing its windows.
 
-**Upgrading across this change:** the report is the indexer's write, so deploy
-the indexer image first, or together. A gateway on this version refuses, with
-a 503, a chain whose indexer has never written one — that chain alone, and
-only until its next cycle lands.
-
 **One gateway, every chain in the store — and a refusal for the rest.** The
 gateway serves whatever chains indexers have written into the database, read
 per request: nothing lists them, and an indexer for a new chain is discovered
@@ -296,11 +291,6 @@ where `_` maps to `-` because X forbids `-`, a Google address may hold both, so
 the map would not be reversible, and an irreversible map on a payment path is
 worse than no name. Such accounts are reachable by address, not by name.
 
-The design's id-derived fallback (`<idNode as 64 hex>._id.handles.link`) is not
-implemented: 64 characters is one past the DNS label ceiling of RFC 1035, so
-no standard client can encode it — ethers' `dnsEncode` refuses above 63. It
-could not have covered these accounts, or any others.
-
 ## Read model
 
 Schema `names`, all tables keyed by `chain_id` (one process follows one
@@ -370,27 +360,17 @@ No image carries both: an entrypoint would have to default to one of them,
 and a deployment that pulled it expecting the other would run a container
 that looks healthy while doing half the job.
 
-**Upgrading from the single-image build:** the `usernames-indexer` image keeps
-its name and keeps indexing, but it no longer serves the API. Deploy
-`usernames-api` alongside it, pointed at the same database; it needs nothing
-else. Nothing in the database changes and no re-index is needed.
-
-**Upgrading to 0.6:** this release indexes the node-keyed `IdentityRegistry`
-and `HandleEscrow` of the libid-contracts release `Cargo.toml` pins, and its
-schema is a single `001_schema.sql`. Start the indexer on a fresh database,
-with `IDENTITY_NAMES_ADDRESS` and `HANDLE_ESCROW_ADDRESS` set to those
-deployments; every chain indexes from its registry's deployment block, or
-from `START_BLOCK`. It refuses a registry whose `nodeKeyed()` does not answer
-true, and a database an earlier release or release candidate migrated. To
-reuse such a database, stop every process on it and run
-`DROP SCHEMA names CASCADE; DROP TABLE _sqlx_migrations;` first; that keeps
-`pg_trgm`, which a least-privilege role cannot create. Each chain answers
-`not_synced` until its first window commits; gate on `/v1/status`'s lag, not
-on `not_synced`.
+**Database.** The indexer indexes the node-keyed `IdentityRegistry` and
+`HandleEscrow` of the libid-contracts release `Cargo.toml` pins, from the
+registry's deployment block or from `START_BLOCK`. It refuses a registry
+whose `nodeKeyed()` does not answer true, and a database whose applied
+migrations differ from its own. To reuse such a database, stop every process
+on it and run `DROP SCHEMA names CASCADE; DROP TABLE _sqlx_migrations;`
+first; that keeps `pg_trgm`, which a least-privilege role cannot create.
 
 Probes belong to the API: `GET /health` for liveness; for readiness gate on
 the status code of `GET /v1/status`, which is 200 whenever the database
-answers — the resolve endpoints answer 503 until the first window lands. It sends permissive CORS for GET, so a browser UI (handle.link) can
+answers — the resolve endpoints answer 503 until the first window lands. It sends permissive CORS for GET, so a browser UI (handles.link) can
 call it directly from any origin. The indexer exposes no port; supervise it on
 process liveness, and alert on `lagBlocks` and `reportValidFor` from the API's
 status — the first cannot move once the loop stops, the second counts down
@@ -417,7 +397,8 @@ compose Postgres — set `RPC_URL` and `IDENTITY_NAMES_ADDRESS` in
   socket loses nothing, because the next session backfills.
 - **Unknown platforms** index fine (events are self-describing), but their
   disclosed text cannot be checked, so it is not stored, and they cannot be
-  asked by text, until `handles.json` learns them.
+  asked by text, until `KnownPlatform` (`crates/usernames-core/src/nodes.rs`)
+  lists them.
 - **Sync state is a caller's concern**: until the first window commits, the
   resolution endpoints answer 503 rather than an authoritative-looking 404.
   After that, a replaying or lagging indexer serves what it has; watch

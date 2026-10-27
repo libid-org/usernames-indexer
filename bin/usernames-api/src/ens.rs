@@ -159,13 +159,10 @@ impl Config {
         // than to an error, so a name that resolves fine for addresses does
         // not look broken.
         //
-        // Settled before any null is built, because a null has the shape of
-        // the record it answers: `addr(bytes32)` returns an `address` and its
-        // null is 32 zero bytes, while ENSIP-11's `addr(bytes32,uint256)`
-        // returns `bytes` and its null is the empty string. A null built
-        // before the record was read hard-coded the second shape, and a wallet
-        // decoding the first read the `bytes` offset word as the address
-        // 0x…0020 — signed.
+        // Read before any null is built: a null has the shape of the record
+        // it answers. `addr(bytes32)` returns an `address`, whose null is 32
+        // zero bytes; ENSIP-11's `addr(bytes32,uint256)` returns `bytes`,
+        // whose null is the empty string.
         let Record::Addr {
             node,
             coin_type,
@@ -324,9 +321,6 @@ impl Config {
             .signer
             .sign_prehash(&reply.digest(self.resolver, request).0)
             .await
-            // Through `internal`, like every other failure here: the raw
-            // error went to an anonymous caller while the operator got no log
-            // line — exactly inverted.
             .map_err(GatewayError::internal)?;
         Ok(GatewayResponse {
             data: Bytes::from(reply.encode(&signature)),

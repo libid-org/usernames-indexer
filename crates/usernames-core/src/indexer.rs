@@ -200,10 +200,9 @@ impl Indexer {
                     }
                     let error = self.redacted(format!("{e:#}"));
                     tracing::warn!(%error, "indexing stopped; resuming from the cursor");
-                    // Surfaced in /v1/status: a deterministic failure (an
-                    // undecodable log, say) stalls the cursor by design —
-                    // integrity over progress — and a stall must be visible
-                    // somewhere a monitor actually looks.
+                    // Surfaced in /v1/status: a deterministic failure, an
+                    // undecodable log say, stalls the cursor rather than skip
+                    // the log, and a monitor has to see the stall.
                     self.writer.set_window_error(Some(&error)).await;
                     cancel
                         .run_until_cancelled(tokio::time::sleep(

@@ -204,15 +204,9 @@ impl Service {
         if let Some(gateway) = self.gateway {
             app = app.nest(ens::ROUTE_PREFIX, ens::GatewayState::new(gateway).router());
         }
-        // ONE layer, over the whole router, after every route is on it. A `layer`
-        // wraps only what is already mounted, so applying it inside `AppState::router`
-        // both missed the gateway route — a browser ERC-3668 client would get no
-        // `Access-Control-Allow-Origin` while `/v1/*` worked from the same page —
-        // and, once a second layer was added to cover it, ran the CORS middleware
-        // twice on every `/v1` response.
-        //
-        // A read-only public resolver: any origin may GET. This is what lets a
-        // browser UI (handle.link) call the API cross-origin at all.
+        // One layer over the whole router, after every route is on it: a
+        // `layer` wraps only what is already mounted. Any origin may GET, so a
+        // browser UI or ERC-3668 client calls the API cross-origin.
         app.layer(
             CorsLayer::new()
                 .allow_origin(Any)
