@@ -1592,13 +1592,9 @@ async fn a_lease_whose_session_goes_silent_reports_itself_lost() {
     chains.done();
 }
 
-/// The lease must give the lock back, not merely stop being referenced.
-///
-/// It used to hold `pg_try_advisory_lock` on a POOLED connection, so dropping
-/// it returned a live session — lock still held — to the idle pool, where it
-/// sat for the idle timeout. A second indexer, or the next test, then blocked
-/// on a lock nobody was using. Two sequential leases on one chain is the
-/// smallest thing that would have caught it.
+/// A released lease gives the lock back, not merely stops being referenced:
+/// a session returned to a pool with its advisory lock still held would
+/// block the next holder until the pool's idle timeout.
 #[tokio::test]
 async fn a_released_lease_frees_the_chain_for_the_next_holder() {
     let Some(chains) = Chains::open(2).await else {
@@ -1607,9 +1603,8 @@ async fn a_released_lease_frees_the_chain_for_the_next_holder() {
     let first = chains.store.acquire_writer().await.expect("first lease");
     first.release().await.expect("release");
 
-    // Bounded, because the failure mode is a block rather than an error: on
-    // the old code this waits for the pool's idle timeout, not forever, and an
-    // unbounded await would look like a hung test rather than a broken lock.
+    // Bounded, because a lock still held blocks rather than fails: an
+    // unbounded await would read as a hung test rather than a held lock.
     let second =
         tokio::time::timeout(Duration::from_secs(5), chains.store.acquire_writer())
             .await

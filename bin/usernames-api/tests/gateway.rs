@@ -113,9 +113,7 @@ impl Gateway {
         // Every chain starts SYNCED AND EMPTY, which is a different state from
         // never indexed: an empty window is committed so a cursor exists, and the
         // head is recorded. An index with neither cannot say how far behind it is,
-        // and the gateway refuses rather than signing a null — correct in
-        // production, and previously invisible here because "unknown" was read as
-        // "fresh".
+        // and the gateway refuses rather than signing a null.
         for id in chains {
             let writer = ChainStore::new(pool.clone(), *id).writer().await;
             writer
@@ -499,10 +497,9 @@ async fn a_name_this_build_cannot_read_is_null_rather_than_an_error() {
 /// The null for an unreadable name takes the shape of the record asked in.
 ///
 /// `addr(bytes32)` returns an `address`, so its null is 32 zero bytes; the
-/// ENSIP-11 form returns `bytes`, whose null is empty. A null built before the
-/// record was read came out in the second shape whatever the caller asked, and
-/// a wallet decoding the first read the `bytes` offset word as the address
-/// 0x…0020 — signed, so authoritative.
+/// ENSIP-11 form returns `bytes`, whose null is empty. A wallet that asked in
+/// the first shape and got the second would read the `bytes` offset word as
+/// the address 0x…0020, signed and so authoritative.
 #[tokio::test]
 async fn an_unreadable_name_is_null_in_the_shape_the_caller_asked_in() {
     // Mainnet, because the legacy form is coin type 60 and a gateway that does
@@ -599,7 +596,7 @@ async fn a_stale_index_refuses_rather_than_signing_a_null() {
     let router = gateway.router();
     gateway.store.bind("alice", Address::from([0xbe; 20])).await;
     // Far ahead of the cursor, as the TARGET: that is the quantity the gate
-    // compares, and the head alone no longer moves it.
+    // compares; the head alone does not move it.
     gateway
         .store
         .writer()
@@ -630,8 +627,8 @@ async fn garbage_in_the_path_is_the_callers_error() {
     gateway.done();
 }
 
-/// The fix, stated as a test: one gateway, two chains, and each coin type gets
-/// its own chain's answer rather than the first one's.
+/// One gateway, two chains: each coin type gets its own chain's answer rather
+/// than the first one's.
 #[tokio::test]
 async fn one_gateway_answers_for_every_chain_it_serves() {
     let Some(gateway) = Gateway::open(&[CHAIN, OTHER], 32).await else {
@@ -1058,13 +1055,11 @@ async fn the_eden_testnet_resolves_despite_its_chain_id() {
 /// The legacy shape decodes, and a gateway that does not serve mainnet refuses
 /// it UNSIGNED.
 ///
-/// Both halves matter. The decode had no coverage at all, and the refusal is
-/// the multi-chain invariant: through the mainnet registry coin type 60 names
-/// Ethereum mainnet, so a gateway serving only some other chain has nothing
-/// to say about it. Saying
-/// so with a 5xx keeps the client walking the resolver's `urls`; a signed null
-/// would be an authoritative "nobody holds this" and would end that walk at
-/// the first gateway asked.
+/// The refusal is the multi-chain invariant: through the mainnet registry
+/// coin type 60 names Ethereum mainnet, so a gateway serving only some other
+/// chain has nothing to say about it. Saying so with a 5xx keeps the client
+/// walking the resolver's `urls`; a signed null would be an authoritative
+/// "nobody holds this" and would end that walk at the first gateway asked.
 #[tokio::test]
 async fn the_legacy_addr_shape_is_refused_unsigned_off_mainnet() {
     let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
@@ -1175,10 +1170,10 @@ async fn the_merged_router_keeps_both_halves_intact() {
     );
 
     // And the gateway answers under its prefix — with the CORS header, on the
-    // answer and on a refusal alike. This is the regression `Service::router`
-    // exists to prevent: a layer applied inside `AppState::router` leaves the
-    // gateway route without `Access-Control-Allow-Origin`, and a browser
-    // running the batch gateway in the page never sees the answer.
+    // answer and on a refusal alike: a layer applied inside `AppState::router`
+    // would leave the gateway route without `Access-Control-Allow-Origin`, and
+    // a browser running the batch gateway in the page would never see the
+    // answer.
     let call = resolve_call(
         &wire_name(&["alice", "x"]),
         &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
