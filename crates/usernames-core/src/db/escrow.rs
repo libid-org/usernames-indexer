@@ -364,41 +364,43 @@ impl Page<SlotCursor> {
     /// What `holder` may claim: the slots of the handles it holds, walked in
     /// the order of its handles and their tokens.
     pub(crate) fn claimable_lookup(&self, prefix: &str, holder: Address) -> Statement {
-        let mut statement = QueryBuilder::new(format!(
-            "{prefix}{} AND h.owner = ",
-            sql::CLAIMABLE_PROJECTION
-        ));
+        let mut statement =
+            QueryBuilder::new(format!("{prefix}{}", sql::CLAIMABLE_HANDLES));
         statement.push_bind(holder);
-        match self.chain {
-            Some(chain) => {
-                statement.push(" AND h.chain_id = ").push_bind(chain);
-                if let Some(before) = self.before {
-                    statement
-                        .push(" AND h.handle_node <= ")
-                        .push_bind(before.handle_node)
-                        .push(" AND (e.handle_node, e.token) < (")
-                        .push_bind(before.handle_node)
-                        .push(", ")
-                        .push_bind(before.token)
-                        .push(")");
-                }
-            }
-            None => {
-                if let Some(before) = self.before {
-                    statement
-                        .push(" AND (h.chain_id, h.handle_node) <= (")
-                        .push_bind(before.chain_id)
-                        .push(", ")
-                        .push_bind(before.handle_node)
-                        .push(") AND (e.chain_id, e.handle_node, e.token) < (")
-                        .push_bind(before.chain_id)
-                        .push(", ")
-                        .push_bind(before.handle_node)
-                        .push(", ")
-                        .push_bind(before.token)
-                        .push(")");
-                }
-            }
+        if let Some(chain) = self.chain {
+            statement.push(" AND chain_id = ").push_bind(chain);
+        }
+        if let Some(before) = self.before {
+            match self.chain {
+                Some(_) => statement
+                    .push(" AND handle_node <= ")
+                    .push_bind(before.handle_node),
+                None => statement
+                    .push(" AND (chain_id, handle_node) <= (")
+                    .push_bind(before.chain_id)
+                    .push(", ")
+                    .push_bind(before.handle_node)
+                    .push(")"),
+            };
+        }
+        statement.push(")\n").push(sql::CLAIMABLE_PROJECTION);
+        if let Some(before) = self.before {
+            match self.chain {
+                Some(_) => statement
+                    .push(" AND (e.handle_node, e.token) < (")
+                    .push_bind(before.handle_node)
+                    .push(", ")
+                    .push_bind(before.token)
+                    .push(")"),
+                None => statement
+                    .push(" AND (e.chain_id, e.handle_node, e.token) < (")
+                    .push_bind(before.chain_id)
+                    .push(", ")
+                    .push_bind(before.handle_node)
+                    .push(", ")
+                    .push_bind(before.token)
+                    .push(")"),
+            };
         }
         statement
             .push(" ORDER BY e.chain_id DESC, e.handle_node DESC, e.token DESC LIMIT ")
@@ -569,19 +571,19 @@ pub(crate) mod plans {
     impl EscrowPlans for PgConnection {
         async fn escrow_plans(&mut self) -> Vec<Plan> {
             let (address, node) = (Address::repeat_byte(2), B256::repeat_byte(1));
-            // A cursor high in the token range, where a list has most of its
-            // rows still ahead of it.
-            let token = Address::repeat_byte(0xEE);
+            // A cursor high in the node and token ranges, where a list read
+            // backwards has most of its rows still ahead of it.
+            let (high, token) = (B256::repeat_byte(0xEE), Address::repeat_byte(0xEE));
             let slot = Some(SlotCursor {
                 chain_id: 1,
-                handle_node: node,
+                handle_node: high,
                 token,
             });
             let unclaimed = Some(UnclaimedCursor {
                 token,
                 held: U256::from(10u64),
                 chain_id: 1,
-                handle_node: node,
+                handle_node: high,
             });
             // The slots drive the page; a holder's handle is checked by either
             // index, at equal cost.

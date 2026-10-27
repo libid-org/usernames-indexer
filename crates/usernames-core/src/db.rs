@@ -1366,6 +1366,9 @@ mod sql {
     /// caller narrows, orders and pages.
     pub const ESCROW_SLOT_PROJECTION: &str =
         include_str!("../sql/escrow_slot_projection.sql");
+    /// A holder's handles, which the claimable slots are read from; the
+    /// caller narrows them.
+    pub const CLAIMABLE_HANDLES: &str = include_str!("../sql/claimable_handles.sql");
     /// The same shape, driven from the handles an address holds.
     pub const CLAIMABLE_PROJECTION: &str =
         include_str!("../sql/claimable_projection.sql");
@@ -1387,6 +1390,8 @@ pub(crate) mod plan_tests {
     /// Rows in the shape production holds them, on the chain every probe
     /// names; the file says how they are shaped.
     const VOLUME: &str = include_str!("../sql/plan_volume.sql");
+    /// The same tables, cleared of what earlier loads left behind.
+    const VACUUM: &str = include_str!("../sql/plan_vacuum.sql");
 
     /// One statement's plan, and the indexes it must seek: `a|b` where either
     /// seeks exactly, `None` where only the row count decides between them.
@@ -1574,6 +1579,10 @@ pub(crate) mod plan_tests {
         };
         let pool = PgPool::connect(&url).await.expect("connect");
         MIGRATOR.run(&pool).await.expect("migrations");
+        sqlx::raw_sql(VACUUM)
+            .execute(&pool)
+            .await
+            .expect("the tables vacuumed");
         let mut conn = pool.begin().await.expect("transaction");
         sqlx::query("SET LOCAL enable_seqscan = off")
             .execute(&mut *conn)
