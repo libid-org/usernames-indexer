@@ -7,11 +7,15 @@ use std::{
     sync::Arc,
 };
 
+use alloy::rpc::types::Log;
 use futures_util::{
     SinkExt,
     StreamExt,
 };
-use serde::Deserialize;
+use serde::{
+    Deserialize,
+    Serialize,
+};
 use tokio::{
     net::{
         TcpListener,
@@ -41,6 +45,17 @@ pub struct Relay {
 struct Shared {
     /// Every method the indexer called, in order, announced as it grows.
     calls: watch::Sender<Vec<String>>,
+    /// Whether `eth_getLogs` answers lose their `blockTimestamp`, as an
+    /// endpoint that does not serve the field answers.
+    timeless: watch::Sender<bool>,
+}
+
+/// A JSON-RPC answer carrying logs.
+#[derive(Deserialize, Serialize)]
+struct LogsAnswer {
+    jsonrpc: String,
+    id: u64,
+    result: Vec<Log>,
 }
 
 /// The part of a JSON-RPC message the relay reads: a request's method, or
@@ -59,6 +74,7 @@ impl Relay {
         let addr = listener.local_addr().expect("the bound address");
         let shared = Arc::new(Shared {
             calls: watch::Sender::new(Vec::new()),
+            timeless: watch::Sender::new(false),
         });
         let (open, _) = watch::channel(true);
         let (live, _) = watch::channel(0);
@@ -123,6 +139,12 @@ impl Relay {
         self.silent.send_replace(silent);
     }
 
+    /// Answer `eth_getLogs` without `blockTimestamp` from now on, or with
+    /// it again.
+    pub fn strip_block_times(&self, strip: bool) {
+        self.shared.timeless.send_replace(strip);
+    }
+
     /// Every method the indexer called through the relay, in order.
     pub fn calls(&self) -> Vec<String> {
         self.shared.calls.borrow().clone()
@@ -176,7 +198,10 @@ impl Shared {
                     }
                 }
                 message = from_server.next() => {
-                    let Some(Ok(message)) = message else { return };
+                    let Some(Ok(mut message)) = message else { return };
+                    if *self.timeless.borrow() {
+                        message = Self::timeless(message);
+                    }
                     let push = match &message {
                         Message::Text(text) => serde_json::from_str::<Call>(text.as_str())
                             .is_ok_and(|call| call.method == "eth_subscription"),
@@ -191,5 +216,23 @@ impl Shared {
                 }
             }
         }
+    }
+
+    /// `message` without the block times of the logs it answers with.
+    fn timeless(message: Message) -> Message {
+        let Message::Text(text) = &message else {
+            return message;
+        };
+        let Ok(mut answer) = serde_json::from_str::<LogsAnswer>(text.as_str()) else {
+            return message;
+        };
+        for log in &mut answer.result {
+            log.block_timestamp = None;
+        }
+        Message::Text(
+            serde_json::to_string(&answer)
+                .expect("logs serialize")
+                .into(),
+        )
     }
 }

@@ -2,9 +2,16 @@
 //! chain: their checks at startup, the registry's deployment block, and
 //! their logs window by window.
 
+use std::collections::{
+    hash_map::Entry,
+    HashMap,
+};
+
 use alloy::{
+    consensus::BlockHeader,
     contract,
     eips::BlockNumberOrTag,
+    network::BlockResponse,
     primitives::Address,
     providers::Provider,
     rpc::types::{
@@ -110,9 +117,13 @@ impl Contracts {
     }
 
     /// The watched contracts' logs in one `eth_getLogs` window, inclusive
-    /// on both ends. The caller sizes windows with its `max_block_range`; a
-    /// failure fails the window so the cursor stays put and the same blocks
-    /// are retried next cycle.
+    /// on both ends, each with its block's time. The caller sizes windows
+    /// with its `max_block_range`; a failure fails the window so the cursor
+    /// stays put and the same blocks are retried next cycle.
+    ///
+    /// `blockTimestamp` is not part of `eth_getLogs`'s standard answer, and
+    /// an endpoint that omits it is asked for the block's header instead,
+    /// once per block and by hash, so the time is the logged block's.
     pub async fn logs(
         &self,
         provider: &impl Provider,
@@ -123,7 +134,22 @@ impl Contracts {
             .address(self.watched())
             .from_block(BlockNumberOrTag::Number(from))
             .to_block(BlockNumberOrTag::Number(to));
-        provider.get_logs(&filter).await
+        let mut logs = provider.get_logs(&filter).await?;
+        let mut times = HashMap::new();
+        for log in logs.iter_mut().filter(|log| log.block_timestamp.is_none()) {
+            let Some(hash) = log.block_hash else {
+                continue;
+            };
+            let time = match times.entry(hash) {
+                Entry::Occupied(known) => Some(*known.get()),
+                Entry::Vacant(unknown) => provider
+                    .get_block_by_hash(hash)
+                    .await?
+                    .map(|block| *unknown.insert(block.header().timestamp())),
+            };
+            log.block_timestamp = time;
+        }
+        Ok(logs)
     }
 
     /// Refuse a registry whose events this build would misread: one not

@@ -427,3 +427,48 @@ async fn an_indexer_whose_chain_was_taken_stops() {
         "{stopped:?}"
     );
 }
+
+/// An endpoint whose `eth_getLogs` answers leave out `blockTimestamp` still
+/// has every event indexed, at its block's time.
+#[tokio::test]
+async fn logs_without_block_times_take_their_blocks_time() {
+    let Some(mut chain) = Chain::start(43131).await else {
+        return;
+    };
+    chain.relay.strip_block_times(true);
+    let running = chain.run(chain.config(1));
+    let holder = chain.accounts()[0];
+    let bound = chain.bind("timeless_1", holder).await;
+    chain.mine(2).await;
+    chain.wait_for_index(bound).await;
+
+    let history: HandleHistory = chain
+        .pool
+        .get_on(
+            chain.writer.store().chain_id(),
+            "/v1/history/handle/x/timeless_1",
+        )
+        .await
+        .answer();
+    let block = chain
+        .node
+        .provider
+        .get_block_by_number(bound.into())
+        .await
+        .expect("the block")
+        .expect("a mined block");
+    let times: Vec<i64> = history
+        .entries
+        .iter()
+        .map(|entry| entry.block_time)
+        .collect();
+    assert!(!times.is_empty());
+    assert!(
+        times
+            .iter()
+            .all(|time| *time == block.header.timestamp as i64),
+        "{times:?} against {}",
+        block.header.timestamp
+    );
+    chain.stop(running).await;
+}
