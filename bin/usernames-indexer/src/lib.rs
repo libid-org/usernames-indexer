@@ -144,7 +144,7 @@ impl Config {
         let provider = config.connect(&self.rpc_url).await.map_err(|e| {
             anyhow::anyhow!("RPC_URL over LOG_SOURCE={}: {e}", self.log_source)
         })?;
-        let reported = provider.get_chain_id().await?;
+        let reported = provider.get_chain_id().await.context("eth_chainId")?;
         if let Some(expected) = self.chain_id {
             anyhow::ensure!(
                 reported == expected,

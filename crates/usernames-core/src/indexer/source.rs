@@ -63,7 +63,7 @@ impl LogSource {
     }
 
     /// A connection to `rpc` for one session, each of its calls failing
-    /// once unanswered for `patience`, the WebSocket handshake too. A
+    /// once unanswered for `patience`, the connection itself too. A
     /// subscription needs a WebSocket, so an `http(s)` endpoint is dialled as
     /// `ws(s)` on the same host and path, where Alchemy serves it; an
     /// endpoint whose WebSocket sits elsewhere is given as a `ws(s)` URL.
@@ -73,21 +73,25 @@ impl LogSource {
         patience: Duration,
     ) -> TransportResult<RootProvider> {
         let client = ClientBuilder::default().layer(Deadline(patience));
-        let client = match self {
-            Self::Poll => client.connect(rpc.as_str()).await?,
-            Self::Subscribe => {
-                // One refused reconnect and alloy closes the subscription,
-                // rather than retrying ten times, three seconds apart.
-                let socket = WsConnect::new(rpc.websocket()?).with_max_retries(1);
-                tokio::time::timeout(patience, client.pubsub(Unretried(socket)))
-                    .await
-                    .map_err(|_| {
-                        TransportErrorKind::custom_str(&format!(
-                            "no WebSocket handshake within {patience:?}"
-                        ))
-                    })??
+        let connected = async {
+            match self {
+                Self::Poll => client.connect(rpc.as_str()).await,
+                Self::Subscribe => {
+                    // One refused reconnect and alloy closes the subscription,
+                    // rather than retrying ten times, three seconds apart.
+                    let socket = WsConnect::new(rpc.websocket()?).with_max_retries(1);
+                    client.pubsub(Unretried(socket)).await
+                }
             }
         };
+        let client =
+            tokio::time::timeout(patience, connected)
+                .await
+                .map_err(|_| {
+                    TransportErrorKind::custom_str(&format!(
+                        "no connection within {patience:?}"
+                    ))
+                })??;
         Ok(RootProvider::new(client))
     }
 }
