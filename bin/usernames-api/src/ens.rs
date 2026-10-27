@@ -54,6 +54,7 @@ use std::{
 use alloy::primitives::{
     Address,
     Bytes,
+    B256,
 };
 use axum::{
     extract::{
@@ -79,6 +80,7 @@ use serde::{
 use usernames_core::{
     db::{
         ChainStore,
+        EnsAnswer,
         IndexPosition,
         Store,
     },
@@ -240,7 +242,7 @@ impl Config {
         // Only now, with an answer actually owed, is staleness worth asking
         // about: in the same read as the holder, so a replay between the two
         // cannot have the gateway sign for emptied tables.
-        let read = indexed.0.ens_answer(handle_node).await?;
+        let read = indexed.answer(handle_node).await?;
         if let Some(why) = Lag::of(read.position).staleness(self.max_lag_blocks) {
             return Ok(Answer::TooStale(why));
         }
@@ -255,20 +257,21 @@ impl Config {
     /// gateway's registry, if there is exactly one.
     ///
     /// Matched against the chains the STORE holds — whatever indexers have
-    /// written — never decoded back into a chain id. `0x80000000 | chainId`
+    /// prepared — never decoded back into a chain id. `0x80000000 | chainId`
     /// is not injective past 2^31 (the eden testnet's 3735928814 is such a
     /// chain), so decoding would answer for a different chain, silently.
     /// Forwards the map is exact. Read per request, so a new indexer is served
-    /// the first time it commits, and refused per request when two indexed
-    /// chains share one coin type: answering either would be a guess, and a
-    /// label does not rescue the pair — the coin type is what the wallet
-    /// sends, and it is the coin type that is ambiguous.
+    /// the first time it commits, and refused per request when two chains
+    /// share one coin type, one still in its first window included: answering
+    /// either would be a guess, and a label does not rescue the pair — the
+    /// coin type is what the wallet sends, and it is the coin type that is
+    /// ambiguous.
     async fn indexed_chain_for(
         &self,
         coin_type: CoinType,
     ) -> Result<ChainMatch, GatewayError> {
         let mut candidates: Vec<(u64, IndexedChain)> = self
-            .indexed_chains()
+            .chains()
             .await?
             .into_iter()
             .filter(|(id, _)| coin_type.names_chain(*id, self.ens_chain))
@@ -288,12 +291,12 @@ impl Config {
         })
     }
 
-    /// Every chain an indexer has written into the store, by the id a coin
+    /// Every chain an indexer has prepared in the store, by the id a coin
     /// type names it with, beside its index.
-    async fn indexed_chains(&self) -> Result<Vec<(u64, IndexedChain)>, GatewayError> {
+    async fn chains(&self) -> Result<Vec<(u64, IndexedChain)>, GatewayError> {
         Ok(self
             .store
-            .indexed_chains()
+            .chains()
             .await?
             .into_iter()
             .filter_map(|id| {
@@ -365,12 +368,12 @@ impl Config {
 
     /// One row per chain the store holds, as supervision should see it.
     async fn status(&self) -> Result<GatewayStatus, GatewayError> {
-        let indexed = self.indexed_chains().await?;
+        let indexed = self.chains().await?;
         let ids: Vec<u64> = indexed.iter().map(|(id, _)| *id).collect();
         let mut chains = Vec::with_capacity(indexed.len());
         for (chain_id, chain) in indexed {
             let position = chain.position().await;
-            let names = chain.0.chain_names().await?;
+            let names = chain.names().await?;
             let lag = Lag::of(position);
             // What the gate sees: a chain sharing its coin type with another
             // in the store is refused for that coin type however fresh either
@@ -416,6 +419,17 @@ impl IndexedChain {
     async fn position(&self) -> Option<IndexPosition> {
         self.0.index_position().await.ok()
     }
+
+    /// Where this index stands and who holds `handle_node` there, read
+    /// together.
+    async fn answer(&self, handle_node: B256) -> Result<EnsAnswer, sqlx::Error> {
+        self.0.ens_answer(handle_node).await
+    }
+
+    /// The names the chain goes by, as its indexer declared them.
+    async fn names(&self) -> Result<Vec<String>, sqlx::Error> {
+        self.0.chain_names().await
+    }
 }
 
 /// How far behind the chain an answer would be.
@@ -442,10 +456,10 @@ enum Lag {
 impl Lag {
     /// The lag an index position amounts to. Missing pieces are `Unknown`,
     /// and unknown is refused: folding it into "no lag" is how a gateway ends
-    /// up signing authoritative nulls off a wiped or unreachable database — a
-    /// fresh deployment, a version-bump replay clearing
-    /// `names.chains`, a chain nobody indexed yet, or Postgres simply
-    /// being down all produce it.
+    /// up signing authoritative nulls off a wiped database — a fresh
+    /// deployment, a replay that reset the chain's row, or a chain still in
+    /// its first window all produce it, and so does a status read the store
+    /// failed.
     fn of(position: Option<IndexPosition>) -> Self {
         match position {
             Some(IndexPosition {
@@ -617,7 +631,8 @@ pub struct ChainStatus {
     pub lag_blocks: Option<u64>,
     /// Unix seconds at which the indexer last reported.
     pub indexer_reported_at: Option<u64>,
-    /// Seconds until the indexer's last report expires, negative once it has.
+    /// Seconds until the indexer's last report expires, negative once it has;
+    /// absent before its first report, or when the store cannot say.
     pub report_valid_for: Option<i64>,
     /// Whether another chain in the store shares this chain's coin type, in
     /// which case queries for that coin type are refused however fresh either

@@ -212,11 +212,10 @@ impl Store {
             .await
     }
 
-    /// Every chain an indexer has written into this store, by cursor.
-    pub async fn indexed_chains(&self) -> Result<Vec<i64>, sqlx::Error> {
-        sqlx::query_scalar(sql::INDEXED_CHAINS)
-            .fetch_all(&self.pool)
-            .await
+    /// Every chain an indexer has prepared in this store, a chain still in
+    /// its first window included.
+    pub async fn chains(&self) -> Result<Vec<i64>, sqlx::Error> {
+        sqlx::query_scalar(sql::CHAINS).fetch_all(&self.pool).await
     }
 }
 
@@ -608,15 +607,15 @@ impl ChainStore {
         tx.commit().await.expect("the chain is forgotten");
     }
 
-    /// Delete the chain's row and keep its read model: an index that cannot
-    /// say how far it got.
+    /// Drop the chain's cursor and keep everything else: an index that
+    /// cannot say how far it got.
     #[cfg(feature = "test-seams")]
     pub async fn forget_progress(&self) {
-        sqlx::query(sql::FORGET_CHAIN)
+        sqlx::query(sql::FORGET_CURSOR)
             .bind(self.chain_id)
             .execute(&self.pool)
             .await
-            .expect("the chain's row is deleted");
+            .expect("the chain's cursor is dropped");
     }
 
     /// Where the index stands, in one read: the target, the cursor, when the
@@ -1296,7 +1295,7 @@ fn search_lookup(
 mod sql {
     pub const CHAIN_STATE: &str = include_str!("../sql/chain_state.sql");
     pub const CHAIN_STATUSES: &str = include_str!("../sql/chain_statuses.sql");
-    pub const INDEXED_CHAINS: &str = include_str!("../sql/indexed_chains.sql");
+    pub const CHAINS: &str = include_str!("../sql/chains.sql");
     pub const LOCK_CHAIN: &str = include_str!("../sql/lock_chain.sql");
     pub const CLAIM_CHAIN: &str = include_str!("../sql/claim_chain.sql");
     pub const RESET_CHAIN: &str = include_str!("../sql/reset_chain.sql");
@@ -1308,6 +1307,8 @@ mod sql {
     pub const SET_WINDOW_ERROR: &str = include_str!("../sql/set_window_error.sql");
     #[cfg(feature = "test-seams")]
     pub const SET_VALID_UNTIL: &str = include_str!("../sql/set_valid_until.sql");
+    #[cfg(feature = "test-seams")]
+    pub const FORGET_CURSOR: &str = include_str!("../sql/forget_cursor.sql");
     pub const FORGET_CHAIN: &str = include_str!("../sql/forget_chain.sql");
     /// Every row an indexer wrote for one chain into the read model: what a
     /// replay clears.

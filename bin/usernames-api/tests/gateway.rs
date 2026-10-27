@@ -10,7 +10,10 @@
 use std::{
     fmt,
     sync::Arc,
-    time::Duration,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 use alloy::{
@@ -615,7 +618,7 @@ async fn an_index_that_cannot_report_its_position_refuses() {
     let (router, store, _pool, guard) = gateway_or_skip!(32);
     bind(&store, "alice", Address::from([0xbe; 20])).await;
 
-    // Wipe what the index knows about its own progress, leaving the binding
+    // Drop what the index knows about its own progress, leaving the binding
     // in place: the rows say one thing, the cursor says nothing.
     store.forget_progress().await;
 
@@ -625,7 +628,60 @@ async fn an_index_that_cannot_report_its_position_refuses() {
     );
     let (status, body) = ask(&router, RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    body.refused();
+    assert!(
+        body.refused().contains("cannot report its position"),
+        "{body}"
+    );
+    drop(guard);
+}
+
+/// Where the index stands and who holds the handle are one read, so a
+/// replay that commits while the gateway reads leaves it refusing, never
+/// signing a null over the emptied tables.
+#[tokio::test]
+async fn a_replay_while_the_gateway_reads_is_refused() {
+    let (router, store, pool, guard) = gateway_or_skip!(32);
+    bind(&store, "alice", Address::from([0xbe; 20])).await;
+    // The replay holds the handles, and commits once the gateway waits on
+    // them.
+    let mut replay = pool.begin().await.expect("a transaction");
+    sqlx::query(include_str!("sql/lock_handles.sql"))
+        .execute(&mut *replay)
+        .await
+        .expect("the handles are held");
+    let call = resolve_call(
+        &wire_name(&["alice", "x"]),
+        &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
+    );
+    let asking = tokio::spawn({
+        let (router, call) = (router.clone(), call.clone());
+        async move { ask(&router, RESOLVER, &call).await }
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !sqlx::query_scalar::<_, bool>(include_str!("sql/waiting_on_a_lock.sql"))
+        .fetch_one(&pool)
+        .await
+        .expect("the waits")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the gateway never waited on the handles"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    sqlx::query(include_str!("sql/replay_chain.sql"))
+        .bind(CHAIN)
+        .execute(&mut *replay)
+        .await
+        .expect("the replay");
+    replay.commit().await.expect("the replay commits");
+
+    let (status, body) = asking.await.expect("the answer");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        body.refused().contains("cannot report its position"),
+        "{body}"
+    );
     drop(guard);
 }
 
@@ -845,6 +901,26 @@ async fn two_indexed_chains_on_one_coin_type_are_refused_unsigned() {
         let row = row_of(&status, id);
         assert!(row.ambiguous && row.stale, "{status:?}");
     }
+    drop(guard);
+}
+
+/// A chain without a cursor (in its first window, or mid-replay) still holds
+/// its coin type, so its twin is refused as ambiguous, not answered as the
+/// only chain.
+#[tokio::test]
+async fn a_twin_without_a_cursor_still_makes_the_coin_type_ambiguous() {
+    let Some((router, store, pool, guard)) = gateway_over(&[EDEN, TWIN], 32).await else {
+        return;
+    };
+    bind(&store, "alice", Address::from([0xed; 20])).await;
+    ChainStore::new(pool.clone(), TWIN).forget_progress().await;
+    let call = resolve_call(
+        &wire_name(&["alice", "x"]),
+        &addr_call(&["alice", "x"], 0x8000_0000u64 | EDEN as u64),
+    );
+    let (status, body) = ask(&router, RESOLVER, &call).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.refused().contains("share"), "{body}");
     drop(guard);
 }
 
