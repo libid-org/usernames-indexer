@@ -185,6 +185,16 @@ impl Chain {
             .await
     }
 
+    /// The last window failure the indexer recorded, while it stands.
+    async fn window_error(&self) -> Option<String> {
+        self.writer
+            .store()
+            .state()
+            .await
+            .expect("the chain's row")
+            .window_error
+    }
+
     /// Where the index stands.
     async fn position(&self) -> IndexPosition {
         self.writer
@@ -367,11 +377,23 @@ async fn a_silent_socket_is_left_and_the_next_session_catches_up() {
     };
     let running = chain.run(IndexerConfig {
         stale_after: Duration::from_secs(2),
+        poll_interval: Duration::from_millis(500),
         ..chain.config(2)
     });
     chain.wait_for_index(chain.head().await - 2).await;
 
+    // The quiet session ends and the next one opens; neither is a failure
+    // a monitor should see.
     chain.relay.silence(true);
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    while chain.called("eth_subscribe") < 2 {
+        assert_eq!(chain.window_error().await, None);
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the silent session was never left"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let holder = chain.accounts()[0];
     let bound = chain.bind("silenced_1", holder).await;
     chain.mine(3).await;

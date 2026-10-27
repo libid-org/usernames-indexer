@@ -61,7 +61,7 @@ indexer's settings.
 | `CONFIRMATIONS` | indexer | `5` | Blocks behind the head to stay (shallow-reorg protection). At least 1 with `LOG_SOURCE=subscribe` |
 | `LOG_SOURCE` | indexer | `subscribe` | How the indexer learns of new blocks: `subscribe` holds an `eth_subscribe("newHeads")` stream on a WebSocket; `poll` reads the head and asks with `eth_getLogs` every `POLL_INTERVAL`, for an endpoint without WebSocket. See [Log sources](#log-sources) |
 | `POLL_INTERVAL` | indexer | `5s` | The loop's cadence, and the retry delay after a failure: a poll cycle, or with a subscription how often it checks that heads still arrive |
-| `STALE_AFTER` | indexer | four poll intervals + 1m | How long readers may trust this indexer's last report; the ENS gateway refuses this chain once it expires. Must exceed `POLL_INTERVAL`, and at most a year |
+| `STALE_AFTER` | indexer | four poll intervals + 1m | How long readers may trust this indexer's last report; the ENS gateway refuses this chain once it expires. Must exceed `POLL_INTERVAL`, and at most a year. With a subscription, keep it above twice the chain's block time: the report renews on pushed heads, and a session that hears none for half of it reconnects |
 | `MAX_BLOCK_RANGE` | indexer | `10000` | Largest `eth_getLogs` window |
 | `START_BLOCK` | indexer | unset | Where a FRESH scan starts — consulted only when no cursor exists (new database, or right after a re-index). Unset means the deployment block is found by binary search over `eth_getCode`; only a successful detection is cached, and an RPC failure mid-search retries next cycle |
 | `LISTEN_ADDR` | api | `127.0.0.1:8080` | Read-API listen address |

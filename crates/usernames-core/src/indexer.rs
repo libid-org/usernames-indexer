@@ -90,6 +90,11 @@ pub struct IndexerConfig {
 }
 
 impl IndexerConfig {
+    /// The contracts whose logs the loop follows.
+    fn watched(&self) -> Vec<Address> {
+        std::iter::once(self.contract).chain(self.escrow).collect()
+    }
+
     /// The last block of the `eth_getLogs` window that starts at `from`, at
     /// most `through`.
     fn window_end(&self, from: u64, through: u64) -> u64 {
@@ -112,10 +117,7 @@ impl Indexer {
     /// Build the indexer; the log filter is derived from the watched contracts
     /// once, here, instead of at every fetch.
     pub fn new(writer: ChainWriter, rpc: Url, config: IndexerConfig) -> Self {
-        let watched: Vec<Address> = std::iter::once(config.contract)
-            .chain(config.escrow)
-            .collect();
-        let filter = Filter::new().address(watched);
+        let filter = Filter::new().address(config.watched());
         Self {
             writer,
             rpc,
@@ -205,19 +207,34 @@ impl Indexer {
 
         while !cancel.is_cancelled() {
             let session = async { Session::open(&self).await?.follow(&cancel).await };
-            if let Err(e) = session.await {
-                let error = self.redacted(format!("{e:#}"));
-                tracing::warn!(%error, "indexing stopped; resuming from the cursor");
-                // Surfaced in /v1/status: a deterministic failure (an
-                // undecodable log, say) stalls the cursor by design —
-                // integrity over progress — and a stall must be visible
-                // somewhere a monitor actually looks.
-                self.writer.set_window_error(Some(&error)).await;
-                sleep_or_cancel(&cancel, self.config.poll_interval).await;
+            match session.await {
+                Ok(Ended::Cancelled) => {}
+                Ok(Ended::Quiet(quiet)) => {
+                    tracing::info!(?quiet, "no head pushed; reconnecting");
+                }
+                Err(e) => {
+                    let error = self.redacted(format!("{e:#}"));
+                    tracing::warn!(%error, "indexing stopped; resuming from the cursor");
+                    // Surfaced in /v1/status: a deterministic failure (an
+                    // undecodable log, say) stalls the cursor by design —
+                    // integrity over progress — and a stall must be visible
+                    // somewhere a monitor actually looks.
+                    self.writer.set_window_error(Some(&error)).await;
+                    sleep_or_cancel(&cancel, self.config.poll_interval).await;
+                }
             }
         }
         tracing::info!("usernames indexer shutting down");
     }
+}
+
+/// How a session that did not fail ended.
+enum Ended {
+    /// The indexer was cancelled.
+    Cancelled,
+    /// No head was pushed for this long, half the report's life: the next
+    /// session reconnects and catches up.
+    Quiet(Duration),
 }
 
 /// One connection to the RPC, from the catch-up that opens it to the
@@ -254,22 +271,20 @@ impl<'a> Session<'a> {
     /// ends the session, so the next one reconnects and catches up: an open
     /// but silent socket would otherwise leave the index frozen and the
     /// report never renewed.
-    async fn follow(mut self, cancel: &CancellationToken) -> anyhow::Result<()> {
+    async fn follow(mut self, cancel: &CancellationToken) -> anyhow::Result<Ended> {
         let config = &self.indexer.config;
-        let watched: Vec<Address> = std::iter::once(config.contract)
-            .chain(config.escrow)
-            .collect();
+        let watched = config.watched();
         let quiet = config.stale_after / 2;
         self.catch_up(cancel).await?;
         let mut heads = Heads::default();
         let mut heard = Instant::now();
         loop {
             match self.feed.wait(config.poll_interval, cancel).await? {
-                Wake::Cancelled => return Ok(()),
+                Wake::Cancelled => return Ok(Ended::Cancelled),
                 Wake::Tick => match self.feed {
                     Feed::Poll => self.catch_up(cancel).await?,
                     Feed::Subscribe(_) if heard.elapsed() >= quiet => {
-                        anyhow::bail!("no head pushed for {quiet:?}; reconnecting")
+                        return Ok(Ended::Quiet(quiet));
                     }
                     Feed::Subscribe(_) => {}
                 },
