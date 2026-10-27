@@ -449,14 +449,6 @@ impl Lag {
         }
     }
 
-    /// Blocks behind the target, when the store could say.
-    fn blocks(&self) -> Option<u64> {
-        match self {
-            Self::Indexed { blocks, .. } => Some(*blocks),
-            Self::Unknown => None,
-        }
-    }
-
     /// Why an index in this position may not answer, if it may not. The one
     /// rule the gate and `/status` share, so supervision sees what the gate
     /// sees.
@@ -633,7 +625,7 @@ impl ServedChain {
         Self {
             chain_id,
             names: row.names,
-            lag_blocks: lag.blocks(),
+            lag_blocks: position.lag_blocks(),
             indexer_reported_at: position.reported_at,
             report_valid_for: position.valid_for_seconds(),
             ambiguous,

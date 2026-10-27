@@ -809,6 +809,11 @@ async fn a_report_expiring_out_of_range_is_refused() {
         body.refused().contains("cannot report its position"),
         "{body}"
     );
+
+    // Supervision sees the refusal, and the lag `/v1/status` reports.
+    let served = router.status().await;
+    assert!(served.row(CHAIN).stale, "{served:?}");
+    assert_eq!(served.row(CHAIN).lag_blocks, Some(0), "{served:?}");
     gateway.done();
 }
 
