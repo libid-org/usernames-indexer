@@ -1,7 +1,6 @@
-//! What the API reads. Every statement, and the join shapes the projections
-//! were designed for, is one file under `sql/`, bound here. Every read spans
-//! the chains the store holds, or the one the caller names, and every row
-//! says which chain it came from.
+//! Resolution and search over the chains the store holds, or the one the
+//! caller names, each row saying which chain it came from; and the ENS
+//! gateway's answer on one chain.
 
 use alloy::primitives::{
     Address,

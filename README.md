@@ -356,10 +356,6 @@ without pushing so packaging cannot rot:
 | `ghcr.io/libid-org/usernames-indexer` | the indexing loop | nothing | RPC + a writer lease |
 | `ghcr.io/libid-org/usernames-api` | the read API | `0.0.0.0:8080` | the database only |
 
-No image carries both: an entrypoint would have to default to one of them,
-and a deployment that pulled it expecting the other would run a container
-that looks healthy while doing half the job.
-
 **Database.** The indexer indexes the node-keyed `IdentityRegistry` and
 `HandleEscrow` of the libid-contracts release `Cargo.toml` pins, from the
 registry's deployment block or from `START_BLOCK`. It refuses a registry

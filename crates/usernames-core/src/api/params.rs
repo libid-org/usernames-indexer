@@ -130,7 +130,7 @@ impl ChainFilter {
 /// Text a request carries, taken apart into what the store reads and
 /// refused in the API's envelope.
 pub(crate) trait Param {
-    /// A platform with node tags.
+    /// A platform by its key or its 0x-hex id, known to this build or not.
     fn parse_platform(&self) -> Result<Platform, ApiError>;
     /// A platform text hashes on: one this build has node tags for.
     fn parse_known_platform(&self) -> Result<KnownPlatform, ApiError>;

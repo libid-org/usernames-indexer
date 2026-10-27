@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # One compile, two runtime images, as the Dockerfile builds them.
+        # One runtime image per job, each a target of the Dockerfile.
         include:
           - target: indexer
             image: usernames-indexer
