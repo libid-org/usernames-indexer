@@ -22,11 +22,7 @@ use super::{
     Param,
 };
 use crate::{
-    db::{
-        HistoryCursor,
-        HistoryRow,
-        Rows,
-    },
+    db::HistoryRow,
     events::NamesEvent,
 };
 
@@ -63,18 +59,6 @@ impl HistoryEntry {
             event: event.into(),
         })
     }
-
-    /// A page's entries, and the cursor that fetches the next one.
-    fn page(
-        rows: Rows<HistoryRow, HistoryCursor>,
-    ) -> Result<(Vec<Self>, Option<String>), ApiError> {
-        let entries = rows
-            .rows
-            .into_iter()
-            .map(Self::of)
-            .collect::<Result<_, _>>()?;
-        Ok((entries, rows.next.map(|next| next.to_string())))
-    }
 }
 
 /// `GET /v1/history/address/{address}?chain=&before=&limit=` — every event the
@@ -90,8 +74,11 @@ pub(crate) async fn address(
     let page = params.page()?;
     state.synced(page.chain).await?;
 
-    let (entries, next) =
-        HistoryEntry::page(state.store.address_history(address, page).await?)?;
+    let (entries, next) = state
+        .store
+        .address_history(address, page)
+        .await?
+        .served(HistoryEntry::of)?;
     Ok(Json(AddressHistory {
         address,
         entries,
@@ -131,8 +118,11 @@ impl AppState {
         let page = params.page()?;
         self.synced(page.chain).await?;
 
-        let (entries, next) =
-            HistoryEntry::page(self.store.handle_history(key.node(), page).await?)?;
+        let (entries, next) = self
+            .store
+            .handle_history(key.node(), page)
+            .await?
+            .served(HistoryEntry::of)?;
         let known = entries.iter().find_map(|entry| entry.handle.as_ref());
         Ok(Json(HandleHistory {
             handle: HandleRef::asked(&key, known),

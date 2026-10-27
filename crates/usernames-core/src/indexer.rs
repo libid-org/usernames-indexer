@@ -449,12 +449,14 @@ impl<'a> Session<'a> {
         {
             Ok(Some(block)) => return Some(block),
             Ok(None) => {}
-            Err(e) => tracing::warn!(%e, "failed to read the cached deployment block"),
+            Err(error) => {
+                tracing::warn!(%error, "failed to read the cached deployment block")
+            }
         }
         let latest = match self.provider.get_block_number().await {
             Ok(n) => n,
-            Err(e) => {
-                tracing::warn!(%e, "no latest block for deployment detection");
+            Err(error) => {
+                tracing::warn!(%error, "no latest block for deployment detection");
                 return None;
             }
         };
@@ -464,8 +466,8 @@ impl<'a> Session<'a> {
         {
             Ok(Some(block)) => {
                 tracing::info!(block, "detected contract deployment block");
-                if let Err(e) = indexer.writer.set_deploy_block(block).await {
-                    tracing::warn!(%e, "failed to cache the deployment block");
+                if let Err(error) = indexer.writer.set_deploy_block(block).await {
+                    tracing::warn!(%error, "failed to cache the deployment block");
                 }
                 Some(block)
             }
@@ -479,8 +481,8 @@ impl<'a> Session<'a> {
                 );
                 Some(0)
             }
-            Err(e) => {
-                tracing::warn!(%e, "deployment detection failed on RPC");
+            Err(error) => {
+                tracing::warn!(%error, "deployment detection failed on RPC");
                 None
             }
         }

@@ -658,8 +658,8 @@ impl ChainWriter {
             .bind(i64::try_from(head).unwrap_or(i64::MAX))
             .execute(&self.store.pool)
             .await;
-        if let Err(e) = written {
-            tracing::warn!(%e, "failed to record the chain head");
+        if let Err(error) = written {
+            tracing::warn!(%error, "failed to record the chain head");
         }
     }
 
@@ -694,8 +694,8 @@ impl ChainWriter {
             .await;
         match written {
             Ok(done) => done.rows_affected() == 1,
-            Err(e) => {
-                tracing::warn!(%e, "failed to record the chain target");
+            Err(error) => {
+                tracing::warn!(%error, "failed to record the chain target");
                 false
             }
         }
@@ -712,8 +712,8 @@ impl ChainWriter {
             .bind(Self::valid_for_bind(valid_for))
             .execute(&self.store.pool)
             .await;
-        if let Err(e) = touched {
-            tracing::warn!(%e, "failed to renew the chain target's report");
+        if let Err(error) = touched {
+            tracing::warn!(%error, "failed to renew the chain target's report");
         }
     }
 
@@ -733,18 +733,18 @@ impl ChainWriter {
             .bind(error)
             .execute(&self.store.pool)
             .await;
-        if let Err(e) = written {
-            tracing::warn!(%e, "failed to record the window error state");
+        if let Err(error) = written {
+            tracing::warn!(%error, "failed to record the window error state");
         }
     }
 
     /// Cache a detected deployment block so a re-index does not redo the
     /// binary search. The chain's row names the contract it belongs to.
-    pub async fn set_deploy_block(&self, block: u64) -> Result<(), sqlx::Error> {
+    pub async fn set_deploy_block(&self, block: u64) -> Result<(), ApplyError> {
         sqlx::query(sql::SET_DEPLOY_BLOCK)
             .bind(self.store.chain_id)
             .bind(self.writer)
-            .bind(i64::try_from(block).unwrap_or(i64::MAX))
+            .bind(as_i64(block, "deployment block")?)
             .execute(&self.store.pool)
             .await?;
         Ok(())
@@ -819,13 +819,13 @@ impl Window {
     /// Advance the cursor and commit everything applied so far as one
     /// transaction: the cursor and the writes it stands for land together or
     /// not at all.
-    pub async fn commit(mut self, through_block: u64) -> Result<(), sqlx::Error> {
+    pub async fn commit(mut self, through_block: u64) -> Result<(), ApplyError> {
         sqlx::query(sql::SET_CURSOR)
             .bind(self.chain_id)
-            .bind(i64::try_from(through_block).unwrap_or(i64::MAX))
+            .bind(as_i64(through_block, "block")?)
             .execute(&mut *self.tx)
             .await?;
-        self.tx.commit().await
+        Ok(self.tx.commit().await?)
     }
 
     /// Apply one decoded event: journal row, projection writes in the order

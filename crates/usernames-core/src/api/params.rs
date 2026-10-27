@@ -1,6 +1,9 @@
 //! What a request names, from its path and query string.
 
-use std::str::FromStr;
+use std::{
+    fmt::Display,
+    str::FromStr,
+};
 
 use alloy::primitives::{
     Address,
@@ -16,6 +19,7 @@ use crate::{
     db::{
         InvalidCursor,
         Page,
+        Rows,
     },
     nodes::{
         KnownPlatform,
@@ -52,6 +56,18 @@ impl PageParams {
                 .unwrap_or(PAGE_DEFAULT_LIMIT)
                 .clamp(1, PAGE_MAX_LIMIT),
         })
+    }
+}
+
+impl<R, C: Display> Rows<R, C> {
+    /// The page's rows as the API serves them, and the cursor that fetches the
+    /// next one.
+    pub(crate) fn served<T>(
+        self,
+        of: impl Fn(R) -> Result<T, ApiError>,
+    ) -> Result<(Vec<T>, Option<String>), ApiError> {
+        let served = self.rows.into_iter().map(of).collect::<Result<_, _>>()?;
+        Ok((served, self.next.map(|next| next.to_string())))
     }
 }
 

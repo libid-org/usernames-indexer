@@ -2,6 +2,8 @@
 //! a container runtime or a supervisor, which kills the process if it has
 //! not exited a grace period later.
 
+use std::io;
+
 use tokio::signal::unix::{
     signal,
     Signal,
@@ -19,7 +21,7 @@ impl StopSignals {
     /// Listen for ctrl-c and SIGTERM from now on. A process running as a
     /// container's PID 1 ignores a SIGTERM nobody listens for, so a service
     /// takes these before anything else.
-    pub fn listen() -> std::io::Result<Self> {
+    pub fn listen() -> io::Result<Self> {
         Ok(Self {
             interrupt: signal(SignalKind::interrupt())?,
             terminate: signal(SignalKind::terminate())?,

@@ -2,8 +2,6 @@
 //! refund, against one handle, and every slot still unclaimed — paged by a
 //! cursor, since anybody can deposit a token they wrote.
 
-use std::fmt::Display;
-
 use axum::{
     extract::State,
     Json,
@@ -31,7 +29,6 @@ use super::{
 use crate::db::{
     ContributionRow,
     EscrowSlotRow,
-    Rows,
 };
 
 impl EscrowAmount {
@@ -62,18 +59,6 @@ impl Contribution {
             amount: EscrowAmount::of(row.slot)?,
             refundable_at: row.refundable_at,
         })
-    }
-}
-
-impl<R, C: Display> Rows<R, C> {
-    /// The page's rows as the API serves them, and the cursor that fetches the
-    /// next one.
-    fn served<T>(
-        self,
-        of: impl Fn(R) -> Result<T, ApiError>,
-    ) -> Result<(Vec<T>, Option<String>), ApiError> {
-        let served = self.rows.into_iter().map(of).collect::<Result<_, _>>()?;
-        Ok((served, self.next.map(|next| next.to_string())))
     }
 }
 

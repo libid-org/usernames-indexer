@@ -23,12 +23,14 @@ use usernames_core::{
     chain::Contracts,
     db::{
         self,
+        ChainStore,
         Superseded,
         WriterLease,
     },
     ens::ChainName,
     indexer::{
-        self,
+        Indexer,
+        IndexerConfig,
         LogSource,
     },
     stop::StopSignals,
@@ -122,12 +124,12 @@ impl Config {
     /// The indexer this configuration describes, under its chain's writer
     /// lease: endpoints checked, the schema migrated, the chain prepared and
     /// its names declared.
-    async fn start(self) -> anyhow::Result<(WriterLease, indexer::Indexer)> {
+    async fn start(self) -> anyhow::Result<(WriterLease, Indexer)> {
         let contracts = self.contracts();
         // Pure configuration, checked before anything is touched: `prepare`
         // below may wipe the chain's rows on a version bump, and a refusal has
         // to come before that, not after.
-        let config = indexer::IndexerConfig {
+        let config = IndexerConfig {
             contracts,
             confirmations: self.confirmations()?,
             source: self.log_source,
@@ -167,7 +169,7 @@ impl Config {
         // The indexer migrates because the indexer writes. The read API connects
         // to whatever schema it finds.
         let pool = db::connect_and_migrate(&self.database_url).await?;
-        let store = db::ChainStore::new(pool, chain_id);
+        let store = ChainStore::new(pool, chain_id);
         // The writer lease outlives the indexer: as long as this process may
         // write the chain, no other instance may. prepare runs under it —
         // the lease is a parameter there, so a version-bump replay cannot race a
@@ -178,7 +180,7 @@ impl Config {
 
         // Startup's own connection: every session of the loop opens its own.
         drop(provider);
-        let indexer = indexer::Indexer::new(writer, self.rpc_url, config);
+        let indexer = Indexer::new(writer, self.rpc_url, config);
         tracing::info!(
             chain_id,
             contract = %contracts.registry,
@@ -225,67 +227,57 @@ impl Config {
         );
         Ok(validity)
     }
+
+    /// Connect everything, and index until ctrl-c or SIGTERM.
+    pub async fn run(self) -> anyhow::Result<()> {
+        // From the start, so a stop request during a long startup (waiting on
+        // another instance's lease, say) ends the process.
+        let mut signals = StopSignals::listen()?;
+        let (mut lease, indexer) = tokio::select! {
+            started = self.start() => started?,
+            () = signals.received() => {
+                tracing::info!("stopped before indexing");
+                return Ok(());
+            }
+        };
+        let mut indexing = Indexing::start(indexer);
+
+        let stopped = tokio::select! {
+            () = signals.received() => {
+                tracing::info!("shutting down");
+                indexing.stop(LEASE_CHECK).await;
+                Ok(())
+            }
+            r = &mut indexing.task => match r {
+                Ok(Ok(())) => Err(anyhow::anyhow!("indexer task exited unexpectedly")),
+                // The lease's session is most likely gone, and releasing a dead
+                // one fails or hangs; dropping the lease closes it either way.
+                Ok(Err(superseded)) => return Err(superseded.into()),
+                Err(e) => Err(anyhow::anyhow!("indexer task died: {e}")),
+            },
+            // Another instance may take the chain once the lock is gone, so this
+            // one stops writing and exits for its supervisor to restart.
+            lost = lease.lost(LEASE_CHECK) => {
+                indexing.stop(LEASE_CHECK).await;
+                return Err(anyhow::Error::new(lost).context("the writer lease was lost"));
+            }
+        };
+        // The loop no longer writes: the chain is the next instance's. Bounded
+        // like the stop, since the database may be the reason it stopped;
+        // dropping the lease closes its session either way.
+        match tokio::time::timeout(LEASE_CHECK, lease.release()).await {
+            Ok(released) => released?,
+            Err(_) => {
+                tracing::warn!(within = ?LEASE_CHECK, "the writer lease was not released in time")
+            }
+        }
+        stopped
+    }
 }
 
 /// How often the indexer asks its writer lease's session whether it still
 /// answers, and how long the session has to answer.
 const LEASE_CHECK: Duration = Duration::from_secs(5);
-
-/// Parse the environment, connect everything, and index until ctrl-c or
-/// SIGTERM.
-pub async fn run() -> anyhow::Result<()> {
-    let _ = dotenvy::dotenv();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-
-    let config = Config::parse();
-    // From the start, so a stop request during a long startup (waiting on
-    // another instance's lease, say) ends the process.
-    let mut signals = StopSignals::listen()?;
-    let (mut lease, indexer) = tokio::select! {
-        started = config.start() => started?,
-        () = signals.received() => {
-            tracing::info!("stopped before indexing");
-            return Ok(());
-        }
-    };
-    let mut indexing = Indexing::start(indexer);
-
-    let stopped = tokio::select! {
-        () = signals.received() => {
-            tracing::info!("shutting down");
-            indexing.stop(LEASE_CHECK).await;
-            Ok(())
-        }
-        r = &mut indexing.task => match r {
-            Ok(Ok(())) => Err(anyhow::anyhow!("indexer task exited unexpectedly")),
-            // The lease's session is most likely gone, and releasing a dead
-            // one fails or hangs; dropping the lease closes it either way.
-            Ok(Err(superseded)) => return Err(superseded.into()),
-            Err(e) => Err(anyhow::anyhow!("indexer task died: {e}")),
-        },
-        // Another instance may take the chain once the lock is gone, so this
-        // one stops writing and exits for its supervisor to restart.
-        lost = lease.lost(LEASE_CHECK) => {
-            indexing.stop(LEASE_CHECK).await;
-            return Err(anyhow::Error::new(lost).context("the writer lease was lost"));
-        }
-    };
-    // The loop no longer writes: the chain is the next instance's. Bounded
-    // like the stop, since the database may be the reason it stopped;
-    // dropping the lease closes its session either way.
-    match tokio::time::timeout(LEASE_CHECK, lease.release()).await {
-        Ok(released) => released?,
-        Err(_) => {
-            tracing::warn!(within = ?LEASE_CHECK, "the writer lease was not released in time")
-        }
-    }
-    stopped
-}
 
 /// The indexer loop running as a task, and the token that stops it.
 struct Indexing {
@@ -295,7 +287,7 @@ struct Indexing {
 
 impl Indexing {
     /// Run `indexer` until it is stopped.
-    fn start(indexer: indexer::Indexer) -> Self {
+    fn start(indexer: Indexer) -> Self {
         let cancel = CancellationToken::new();
         let task = tokio::spawn(indexer.run(cancel.clone()));
         Self { cancel, task }

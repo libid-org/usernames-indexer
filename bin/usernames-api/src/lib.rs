@@ -43,7 +43,10 @@ use tower_http::cors::{
 };
 use usernames_core::{
     api,
-    db,
+    db::{
+        self,
+        Store,
+    },
     ens::{
         Domain,
         DEFAULT_DOMAIN,
@@ -149,43 +152,6 @@ impl Serving {
 /// inside the grace period a supervisor gives before it kills the process.
 const DRAIN: Duration = Duration::from_secs(10);
 
-/// Parse the environment, connect, and serve until ctrl-c or SIGTERM.
-pub async fn run() -> anyhow::Result<()> {
-    let _ = dotenvy::dotenv();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .init();
-
-    let config = Config::parse();
-
-    // From the start, so a stop request during startup ends the process.
-    let mut signals = StopSignals::listen()?;
-    let (listener, app) = tokio::select! {
-        started = config.start() => started?,
-        () = signals.received() => {
-            tracing::info!("stopped before serving");
-            return Ok(());
-        }
-    };
-
-    let mut serving = Serving::start(listener, app);
-    tokio::select! {
-        () = signals.received() => {
-            tracing::info!("shutting down");
-            serving.stop(DRAIN).await;
-            Ok(())
-        }
-        r = &mut serving.task => match r {
-            Ok(Ok(())) => Err(anyhow::anyhow!("API task exited unexpectedly")),
-            Ok(Err(e)) => Err(anyhow::anyhow!("API server failed: {e}")),
-            Err(e) => Err(anyhow::anyhow!("API task died: {e}")),
-        },
-    }
-}
-
 /// Everything the binary serves: the read API, and the ENS gateway when one
 /// is configured.
 pub struct Service {
@@ -241,7 +207,7 @@ impl Config {
     async fn start(self) -> anyhow::Result<(TcpListener, Router)> {
         // `connect`, not `connect_and_migrate`: the schema belongs to the writer.
         let pool = db::connect(&self.database_url).await?;
-        let store = db::Store::new(pool.clone());
+        let store = Store::new(pool.clone());
 
         // Configured BEFORE the port opens: it can refuse to start, and binding
         // first would accept connections the process is not yet able to serve.
@@ -328,11 +294,38 @@ impl Config {
             domain: self.ens_domain.clone(),
             resolver,
             ens_chain: self.ens_chain_id,
-            store: db::Store::new(pool),
+            store: Store::new(pool),
             ttl: self.ens_ttl,
             max_lag_blocks: self.ens_max_lag_blocks,
             signer: Arc::new(signer),
         }))
+    }
+
+    /// Connect, and serve until ctrl-c or SIGTERM.
+    pub async fn run(self) -> anyhow::Result<()> {
+        // From the start, so a stop request during startup ends the process.
+        let mut signals = StopSignals::listen()?;
+        let (listener, app) = tokio::select! {
+            started = self.start() => started?,
+            () = signals.received() => {
+                tracing::info!("stopped before serving");
+                return Ok(());
+            }
+        };
+
+        let mut serving = Serving::start(listener, app);
+        tokio::select! {
+            () = signals.received() => {
+                tracing::info!("shutting down");
+                serving.stop(DRAIN).await;
+                Ok(())
+            }
+            r = &mut serving.task => match r {
+                Ok(Ok(())) => Err(anyhow::anyhow!("API task exited unexpectedly")),
+                Ok(Err(e)) => Err(anyhow::anyhow!("API server failed: {e}")),
+                Err(e) => Err(anyhow::anyhow!("API task died: {e}")),
+            },
+        }
     }
 }
 
