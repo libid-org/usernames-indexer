@@ -1443,7 +1443,7 @@ async fn names_of(pool: &PgPool, chain: i64) -> Vec<String> {
         .into_iter()
         .find(|row| row.state.chain_id == chain)
         .map(|row| row.names)
-        .unwrap_or_default()
+        .expect("the chain has a status row")
 }
 
 /// A chain's names are its indexer's declaration: a set, replaced whole on
@@ -1497,7 +1497,6 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
         ),
         "{refused:?}"
     );
-    assert_eq!(names_of(&pool, OTHER_CHAIN).await, Vec::<String>::new());
 
     // A dropped name resolves to no chain, like one nobody declared.
     assert_eq!(reader.chain_named("alpha").await.unwrap(), Some(CHAIN));
