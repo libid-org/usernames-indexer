@@ -20,7 +20,8 @@
 //! preimage that drifted, and a chain the gateway answered for when it should
 //! have stepped aside.
 //!
-//! Skips silently without `DATABASE_URL`, and needs `anvil` on PATH.
+//! Skips without `DATABASE_URL`, unless `CI` is set: there its absence
+//! fails. Needs `anvil` on PATH.
 
 use std::{
     sync::Arc,
@@ -70,6 +71,7 @@ use usernames_core::{
 };
 
 use usernames_fixtures::{
+    database_url,
     Labels,
     Seed,
 };
@@ -193,7 +195,7 @@ impl WhoSigns {
     /// The four protocol steps, end to end. `None` means the suite skipped.
     async fn walk(self) -> Option<Result<Address, contract::Error>> {
         let guard = DB_LOCK.lock().await;
-        let url = std::env::var("DATABASE_URL").ok()?;
+        let url = database_url()?;
 
         // ── the read model the gateway answers from ──────────────────────
         let pool = sqlx::PgPool::connect(&url).await.expect("connect");

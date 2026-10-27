@@ -22,13 +22,15 @@ COPY crates/usernames-core/Cargo.toml crates/usernames-core/
 COPY crates/usernames-fixtures/Cargo.toml crates/usernames-fixtures/
 COPY bin/usernames-indexer/Cargo.toml bin/usernames-indexer/
 COPY bin/usernames-api/Cargo.toml bin/usernames-api/
+# Both builds name the binaries: the whole workspace would compile the test
+# fixtures, and the test features they turn on, into the core both link.
 RUN mkdir -p crates/usernames-core/src crates/usernames-fixtures/src bin/usernames-indexer/src bin/usernames-api/src \
     && touch crates/usernames-core/src/lib.rs crates/usernames-fixtures/src/lib.rs \
     && for b in usernames-indexer usernames-api; do \
          echo 'fn main() {}' > "bin/$b/src/main.rs"; \
          touch "bin/$b/src/lib.rs"; \
        done \
-    && cargo build --release --workspace \
+    && cargo build --release -p usernames-indexer -p usernames-api \
     && rm -rf crates/usernames-core/src crates/usernames-fixtures/src bin/usernames-indexer/src bin/usernames-api/src
 
 # ── Layer 2: the real build ──────────────────────────────────────────────────
@@ -42,7 +44,7 @@ COPY crates/usernames-fixtures/src crates/usernames-fixtures/src
 COPY bin/usernames-indexer/src bin/usernames-indexer/src
 COPY bin/usernames-api/src bin/usernames-api/src
 RUN find crates bin -name '*.rs' -exec touch {} + \
-    && cargo build --release --workspace
+    && cargo build --release -p usernames-indexer -p usernames-api
 
 # === Runtime base ===
 FROM debian:bookworm-slim AS runtime
