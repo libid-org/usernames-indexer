@@ -12,9 +12,9 @@
 //! - [`addr_call`] and [`legacy_addr_call`]: the record request, in the
 //!   ENSIP-11 multichain form and in the older form that means coin type 60.
 //! - [`resolve_call`]: the wrapped call the gateway receives.
-//! - [`bind`] and [`bind_private`]: one binding written into the store the
-//!   gateway answers from, with its chain marked synced.
-//! - [`writer`]: the right to write a chain, as an indexer takes it.
+//! - [`Seed`]: a chain's store seeded the way its indexer writes it — the
+//!   right to write it, and one binding with the chain marked synced.
+//! - [`IdNode`]: a user id's node, as the chain keys it.
 //!
 //! `gateway.rs` drives the router in process with these; `end_to_end.rs`
 //! deploys the real `HandleResolver` on anvil and walks the protocol with
@@ -33,7 +33,10 @@
 #![deny(missing_docs)]
 #![deny(dead_code)]
 
-use std::time::Duration;
+use std::{
+    future::Future,
+    time::Duration,
+};
 
 use alloy::{
     primitives::{
@@ -44,6 +47,7 @@ use alloy::{
     sol_types::SolCall,
 };
 use usernames_core::{
+    chain::Contracts,
     db::{
         ChainStore,
         ChainWriter,
@@ -121,84 +125,122 @@ pub fn legacy_addr_call(labels: &[&str]) -> Vec<u8> {
     .abi_encode()
 }
 
-/// Seed one disclosing X binding into the read model the gateway answers
-/// from: its `IdentityBound`, `HandleRevealed` and `HandlePublished`, in one
-/// transaction.
-pub async fn bind(store: &ChainStore, handle: &str, holder: Address) {
-    seed(store, handle, holder, true).await;
-}
-
 /// The registry a chain these fixtures write is prepared for.
 const REGISTRY: Address = Address::repeat_byte(0x1D);
 
-/// The right to write `store`'s chain, taken the way an indexer takes it at
-/// startup: under the chain's lease, prepared for `REGISTRY`. The lease
-/// goes back at once; the writer stays good until the chain is prepared
-/// again.
-pub async fn writer(store: &ChainStore) -> ChainWriter {
-    let lease = store.acquire_writer().await.expect("the writer lease");
-    let writer = store
-        .prepare(&lease, REGISTRY, None)
-        .await
-        .expect("the chain is prepared");
-    lease.release().await.expect("the lease goes back");
-    writer
+/// A user id's node on a platform.
+pub trait IdNode {
+    /// The node `id` is bound under, as libid-identity derives it.
+    fn id_node(self, id: &str) -> B256;
 }
 
-/// [`bind`] without the `HandleRevealed` and `HandlePublished`: a private
-/// binding.
-pub async fn bind_private(store: &ChainStore, handle: &str, holder: Address) {
-    seed(store, handle, holder, false).await;
-}
-
-async fn seed(store: &ChainStore, handle: &str, holder: Address, disclosed: bool) {
-    let x = KnownPlatform::X;
-    let handle_node = x.handle_node(handle).expect("an X handle");
-    let mut events = vec![NamesEvent::IdentityBound {
-        holder,
-        id_node: B256::from(
-            libid_identity::platforms::platform(x.key())
-                .and_then(|spec| spec.id_node("42").ok())
-                .expect("an X id"),
-        ),
-        handle_node,
-        platform_id: x.id(),
-        observed_at: 1_700_000_000,
-        ceremony_version: 1,
-    }];
-    if disclosed {
-        events.push(NamesEvent::HandleRevealed {
-            platform_id: x.id(),
-            handle_node,
-            handle: DisclosedHandle::verify(x, handle_node, handle),
-        });
-        events.push(NamesEvent::HandlePublished {
-            holder,
-            platform_id: x.id(),
-            handle_node,
-        });
+impl IdNode for KnownPlatform {
+    fn id_node(self, id: &str) -> B256 {
+        let spec =
+            libid_identity::platforms::platform(self.key()).expect("a libid platform");
+        B256::from(spec.id_node(id).expect("an id"))
     }
-    let writer = writer(store).await;
-    let mut window = writer.begin_window().await.expect("begin");
-    for (log_index, event) in (0u64..).zip(&events) {
-        window
-            .apply(
-                event,
-                &LogPosition {
-                    block_number: 1,
-                    log_index,
-                    tx_hash: B256::from([1u8; 32]),
-                    block_time: 1_700_000_000,
+}
+
+/// A chain's store, seeded the way its indexer writes it.
+pub trait Seed {
+    /// The right to write the chain, taken the way an indexer takes it at
+    /// startup: under the chain's lease, prepared for one registry. The
+    /// lease goes back at once; the writer stays good until the chain is
+    /// prepared again.
+    fn writer(&self) -> impl Future<Output = ChainWriter> + Send;
+
+    /// One disclosing X binding: its `IdentityBound`, `HandleRevealed` and
+    /// `HandlePublished`, in one transaction, with the chain marked synced.
+    fn bind(&self, handle: &str, holder: Address) -> impl Future<Output = ()> + Send;
+
+    /// [`Seed::bind`] without the `HandleRevealed` and `HandlePublished`:
+    /// an unlisted binding.
+    fn bind_private(
+        &self,
+        handle: &str,
+        holder: Address,
+    ) -> impl Future<Output = ()> + Send;
+}
+
+impl Seed for ChainStore {
+    async fn writer(&self) -> ChainWriter {
+        let lease = self.acquire_writer().await.expect("the writer lease");
+        let writer = self
+            .prepare(
+                &lease,
+                Contracts {
+                    registry: REGISTRY,
+                    escrow: None,
                 },
             )
             .await
-            .expect("apply");
+            .expect("the chain is prepared");
+        lease.release().await.expect("the lease goes back");
+        writer
     }
-    window.commit(1).await.expect("commit");
-    // The indexer records both every cycle, and the gateway refuses to answer
-    // from an index that cannot say how far behind it is. Staleness is measured
-    // against the TARGET — the block the cursor chases — so that is the one a
-    // fixture must record.
-    writer.set_chain_head(1).await;
-    writer.set_chain_target(1, Duration::from_secs(120)).await;
+
+    async fn bind(&self, handle: &str, holder: Address) {
+        self.writer().await.seed(handle, holder, true).await;
+    }
+
+    async fn bind_private(&self, handle: &str, holder: Address) {
+        self.writer().await.seed(handle, holder, false).await;
+    }
+}
+
+/// A binding written the way the indexer writes one.
+trait Binding {
+    /// An X binding of `handle` to `holder` at block 1, disclosed or not,
+    /// and the chain's head and target there.
+    async fn seed(&self, handle: &str, holder: Address, disclosed: bool);
+}
+
+impl Binding for ChainWriter {
+    async fn seed(&self, handle: &str, holder: Address, disclosed: bool) {
+        let x = KnownPlatform::X;
+        let handle_node = x.handle_node(handle).expect("an X handle");
+        let mut events = vec![NamesEvent::IdentityBound {
+            holder,
+            id_node: x.id_node("42"),
+            handle_node,
+            platform_id: x.id(),
+            observed_at: 1_700_000_000,
+            ceremony_version: 1,
+        }];
+        if disclosed {
+            events.push(NamesEvent::HandleRevealed {
+                platform_id: x.id(),
+                handle_node,
+                handle: DisclosedHandle::verify(x, handle_node, handle),
+            });
+            events.push(NamesEvent::HandlePublished {
+                holder,
+                platform_id: x.id(),
+                handle_node,
+            });
+        }
+        let mut window = self.begin_window().await.expect("begin");
+        for (log_index, event) in (0u64..).zip(&events) {
+            window
+                .apply(
+                    event,
+                    &LogPosition {
+                        block_number: 1,
+                        log_index,
+                        tx_hash: B256::from([1u8; 32]),
+                        block_time: 1_700_000_000,
+                    },
+                )
+                .await
+                .expect("apply");
+        }
+        window.commit(1).await.expect("commit");
+        // The indexer records both every cycle, and the gateway refuses to
+        // answer from an index that cannot say how far behind it is.
+        // Staleness is measured against the TARGET — the block the cursor
+        // chases — so that is the one a fixture must record.
+        self.set_chain_head(1).await;
+        self.set_chain_target(1, Duration::from_secs(120)).await;
+    }
 }

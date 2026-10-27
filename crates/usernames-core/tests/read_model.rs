@@ -24,17 +24,12 @@ use alloy::primitives::{
 };
 use axum::http::StatusCode;
 use common::{
-    apply,
-    apply_tx,
-    bind,
-    disclosed,
-    publish,
-    retire,
-    revealed,
-    unpublish,
-    Reply,
+    Events,
+    IdNode,
+    Reads,
+    Seed,
+    Writes,
 };
-use serde::de::DeserializeOwned;
 use sqlx::{
     postgres::PgPoolOptions,
     PgPool,
@@ -54,6 +49,7 @@ use usernames_core::{
         SearchResults,
         Status,
     },
+    chain::Contracts,
     db::{
         self,
         ChainState,
@@ -101,33 +97,119 @@ async fn test_store_with(
     // Scoped to this suite's chain, like the anvil suite scopes to its own:
     // neither depends on cargo happening to run test binaries sequentially.
     for chain in [CHAIN, OTHER_CHAIN] {
-        common::clear_chain(&pool, chain).await;
+        ChainStore::new(pool.clone(), chain).forget().await;
     }
     Some((ChainStore::new(pool.clone(), CHAIN), pool, guard))
 }
 
-fn addr(byte: u8) -> Address {
-    Address::from_slice(&[byte; 20])
+/// The one item a list holds in these single-chain scenarios.
+trait Only<T> {
+    /// The list's only item; any other count fails the test.
+    fn only(&self) -> &T;
 }
 
-/// A request scoped to this suite's chain: the store is shared with the
-/// anvil suite's chain, and an unscoped read would see both. The reads that
-/// span chains have their own test below.
-async fn get<T: DeserializeOwned>(pool: &PgPool, path: &str) -> Reply<T> {
-    common::get_on(pool, CHAIN, path).await
-}
-
-/// The one binding a resolution carries in these single-chain scenarios.
-fn only<T: Debug>(bindings: &[T]) -> &T {
-    match bindings {
-        [one] => one,
-        many => panic!("one binding expected: {many:?}"),
+impl<T: Debug> Only<T> for [T] {
+    fn only(&self) -> &T {
+        match self {
+            [one] => one,
+            many => panic!("one binding expected: {many:?}"),
+        }
     }
 }
 
-/// The id-node route for an id, hashed here as a client would.
-fn id_route(platform: KnownPlatform, id: &str) -> String {
-    format!("/v1/resolve/id-node/{}", common::id_node(platform, id))
+/// The id-node route for an id.
+trait IdRoute {
+    /// The route for `id`, hashed here as a client would.
+    fn id_route(self, id: &str) -> String;
+}
+
+impl IdRoute for KnownPlatform {
+    fn id_route(self, id: &str) -> String {
+        format!("/v1/resolve/id-node/{}", self.id_node(id))
+    }
+}
+
+/// An address's published names, as the suite compares them.
+trait NamedPlatforms {
+    /// The platforms of the identities whose names are published.
+    fn named_platforms(&self) -> Vec<Option<KnownPlatform>>;
+}
+
+impl NamedPlatforms for AddressResolution {
+    fn named_platforms(&self) -> Vec<Option<KnownPlatform>> {
+        self.identities
+            .iter()
+            .filter(|identity| identity.published)
+            .map(|identity| identity.platform)
+            .collect()
+    }
+}
+
+/// A search's hits, as the suite compares them.
+trait Handles {
+    /// The handles found, in the order served.
+    fn handles(&self) -> Vec<&str>;
+}
+
+impl Handles for SearchResults {
+    fn handles(&self) -> Vec<&str> {
+        self.hits.iter().map(|h| h.handle.as_str()).collect()
+    }
+}
+
+/// Rows the API does not serve, read straight from the store.
+trait StoreRows {
+    /// How many names `owner` publishes on the suite's chain.
+    async fn names_held(&self, owner: Address) -> i64;
+
+    /// The names `chain` goes by, as its status lists them.
+    async fn names_of(&self, chain: i64) -> Vec<String>;
+}
+
+impl StoreRows for PgPool {
+    async fn names_held(&self, owner: Address) -> i64 {
+        sqlx::query_scalar(include_str!("sql/names_held.sql"))
+            .bind(CHAIN)
+            .bind(owner)
+            .fetch_one(self)
+            .await
+            .expect("a name count")
+    }
+
+    async fn names_of(&self, chain: i64) -> Vec<String> {
+        db::Store::new(self.clone())
+            .chain_statuses()
+            .await
+            .expect("the statuses")
+            .into_iter()
+            .find(|row| row.state.chain_id == chain)
+            .map(|row| row.names)
+            .expect("the chain has a status row")
+    }
+}
+
+/// A chain with something for a replay to take and something to leave.
+trait Seeded {
+    /// Bind one handle and note a deployment block.
+    async fn seed(&self);
+}
+
+impl Seeded for ChainWriter {
+    async fn seed(&self) {
+        self.apply_tx(
+            1,
+            NamesEvent::bind(
+                Address::repeat_byte(1),
+                KnownPlatform::X,
+                "1",
+                "alice",
+                1,
+                true,
+            ),
+        )
+        .await;
+        self.set_deploy_block(4321).await.expect("deploy block");
+    }
 }
 
 #[tokio::test]
@@ -136,36 +218,43 @@ async fn bind_resolves_all_three_directions() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = common::writer(&store).await;
+    let writer = store.writer().await;
     let x = KnownPlatform::X;
-    let alice = addr(0xA1);
-    apply_tx(&writer, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
+    let alice = Address::repeat_byte(0xA1);
+    writer
+        .apply_tx(1, NamesEvent::bind(alice, x, "111", "alice_1", 1000, true))
+        .await;
 
-    let resolved: HandleResolution =
-        get(&pool, "/v1/resolve/handle/x/alice_1").await.answer();
-    let binding = only(&resolved.bindings);
+    let resolved: HandleResolution = pool
+        .get_on(CHAIN, "/v1/resolve/handle/x/alice_1")
+        .await
+        .answer();
+    let binding = resolved.bindings.only();
     assert_eq!(binding.chain_id, CHAIN);
     assert_eq!(binding.owner, alice);
-    assert_eq!(binding.id_node, common::id_node(x, "111"));
+    assert_eq!(binding.id_node, x.id_node("111"));
     assert_eq!(binding.handle.as_deref(), Some("alice_1"));
     assert_eq!(binding.ceremony_version, 1);
 
     // The path is hashed the way the circuit hashed it: case folds.
-    let resolved: HandleResolution =
-        get(&pool, "/v1/resolve/handle/x/Alice_1").await.answer();
+    let resolved: HandleResolution = pool
+        .get_on(CHAIN, "/v1/resolve/handle/x/Alice_1")
+        .await
+        .answer();
     assert_eq!(resolved.handle_node, x.handle_node("alice_1").unwrap());
     assert_eq!(resolved.platform, Some(KnownPlatform::X));
 
-    let resolved: IdResolution = get(&pool, &id_route(x, "111")).await.answer();
-    let binding = only(&resolved.bindings);
+    let resolved: IdResolution = pool.get_on(CHAIN, &x.id_route("111")).await.answer();
+    let binding = resolved.bindings.only();
     assert_eq!(binding.owner, alice);
     assert_eq!(binding.handle.as_deref(), Some("alice_1"));
     assert!(binding.published);
 
-    let resolved: AddressResolution = get(&pool, &format!("/v1/resolve/address/{alice}"))
+    let resolved: AddressResolution = pool
+        .get_on(CHAIN, &format!("/v1/resolve/address/{alice}"))
         .await
         .answer();
-    let identity = only(&resolved.identities);
+    let identity = resolved.identities.only();
     assert_eq!(identity.handle.as_deref(), Some("alice_1"));
     assert!(identity.published);
     assert!(identity.resolves);
@@ -178,28 +267,36 @@ async fn rename_retires_the_previous_handle() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = common::writer(&store).await;
+    let writer = store.writer().await;
     let x = KnownPlatform::X;
-    let alice = addr(0xA1);
-    apply_tx(&writer, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
+    let alice = Address::repeat_byte(0xA1);
+    writer
+        .apply_tx(1, NamesEvent::bind(alice, x, "111", "alice_1", 1000, true))
+        .await;
     // The rename's bind retires alice_1 and withdraws its name first.
-    let mut rename = vec![retire(x, "alice_1", alice), unpublish(alice)];
-    rename.extend(bind(alice, x, "111", "alice_2", 2000, true));
-    apply_tx(&writer, 2, rename).await;
+    let mut rename = vec![
+        NamesEvent::retire(x, "alice_1", alice),
+        NamesEvent::unpublish(alice),
+    ];
+    rename.extend(NamesEvent::bind(alice, x, "111", "alice_2", 2000, true));
+    writer.apply_tx(2, rename).await;
 
     // The code is the machine-readable half: a UI renders "retired"
     // differently from "never claimed" without parsing prose.
-    let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/alice_1")
+    let refusal = pool
+        .get_on::<HandleResolution>(CHAIN, "/v1/resolve/handle/x/alice_1")
         .await
         .refusal();
     assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::HandleRetired));
 
-    let resolved: HandleResolution =
-        get(&pool, "/v1/resolve/handle/x/alice_2").await.answer();
-    assert_eq!(only(&resolved.bindings).owner, alice);
+    let resolved: HandleResolution = pool
+        .get_on(CHAIN, "/v1/resolve/handle/x/alice_2")
+        .await
+        .answer();
+    assert_eq!(resolved.bindings.only().owner, alice);
 
-    let resolved: IdResolution = get(&pool, &id_route(x, "111")).await.answer();
-    assert_eq!(only(&resolved.bindings).handle.as_deref(), Some("alice_2"));
+    let resolved: IdResolution = pool.get_on(CHAIN, &x.id_route("111")).await.answer();
+    assert_eq!(resolved.bindings.only().handle.as_deref(), Some("alice_2"));
 
     // The retired node keeps its watermark, mirroring the contract's
     // stale-proof gate.
@@ -221,26 +318,32 @@ async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = common::writer(&store).await;
+    let writer = store.writer().await;
     let x = KnownPlatform::X;
-    let (alice, bob) = (addr(0xA1), addr(0xB2));
+    let (alice, bob) = (Address::repeat_byte(0xA1), Address::repeat_byte(0xB2));
     // Alice holds the handle, renames her platform account, re-proves under
     // the same handle... then the platform recycles the name to Bob's
     // account, and Bob proves it with a fresher observation.
-    apply_tx(&writer, 1, bind(alice, x, "111", "popular", 1000, false)).await;
-    apply_tx(&writer, 2, bind(bob, x, "222", "popular", 2000, false)).await;
+    writer
+        .apply_tx(1, NamesEvent::bind(alice, x, "111", "popular", 1000, false))
+        .await;
+    writer
+        .apply_tx(2, NamesEvent::bind(bob, x, "222", "popular", 2000, false))
+        .await;
 
     // The handle resolves to Bob now, paired with Bob's id.
-    let resolved: HandleResolution =
-        get(&pool, "/v1/resolve/handle/x/popular").await.answer();
-    let binding = only(&resolved.bindings);
+    let resolved: HandleResolution = pool
+        .get_on(CHAIN, "/v1/resolve/handle/x/popular")
+        .await
+        .answer();
+    let binding = resolved.bindings.only();
     assert_eq!(binding.owner, bob);
-    assert_eq!(binding.id_node, common::id_node(x, "222"));
+    assert_eq!(binding.id_node, x.id_node("222"));
 
     // Alice's id still resolves to her wallet, but the handle is no longer
     // hers to display: the node points at Bob's id.
-    let resolved: IdResolution = get(&pool, &id_route(x, "111")).await.answer();
-    let binding = only(&resolved.bindings);
+    let resolved: IdResolution = pool.get_on(CHAIN, &x.id_route("111")).await.answer();
+    let binding = resolved.bindings.only();
     assert_eq!(binding.owner, alice);
     assert_eq!(binding.handle, None);
     drop(guard);
@@ -255,11 +358,15 @@ async fn a_takeover_keeps_the_disclosed_text() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = common::writer(&store).await;
+    let writer = store.writer().await;
     let x = KnownPlatform::X;
-    let (tom, uma, val) = (addr(0xC1), addr(0xC2), addr(0xC3));
+    let (tom, uma, val) = (
+        Address::repeat_byte(0xC1),
+        Address::repeat_byte(0xC2),
+        Address::repeat_byte(0xC3),
+    );
     let holder_text = |resolved: &HandleResolution| {
-        let binding = only(&resolved.bindings);
+        let binding = resolved.bindings.only();
         (binding.owner, binding.handle.clone())
     };
     let hits_of = |found: &SearchResults| -> Vec<(String, Address, bool)> {
@@ -271,37 +378,47 @@ async fn a_takeover_keeps_the_disclosed_text() {
     };
 
     // (a) Tom discloses @lee1; Uma's account takes it privately.
-    apply_tx(&writer, 1, bind(tom, x, "555", "lee1", 1_000, true)).await;
-    let mut takeover = vec![unpublish(tom)];
-    takeover.extend(bind(uma, x, "556", "lee1", 2_000, false));
-    apply_tx(&writer, 2, takeover).await;
-    let resolved: HandleResolution =
-        get(&pool, "/v1/resolve/handle/x/lee1").await.answer();
-    assert_eq!(holder_text(&resolved), (uma, Some("lee1".into())));
-    let found: SearchResults = get(&pool, "/v1/search?q=lee1").await.answer();
-    assert_eq!(hits_of(&found), [("lee1".to_string(), uma, false)]);
-    let umas: AddressResolution = get(&pool, &format!("/v1/resolve/address/{uma}"))
+    writer
+        .apply_tx(1, NamesEvent::bind(tom, x, "555", "lee1", 1_000, true))
+        .await;
+    let mut takeover = vec![NamesEvent::unpublish(tom)];
+    takeover.extend(NamesEvent::bind(uma, x, "556", "lee1", 2_000, false));
+    writer.apply_tx(2, takeover).await;
+    let resolved: HandleResolution = pool
+        .get_on(CHAIN, "/v1/resolve/handle/x/lee1")
         .await
         .answer();
-    assert_eq!(only(&umas.identities).handle.as_deref(), Some("lee1"));
-    assert!(!only(&umas.identities).published);
+    assert_eq!(holder_text(&resolved), (uma, Some("lee1".into())));
+    let found: SearchResults = pool.get_on(CHAIN, "/v1/search?q=lee1").await.answer();
+    assert_eq!(hits_of(&found), [("lee1".to_string(), uma, false)]);
+    let umas: AddressResolution = pool
+        .get_on(CHAIN, &format!("/v1/resolve/address/{uma}"))
+        .await
+        .answer();
+    assert_eq!(umas.identities.only().handle.as_deref(), Some("lee1"));
+    assert!(!umas.identities.only().published);
 
     // (b) Tom discloses @lee2; Val's account takes it, disclosing it again:
     // still one disclosure.
-    apply_tx(&writer, 3, bind(tom, x, "555", "lee2", 3_000, true)).await;
-    let mut takeover = vec![unpublish(tom)];
-    takeover.extend(bind(val, x, "557", "lee2", 4_000, true));
-    apply_tx(&writer, 4, takeover).await;
-    let resolved: HandleResolution =
-        get(&pool, "/v1/resolve/handle/x/lee2").await.answer();
+    writer
+        .apply_tx(3, NamesEvent::bind(tom, x, "555", "lee2", 3_000, true))
+        .await;
+    let mut takeover = vec![NamesEvent::unpublish(tom)];
+    takeover.extend(NamesEvent::bind(val, x, "557", "lee2", 4_000, true));
+    writer.apply_tx(4, takeover).await;
+    let resolved: HandleResolution = pool
+        .get_on(CHAIN, "/v1/resolve/handle/x/lee2")
+        .await
+        .answer();
     assert_eq!(holder_text(&resolved), (val, Some("lee2".into())));
-    let found: SearchResults = get(&pool, "/v1/search?q=lee2").await.answer();
+    let found: SearchResults = pool.get_on(CHAIN, "/v1/search?q=lee2").await.answer();
     // The exact match ranks first; lee1 follows as a fuzzy neighbor.
     assert_eq!(hits_of(&found)[0], ("lee2".to_string(), val, true));
     let lee2 = x.handle_node("lee2").unwrap();
-    assert_eq!(disclosed(&pool, CHAIN, lee2).await.as_deref(), Some("lee2"));
+    assert_eq!(pool.disclosed(CHAIN, lee2).await.as_deref(), Some("lee2"));
     // Tom's account no longer holds either handle, so it shows neither.
-    let toms: AddressResolution = get(&pool, &format!("/v1/resolve/address/{tom}"))
+    let toms: AddressResolution = pool
+        .get_on(CHAIN, &format!("/v1/resolve/address/{tom}"))
         .await
         .answer();
     assert!(
@@ -322,34 +439,45 @@ async fn publishing_another_name_keeps_the_one_it_replaces_disclosed() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = common::writer(&store).await;
+    let writer = store.writer().await;
     let x = KnownPlatform::X;
-    let (alice, bob) = (addr(0xD1), addr(0xD2));
-    apply_tx(&writer, 1, bind(alice, x, "71", "kim", 1_000, true)).await;
-    apply_tx(&writer, 2, bind(alice, x, "72", "lee", 2_000, false)).await;
-    apply_tx(&writer, 3, publish(alice, x, "lee")).await;
+    let (alice, bob) = (Address::repeat_byte(0xD1), Address::repeat_byte(0xD2));
+    writer
+        .apply_tx(1, NamesEvent::bind(alice, x, "71", "kim", 1_000, true))
+        .await;
+    writer
+        .apply_tx(2, NamesEvent::bind(alice, x, "72", "lee", 2_000, false))
+        .await;
+    writer
+        .apply_tx(3, NamesEvent::publish(alice, x, "lee"))
+        .await;
     let kim = x.handle_node("kim").unwrap();
-    assert_eq!(disclosed(&pool, CHAIN, kim).await.as_deref(), Some("kim"));
+    assert_eq!(pool.disclosed(CHAIN, kim).await.as_deref(), Some("kim"));
 
     // Bob's account takes kim privately: Alice's name is lee, so the bind
     // withdraws nothing on chain.
-    apply_tx(&writer, 4, bind(bob, x, "71", "kim", 3_000, false)).await;
-    let resolved: HandleResolution =
-        get(&pool, "/v1/resolve/handle/x/kim").await.answer();
-    let binding = only(&resolved.bindings);
+    writer
+        .apply_tx(4, NamesEvent::bind(bob, x, "71", "kim", 3_000, false))
+        .await;
+    let resolved: HandleResolution = pool
+        .get_on(CHAIN, "/v1/resolve/handle/x/kim")
+        .await
+        .answer();
+    let binding = resolved.bindings.only();
     assert_eq!(
         (binding.owner, binding.handle.as_deref()),
         (bob, Some("kim"))
     );
-    let found: SearchResults = get(&pool, "/v1/search?q=kim").await.answer();
-    assert_eq!(handles_of(&found), ["kim"]);
-    assert_eq!(only(&found.hits).owner, bob);
-    let bobs: AddressResolution = get(&pool, &format!("/v1/resolve/address/{bob}"))
+    let found: SearchResults = pool.get_on(CHAIN, "/v1/search?q=kim").await.answer();
+    assert_eq!(found.handles(), ["kim"]);
+    assert_eq!(found.hits.only().owner, bob);
+    let bobs: AddressResolution = pool
+        .get_on(CHAIN, &format!("/v1/resolve/address/{bob}"))
         .await
         .answer();
-    assert_eq!(only(&bobs.identities).handle.as_deref(), Some("kim"));
-    let found: SearchResults = get(&pool, "/v1/search?q=lee").await.answer();
-    assert_eq!(handles_of(&found), ["lee"]);
+    assert_eq!(bobs.identities.only().handle.as_deref(), Some("kim"));
+    let found: SearchResults = pool.get_on(CHAIN, "/v1/search?q=lee").await.answer();
+    assert_eq!(found.handles(), ["lee"]);
     drop(guard);
 }
 
@@ -361,42 +489,52 @@ async fn a_withdrawn_name_is_no_longer_published_but_still_shows() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = common::writer(&store).await;
+    let writer = store.writer().await;
     let x = KnownPlatform::X;
-    let alice = addr(0xA1);
-    apply_tx(&writer, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
+    let alice = Address::repeat_byte(0xA1);
+    writer
+        .apply_tx(1, NamesEvent::bind(alice, x, "111", "alice_1", 1000, true))
+        .await;
     // A rename retires the old handle and withdraws the name it published,
     // before the new, private bind.
-    let mut rename = vec![retire(x, "alice_1", alice), unpublish(alice)];
-    rename.extend(bind(alice, x, "111", "alice_2", 2000, false));
-    apply_tx(&writer, 2, rename).await;
+    let mut rename = vec![
+        NamesEvent::retire(x, "alice_1", alice),
+        NamesEvent::unpublish(alice),
+    ];
+    rename.extend(NamesEvent::bind(alice, x, "111", "alice_2", 2000, false));
+    writer.apply_tx(2, rename).await;
 
     let address = format!("/v1/resolve/address/{alice}");
-    let resolved: AddressResolution = get(&pool, &address).await.answer();
-    let identity = only(&resolved.identities);
+    let resolved: AddressResolution = pool.get_on(CHAIN, &address).await.answer();
+    let identity = resolved.identities.only();
     assert!(!identity.published);
     assert_eq!(identity.handle, None, "a private bind shows no text");
 
     // A later `publish` discloses it.
-    apply_tx(&writer, 3, publish(alice, x, "alice_2")).await;
-    let resolved: AddressResolution = get(&pool, &address).await.answer();
-    let identity = only(&resolved.identities);
+    writer
+        .apply_tx(3, NamesEvent::publish(alice, x, "alice_2"))
+        .await;
+    let resolved: AddressResolution = pool.get_on(CHAIN, &address).await.answer();
+    let identity = resolved.identities.only();
     assert!(identity.published);
     assert_eq!(identity.handle.as_deref(), Some("alice_2"));
 
     // HandleUnpublished takes the name down; the text stays.
-    apply(&writer, 4, unpublish(alice)).await;
-    let resolved: AddressResolution = get(&pool, &address).await.answer();
-    let identity = only(&resolved.identities);
+    writer.apply(4, NamesEvent::unpublish(alice)).await;
+    let resolved: AddressResolution = pool.get_on(CHAIN, &address).await.answer();
+    let identity = resolved.identities.only();
     assert!(!identity.published);
     assert_eq!(identity.handle.as_deref(), Some("alice_2"));
-    let resolved: HandleResolution =
-        get(&pool, "/v1/resolve/handle/x/alice_2").await.answer();
-    assert_eq!(only(&resolved.bindings).handle.as_deref(), Some("alice_2"));
-    let found: SearchResults = get(&pool, "/v1/search?q=alice_2").await.answer();
-    assert_eq!(handles_of(&found), ["alice_2"]);
-    assert!(!only(&found.hits).published);
-    let history: AddressHistory = get(&pool, &format!("/v1/history/address/{alice}"))
+    let resolved: HandleResolution = pool
+        .get_on(CHAIN, "/v1/resolve/handle/x/alice_2")
+        .await
+        .answer();
+    assert_eq!(resolved.bindings.only().handle.as_deref(), Some("alice_2"));
+    let found: SearchResults = pool.get_on(CHAIN, "/v1/search?q=alice_2").await.answer();
+    assert_eq!(found.handles(), ["alice_2"]);
+    assert!(!found.hits.only().published);
+    let history: AddressHistory = pool
+        .get_on(CHAIN, &format!("/v1/history/address/{alice}"))
         .await
         .answer();
     let texts: Vec<&str> = history
@@ -409,28 +547,6 @@ async fn a_withdrawn_name_is_no_longer_published_but_still_shows() {
     drop(guard);
 }
 
-/// The platforms of a wallet's identities that carry its name.
-fn named_platforms(resolved: &AddressResolution) -> Vec<Option<KnownPlatform>> {
-    resolved
-        .identities
-        .iter()
-        .filter(|identity| identity.published)
-        .map(|identity| identity.platform)
-        .collect()
-}
-
-/// The names `names.published` holds for a wallet on this suite's chain.
-async fn names_held(pool: &PgPool, owner: Address) -> i64 {
-    sqlx::query_scalar(
-        "SELECT count(*) FROM names.published WHERE chain_id = $1 AND owner = $2",
-    )
-    .bind(CHAIN)
-    .bind(owner)
-    .fetch_one(pool)
-    .await
-    .expect("a name count")
-}
-
 /// A holder has one name: a name on GitHub replaces the one on X, and
 /// `published` marks only the identity whose handle it is. Publishing the X
 /// handle again moves the name back.
@@ -440,17 +556,24 @@ async fn a_name_on_another_platform_replaces_the_one_before() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = common::writer(&store).await;
+    let writer = store.writer().await;
     let (x, github) = (KnownPlatform::X, KnownPlatform::GitHub);
-    let eve = addr(0xE1);
-    apply_tx(&writer, 1, bind(eve, x, "81", "eve_x", 1_000, true)).await;
-    apply_tx(&writer, 2, bind(eve, github, "82", "eve_gh", 1_000, true)).await;
+    let eve = Address::repeat_byte(0xE1);
+    writer
+        .apply_tx(1, NamesEvent::bind(eve, x, "81", "eve_x", 1_000, true))
+        .await;
+    writer
+        .apply_tx(
+            2,
+            NamesEvent::bind(eve, github, "82", "eve_gh", 1_000, true),
+        )
+        .await;
 
     let address = format!("/v1/resolve/address/{eve}");
-    let resolved: AddressResolution = get(&pool, &address).await.answer();
+    let resolved: AddressResolution = pool.get_on(CHAIN, &address).await.answer();
     assert_eq!(resolved.identities.len(), 2, "{resolved:?}");
-    assert_eq!(named_platforms(&resolved), [Some(github)]);
-    assert_eq!(names_held(&pool, eve).await, 1);
+    assert_eq!(resolved.named_platforms(), [Some(github)]);
+    assert_eq!(pool.names_held(eve).await, 1);
     let flags = |found: &SearchResults| -> Vec<(String, bool)> {
         let mut flags: Vec<_> = found
             .hits
@@ -460,21 +583,25 @@ async fn a_name_on_another_platform_replaces_the_one_before() {
         flags.sort();
         flags
     };
-    let found: SearchResults = get(&pool, &format!("/v1/search?owner={eve}"))
+    let found: SearchResults = pool
+        .get_on(CHAIN, &format!("/v1/search?owner={eve}"))
         .await
         .answer();
     assert_eq!(
         flags(&found),
         [("eve_gh".to_string(), true), ("eve_x".to_string(), false)]
     );
-    let resolved: IdResolution = get(&pool, &id_route(x, "81")).await.answer();
-    assert!(!only(&resolved.bindings).published);
+    let resolved: IdResolution = pool.get_on(CHAIN, &x.id_route("81")).await.answer();
+    assert!(!resolved.bindings.only().published);
 
-    apply_tx(&writer, 3, publish(eve, x, "eve_x")).await;
-    let resolved: AddressResolution = get(&pool, &address).await.answer();
-    assert_eq!(named_platforms(&resolved), [Some(x)]);
-    assert_eq!(names_held(&pool, eve).await, 1);
-    let found: SearchResults = get(&pool, &format!("/v1/search?owner={eve}"))
+    writer
+        .apply_tx(3, NamesEvent::publish(eve, x, "eve_x"))
+        .await;
+    let resolved: AddressResolution = pool.get_on(CHAIN, &address).await.answer();
+    assert_eq!(resolved.named_platforms(), [Some(x)]);
+    assert_eq!(pool.names_held(eve).await, 1);
+    let found: SearchResults = pool
+        .get_on(CHAIN, &format!("/v1/search?owner={eve}"))
         .await
         .answer();
     assert_eq!(
@@ -492,20 +619,29 @@ async fn a_withdrawal_clears_the_name_whatever_its_platform() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = common::writer(&store).await;
+    let writer = store.writer().await;
     let (x, github) = (KnownPlatform::X, KnownPlatform::GitHub);
-    let eve = addr(0xE2);
-    apply_tx(&writer, 1, bind(eve, x, "83", "eve_x", 1_000, true)).await;
-    apply_tx(&writer, 2, bind(eve, github, "84", "eve_gh", 1_000, true)).await;
-    apply(&writer, 3, unpublish(eve)).await;
+    let eve = Address::repeat_byte(0xE2);
+    writer
+        .apply_tx(1, NamesEvent::bind(eve, x, "83", "eve_x", 1_000, true))
+        .await;
+    writer
+        .apply_tx(
+            2,
+            NamesEvent::bind(eve, github, "84", "eve_gh", 1_000, true),
+        )
+        .await;
+    writer.apply(3, NamesEvent::unpublish(eve)).await;
 
-    let resolved: AddressResolution = get(&pool, &format!("/v1/resolve/address/{eve}"))
+    let resolved: AddressResolution = pool
+        .get_on(CHAIN, &format!("/v1/resolve/address/{eve}"))
         .await
         .answer();
     assert_eq!(resolved.identities.len(), 2, "{resolved:?}");
-    assert_eq!(named_platforms(&resolved), []);
-    assert_eq!(names_held(&pool, eve).await, 0);
-    let found: SearchResults = get(&pool, &format!("/v1/search?owner={eve}"))
+    assert_eq!(resolved.named_platforms(), []);
+    assert_eq!(pool.names_held(eve).await, 0);
+    let found: SearchResults = pool
+        .get_on(CHAIN, &format!("/v1/search?owner={eve}"))
         .await
         .answer();
     assert_eq!(found.hits.len(), 2, "{found:?}");
@@ -523,36 +659,33 @@ async fn every_reveal_fills_one_map_and_sets_no_name() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = common::writer(&store).await;
+    let writer = store.writer().await;
     let x = KnownPlatform::X;
-    let (eve, fay) = (addr(0xE3), addr(0xE5));
-    let mut reveal_only = bind(eve, x, "91", "eve_r", 1_000, false);
-    reveal_only.push(revealed(x, "Eve_R"));
-    apply_tx(&writer, 1, reveal_only).await;
-    apply(&writer, 2, revealed(x, "Fay_E")).await;
-    apply_tx(&writer, 3, bind(fay, x, "92", "fay_e", 2_000, false)).await;
+    let (eve, fay) = (Address::repeat_byte(0xE3), Address::repeat_byte(0xE5));
+    let mut reveal_only = NamesEvent::bind(eve, x, "91", "eve_r", 1_000, false);
+    reveal_only.push(NamesEvent::revealed(x, "Eve_R"));
+    writer.apply_tx(1, reveal_only).await;
+    writer.apply(2, NamesEvent::revealed(x, "Fay_E")).await;
+    writer
+        .apply_tx(3, NamesEvent::bind(fay, x, "92", "fay_e", 2_000, false))
+        .await;
 
     for (holder, handle) in [(eve, "eve_r"), (fay, "fay_e")] {
         let node = x.handle_node(handle).unwrap();
-        assert_eq!(disclosed(&pool, CHAIN, node).await.as_deref(), Some(handle));
-        let resolved: AddressResolution =
-            get(&pool, &format!("/v1/resolve/address/{holder}"))
-                .await
-                .answer();
-        let identity = only(&resolved.identities);
+        assert_eq!(pool.disclosed(CHAIN, node).await.as_deref(), Some(handle));
+        let resolved: AddressResolution = pool
+            .get_on(CHAIN, &format!("/v1/resolve/address/{holder}"))
+            .await
+            .answer();
+        let identity = resolved.identities.only();
         assert_eq!(identity.handle.as_deref(), Some(handle));
         assert!(!identity.published, "{resolved:?}");
-        assert_eq!(names_held(&pool, holder).await, 0);
+        assert_eq!(pool.names_held(holder).await, 0);
     }
-    let found: SearchResults = get(&pool, "/v1/search?q=fay_e").await.answer();
-    assert_eq!(handles_of(&found), ["fay_e"]);
-    assert_eq!(only(&found.hits).owner, fay);
+    let found: SearchResults = pool.get_on(CHAIN, "/v1/search?q=fay_e").await.answer();
+    assert_eq!(found.handles(), ["fay_e"]);
+    assert_eq!(found.hits.only().owner, fay);
     drop(guard);
-}
-
-/// The handles a search answered with, in its order.
-fn handles_of(results: &SearchResults) -> Vec<&str> {
-    results.hits.iter().map(|h| h.handle.as_str()).collect()
 }
 
 #[tokio::test]
@@ -561,86 +694,127 @@ async fn search_ranks_exact_prefix_substring() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = common::writer(&store).await;
+    let writer = store.writer().await;
     let x = KnownPlatform::X;
     let github = KnownPlatform::GitHub;
-    apply_tx(&writer, 1, bind(addr(1), x, "1", "ali", 1000, true)).await;
-    apply_tx(&writer, 2, bind(addr(2), x, "2", "alice_1", 1000, true)).await;
-    apply_tx(&writer, 3, bind(addr(3), x, "3", "malice", 1000, true)).await;
-    apply_tx(&writer, 4, bind(addr(4), x, "4", "bob", 1000, true)).await;
-    apply_tx(
-        &writer,
-        5,
-        bind(addr(5), github, "5", "alicorn", 1000, true),
-    )
-    .await;
+    writer
+        .apply_tx(
+            1,
+            NamesEvent::bind(Address::repeat_byte(1), x, "1", "ali", 1000, true),
+        )
+        .await;
+    writer
+        .apply_tx(
+            2,
+            NamesEvent::bind(Address::repeat_byte(2), x, "2", "alice_1", 1000, true),
+        )
+        .await;
+    writer
+        .apply_tx(
+            3,
+            NamesEvent::bind(Address::repeat_byte(3), x, "3", "malice", 1000, true),
+        )
+        .await;
+    writer
+        .apply_tx(
+            4,
+            NamesEvent::bind(Address::repeat_byte(4), x, "4", "bob", 1000, true),
+        )
+        .await;
+    writer
+        .apply_tx(
+            5,
+            NamesEvent::bind(Address::repeat_byte(5), github, "5", "alicorn", 1000, true),
+        )
+        .await;
     // A private bind is never a hit, whatever it would match.
-    apply_tx(&writer, 6, bind(addr(6), x, "6", "alina", 1000, false)).await;
+    writer
+        .apply_tx(
+            6,
+            NamesEvent::bind(Address::repeat_byte(6), x, "6", "alina", 1000, false),
+        )
+        .await;
     // A name its holder withdrew still is, no longer published.
-    apply(&writer, 7, unpublish(addr(3))).await;
+    writer
+        .apply(7, NamesEvent::unpublish(Address::repeat_byte(3)))
+        .await;
 
-    let results: SearchResults = get(&pool, "/v1/search?q=ali").await.answer();
+    let results: SearchResults = pool.get_on(CHAIN, "/v1/search?q=ali").await.answer();
     // Exact first, then prefix alphabetically, then substring.
-    assert_eq!(
-        handles_of(&results),
-        ["ali", "alice_1", "alicorn", "malice"]
-    );
+    assert_eq!(results.handles(), ["ali", "alice_1", "alicorn", "malice"]);
     assert!(!results.hits[3].published);
     // And the hit carries the right binding, not just the right string.
     let exact = &results.hits[0];
-    assert_eq!(exact.owner, addr(1));
-    assert_eq!(exact.id_node, common::id_node(x, "1"));
+    assert_eq!(exact.owner, Address::repeat_byte(1));
+    assert_eq!(exact.id_node, x.id_node("1"));
     assert_eq!(exact.handle_node, x.handle_node("ali").unwrap());
     assert!(exact.published);
     assert_eq!(results.query.as_deref(), Some("ali"));
 
     // Pages walk the same ranked list; a short page is the last one.
-    let page: SearchResults = get(&pool, "/v1/search?q=ali&limit=2&offset=1")
+    let page: SearchResults = pool
+        .get_on(CHAIN, "/v1/search?q=ali&limit=2&offset=1")
         .await
         .answer();
     assert_eq!((page.limit, page.offset), (2, 1));
-    assert_eq!(handles_of(&page), ["alice_1", "alicorn"]);
-    let page: SearchResults = get(&pool, "/v1/search?q=ali&limit=2&offset=3")
+    assert_eq!(page.handles(), ["alice_1", "alicorn"]);
+    let page: SearchResults = pool
+        .get_on(CHAIN, "/v1/search?q=ali&limit=2&offset=3")
         .await
         .answer();
     assert_eq!(page.hits.len(), 1, "{page:?}");
 
     // The platform filter narrows to that keyspace.
-    let results: SearchResults = get(&pool, "/v1/search?q=ali&platform=github")
+    let results: SearchResults = pool
+        .get_on(CHAIN, "/v1/search?q=ali&platform=github")
         .await
         .answer();
-    assert_eq!(handles_of(&results), ["alicorn"]);
+    assert_eq!(results.handles(), ["alicorn"]);
     assert_eq!(results.hits[0].platform, Some(KnownPlatform::GitHub));
 
     // Search folds the way normalization does: case and a leading @ vanish.
-    let results: SearchResults = get(&pool, "/v1/search?q=%40ALI").await.answer();
+    let results: SearchResults = pool.get_on(CHAIN, "/v1/search?q=%40ALI").await.answer();
     assert_eq!(results.hits.len(), 4);
 
     // A wallet's handles, alone or narrowed by text; the two intersect.
-    let results: SearchResults = get(&pool, &format!("/v1/search?owner={}", addr(2)))
+    let results: SearchResults = pool
+        .get_on(
+            CHAIN,
+            &format!("/v1/search?owner={}", Address::repeat_byte(2)),
+        )
         .await
         .answer();
-    assert_eq!(handles_of(&results), ["alice_1"]);
-    assert_eq!(results.owner, Some(addr(2)));
+    assert_eq!(results.handles(), ["alice_1"]);
+    assert_eq!(results.owner, Some(Address::repeat_byte(2)));
     assert_eq!(results.query, None);
-    let results: SearchResults =
-        get(&pool, &format!("/v1/search?q=ali&owner={}", addr(1)))
-            .await
-            .answer();
-    assert_eq!(handles_of(&results), ["ali"]);
-    let results: SearchResults =
-        get(&pool, &format!("/v1/search?q=bob&owner={}", addr(1)))
-            .await
-            .answer();
+    let results: SearchResults = pool
+        .get_on(
+            CHAIN,
+            &format!("/v1/search?q=ali&owner={}", Address::repeat_byte(1)),
+        )
+        .await
+        .answer();
+    assert_eq!(results.handles(), ["ali"]);
+    let results: SearchResults = pool
+        .get_on(
+            CHAIN,
+            &format!("/v1/search?q=bob&owner={}", Address::repeat_byte(1)),
+        )
+        .await
+        .answer();
     assert!(results.hits.is_empty(), "{results:?}");
 
     // Neither text nor wallet is not a question, and a wallet must parse.
-    let refusal = get::<SearchResults>(&pool, "/v1/search").await.refusal();
+    let refusal = pool
+        .get_on::<SearchResults>(CHAIN, "/v1/search")
+        .await
+        .refusal();
     assert_eq!(
         refusal,
         (StatusCode::BAD_REQUEST, ErrorCode::InvalidArgument)
     );
-    let refusal = get::<SearchResults>(&pool, "/v1/search?owner=nobody")
+    let refusal = pool
+        .get_on::<SearchResults>(CHAIN, "/v1/search?owner=nobody")
         .await
         .refusal();
     assert_eq!(
@@ -651,19 +825,23 @@ async fn search_ranks_exact_prefix_substring() {
     // A retired handle stops matching. Its fuzzy neighbors still do — that
     // is what the trigram branch is for — but the retired name itself is
     // gone from the results.
-    apply_tx(
-        &writer,
-        8,
-        vec![retire(x, "alice_1", addr(2)), unpublish(addr(2))],
-    )
-    .await;
-    let results: SearchResults = get(&pool, "/v1/search?q=alice_1").await.answer();
-    let handles = handles_of(&results);
+    writer
+        .apply_tx(
+            8,
+            vec![
+                NamesEvent::retire(x, "alice_1", Address::repeat_byte(2)),
+                NamesEvent::unpublish(Address::repeat_byte(2)),
+            ],
+        )
+        .await;
+    let results: SearchResults =
+        pool.get_on(CHAIN, "/v1/search?q=alice_1").await.answer();
+    let handles = results.handles();
     assert!(!handles.contains(&"alice_1"), "{handles:?}");
     assert!(!handles.is_empty(), "fuzzy neighbors should still match");
 
     // LIKE metacharacters match themselves, not everything.
-    let results: SearchResults = get(&pool, "/v1/search?q=%25").await.answer();
+    let results: SearchResults = pool.get_on(CHAIN, "/v1/search?q=%25").await.answer();
     assert!(results.hits.is_empty());
 
     drop(guard);
@@ -675,12 +853,12 @@ async fn replay_converges_instead_of_duplicating() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = common::writer(&store).await;
+    let writer = store.writer().await;
     let x = KnownPlatform::X;
-    let alice = addr(0xA1);
-    let events = bind(alice, x, "111", "alice_1", 1000, true);
-    apply_tx(&writer, 1, events.clone()).await;
-    apply_tx(&writer, 1, events).await;
+    let alice = Address::repeat_byte(0xA1);
+    let events = NamesEvent::bind(alice, x, "111", "alice_1", 1000, true);
+    writer.apply_tx(1, events.clone()).await;
+    writer.apply_tx(1, events).await;
 
     let journal: i64 =
         sqlx::query_scalar("SELECT count(*) FROM names.events WHERE chain_id = $1")
@@ -690,9 +868,11 @@ async fn replay_converges_instead_of_duplicating() {
             .expect("count");
     // The bind, its reveal and its name.
     assert_eq!(journal, 3);
-    let resolved: HandleResolution =
-        get(&pool, "/v1/resolve/handle/x/alice_1").await.answer();
-    assert_eq!(only(&resolved.bindings).owner, alice);
+    let resolved: HandleResolution = pool
+        .get_on(CHAIN, "/v1/resolve/handle/x/alice_1")
+        .await
+        .answer();
+    assert_eq!(resolved.bindings.only().owner, alice);
 
     let disclosures: i64 =
         sqlx::query_scalar("SELECT count(*) FROM names.handle_nodes WHERE chain_id = $1 AND handle IS NOT NULL")
@@ -710,23 +890,32 @@ async fn unclaimed_names_on_a_configured_platform_are_coded_404s() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = common::writer(&store).await;
+    let writer = store.writer().await;
     let x = KnownPlatform::X;
     // Something was bound on the platform — the branch the absent-platform
     // test cannot reach, and the one that once shipped a decode 500.
-    apply_tx(
-        &writer,
-        1,
-        bind(addr(0xA1), x, "111", "alice_1", 1000, false),
-    )
-    .await;
+    writer
+        .apply_tx(
+            1,
+            NamesEvent::bind(
+                Address::repeat_byte(0xA1),
+                x,
+                "111",
+                "alice_1",
+                1000,
+                false,
+            ),
+        )
+        .await;
 
-    let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/zzz")
+    let refusal = pool
+        .get_on::<HandleResolution>(CHAIN, "/v1/resolve/handle/x/zzz")
         .await
         .refusal();
     assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::HandleNotBound));
 
-    let refusal = get::<IdResolution>(&pool, &id_route(x, "999999"))
+    let refusal = pool
+        .get_on::<IdResolution>(CHAIN, &x.id_route("999999"))
         .await
         .refusal();
     assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::IdNotBound));
@@ -741,20 +930,22 @@ async fn api_refuses_to_answer_before_the_first_window() {
     };
     // No window ever committed: resolution must say "not synced", never an
     // authoritative-looking "not bound".
-    let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/alice_1")
+    let refusal = pool
+        .get_on::<HandleResolution>(CHAIN, "/v1/resolve/handle/x/alice_1")
         .await
         .refusal();
     assert_eq!(
         refusal,
         (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::NotSynced)
     );
-    let (status, _) = get::<SearchResults>(&pool, "/v1/search?q=ali")
+    let (status, _) = pool
+        .get_on::<SearchResults>(CHAIN, "/v1/search?q=ali")
         .await
         .refusal();
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     // Status still answers — it is how a caller learns the sync state: the
     // chain is simply not among those the store holds.
-    let status: Status = common::get(&pool, "/v1/status").await.answer();
+    let status: Status = pool.get("/v1/status").await.answer();
     assert!(
         status.chains.iter().all(|c| c.chain_id != CHAIN),
         "{status:?}"
@@ -768,22 +959,31 @@ async fn a_nul_byte_in_a_query_is_refused_not_a_500() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = common::writer(&store).await;
-    apply_tx(
-        &writer,
-        1,
-        bind(addr(9), KnownPlatform::X, "1", "evil", 1000, true),
-    )
-    .await;
+    let writer = store.writer().await;
+    writer
+        .apply_tx(
+            1,
+            NamesEvent::bind(
+                Address::repeat_byte(9),
+                KnownPlatform::X,
+                "1",
+                "evil",
+                1000,
+                true,
+            ),
+        )
+        .await;
     // No platform issues a handle holding NUL.
-    let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/evil%00")
+    let refusal = pool
+        .get_on::<HandleResolution>(CHAIN, "/v1/resolve/handle/x/evil%00")
         .await
         .refusal();
     assert_eq!(
         refusal,
         (StatusCode::NOT_FOUND, ErrorCode::HandleImpossible)
     );
-    let (status, _) = get::<SearchResults>(&pool, "/v1/search?q=evil%00")
+    let (status, _) = pool
+        .get_on::<SearchResults>(CHAIN, "/v1/search?q=evil%00")
         .await
         .refusal();
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -796,56 +996,59 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = common::writer(&store).await;
+    let writer = store.writer().await;
     let x = KnownPlatform::X;
     let digest = B256::repeat_byte(0xD1);
-    apply(
-        &writer,
-        2,
-        NamesEvent::ProofVerifierConfigured {
-            verifier: addr(0xEE),
-        },
-    )
-    .await;
-    apply(
-        &writer,
-        3,
-        NamesEvent::CeremonyBound {
-            authorization_digest: digest,
-            holder: addr(0xA1),
-            platform_id: x.id(),
-            client_identifier: Bytes::from_static(b"client-a"),
-        },
-    )
-    .await;
-    apply(
-        &writer,
-        4,
-        NamesEvent::BindFeePaid {
-            authorization_digest: digest,
-            receiver: addr(0xFE),
-            amount: U256::from(1_000u64),
-        },
-    )
-    .await;
+    writer
+        .apply(
+            2,
+            NamesEvent::ProofVerifierConfigured {
+                verifier: Address::repeat_byte(0xEE),
+            },
+        )
+        .await;
+    writer
+        .apply(
+            3,
+            NamesEvent::CeremonyBound {
+                authorization_digest: digest,
+                holder: Address::repeat_byte(0xA1),
+                platform_id: x.id(),
+                client_identifier: Bytes::from_static(b"client-a"),
+            },
+        )
+        .await;
+    writer
+        .apply(
+            4,
+            NamesEvent::BindFeePaid {
+                authorization_digest: digest,
+                receiver: Address::repeat_byte(0xFE),
+                amount: U256::from(1_000u64),
+            },
+        )
+        .await;
 
     // The Proof Verifier is the chain's one verification component; the
     // status reports it so an operator need not ask the RPC.
-    let status: Status = common::get(&pool, "/v1/status").await.answer();
+    let status: Status = pool.get("/v1/status").await.answer();
     let chain = status
         .chains
         .iter()
         .find(|c| c.chain_id == CHAIN)
         .unwrap_or_else(|| panic!("chain {CHAIN} is listed: {status:?}"));
-    assert_eq!(chain.proof_verifier, Some(addr(0xEE)));
+    assert_eq!(chain.proof_verifier, Some(Address::repeat_byte(0xEE)));
 
     // The ceremony's own events are journaled with what an operator asks
     // by — read back here through the histories of the addresses they name —
     // and bind nothing.
-    let holder: AddressHistory =
-        get(&pool, &format!("/v1/history/address/{}", addr(0xA1)))
-            .await
-            .answer();
+    let holder: AddressHistory = pool
+        .get_on(
+            CHAIN,
+            &format!("/v1/history/address/{}", Address::repeat_byte(0xA1)),
+        )
+        .await
+        .answer();
     let [entry] = &holder.entries[..] else {
         panic!("one ceremony: {holder:?}");
     };
@@ -853,15 +1056,18 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
         entry.event,
         HistoryEvent::CeremonyBound {
             authorization_digest: digest,
-            holder: addr(0xA1),
+            holder: Address::repeat_byte(0xA1),
             platform_id: x.id(),
             client_identifier: Bytes::from_static(b"client-a"),
         }
     );
-    let receiver: AddressHistory =
-        get(&pool, &format!("/v1/history/address/{}", addr(0xFE)))
-            .await
-            .answer();
+    let receiver: AddressHistory = pool
+        .get_on(
+            CHAIN,
+            &format!("/v1/history/address/{}", Address::repeat_byte(0xFE)),
+        )
+        .await
+        .answer();
     let [entry] = &receiver.entries[..] else {
         panic!("one fee: {receiver:?}");
     };
@@ -869,7 +1075,7 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
         entry.event,
         HistoryEvent::BindFeePaid {
             authorization_digest: digest,
-            receiver: addr(0xFE),
+            receiver: Address::repeat_byte(0xFE),
             amount: U256::from(1_000u64),
         }
     );
@@ -889,35 +1095,41 @@ async fn unbound_handle_and_impossible_text_name_their_codes() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = common::writer(&store).await;
+    let writer = store.writer().await;
     let x = KnownPlatform::X;
-    apply_tx(
-        &writer,
-        1,
-        bind(addr(0xA1), x, "111", "alice_1", 1000, true),
-    )
-    .await;
+    writer
+        .apply_tx(
+            1,
+            NamesEvent::bind(Address::repeat_byte(0xA1), x, "111", "alice_1", 1000, true),
+        )
+        .await;
 
     // A known platform's unbound handle is `handle_not_bound`, whether or
     // not anything was ever bound on it; an id misses as unbound the same way.
-    let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/alice")
+    let refusal = pool
+        .get_on::<HandleResolution>(CHAIN, "/v1/resolve/handle/x/alice")
         .await
         .refusal();
     assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::HandleNotBound));
-    let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/github/alice")
+    let refusal = pool
+        .get_on::<HandleResolution>(CHAIN, "/v1/resolve/handle/github/alice")
         .await
         .refusal();
     assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::HandleNotBound));
-    let refusal = get::<IdResolution>(&pool, &id_route(KnownPlatform::GitHub, "111"))
+    let refusal = pool
+        .get_on::<IdResolution>(CHAIN, &KnownPlatform::GitHub.id_route("111"))
         .await
         .refusal();
     assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::IdNotBound));
     // A platform this build has no tags for cannot hash text at all.
     let foreign = B256::repeat_byte(7);
-    let refusal =
-        get::<HandleResolution>(&pool, &format!("/v1/resolve/handle/{foreign}/alice_1"))
-            .await
-            .refusal();
+    let refusal = pool
+        .get_on::<HandleResolution>(
+            CHAIN,
+            &format!("/v1/resolve/handle/{foreign}/alice_1"),
+        )
+        .await
+        .refusal();
     assert_eq!(
         refusal,
         (StatusCode::BAD_REQUEST, ErrorCode::InvalidPlatform)
@@ -926,7 +1138,8 @@ async fn unbound_handle_and_impossible_text_name_their_codes() {
     // Text no circuit hashes (a quote) mirrors the contract's deliberate
     // zero-address answer: "no such handle can exist", a 404 with its own
     // code — not "you asked wrong".
-    let refusal = get::<HandleResolution>(&pool, "/v1/resolve/handle/x/a%22b")
+    let refusal = pool
+        .get_on::<HandleResolution>(CHAIN, "/v1/resolve/handle/x/a%22b")
         .await
         .refusal();
     assert_eq!(
@@ -945,18 +1158,21 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = common::writer(&store).await;
-    let other = common::writer(&ChainStore::new(pool.clone(), OTHER_CHAIN)).await;
+    let writer = store.writer().await;
+    let other = ChainStore::new(pool.clone(), OTHER_CHAIN).writer().await;
     let x = KnownPlatform::X;
-    let (alice, bob) = (addr(0xA1), addr(0xB2));
+    let (alice, bob) = (Address::repeat_byte(0xA1), Address::repeat_byte(0xB2));
     // The same handle, held by different wallets on the two chains.
-    apply_tx(&writer, 1, bind(alice, x, "111", "alice_1", 1000, true)).await;
-    apply_tx(&other, 1, bind(bob, x, "999", "alice_1", 1000, true)).await;
+    writer
+        .apply_tx(1, NamesEvent::bind(alice, x, "111", "alice_1", 1000, true))
+        .await;
+    other
+        .apply_tx(1, NamesEvent::bind(bob, x, "999", "alice_1", 1000, true))
+        .await;
 
     // Other suites share the store, so only this suite's chains are read.
-    let resolved: HandleResolution = common::get(&pool, "/v1/resolve/handle/x/alice_1")
-        .await
-        .answer();
+    let resolved: HandleResolution =
+        pool.get("/v1/resolve/handle/x/alice_1").await.answer();
     let ours: Vec<(i64, Address)> = resolved
         .bindings
         .iter()
@@ -965,19 +1181,17 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
         .collect();
     assert_eq!(ours, [(CHAIN, alice), (OTHER_CHAIN, bob)], "{resolved:?}");
 
-    let resolved: HandleResolution = common::get(
-        &pool,
-        &format!("/v1/resolve/handle/x/alice_1?chain={OTHER_CHAIN}"),
-    )
-    .await
-    .answer();
-    assert_eq!(only(&resolved.bindings).owner, bob);
+    let resolved: HandleResolution = pool
+        .get(&format!("/v1/resolve/handle/x/alice_1?chain={OTHER_CHAIN}"))
+        .await
+        .answer();
+    assert_eq!(resolved.bindings.only().owner, bob);
 
     // An address is asked without a chain; each identity names its own.
-    let resolved: AddressResolution =
-        common::get(&pool, &format!("/v1/resolve/address/{bob}"))
-            .await
-            .answer();
+    let resolved: AddressResolution = pool
+        .get(&format!("/v1/resolve/address/{bob}"))
+        .await
+        .answer();
     assert!(
         resolved
             .identities
@@ -991,9 +1205,8 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
     );
 
     // Search too, and a hit says where it lives.
-    let results: SearchResults = common::get(&pool, "/v1/search?q=alice_1&platform=x")
-        .await
-        .answer();
+    let results: SearchResults =
+        pool.get("/v1/search?q=alice_1&platform=x").await.answer();
     let hit_chains: Vec<i64> = results
         .hits
         .iter()
@@ -1007,20 +1220,18 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
 
     // A chain nobody indexed is not an error to ask about; it has nothing
     // to answer from, and says so.
-    let refusal = common::get::<HandleResolution>(
-        &pool,
-        "/v1/resolve/handle/x/alice_1?chain=424242",
-    )
-    .await
-    .refusal();
+    let refusal = pool
+        .get::<HandleResolution>("/v1/resolve/handle/x/alice_1?chain=424242")
+        .await
+        .refusal();
     assert_eq!(
         refusal,
         (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::NotSynced)
     );
-    let refusal =
-        common::get::<HandleResolution>(&pool, "/v1/resolve/handle/x/alice_1?chain=eden")
-            .await
-            .refusal();
+    let refusal = pool
+        .get::<HandleResolution>("/v1/resolve/handle/x/alice_1?chain=eden")
+        .await
+        .refusal();
     assert_eq!(refusal, (StatusCode::BAD_REQUEST, ErrorCode::InvalidChain));
     drop(guard);
 }
@@ -1037,18 +1248,6 @@ fn a_contract() -> Address {
     Address::new([0xab; 20])
 }
 
-/// Bind one handle and note a deployment block, so a wipe has something to
-/// take and something to leave.
-async fn seed(writer: &ChainWriter) {
-    apply_tx(
-        writer,
-        1,
-        bind(addr(1), KnownPlatform::X, "1", "alice", 1, true),
-    )
-    .await;
-    writer.set_deploy_block(4321).await.expect("deploy block");
-}
-
 #[tokio::test]
 async fn preparing_an_unchanged_chain_keeps_everything() {
     let Some((store, _pool, guard)) = test_store_with(2).await else {
@@ -1056,14 +1255,26 @@ async fn preparing_an_unchanged_chain_keeps_everything() {
     };
     let lease = store.acquire_writer().await.expect("lease");
     let writer = store
-        .prepare(&lease, a_contract(), None)
+        .prepare(
+            &lease,
+            Contracts {
+                registry: a_contract(),
+                escrow: None,
+            },
+        )
         .await
         .expect("first");
-    seed(&writer).await;
+    writer.seed().await;
 
     // Same version, same contract: nothing to replay.
     store
-        .prepare(&lease, a_contract(), None)
+        .prepare(
+            &lease,
+            Contracts {
+                registry: a_contract(),
+                escrow: None,
+            },
+        )
         .await
         .expect("second");
     assert!(
@@ -1092,18 +1303,32 @@ async fn watching_another_contract_clears_the_chain() {
     };
     let lease = store.acquire_writer().await.expect("lease");
     let writer = store
-        .prepare(&lease, a_contract(), None)
+        .prepare(
+            &lease,
+            Contracts {
+                registry: a_contract(),
+                escrow: None,
+            },
+        )
         .await
         .expect("first");
-    seed(&writer).await;
+    writer.seed().await;
     writer.set_chain_head(9).await;
     writer.set_chain_target(7, Duration::from_secs(60)).await;
     writer.set_window_error(Some("a window failed")).await;
-    let verifier = NamesEvent::ProofVerifierConfigured { verifier: addr(9) };
-    apply(&writer, 2, verifier).await;
+    let verifier = NamesEvent::ProofVerifierConfigured {
+        verifier: Address::repeat_byte(9),
+    };
+    writer.apply(2, verifier).await;
 
     store
-        .prepare(&lease, OTHER_CONTRACT, Some(OTHER_ESCROW))
+        .prepare(
+            &lease,
+            Contracts {
+                registry: OTHER_CONTRACT,
+                escrow: Some(OTHER_ESCROW),
+            },
+        )
         .await
         .expect("repoint");
 
@@ -1145,22 +1370,40 @@ async fn the_deployment_block_survives_a_replay_of_the_same_registry() {
     };
     let lease = store.acquire_writer().await.expect("lease");
     let writer = store
-        .prepare(&lease, a_contract(), None)
+        .prepare(
+            &lease,
+            Contracts {
+                registry: a_contract(),
+                escrow: None,
+            },
+        )
         .await
         .expect("first");
-    seed(&writer).await;
+    writer.seed().await;
 
     // A newly watched escrow replays the chain from the same registry.
     let escrow = Address::repeat_byte(0xE5);
     store
-        .prepare(&lease, a_contract(), Some(escrow))
+        .prepare(
+            &lease,
+            Contracts {
+                registry: a_contract(),
+                escrow: Some(escrow),
+            },
+        )
         .await
         .expect("an escrow added");
     assert!(store.cursor().await.unwrap().is_none(), "the chain replays");
     assert_eq!(store.deploy_block(a_contract()).await.unwrap(), Some(4321));
 
     store
-        .prepare(&lease, OTHER_CONTRACT, Some(escrow))
+        .prepare(
+            &lease,
+            Contracts {
+                registry: OTHER_CONTRACT,
+                escrow: Some(escrow),
+            },
+        )
         .await
         .expect("repoint");
     assert_eq!(store.deploy_block(OTHER_CONTRACT).await.unwrap(), None);
@@ -1263,10 +1506,10 @@ async fn a_writer_whose_chain_was_prepared_again_writes_nothing() {
     let Some((store, _pool, guard)) = test_store_with(2).await else {
         return;
     };
-    let stale = common::writer(&store).await;
-    seed(&stale).await;
+    let stale = store.writer().await;
+    stale.seed().await;
     let before = store.state().await.unwrap();
-    let current = common::writer(&store).await;
+    let current = store.writer().await;
 
     let refused = stale.begin_window().await.err();
     assert!(
@@ -1290,7 +1533,9 @@ async fn a_writer_whose_chain_was_prepared_again_writes_nothing() {
     assert_eq!(store.state().await.unwrap(), before);
 
     // The writer that prepared the chain last writes as before.
-    apply(&current, 2, unpublish(addr(1))).await;
+    current
+        .apply(2, NamesEvent::unpublish(Address::repeat_byte(1)))
+        .await;
     assert_eq!(store.cursor().await.unwrap(), Some(2));
     drop(guard);
 }
@@ -1302,9 +1547,9 @@ async fn a_writer_from_before_its_chain_row_was_deleted_writes_nothing() {
     let Some((store, _pool, guard)) = test_store_with(2).await else {
         return;
     };
-    let stale = common::writer(&store).await;
+    let stale = store.writer().await;
     store.forget().await;
-    common::writer(&store).await;
+    store.writer().await;
 
     let refused = stale.begin_window().await.err();
     assert!(
@@ -1325,9 +1570,16 @@ async fn a_replay_waits_for_the_window_in_flight_and_clears_it() {
     let Some((store, pool, guard)) = test_store_with(3).await else {
         return;
     };
-    let stale = common::writer(&store).await;
+    let stale = store.writer().await;
     let mut window = stale.begin_window().await.expect("a window");
-    let events = bind(addr(1), KnownPlatform::X, "1", "alice", 1, true);
+    let events = NamesEvent::bind(
+        Address::repeat_byte(1),
+        KnownPlatform::X,
+        "1",
+        "alice",
+        1,
+        true,
+    );
     for (log_index, event) in (0u64..).zip(&events) {
         let at = LogPosition {
             block_number: 1,
@@ -1349,7 +1601,13 @@ async fn a_replay_waits_for_the_window_in_flight_and_clears_it() {
     .await
     .expect("a pool that waits a moment for a lock");
     let refused = ChainStore::new(hurried, CHAIN)
-        .prepare(&lease, OTHER_CONTRACT, None)
+        .prepare(
+            &lease,
+            Contracts {
+                registry: OTHER_CONTRACT,
+                escrow: None,
+            },
+        )
         .await
         .err();
     assert!(
@@ -1362,7 +1620,13 @@ async fn a_replay_waits_for_the_window_in_flight_and_clears_it() {
         .await
         .expect("the window in flight commits");
     store
-        .prepare(&lease, OTHER_CONTRACT, None)
+        .prepare(
+            &lease,
+            Contracts {
+                registry: OTHER_CONTRACT,
+                escrow: None,
+            },
+        )
         .await
         .expect("the replay is prepared");
 
@@ -1392,7 +1656,7 @@ async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
     let Some((store, _pool, guard)) = test_store().await else {
         return;
     };
-    let writer = common::writer(&store).await;
+    let writer = store.writer().await;
     assert!(
         writer.set_chain_target(5, Duration::from_secs(1)).await,
         "the target write landed"
@@ -1427,18 +1691,6 @@ async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
     drop(guard);
 }
 
-/// The names `chain` goes by, as its status lists them.
-async fn names_of(pool: &PgPool, chain: i64) -> Vec<String> {
-    db::Store::new(pool.clone())
-        .chain_statuses()
-        .await
-        .expect("the statuses")
-        .into_iter()
-        .find(|row| row.state.chain_id == chain)
-        .map(|row| row.names)
-        .expect("the chain has a status row")
-}
-
 /// A chain's names are its indexer's declaration: a set, replaced whole on
 /// each start, owned by one chain across the store, and listed on
 /// `/v1/status`.
@@ -1451,7 +1703,13 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
     let lease = store.acquire_writer().await.expect("lease");
     // In the indexer's order: the chain is prepared, then named.
     store
-        .prepare(&lease, a_contract(), None)
+        .prepare(
+            &lease,
+            Contracts {
+                registry: a_contract(),
+                escrow: None,
+            },
+        )
         .await
         .expect("prepared");
     store
@@ -1461,7 +1719,7 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
         )
         .await
         .expect("declared");
-    assert_eq!(names_of(&pool, CHAIN).await, ["alpha", "alpha-testnet"]);
+    assert_eq!(pool.names_of(CHAIN).await, ["alpha", "alpha-testnet"]);
 
     // Both names resolve to this chain.
     let reader = db::Store::new(pool.clone());
@@ -1474,7 +1732,7 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
         .set_chain_names(&lease, &[name("alpha")])
         .await
         .expect("declared again");
-    assert_eq!(names_of(&pool, CHAIN).await, ["alpha"]);
+    assert_eq!(pool.names_of(CHAIN).await, ["alpha"]);
 
     // Another chain cannot take a name this one holds, and writes nothing.
     let other = ChainStore::new(pool.clone(), OTHER_CHAIN);
@@ -1497,7 +1755,7 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
     assert_eq!(reader.chain_named("beta").await.unwrap(), None);
 
     // Supervision sees the declaration.
-    let status: Status = get(&pool, "/v1/status").await.answer();
+    let status: Status = pool.get_on(CHAIN, "/v1/status").await.answer();
     let row = status
         .chains
         .iter()

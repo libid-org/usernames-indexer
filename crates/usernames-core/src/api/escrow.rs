@@ -131,7 +131,9 @@ pub(crate) async fn handle(
     ApiPath((platform, handle)): ApiPath<(String, String)>,
     ApiQuery(params): ApiQuery<PageParams>,
 ) -> Result<Json<HandleAmounts>, ApiError> {
-    of_handle(&state, HandleKey::of_text(&platform, &handle)?, params).await
+    state
+        .escrow_of(HandleKey::of_text(&platform, &handle)?, params)
+        .await
 }
 
 /// `GET /v1/escrow/node/{node}?chain=&before=&limit=` — the same, for a
@@ -141,28 +143,30 @@ pub(crate) async fn node(
     ApiPath(node): ApiPath<String>,
     ApiQuery(params): ApiQuery<PageParams>,
 ) -> Result<Json<HandleAmounts>, ApiError> {
-    of_handle(&state, HandleKey::of_node(&node)?, params).await
+    state.escrow_of(HandleKey::of_node(&node)?, params).await
 }
 
-async fn of_handle(
-    state: &AppState,
-    key: HandleKey,
-    params: PageParams,
-) -> Result<Json<HandleAmounts>, ApiError> {
-    let page = params.page()?;
-    state.synced(page.chain).await?;
+impl AppState {
+    async fn escrow_of(
+        &self,
+        key: HandleKey,
+        params: PageParams,
+    ) -> Result<Json<HandleAmounts>, ApiError> {
+        let page = params.page()?;
+        self.synced(page.chain).await?;
 
-    let (amounts, next) = state
-        .store
-        .escrowed_for(key.node(), page)
-        .await?
-        .served(EscrowAmount::of)?;
-    let known = amounts.first().map(|amount| &amount.handle);
-    Ok(Json(HandleAmounts {
-        handle: HandleRef::asked(&key, known),
-        amounts,
-        next,
-    }))
+        let (amounts, next) = self
+            .store
+            .escrowed_for(key.node(), page)
+            .await?
+            .served(EscrowAmount::of)?;
+        let known = amounts.first().map(|amount| &amount.handle);
+        Ok(Json(HandleAmounts {
+            handle: HandleRef::asked(&key, known),
+            amounts,
+            next,
+        }))
+    }
 }
 
 /// `?token=0x…&chain=8453&before=<next>&limit=20`.

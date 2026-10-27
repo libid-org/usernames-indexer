@@ -645,9 +645,11 @@ mod tests {
         "testnet.handles.link".parse().unwrap()
     }
 
-    fn handle_of(q: &Query) -> String {
-        match &q.subject {
-            Subject::Handle { handle, .. } => handle.clone(),
+    impl Query {
+        fn handle(&self) -> String {
+            match &self.subject {
+                Subject::Handle { handle, .. } => handle.clone(),
+            }
         }
     }
 
@@ -674,7 +676,7 @@ mod tests {
             .unwrap()
             .query(&handles_link())
             .unwrap();
-        assert_eq!(handle_of(&q), "alice");
+        assert_eq!(q.handle(), "alice");
         assert_eq!(q.chain_label, None);
     }
 
@@ -684,7 +686,7 @@ mod tests {
             .unwrap()
             .query(&handles_link())
             .unwrap();
-        assert_eq!(handle_of(&q), "alice");
+        assert_eq!(q.handle(), "alice");
         assert_eq!(q.chain_label.as_deref(), Some("base"));
     }
 
@@ -705,7 +707,7 @@ mod tests {
             .unwrap()
             .query(&testnet_handles_link())
             .unwrap();
-        assert_eq!(handle_of(&q), "alice");
+        assert_eq!(q.handle(), "alice");
         assert_eq!(q.chain_label, None);
 
         // The parent's own names are not this gateway's to speak about.
@@ -722,7 +724,7 @@ mod tests {
             .unwrap()
             .query(&testnet_handles_link())
             .unwrap();
-        assert_eq!(handle_of(&q), "alice");
+        assert_eq!(q.handle(), "alice");
         assert_eq!(q.chain_label.as_deref(), Some("sepolia"));
     }
 
@@ -769,7 +771,7 @@ mod tests {
             .unwrap()
             .query(&handles_link())
             .unwrap();
-        assert_eq!(handle_of(&q), "a__b");
+        assert_eq!(q.handle(), "a__b");
     }
 
     #[test]
@@ -778,7 +780,7 @@ mod tests {
             .unwrap()
             .query(&handles_link())
             .unwrap();
-        assert_eq!(handle_of(&q), "alice");
+        assert_eq!(q.handle(), "alice");
     }
 
     #[test]
@@ -787,7 +789,7 @@ mod tests {
             .unwrap()
             .query(&handles_link())
             .unwrap();
-        assert_eq!(handle_of(&q), "alice.b@gmail.com");
+        assert_eq!(q.handle(), "alice.b@gmail.com");
     }
 
     #[test]

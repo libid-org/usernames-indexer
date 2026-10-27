@@ -115,7 +115,7 @@ async fn gateway_parts(
     // production, and previously invisible here because "unknown" was read as
     // "fresh".
     for id in chains {
-        let writer = writer(&ChainStore::new(pool.clone(), *id)).await;
+        let writer = ChainStore::new(pool.clone(), *id).writer().await;
         writer
             .begin_window()
             .await
@@ -145,33 +145,69 @@ async fn gateway_parts(
     Some((config, store, pool, guard))
 }
 
-/// What a chain's indexer does at startup: declare the names the chain goes
-/// by. The gateway learns them from the store and nowhere else.
-async fn declare_names(store: &ChainStore, names: &[&str]) {
-    let names: Vec<_> = names
-        .iter()
-        .map(|name| name.parse::<ens::ChainName>().expect("a chain name"))
-        .collect();
-    let writer = store.acquire_writer().await.expect("lease");
-    store
-        .set_chain_names(&writer, &names)
-        .await
-        .expect("names declared");
-    writer.release().await.expect("release");
-}
-
 /// The gateway route alone, which is what most of these tests exercise.
 async fn gateway_over(
     chains: &[i64],
     max_lag_blocks: u64,
 ) -> Option<(Router, ChainStore, PgPool, MutexGuard<'static, ()>)> {
     let (config, store, pool, guard) = gateway_parts(chains, max_lag_blocks).await?;
-    Some((
-        usernames_api::ens::router(GatewayState::new(config)),
-        store,
-        pool,
-        guard,
-    ))
+    Some((GatewayState::new(config).router(), store, pool, guard))
+}
+
+/// What a chain's indexer declares at startup.
+trait DeclareNames {
+    /// What a chain's indexer does at startup: declare the names the chain goes
+    /// by. The gateway learns them from the store and nowhere else.
+    async fn declare_names(&self, names: &[&str]);
+}
+
+impl DeclareNames for ChainStore {
+    async fn declare_names(&self, names: &[&str]) {
+        let names: Vec<_> = names
+            .iter()
+            .map(|name| name.parse::<ens::ChainName>().expect("a chain name"))
+            .collect();
+        let writer = self.acquire_writer().await.expect("lease");
+        self.set_chain_names(&writer, &names)
+            .await
+            .expect("names declared");
+        writer.release().await.expect("release");
+    }
+}
+
+/// One forwarded call to the gateway.
+trait Ask {
+    async fn ask(&self, sender: Address, call: &[u8]) -> (StatusCode, Reply);
+}
+
+impl Ask for Router {
+    async fn ask(&self, sender: Address, call: &[u8]) -> (StatusCode, Reply) {
+        let uri = format!("/{sender}/0x{}.json", hex::encode(call));
+        let response = self
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .expect("router");
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, Reply(body))
+    }
+}
+
+/// One chain's row of the gateway's status.
+trait Row {
+    /// The status row of one chain; a chain the status does not list fails the
+    /// test.
+    fn row(&self, chain_id: i64) -> &ChainStatus;
+}
+
+impl Row for GatewayStatus {
+    fn row(&self, chain_id: i64) -> &ChainStatus {
+        self.chains
+            .iter()
+            .find(|row| i64::try_from(row.chain_id) == Ok(chain_id))
+            .unwrap_or_else(|| panic!("chain {chain_id} is listed: {self:?}"))
+    }
 }
 
 /// What the gateway sent back: a signed answer or a refusal, read as one of
@@ -196,78 +232,66 @@ impl Reply {
             .unwrap_or_else(|e| panic!("not a refusal ({e}): {self}"));
         refusal.message
     }
+
+    /// The signed result inside a gateway answer, once the signature is checked
+    /// to be one the resolver would accept. These are the bytes the callback
+    /// returns to the wallet, in whatever shape the record call asked for.
+    fn signed_result(&self, call: &[u8]) -> Vec<u8> {
+        let data = self.answer().data;
+
+        // (bytes result, uint64 expires, bytes signature), by hand.
+        let word = |at: usize| -> u64 {
+            let mut n = [0u8; 8];
+            n.copy_from_slice(&data[at + 24..at + 32]);
+            u64::from_be_bytes(n)
+        };
+        let result_at = word(0) as usize;
+        let expires = word(32);
+        let sig_at = word(64) as usize;
+        let result_len = word(result_at) as usize;
+        let result = &data[result_at + 32..result_at + 32 + result_len];
+        let sig_len = word(sig_at) as usize;
+        let signature = &data[sig_at + 32..sig_at + 32 + sig_len];
+
+        let digest = ens::Reply {
+            result: result.to_vec(),
+            expires,
+        }
+        .digest(RESOLVER, call);
+        let recovered = Signature::try_from(signature)
+            .expect("65-byte signature")
+            .recover_address_from_prehash(&digest)
+            .expect("recover");
+        assert_eq!(
+            recovered,
+            SIGNER_KEY.parse::<PrivateKeySigner>().unwrap().address(),
+            "the resolver would recover a signer it does not trust"
+        );
+        result.to_vec()
+    }
+
+    /// The address in a gateway answer, or `None` for a null in either shape.
+    fn verify(&self, call: &[u8]) -> Option<Address> {
+        let result = self.signed_result(call);
+        // Both shapes, because the caller chooses which to ask in and a helper that
+        // knows only one reports a correct legacy answer as a null.
+        match result.len() {
+            // `addr(bytes32)` returns a bare `address`; the zero address is null.
+            32 => {
+                let who = Address::from_slice(&result[12..32]);
+                (!who.is_zero()).then_some(who)
+            }
+            // ENSIP-11's `addr(bytes32,uint256)` returns `bytes`: offset, length,
+            // then the payload. An empty byte string is null.
+            n if n >= 96 => Some(Address::from_slice(&result[64..84])),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for Reply {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&String::from_utf8_lossy(&self.0))
-    }
-}
-
-async fn ask(router: &Router, sender: Address, call: &[u8]) -> (StatusCode, Reply) {
-    let uri = format!("/{sender}/0x{}.json", hex::encode(call));
-    let response = router
-        .clone()
-        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
-        .await
-        .expect("router");
-    let status = response.status();
-    let body = response.into_body().collect().await.unwrap().to_bytes();
-    (status, Reply(body))
-}
-
-/// The signed result inside a gateway answer, once the signature is checked
-/// to be one the resolver would accept. These are the bytes the callback
-/// returns to the wallet, in whatever shape the record call asked for.
-fn signed_result(body: &Reply, call: &[u8]) -> Vec<u8> {
-    let data = body.answer().data;
-
-    // (bytes result, uint64 expires, bytes signature), by hand.
-    let word = |at: usize| -> u64 {
-        let mut n = [0u8; 8];
-        n.copy_from_slice(&data[at + 24..at + 32]);
-        u64::from_be_bytes(n)
-    };
-    let result_at = word(0) as usize;
-    let expires = word(32);
-    let sig_at = word(64) as usize;
-    let result_len = word(result_at) as usize;
-    let result = &data[result_at + 32..result_at + 32 + result_len];
-    let sig_len = word(sig_at) as usize;
-    let signature = &data[sig_at + 32..sig_at + 32 + sig_len];
-
-    let digest = ens::Reply {
-        result: result.to_vec(),
-        expires,
-    }
-    .digest(RESOLVER, call);
-    let recovered = Signature::try_from(signature)
-        .expect("65-byte signature")
-        .recover_address_from_prehash(&digest)
-        .expect("recover");
-    assert_eq!(
-        recovered,
-        SIGNER_KEY.parse::<PrivateKeySigner>().unwrap().address(),
-        "the resolver would recover a signer it does not trust"
-    );
-    result.to_vec()
-}
-
-/// The address in a gateway answer, or `None` for a null in either shape.
-fn verify(body: &Reply, call: &[u8]) -> Option<Address> {
-    let result = signed_result(body, call);
-    // Both shapes, because the caller chooses which to ask in and a helper that
-    // knows only one reports a correct legacy answer as a null.
-    match result.len() {
-        // `addr(bytes32)` returns a bare `address`; the zero address is null.
-        32 => {
-            let who = Address::from_slice(&result[12..32]);
-            (!who.is_zero()).then_some(who)
-        }
-        // ENSIP-11's `addr(bytes32,uint256)` returns `bytes`: offset, length,
-        // then the payload. An empty byte string is null.
-        n if n >= 96 => Some(Address::from_slice(&result[64..84])),
-        _ => None,
     }
 }
 
@@ -284,15 +308,15 @@ macro_rules! gateway_or_skip {
 async fn a_bound_handle_resolves_and_the_signature_verifies() {
     let (router, store, _pool, guard) = gateway_or_skip!(32);
     let owner = Address::from([0xbe; 20]);
-    bind(&store, "alice", owner).await;
+    store.bind("alice", owner).await;
 
     let call = resolve_call(
         &wire_name(&["alice", "x"]),
         &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
     );
-    let (status, body) = ask(&router, RESOLVER, &call).await;
+    let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(verify(&body, &call), Some(owner));
+    assert_eq!(body.verify(&call), Some(owner));
     drop(guard);
 }
 
@@ -301,15 +325,15 @@ async fn a_bound_handle_resolves_and_the_signature_verifies() {
 async fn a_private_binding_resolves() {
     let (router, store, _pool, guard) = gateway_or_skip!(32);
     let owner = Address::from([0xbe; 20]);
-    bind_private(&store, "alice", owner).await;
+    store.bind_private("alice", owner).await;
 
     let call = resolve_call(
         &wire_name(&["alice", "x"]),
         &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
     );
-    let (status, body) = ask(&router, RESOLVER, &call).await;
+    let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(verify(&body, &call), Some(owner));
+    assert_eq!(body.verify(&call), Some(owner));
     drop(guard);
 }
 
@@ -322,9 +346,9 @@ async fn a_name_nobody_holds_gets_a_signed_null() {
         &wire_name(&["nobody", "x"]),
         &addr_call(&["nobody", "x"], 0x8000_0000 | CHAIN as u64),
     );
-    let (status, body) = ask(&router, RESOLVER, &call).await;
+    let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(verify(&body, &call), None);
+    assert_eq!(body.verify(&call), None);
     drop(guard);
 }
 
@@ -339,14 +363,14 @@ async fn a_name_nobody_holds_gets_a_signed_null() {
 #[tokio::test]
 async fn a_chain_this_gateway_does_not_serve_is_refused_not_signed() {
     let (router, store, _pool, guard) = gateway_or_skip!(32);
-    bind(&store, "alice", Address::from([0xbe; 20])).await;
+    store.bind("alice", Address::from([0xbe; 20])).await;
 
     // Base, while this gateway serves only the test chain.
     let call = resolve_call(
         &wire_name(&["alice", "x"]),
         &addr_call(&["alice", "x"], 0x8000_2105),
     );
-    let (status, body) = ask(&router, RESOLVER, &call).await;
+    let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     body.refused();
     drop(guard);
@@ -357,12 +381,12 @@ async fn a_chain_this_gateway_does_not_serve_is_refused_not_signed() {
 #[tokio::test]
 async fn a_non_evm_coin_type_is_answered_null() {
     let (router, store, _pool, guard) = gateway_or_skip!(32);
-    bind(&store, "alice", Address::from([0xbe; 20])).await;
+    store.bind("alice", Address::from([0xbe; 20])).await;
 
     let call = resolve_call(&wire_name(&["alice", "x"]), &addr_call(&["alice", "x"], 0));
-    let (status, body) = ask(&router, RESOLVER, &call).await;
+    let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(verify(&body, &call), None);
+    assert_eq!(body.verify(&call), None);
     drop(guard);
 }
 
@@ -371,8 +395,8 @@ async fn a_chain_label_narrows_and_never_widens() {
     let Some((router, store, _pool, guard)) = gateway_over(&[EDEN], 32).await else {
         return;
     };
-    bind(&store, "alice", Address::from([0xbe; 20])).await;
-    declare_names(&store, &["eden"]).await;
+    store.bind("alice", Address::from([0xbe; 20])).await;
+    store.declare_names(&["eden"]).await;
     let coin = 0x8000_0000 | EDEN as u64;
 
     // Our label: answered.
@@ -380,16 +404,16 @@ async fn a_chain_label_narrows_and_never_widens() {
         &wire_name(&["alice", "x", "eden"]),
         &addr_call(&["alice", "x", "eden"], coin),
     );
-    let (_, body) = ask(&router, RESOLVER, &ours).await;
-    assert!(verify(&body, &ours).is_some());
+    let (_, body) = router.ask(RESOLVER, &ours).await;
+    assert!(body.verify(&ours).is_some());
 
     // Another chain's label, same coin type: not this gateway's name.
     let theirs = resolve_call(
         &wire_name(&["alice", "x", "base"]),
         &addr_call(&["alice", "x", "base"], coin),
     );
-    let (_, body) = ask(&router, RESOLVER, &theirs).await;
-    assert_eq!(verify(&body, &theirs), None);
+    let (_, body) = router.ask(RESOLVER, &theirs).await;
+    assert_eq!(body.verify(&theirs), None);
     drop(guard);
 }
 
@@ -401,8 +425,8 @@ async fn every_name_a_chain_declares_resolves_it() {
         return;
     };
     let owner = Address::from([0xbe; 20]);
-    bind(&store, "alice", owner).await;
-    declare_names(&store, &["eden", "eden-testnet"]).await;
+    store.bind("alice", owner).await;
+    store.declare_names(&["eden", "eden-testnet"]).await;
     let coin = 0x8000_0000 | EDEN as u64;
 
     for labels in [
@@ -411,9 +435,9 @@ async fn every_name_a_chain_declares_resolves_it() {
         ["alice", "x", "eden-testnet"].as_slice(),
     ] {
         let call = resolve_call(&wire_name(labels), &addr_call(labels, coin));
-        let (status, body) = ask(&router, RESOLVER, &call).await;
+        let (status, body) = router.ask(RESOLVER, &call).await;
         assert_eq!(status, StatusCode::OK, "{labels:?}: {body}");
-        assert_eq!(verify(&body, &call), Some(owner), "{labels:?}");
+        assert_eq!(body.verify(&call), Some(owner), "{labels:?}");
     }
     drop(guard);
 }
@@ -423,12 +447,12 @@ async fn a_record_that_is_not_addr_degrades_to_null() {
     // A client asking for `text()` must not see an error on a name that
     // resolves fine for addresses.
     let (router, store, _pool, guard) = gateway_or_skip!(32);
-    bind(&store, "alice", Address::from([0xbe; 20])).await;
+    store.bind("alice", Address::from([0xbe; 20])).await;
 
     let call = resolve_call(&wire_name(&["alice", "x"]), &[0xaa, 0xbb, 0xcc, 0xdd]);
-    let (status, body) = ask(&router, RESOLVER, &call).await;
+    let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(verify(&body, &call), None);
+    assert_eq!(body.verify(&call), None);
     drop(guard);
 }
 
@@ -441,9 +465,9 @@ async fn a_name_this_build_cannot_read_is_null_rather_than_an_error() {
         ["alice", "x", "toolong"].as_slice(), // a chain label that is not ours
     ] {
         let call = resolve_call(&wire_name(labels), &addr_call(labels, coin));
-        let (status, body) = ask(&router, RESOLVER, &call).await;
+        let (status, body) = router.ask(RESOLVER, &call).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(verify(&body, &call), None);
+        assert_eq!(body.verify(&call), None);
     }
     drop(guard);
 }
@@ -464,14 +488,14 @@ async fn an_unreadable_name_is_null_in_the_shape_the_caller_asked_in() {
     };
     let labels = ["alice", "myspace"];
     let call = resolve_call(&wire_name(&labels), &legacy_addr_call(&labels));
-    let (status, body) = ask(&router, RESOLVER, &call).await;
+    let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
-        signed_result(&body, &call),
+        body.signed_result(&call),
         [0u8; 32],
         "the legacy null is the zero address, 32 bytes"
     );
-    assert_eq!(verify(&body, &call), None);
+    assert_eq!(body.verify(&call), None);
     drop(guard);
 }
 
@@ -483,7 +507,7 @@ async fn an_unreadable_name_off_our_chains_is_still_refused_unsigned() {
     let (router, _store, _pool, guard) = gateway_or_skip!(32);
     let labels = ["alice", "myspace"];
     let call = resolve_call(&wire_name(&labels), &addr_call(&labels, 0x8000_2105));
-    let (status, body) = ask(&router, RESOLVER, &call).await;
+    let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     body.refused();
     drop(guard);
@@ -498,7 +522,7 @@ async fn a_request_for_another_resolver_is_refused_not_signed() {
         &wire_name(&["alice", "x"]),
         &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
     );
-    let (status, _) = ask(&router, Address::from([0xcc; 20]), &call).await;
+    let (status, _) = router.ask(Address::from([0xcc; 20]), &call).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     drop(guard);
 }
@@ -512,9 +536,9 @@ async fn a_gateway_under_a_subname_answers_its_names_and_refuses_the_parents() {
         return;
     };
     config.domain = "testnet.handles.link".parse().expect("domain");
-    let router = usernames_api::ens::router(GatewayState::new(config));
+    let router = GatewayState::new(config).router();
     let owner = Address::from([0xbe; 20]);
-    bind(&store, "alice", owner).await;
+    store.bind("alice", owner).await;
     let coin = 0x8000_0000 | CHAIN as u64;
 
     // `wire_name` appends `handles.link`, so the subname rides as a label.
@@ -522,15 +546,15 @@ async fn a_gateway_under_a_subname_answers_its_names_and_refuses_the_parents() {
         &wire_name(&["alice", "x", "testnet"]),
         &addr_call(&["alice", "x", "testnet"], coin),
     );
-    let (status, body) = ask(&router, RESOLVER, &ours).await;
+    let (status, body) = router.ask(RESOLVER, &ours).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(verify(&body, &ours), Some(owner));
+    assert_eq!(body.verify(&ours), Some(owner));
 
     let parents = resolve_call(
         &wire_name(&["alice", "x"]),
         &addr_call(&["alice", "x"], coin),
     );
-    let (status, body) = ask(&router, RESOLVER, &parents).await;
+    let (status, body) = router.ask(RESOLVER, &parents).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     drop(guard);
 }
@@ -540,10 +564,11 @@ async fn a_stale_index_refuses_rather_than_signing_a_null() {
     // The distinction the lag gate exists for: a signed null asserts that no
     // binding exists, and an index this far behind has not earned that.
     let (router, store, _pool, guard) = gateway_or_skip!(0);
-    bind(&store, "alice", Address::from([0xbe; 20])).await;
+    store.bind("alice", Address::from([0xbe; 20])).await;
     // Far ahead of the cursor, as the TARGET: that is the quantity the gate
     // compares, and the head alone no longer moves it.
-    writer(&store)
+    store
+        .writer()
         .await
         .set_chain_target(10_000, Duration::from_secs(120))
         .await;
@@ -552,7 +577,7 @@ async fn a_stale_index_refuses_rather_than_signing_a_null() {
         &wire_name(&["alice", "x"]),
         &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
     );
-    let (status, body) = ask(&router, RESOLVER, &call).await;
+    let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     body.refused();
     drop(guard);
@@ -562,7 +587,7 @@ async fn a_stale_index_refuses_rather_than_signing_a_null() {
 async fn garbage_in_the_path_is_the_callers_error() {
     let (router, _store, _pool, guard) = gateway_or_skip!(32);
     for call in [vec![0xde, 0xad, 0xbe, 0xef], vec![]] {
-        let (status, _) = ask(&router, RESOLVER, &call).await;
+        let (status, _) = router.ask(RESOLVER, &call).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
     drop(guard);
@@ -578,7 +603,7 @@ async fn one_gateway_answers_for_every_chain_it_serves() {
     };
     let here = Address::from([0xbe; 20]);
     let there = Address::from([0xed; 20]);
-    bind(&store, "alice", here).await;
+    store.bind("alice", here).await;
 
     // The same handle, bound to a different wallet on the other chain.
     let other_store = ChainStore::new(
@@ -587,17 +612,17 @@ async fn one_gateway_answers_for_every_chain_it_serves() {
             .unwrap(),
         OTHER,
     );
-    bind(&other_store, "alice", there).await;
+    other_store.bind("alice", there).await;
 
     for (chain, expected) in [(CHAIN, here), (OTHER, there)] {
         let call = resolve_call(
             &wire_name(&["alice", "x"]),
             &addr_call(&["alice", "x"], 0x8000_0000 | chain as u64),
         );
-        let (status, body) = ask(&router, RESOLVER, &call).await;
+        let (status, body) = router.ask(RESOLVER, &call).await;
         assert_eq!(status, StatusCode::OK, "chain {chain}: {body}");
         assert_eq!(
-            verify(&body, &call),
+            body.verify(&call),
             Some(expected),
             "chain {chain} answered with another chain's wallet"
         );
@@ -616,7 +641,7 @@ async fn one_gateway_answers_for_every_chain_it_serves() {
 #[tokio::test]
 async fn an_index_that_cannot_report_its_position_refuses() {
     let (router, store, _pool, guard) = gateway_or_skip!(32);
-    bind(&store, "alice", Address::from([0xbe; 20])).await;
+    store.bind("alice", Address::from([0xbe; 20])).await;
 
     // Drop what the index knows about its own progress, leaving the binding
     // in place: the rows say one thing, the cursor says nothing.
@@ -626,7 +651,7 @@ async fn an_index_that_cannot_report_its_position_refuses() {
         &wire_name(&["alice", "x"]),
         &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
     );
-    let (status, body) = ask(&router, RESOLVER, &call).await;
+    let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert!(
         body.refused().contains("cannot report its position"),
@@ -643,7 +668,7 @@ async fn a_replay_while_the_gateway_reads_is_refused() {
     let Some((mut config, store, pool, guard)) = gateway_parts(&[CHAIN], 32).await else {
         return;
     };
-    bind(&store, "alice", Address::from([0xbe; 20])).await;
+    store.bind("alice", Address::from([0xbe; 20])).await;
     // The gateway reads on sessions of its own name, so the wait below is
     // its wait and no other session's.
     const GATEWAY: &str = "gateway under test";
@@ -652,7 +677,7 @@ async fn a_replay_while_the_gateway_reads_is_refused() {
             .await
             .expect("the gateway's pool");
     config.store = db::Store::new(gateway_pool);
-    let router = usernames_api::ens::router(GatewayState::new(config));
+    let router = GatewayState::new(config).router();
     // The replay holds the handles, and commits once the gateway waits on
     // them.
     let mut replay = pool.begin().await.expect("a transaction");
@@ -666,7 +691,7 @@ async fn a_replay_while_the_gateway_reads_is_refused() {
     );
     let asking = tokio::spawn({
         let (router, call) = (router.clone(), call.clone());
-        async move { ask(&router, RESOLVER, &call).await }
+        async move { router.ask(RESOLVER, &call).await }
     });
     let deadline = Instant::now() + Duration::from_secs(5);
     while !sqlx::query_scalar::<_, bool>(include_str!("sql/waiting_on_a_lock.sql"))
@@ -706,7 +731,7 @@ async fn a_replay_while_the_gateway_reads_is_refused() {
 #[tokio::test]
 async fn an_expired_report_is_too_stale_however_small_the_lag() {
     let (router, store, _pool, guard) = gateway_or_skip!(32);
-    bind(&store, "alice", Address::from([0xbe; 20])).await;
+    store.bind("alice", Address::from([0xbe; 20])).await;
     // Caught up by the block measure, and the report long expired.
     store.set_chain_target_valid_until(1).await;
 
@@ -714,7 +739,7 @@ async fn an_expired_report_is_too_stale_however_small_the_lag() {
         &wire_name(&["alice", "x"]),
         &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
     );
-    let (status, body) = ask(&router, RESOLVER, &call).await;
+    let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert!(body.refused().contains("expired"), "{body}");
     drop(guard);
@@ -725,14 +750,14 @@ async fn an_expired_report_is_too_stale_however_small_the_lag() {
 #[tokio::test]
 async fn a_report_expiring_out_of_range_is_refused() {
     let (router, store, _pool, guard) = gateway_or_skip!(32);
-    bind(&store, "alice", Address::from([0xbe; 20])).await;
+    store.bind("alice", Address::from([0xbe; 20])).await;
     store.set_chain_target_valid_until(i64::MAX as u64).await;
 
     let call = resolve_call(
         &wire_name(&["alice", "x"]),
         &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
     );
-    let (status, body) = ask(&router, RESOLVER, &call).await;
+    let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert!(
         body.refused().contains("cannot report its position"),
@@ -752,9 +777,9 @@ async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
         return;
     };
     let here = Address::from([0xbe; 20]);
-    bind(&store, "alice", here).await;
+    store.bind("alice", here).await;
     let other_store = ChainStore::new(pool.clone(), OTHER);
-    bind(&other_store, "alice", Address::from([0xed; 20])).await;
+    other_store.bind("alice", Address::from([0xed; 20])).await;
     // The other chain's indexer stopped long ago.
     other_store.set_chain_target_valid_until(1).await;
 
@@ -762,7 +787,7 @@ async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
         &wire_name(&["alice", "x"]),
         &addr_call(&["alice", "x"], 0x8000_0000 | OTHER as u64),
     );
-    let (status, body) = ask(&router, RESOLVER, &dead).await;
+    let (status, body) = router.ask(RESOLVER, &dead).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert!(
         body.refused().contains("expired"),
@@ -773,9 +798,9 @@ async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
         &wire_name(&["alice", "x"]),
         &addr_call(&["alice", "x"], 0x8000_0000 | CHAIN as u64),
     );
-    let (status, body) = ask(&router, RESOLVER, &alive).await;
+    let (status, body) = router.ask(RESOLVER, &alive).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(verify(&body, &alive), Some(here));
+    assert_eq!(body.verify(&alive), Some(here));
 
     let response = router
         .clone()
@@ -790,23 +815,13 @@ async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let status: GatewayStatus = serde_json::from_slice(&body).expect("a gateway status");
-    let other = row_of(&status, OTHER);
-    let chain = row_of(&status, CHAIN);
+    let other = status.row(OTHER);
+    let chain = status.row(CHAIN);
     assert!(other.stale, "{status:?}");
     assert!(!chain.stale, "{status:?}");
     assert!(other.report_valid_for.is_some_and(|s| s < 0), "{status:?}");
     assert!(chain.report_valid_for.is_some_and(|s| s > 0), "{status:?}");
     drop(guard);
-}
-
-/// The status row of one chain; a chain the status does not list fails the
-/// test.
-fn row_of(status: &GatewayStatus, chain_id: i64) -> &ChainStatus {
-    status
-        .chains
-        .iter()
-        .find(|row| i64::try_from(row.chain_id) == Ok(chain_id))
-        .unwrap_or_else(|| panic!("chain {chain_id} is listed: {status:?}"))
 }
 
 /// A chain has only the names its indexer declared. With none declared, the
@@ -816,23 +831,23 @@ fn row_of(status: &GatewayStatus, chain_id: i64) -> &ChainStatus {
 async fn a_chain_with_no_declared_name_answers_only_the_unlabelled_name() {
     let (router, store, _pool, guard) = gateway_or_skip!(32);
     let here = Address::from([0xbe; 20]);
-    bind(&store, "alice", here).await;
+    store.bind("alice", here).await;
     let coin = 0x8000_0000 | CHAIN as u64;
 
     let plain = resolve_call(
         &wire_name(&["alice", "x"]),
         &addr_call(&["alice", "x"], coin),
     );
-    let (_, body) = ask(&router, RESOLVER, &plain).await;
-    assert_eq!(verify(&body, &plain), Some(here));
+    let (_, body) = router.ask(RESOLVER, &plain).await;
+    assert_eq!(body.verify(&plain), Some(here));
 
     let labelled = resolve_call(
         &wire_name(&["alice", "x", "local"]),
         &addr_call(&["alice", "x", "local"], coin),
     );
-    let (status, body) = ask(&router, RESOLVER, &labelled).await;
+    let (status, body) = router.ask(RESOLVER, &labelled).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(verify(&body, &labelled), None);
+    assert_eq!(body.verify(&labelled), None);
     drop(guard);
 }
 
@@ -848,7 +863,7 @@ async fn a_chain_that_appears_in_the_store_is_served_without_a_restart() {
     );
 
     // Not in the store yet: refused unsigned, so a wallet walks on.
-    let (status, body) = ask(&router, RESOLVER, &call).await;
+    let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert!(
         body.refused().contains("serves no chain"),
@@ -856,7 +871,7 @@ async fn a_chain_that_appears_in_the_store_is_served_without_a_restart() {
     );
 
     // An indexer for it commits its first window and reports.
-    let other = writer(&ChainStore::new(pool.clone(), OTHER)).await;
+    let other = ChainStore::new(pool.clone(), OTHER).writer().await;
     other
         .begin_window()
         .await
@@ -867,12 +882,12 @@ async fn a_chain_that_appears_in_the_store_is_served_without_a_restart() {
     other.set_chain_head(1).await;
     other.set_chain_target(1, Duration::from_secs(120)).await;
     let there = Address::from([0xed; 20]);
-    bind(other.store(), "alice", there).await;
+    other.store().bind("alice", there).await;
 
     // The same router, untouched, now answers for it.
-    let (status, body) = ask(&router, RESOLVER, &call).await;
+    let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(verify(&body, &call), Some(there));
+    assert_eq!(body.verify(&call), Some(there));
     drop(guard);
 }
 
@@ -887,12 +902,12 @@ async fn two_indexed_chains_on_one_coin_type_are_refused_unsigned() {
     else {
         return;
     };
-    bind(&store, "alice", Address::from([0xed; 20])).await;
+    store.bind("alice", Address::from([0xed; 20])).await;
     let call = resolve_call(
         &wire_name(&["alice", "x"]),
         &addr_call(&["alice", "x"], 0x8000_0000u64 | EDEN as u64),
     );
-    let (status, body) = ask(&router, RESOLVER, &call).await;
+    let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert!(body.refused().contains("share"), "{body}");
 
@@ -910,7 +925,7 @@ async fn two_indexed_chains_on_one_coin_type_are_refused_unsigned() {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let status: GatewayStatus = serde_json::from_slice(&body).expect("a gateway status");
     for id in [EDEN, TWIN] {
-        let row = row_of(&status, id);
+        let row = status.row(id);
         assert!(row.ambiguous && row.stale, "{status:?}");
     }
     drop(guard);
@@ -924,13 +939,13 @@ async fn a_label_on_a_chain_without_a_cursor_refuses() {
     let Some((router, store, _pool, guard)) = gateway_over(&[EDEN], 32).await else {
         return;
     };
-    bind(&store, "alice", Address::from([0xed; 20])).await;
+    store.bind("alice", Address::from([0xed; 20])).await;
     store.forget_progress().await;
     let call = resolve_call(
         &wire_name(&["alice", "x", "eden"]),
         &addr_call(&["alice", "x", "eden"], 0x8000_0000u64 | EDEN as u64),
     );
-    let (status, body) = ask(&router, RESOLVER, &call).await;
+    let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert!(
         body.refused().contains("cannot report its position"),
@@ -947,13 +962,13 @@ async fn a_twin_without_a_cursor_still_makes_the_coin_type_ambiguous() {
     let Some((router, store, pool, guard)) = gateway_over(&[EDEN, TWIN], 32).await else {
         return;
     };
-    bind(&store, "alice", Address::from([0xed; 20])).await;
+    store.bind("alice", Address::from([0xed; 20])).await;
     ChainStore::new(pool.clone(), TWIN).forget_progress().await;
     let call = resolve_call(
         &wire_name(&["alice", "x"]),
         &addr_call(&["alice", "x"], 0x8000_0000u64 | EDEN as u64),
     );
-    let (status, body) = ask(&router, RESOLVER, &call).await;
+    let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert!(body.refused().contains("share"), "{body}");
     drop(guard);
@@ -974,8 +989,8 @@ async fn the_eden_testnet_resolves_despite_its_chain_id() {
         return;
     };
     let owner = Address::from([0xed; 20]);
-    bind(&store, "alice", owner).await;
-    declare_names(&store, &["eden"]).await;
+    store.bind("alice", owner).await;
+    store.declare_names(&["eden"]).await;
 
     // Exactly what a wallet on eden sends: `0x80000000 | 3735928814`, which is
     // 3735928814 itself.
@@ -983,9 +998,9 @@ async fn the_eden_testnet_resolves_despite_its_chain_id() {
         &wire_name(&["alice", "x", "eden"]),
         &addr_call(&["alice", "x", "eden"], 0x8000_0000u64 | EDEN as u64),
     );
-    let (status, body) = ask(&router, RESOLVER, &call).await;
+    let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "eden must resolve: {body}");
-    assert_eq!(verify(&body, &call), Some(owner));
+    assert_eq!(body.verify(&call), Some(owner));
     drop(guard);
 }
 
@@ -1002,13 +1017,13 @@ async fn the_eden_testnet_resolves_despite_its_chain_id() {
 #[tokio::test]
 async fn the_legacy_addr_shape_is_refused_unsigned_off_mainnet() {
     let (router, store, _pool, guard) = gateway_or_skip!(32);
-    bind(&store, "alice", Address::from([0xbe; 20])).await;
+    store.bind("alice", Address::from([0xbe; 20])).await;
 
     let call = resolve_call(
         &wire_name(&["alice", "x"]),
         &legacy_addr_call(&["alice", "x"]),
     );
-    let (status, body) = ask(&router, RESOLVER, &call).await;
+    let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(
         status,
         StatusCode::SERVICE_UNAVAILABLE,
@@ -1029,26 +1044,26 @@ async fn bare_addr_asks_for_the_chain_of_the_gateways_registry() {
     let Some((config, store, _pool, guard)) = gateway_parts(&[CHAIN], 32).await else {
         return;
     };
-    let in_the_mainnet_registry =
-        usernames_api::ens::router(GatewayState::new(config.clone()));
-    let in_our_chains_registry = usernames_api::ens::router(GatewayState::new(Config {
+    let in_the_mainnet_registry = GatewayState::new(config.clone()).router();
+    let in_our_chains_registry = GatewayState::new(Config {
         ens_chain: CHAIN as u64,
         ..config
-    }));
+    })
+    .router();
     let owner = Address::from([0xbe; 20]);
-    bind(&store, "alice", owner).await;
+    store.bind("alice", owner).await;
 
     let call = resolve_call(
         &wire_name(&["alice", "x"]),
         &legacy_addr_call(&["alice", "x"]),
     );
-    let (status, body) = ask(&in_our_chains_registry, RESOLVER, &call).await;
+    let (status, body) = in_our_chains_registry.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(verify(&body, &call), Some(owner));
+    assert_eq!(body.verify(&call), Some(owner));
 
     // The same question through the mainnet registry is a mainnet one, and
     // this store holds no mainnet.
-    let (status, body) = ask(&in_the_mainnet_registry, RESOLVER, &call).await;
+    let (status, body) = in_the_mainnet_registry.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     body.refused();
     drop(guard);
@@ -1065,12 +1080,13 @@ async fn the_merged_router_keeps_both_halves_intact() {
         return;
     };
     let owner = Address::from([0xbe; 20]);
-    bind(&store, "alice", owner).await;
+    store.bind("alice", owner).await;
 
-    let app = usernames_api::build_router(
-        AppState::new(Store::new(pool.clone())),
-        Some(config),
-    );
+    let app = usernames_api::Service {
+        api: AppState::new(Store::new(pool.clone())),
+        gateway: Some(config),
+    }
+    .router();
 
     let get = |uri: String| {
         let app = app.clone();
@@ -1148,7 +1164,7 @@ async fn the_merged_router_keeps_both_halves_intact() {
 #[tokio::test]
 async fn a_node_that_is_not_this_name_is_refused() {
     let (router, store, _pool, guard) = gateway_or_skip!(32);
-    bind(&store, "alice", Address::from([0xbe; 20])).await;
+    store.bind("alice", Address::from([0xbe; 20])).await;
 
     let coin = 0x8000_0000 | CHAIN as u64;
     let call = resolve_call(
@@ -1156,7 +1172,7 @@ async fn a_node_that_is_not_this_name_is_refused() {
         // The namehash of a different name entirely.
         &addr_call(&["bob", "x"], coin),
     );
-    let (status, body) = ask(&router, RESOLVER, &call).await;
+    let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
     // And the well-formed request it differs from still answers, so the
@@ -1165,9 +1181,9 @@ async fn a_node_that_is_not_this_name_is_refused() {
         &wire_name(&["alice", "x"]),
         &addr_call(&["alice", "x"], coin),
     );
-    let (status, body) = ask(&router, RESOLVER, &ok).await;
+    let (status, body) = router.ask(RESOLVER, &ok).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(verify(&body, &ok).is_some());
+    assert!(body.verify(&ok).is_some());
     drop(guard);
 }
 
@@ -1197,7 +1213,7 @@ async fn a_name_outside_the_domain_is_refused_whatever_the_record() {
             &b"\x07Vitalik\x03eth\x00"[..],
         ] {
             let call = resolve_call(name, &inner);
-            let (status, body) = ask(&router, RESOLVER, &call).await;
+            let (status, body) = router.ask(RESOLVER, &call).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         }
     }

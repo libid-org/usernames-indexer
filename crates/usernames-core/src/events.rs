@@ -458,48 +458,53 @@ pub enum DecodeError {
     },
 }
 
-/// The payload of a log whose topic named `E`. Failing here is
-/// [`DecodeError::Payload`], never `Ok(None)`: the topic was recognized.
-fn payload_of<E: SolEvent>(log: &Log, event: &'static str) -> Result<E, DecodeError> {
-    log.log_decode::<E>()
-        .map(|decoded| decoded.inner.data)
-        .map_err(|source| DecodeError::Payload { event, source })
+/// A watched log's payload, read by its topic.
+trait Payload {
+    /// The payload of a log whose topic named `E`. Failing here is
+    /// [`DecodeError::Payload`], never `Ok(None)`: the topic was recognized.
+    fn payload<E: SolEvent>(&self, event: &'static str) -> Result<E, DecodeError>;
 }
 
-/// The text a `HandleRevealed` carried, when it is a handle hashing to the
-/// node the event names. Other text is dropped and logged without itself.
-fn disclosed(
-    platform_id: B256,
-    handle_node: B256,
-    text: &str,
-) -> Option<DisclosedHandle> {
-    let Some(platform) = Platform::known_of(platform_id) else {
-        tracing::warn!(
-            %platform_id,
-            "revealed text on a platform this build does not know; not stored"
-        );
-        return None;
-    };
-    let verified = DisclosedHandle::verify(platform, handle_node, text);
-    if verified.is_none() {
-        tracing::warn!(
-            %platform_id,
-            %handle_node,
-            "revealed text is not a handle hashing to its node; not stored"
-        );
+impl Payload for Log {
+    fn payload<E: SolEvent>(&self, event: &'static str) -> Result<E, DecodeError> {
+        self.log_decode::<E>()
+            .map(|decoded| decoded.inner.data)
+            .map_err(|source| DecodeError::Payload { event, source })
     }
-    verified
+}
+
+impl DisclosedHandle {
+    /// The text a `HandleRevealed` carried, when it is a handle hashing to the
+    /// node the event names. Other text is dropped and logged without itself.
+    fn revealed(platform_id: B256, handle_node: B256, text: &str) -> Option<Self> {
+        let Some(platform) = Platform::known_of(platform_id) else {
+            tracing::warn!(
+                %platform_id,
+                "revealed text on a platform this build does not know; not stored"
+            );
+            return None;
+        };
+        let verified = DisclosedHandle::verify(platform, handle_node, text);
+        if verified.is_none() {
+            tracing::warn!(
+                %platform_id,
+                %handle_node,
+                "revealed text is not a handle hashing to its node; not stored"
+            );
+        }
+        verified
+    }
 }
 
 impl NamesEvent {
     /// The `HandleRevealed` a log carries, whichever libid contract wrote it:
     /// they share the event, topic and all.
-    fn revealed(log: &Log) -> Result<Self, DecodeError> {
-        let d: HandleRevealed = payload_of(log, "HandleRevealed")?;
+    fn from_revealed(log: &Log) -> Result<Self, DecodeError> {
+        let d: HandleRevealed = log.payload("HandleRevealed")?;
         Ok(Self::HandleRevealed {
             platform_id: d.platformId,
             handle_node: d.handleNode,
-            handle: disclosed(d.platformId, d.handleNode, &d.handle),
+            handle: DisclosedHandle::revealed(d.platformId, d.handleNode, &d.handle),
         })
     }
 }
@@ -525,140 +530,138 @@ impl LogPosition {
     }
 }
 
-/// Decode one log from `IdentityRegistry`. `Ok(None)` is a topic this indexer
-/// does not know — legal, because an upgraded contract may emit new events
-/// before this build learns them. A log that names a known topic but fails to
-/// decode is an error: skipping it would silently fork the read model from
-/// the chain.
-pub fn decode_registry(
-    log: &Log,
-) -> Result<Option<(NamesEvent, LogPosition)>, DecodeError> {
-    let position = LogPosition::of(log)?;
-    let Some(&topic0) = log.topic0() else {
-        return Ok(None);
-    };
+impl NamesEvent {
+    /// Decode one log from `IdentityRegistry`. `Ok(None)` is a topic this indexer
+    /// does not know — legal, because an upgraded contract may emit new events
+    /// before this build learns them. A log that names a known topic but fails to
+    /// decode is an error: skipping it would silently fork the read model from
+    /// the chain.
+    pub fn from_registry(log: &Log) -> Result<Option<(Self, LogPosition)>, DecodeError> {
+        let position = LogPosition::of(log)?;
+        let Some(&topic0) = log.topic0() else {
+            return Ok(None);
+        };
 
-    let event = if topic0 == IdentityRegistry::IdentityBound::SIGNATURE_HASH {
-        let d: IdentityRegistry::IdentityBound = payload_of(log, "IdentityBound")?;
-        NamesEvent::IdentityBound {
-            holder: d.holder,
-            id_node: d.idNode,
-            handle_node: d.handleNode,
-            platform_id: d.platformId,
-            observed_at: d.observedAt,
-            ceremony_version: d.ceremonyVersion,
-        }
-    } else if topic0 == HandleRevealed::SIGNATURE_HASH {
-        NamesEvent::revealed(log)?
-    } else if topic0 == IdentityRegistry::HandlePublished::SIGNATURE_HASH {
-        let d: IdentityRegistry::HandlePublished = payload_of(log, "HandlePublished")?;
-        NamesEvent::HandlePublished {
-            holder: d.holder,
-            platform_id: d.platformId,
-            handle_node: d.handleNode,
-        }
-    } else if topic0 == IdentityRegistry::HandleRetired::SIGNATURE_HASH {
-        let d: IdentityRegistry::HandleRetired = payload_of(log, "HandleRetired")?;
-        NamesEvent::HandleRetired {
-            platform_id: d.platformId,
-            handle_node: d.handleNode,
-            holder: d.holder,
-        }
-    } else if topic0 == IdentityRegistry::HandleUnpublished::SIGNATURE_HASH {
-        let d: IdentityRegistry::HandleUnpublished =
-            payload_of(log, "HandleUnpublished")?;
-        NamesEvent::HandleUnpublished { holder: d.holder }
-    } else if topic0 == IdentityRegistry::ProofVerifierConfigured::SIGNATURE_HASH {
-        let d: IdentityRegistry::ProofVerifierConfigured =
-            payload_of(log, "ProofVerifierConfigured")?;
-        NamesEvent::ProofVerifierConfigured {
-            verifier: d.verifier,
-        }
-    } else if topic0 == IdentityRegistry::CeremonyBound::SIGNATURE_HASH {
-        let d: IdentityRegistry::CeremonyBound = payload_of(log, "CeremonyBound")?;
-        NamesEvent::CeremonyBound {
-            authorization_digest: d.authorizationDigest,
-            holder: d.holder,
-            platform_id: d.platformId,
-            client_identifier: d.clientIdentifier,
-        }
-    } else if topic0 == IdentityRegistry::BindFeePaid::SIGNATURE_HASH {
-        let d: IdentityRegistry::BindFeePaid = payload_of(log, "BindFeePaid")?;
-        NamesEvent::BindFeePaid {
-            authorization_digest: d.authorizationDigest,
-            receiver: d.receiver,
-            amount: d.amount,
-        }
-    } else {
-        return Ok(None);
-    };
+        let event = if topic0 == IdentityRegistry::IdentityBound::SIGNATURE_HASH {
+            let d: IdentityRegistry::IdentityBound = log.payload("IdentityBound")?;
+            NamesEvent::IdentityBound {
+                holder: d.holder,
+                id_node: d.idNode,
+                handle_node: d.handleNode,
+                platform_id: d.platformId,
+                observed_at: d.observedAt,
+                ceremony_version: d.ceremonyVersion,
+            }
+        } else if topic0 == HandleRevealed::SIGNATURE_HASH {
+            NamesEvent::from_revealed(log)?
+        } else if topic0 == IdentityRegistry::HandlePublished::SIGNATURE_HASH {
+            let d: IdentityRegistry::HandlePublished = log.payload("HandlePublished")?;
+            NamesEvent::HandlePublished {
+                holder: d.holder,
+                platform_id: d.platformId,
+                handle_node: d.handleNode,
+            }
+        } else if topic0 == IdentityRegistry::HandleRetired::SIGNATURE_HASH {
+            let d: IdentityRegistry::HandleRetired = log.payload("HandleRetired")?;
+            NamesEvent::HandleRetired {
+                platform_id: d.platformId,
+                handle_node: d.handleNode,
+                holder: d.holder,
+            }
+        } else if topic0 == IdentityRegistry::HandleUnpublished::SIGNATURE_HASH {
+            let d: IdentityRegistry::HandleUnpublished =
+                log.payload("HandleUnpublished")?;
+            NamesEvent::HandleUnpublished { holder: d.holder }
+        } else if topic0 == IdentityRegistry::ProofVerifierConfigured::SIGNATURE_HASH {
+            let d: IdentityRegistry::ProofVerifierConfigured =
+                log.payload("ProofVerifierConfigured")?;
+            NamesEvent::ProofVerifierConfigured {
+                verifier: d.verifier,
+            }
+        } else if topic0 == IdentityRegistry::CeremonyBound::SIGNATURE_HASH {
+            let d: IdentityRegistry::CeremonyBound = log.payload("CeremonyBound")?;
+            NamesEvent::CeremonyBound {
+                authorization_digest: d.authorizationDigest,
+                holder: d.holder,
+                platform_id: d.platformId,
+                client_identifier: d.clientIdentifier,
+            }
+        } else if topic0 == IdentityRegistry::BindFeePaid::SIGNATURE_HASH {
+            let d: IdentityRegistry::BindFeePaid = log.payload("BindFeePaid")?;
+            NamesEvent::BindFeePaid {
+                authorization_digest: d.authorizationDigest,
+                receiver: d.receiver,
+                amount: d.amount,
+            }
+        } else {
+            return Ok(None);
+        };
 
-    Ok(Some((event, position)))
-}
-
-/// Decode one log from `HandleEscrow`, under the same rules as
-/// [`decode_registry`]: an unknown topic is `Ok(None)`, a known one that does
-/// not decode is an error. The proxy's own events — ownership, upgrades,
-/// initialization — are unknown topics here. A `depositToHandle`'s
-/// `HandleRevealed` decodes as the registry's does.
-pub fn decode_escrow(
-    log: &Log,
-) -> Result<Option<(NamesEvent, LogPosition)>, DecodeError> {
-    let position = LogPosition::of(log)?;
-    let Some(&topic0) = log.topic0() else {
-        return Ok(None);
-    };
-    if topic0 == HandleRevealed::SIGNATURE_HASH {
-        return Ok(Some((NamesEvent::revealed(log)?, position)));
+        Ok(Some((event, position)))
     }
 
-    let event = if topic0 == HandleEscrow::Deposited::SIGNATURE_HASH {
-        let d: HandleEscrow::Deposited = payload_of(log, "Deposited")?;
-        EscrowEvent::Deposited {
-            handle_node: d.handleNode,
-            token: d.token,
-            sender: d.sender,
-            round: d.round,
-            amount: d.amount,
-            refundable_at: d.refundableAt,
+    /// Decode one log from `HandleEscrow`, under the same rules as
+    /// [`Self::from_registry`]: an unknown topic is `Ok(None)`, a known one that does
+    /// not decode is an error. The proxy's own events — ownership, upgrades,
+    /// initialization — are unknown topics here. A `depositToHandle`'s
+    /// `HandleRevealed` decodes as the registry's does.
+    pub fn from_escrow(log: &Log) -> Result<Option<(Self, LogPosition)>, DecodeError> {
+        let position = LogPosition::of(log)?;
+        let Some(&topic0) = log.topic0() else {
+            return Ok(None);
+        };
+        if topic0 == HandleRevealed::SIGNATURE_HASH {
+            return Ok(Some((NamesEvent::from_revealed(log)?, position)));
         }
-    } else if topic0 == HandleEscrow::Forwarded::SIGNATURE_HASH {
-        let d: HandleEscrow::Forwarded = payload_of(log, "Forwarded")?;
-        EscrowEvent::Forwarded {
-            handle_node: d.handleNode,
-            token: d.token,
-            sender: d.sender,
-            holder: d.holder,
-            amount: d.amount,
-            received: d.received,
-        }
-    } else if topic0 == HandleEscrow::Claimed::SIGNATURE_HASH {
-        let d: HandleEscrow::Claimed = payload_of(log, "Claimed")?;
-        EscrowEvent::Claimed {
-            handle_node: d.handleNode,
-            token: d.token,
-            claimer: d.claimer,
-            recipient: d.recipient,
-            round: d.round,
-            released: d.released,
-            received: d.received,
-        }
-    } else if topic0 == HandleEscrow::Refunded::SIGNATURE_HASH {
-        let d: HandleEscrow::Refunded = payload_of(log, "Refunded")?;
-        EscrowEvent::Refunded {
-            handle_node: d.handleNode,
-            token: d.token,
-            sender: d.sender,
-            recipient: d.recipient,
-            round: d.round,
-            released: d.released,
-            received: d.received,
-        }
-    } else {
-        return Ok(None);
-    };
 
-    Ok(Some((NamesEvent::Escrow(event), position)))
+        let event = if topic0 == HandleEscrow::Deposited::SIGNATURE_HASH {
+            let d: HandleEscrow::Deposited = log.payload("Deposited")?;
+            EscrowEvent::Deposited {
+                handle_node: d.handleNode,
+                token: d.token,
+                sender: d.sender,
+                round: d.round,
+                amount: d.amount,
+                refundable_at: d.refundableAt,
+            }
+        } else if topic0 == HandleEscrow::Forwarded::SIGNATURE_HASH {
+            let d: HandleEscrow::Forwarded = log.payload("Forwarded")?;
+            EscrowEvent::Forwarded {
+                handle_node: d.handleNode,
+                token: d.token,
+                sender: d.sender,
+                holder: d.holder,
+                amount: d.amount,
+                received: d.received,
+            }
+        } else if topic0 == HandleEscrow::Claimed::SIGNATURE_HASH {
+            let d: HandleEscrow::Claimed = log.payload("Claimed")?;
+            EscrowEvent::Claimed {
+                handle_node: d.handleNode,
+                token: d.token,
+                claimer: d.claimer,
+                recipient: d.recipient,
+                round: d.round,
+                released: d.released,
+                received: d.received,
+            }
+        } else if topic0 == HandleEscrow::Refunded::SIGNATURE_HASH {
+            let d: HandleEscrow::Refunded = log.payload("Refunded")?;
+            EscrowEvent::Refunded {
+                handle_node: d.handleNode,
+                token: d.token,
+                sender: d.sender,
+                recipient: d.recipient,
+                round: d.round,
+                released: d.released,
+                received: d.received,
+            }
+        } else {
+            return Ok(None);
+        };
+
+        Ok(Some((NamesEvent::Escrow(event), position)))
+    }
 }
 
 #[cfg(test)]
@@ -735,7 +738,9 @@ mod tests {
         let log = mined(
             IdentityRegistry::HandleUnpublished { holder: HOLDER }.encode_log_data(),
         );
-        let (event, position) = decode_registry(&log).unwrap().expect("a known topic");
+        let (event, position) = NamesEvent::from_registry(&log)
+            .unwrap()
+            .expect("a known topic");
         assert!(
             matches!(
                 event,
@@ -790,7 +795,9 @@ mod tests {
             }
             .encode_log_data(),
         );
-        let (event, _) = decode_escrow(&log).unwrap().expect("a known topic");
+        let (event, _) = NamesEvent::from_escrow(&log)
+            .unwrap()
+            .expect("a known topic");
         assert_eq!(event.kind(), EventKind::Deposited);
         assert_eq!(event.parties(), [(payer, Role::Sender)]);
         assert!(matches!(
@@ -817,11 +824,11 @@ mod tests {
             }
             .encode_log_data(),
         );
-        assert!(decode_registry(&escrow_log).unwrap().is_none());
+        assert!(NamesEvent::from_registry(&escrow_log).unwrap().is_none());
         let registry_log = mined(
             IdentityRegistry::HandleUnpublished { holder: HOLDER }.encode_log_data(),
         );
-        assert!(decode_escrow(&registry_log).unwrap().is_none());
+        assert!(NamesEvent::from_escrow(&registry_log).unwrap().is_none());
     }
 
     #[test]
@@ -831,7 +838,7 @@ mod tests {
         );
         log.block_timestamp = None;
         assert!(matches!(
-            decode_registry(&log),
+            NamesEvent::from_registry(&log),
             Err(DecodeError::MissingField("block timestamp"))
         ));
     }
@@ -850,7 +857,11 @@ mod tests {
                 }
                 .encode_log_data(),
             );
-            match decode_registry(&log).unwrap().expect("a known topic").0 {
+            match NamesEvent::from_registry(&log)
+                .unwrap()
+                .expect("a known topic")
+                .0
+            {
                 NamesEvent::HandleRevealed { handle, .. } => handle,
                 other => panic!("{other:?}"),
             }
@@ -876,8 +887,12 @@ mod tests {
             }
             .encode_log_data(),
         );
-        let (from_escrow, _) = decode_escrow(&log).unwrap().expect("a known topic");
-        let (from_registry, _) = decode_registry(&log).unwrap().expect("a known topic");
+        let (from_escrow, _) = NamesEvent::from_escrow(&log)
+            .unwrap()
+            .expect("a known topic");
+        let (from_registry, _) = NamesEvent::from_registry(&log)
+            .unwrap()
+            .expect("a known topic");
         assert_eq!(from_escrow, from_registry);
         assert_eq!(from_escrow.parties(), []);
         assert_eq!(

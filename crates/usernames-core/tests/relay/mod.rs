@@ -85,7 +85,7 @@ impl Relay {
                     let reopened = open.wait_for(|open| *open).await.is_ok();
                     if reopened {
                         live.send_modify(|live| *live += 1);
-                        pipe(socket, upstream, shared, open, silent).await;
+                        shared.pipe(socket, upstream, open, silent).await;
                         live.send_modify(|live| *live -= 1);
                     }
                 });
@@ -142,50 +142,52 @@ impl Relay {
     }
 }
 
-/// Relay one connection both ways, recording each request's method and
-/// dropping pushes while silenced, until either side closes or the relay is
-/// cut.
-async fn pipe(
-    socket: TcpStream,
-    upstream: Url,
-    shared: Arc<Shared>,
-    mut open: watch::Receiver<bool>,
-    silent: watch::Receiver<bool>,
-) {
-    let Ok(client) = accept_async(socket).await else {
-        return;
-    };
-    let Ok((server, _)) = connect_async(upstream.as_str()).await else {
-        return;
-    };
-    let (mut to_client, mut from_client) = client.split();
-    let (mut to_server, mut from_server) = server.split();
-    loop {
-        tokio::select! {
-            _ = async { open.wait_for(|open| !*open).await.map(drop) } => return,
-            message = from_client.next() => {
-                let Some(Ok(message)) = message else { return };
-                if let Message::Text(text) = &message {
-                    if let Ok(call) = serde_json::from_str::<Call>(text.as_str()) {
-                        shared.calls.send_modify(|calls| calls.push(call.method));
+impl Shared {
+    /// Relay one connection both ways, recording each request's method and
+    /// dropping pushes while silenced, until either side closes or the relay is
+    /// cut.
+    async fn pipe(
+        &self,
+        socket: TcpStream,
+        upstream: Url,
+        mut open: watch::Receiver<bool>,
+        silent: watch::Receiver<bool>,
+    ) {
+        let Ok(client) = accept_async(socket).await else {
+            return;
+        };
+        let Ok((server, _)) = connect_async(upstream.as_str()).await else {
+            return;
+        };
+        let (mut to_client, mut from_client) = client.split();
+        let (mut to_server, mut from_server) = server.split();
+        loop {
+            tokio::select! {
+                _ = async { open.wait_for(|open| !*open).await.map(drop) } => return,
+                message = from_client.next() => {
+                    let Some(Ok(message)) = message else { return };
+                    if let Message::Text(text) = &message {
+                        if let Ok(call) = serde_json::from_str::<Call>(text.as_str()) {
+                            self.calls.send_modify(|calls| calls.push(call.method));
+                        }
+                    }
+                    if to_server.send(message).await.is_err() {
+                        return;
                     }
                 }
-                if to_server.send(message).await.is_err() {
-                    return;
-                }
-            }
-            message = from_server.next() => {
-                let Some(Ok(message)) = message else { return };
-                let push = match &message {
-                    Message::Text(text) => serde_json::from_str::<Call>(text.as_str())
-                        .is_ok_and(|call| call.method == "eth_subscription"),
-                    _ => false,
-                };
-                if push && *silent.borrow() {
-                    continue;
-                }
-                if to_client.send(message).await.is_err() {
-                    return;
+                message = from_server.next() => {
+                    let Some(Ok(message)) = message else { return };
+                    let push = match &message {
+                        Message::Text(text) => serde_json::from_str::<Call>(text.as_str())
+                            .is_ok_and(|call| call.method == "eth_subscription"),
+                        _ => false,
+                    };
+                    if push && *silent.borrow() {
+                        continue;
+                    }
+                    if to_client.send(message).await.is_err() {
+                        return;
+                    }
                 }
             }
         }

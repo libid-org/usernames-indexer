@@ -30,6 +30,8 @@ use common::{
         Node,
         Proof,
     },
+    IdNode,
+    Reads,
     Reply,
 };
 use serde::de::DeserializeOwned;
@@ -89,16 +91,14 @@ impl Harness {
             return None;
         }
         let pool = db::connect_and_migrate(&url).await.expect("database");
-        common::clear_chain(&pool, chain as i64).await;
+        ChainStore::new(pool.clone(), chain as i64).forget().await;
         let store = ChainStore::new(pool.clone(), chain as i64);
 
         let node = Node::spawn(chain);
         let libid = Libid::deploy(&node.provider, node.accounts()[0]).await;
-        let (registry, escrow) = (*libid.registry.address(), *libid.escrow.address());
-
         let lease = store.acquire_writer().await.expect("writer lease");
         let writer = store
-            .prepare(&lease, registry, Some(escrow))
+            .prepare(&lease, libid.contracts())
             .await
             .expect("prepare");
         let cancel = CancellationToken::new();
@@ -107,8 +107,7 @@ impl Harness {
                 writer,
                 node.rpc(),
                 indexer::IndexerConfig {
-                    contract: registry,
-                    escrow: Some(escrow),
+                    contracts: libid.contracts(),
                     confirmations: 0,
                     source: indexer::LogSource::Poll,
                     poll_interval: Duration::from_millis(10),
@@ -141,7 +140,7 @@ impl Harness {
 
     /// The answer to one GET on the read API, scoped to this chain.
     async fn get<T: DeserializeOwned + Debug>(&self, path: &str) -> T {
-        let reply: Reply<T> = common::get_on(&self.pool, self.chain as i64, path).await;
+        let reply: Reply<T> = self.pool.get_on(self.chain as i64, path).await;
         reply.answer()
     }
 
@@ -222,7 +221,7 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
 
     let x = KnownPlatform::X;
     let alice_node = x.handle_node("Alice_1").expect("a handle");
-    let alice_id = common::id_node(x, ALICE_ID);
+    let alice_id = x.id_node(ALICE_ID);
 
     // 1. A private bind of @Alice_1: nodes only, resolved by hashing here,
     //    with no text to show.
@@ -273,7 +272,8 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
     let resolved: HandleResolution = h.get("/v1/resolve/handle/x/alice_1").await;
     assert_eq!(resolved.bindings[0].handle.as_deref(), Some("alice_1"));
     assert_eq!(
-        common::disclosed(&h.pool, h.chain as i64, alice_node)
+        h.pool
+            .disclosed(h.chain as i64, alice_node)
             .await
             .as_deref(),
         Some("alice_1")
@@ -292,7 +292,7 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
     //    escrow's reveal maps the handle to his id node. A private deposit names only
     //    a node, and no platform.
     let bob_node = x.handle_node("bob_2").expect("a handle");
-    let bob_id = common::id_node(x, BOB_ID);
+    let bob_id = x.id_node(BOB_ID);
     let carol_node = x.handle_node("carol_3").expect("a handle");
     h.libid
         .deposit_to_handle(payer, Handle(x, "Bob_2"), 100)

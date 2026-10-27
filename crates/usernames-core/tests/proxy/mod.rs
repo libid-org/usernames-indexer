@@ -52,8 +52,8 @@ impl Proxy {
                     .expect("the database answers");
                 let (from_client, to_client) = client.into_split();
                 let (from_server, to_server) = server.into_split();
-                tokio::spawn(pump(from_client, to_server, switch.subscribe()));
-                tokio::spawn(pump(from_server, to_client, switch.subscribe()));
+                tokio::spawn(from_client.pump(to_server, switch.subscribe()));
+                tokio::spawn(from_server.pump(to_client, switch.subscribe()));
             }
         });
         Self { url, silent }
@@ -70,28 +70,31 @@ impl Proxy {
     }
 }
 
-/// Copy one direction until either end closes, and hold both halves open,
-/// relaying nothing, once silenced.
-async fn pump(
-    mut from: OwnedReadHalf,
-    mut to: OwnedWriteHalf,
-    mut silent: watch::Receiver<bool>,
-) {
-    let mut buffer = vec![0u8; 8192];
-    loop {
-        let read = tokio::select! {
-            read = from.read(&mut buffer) => read,
-            _ = silent.wait_for(|silent| *silent) => break,
-        };
-        let Ok(read @ 1..) = read else {
-            return;
-        };
-        if *silent.borrow() {
-            break;
+/// One direction of a proxied connection.
+trait Pump {
+    /// Copy one direction until either end closes, and hold both halves open,
+    /// relaying nothing, once silenced.
+    async fn pump(self, to: OwnedWriteHalf, silent: watch::Receiver<bool>);
+}
+
+impl Pump for OwnedReadHalf {
+    async fn pump(mut self, mut to: OwnedWriteHalf, mut silent: watch::Receiver<bool>) {
+        let mut buffer = vec![0u8; 8192];
+        loop {
+            let read = tokio::select! {
+                read = self.read(&mut buffer) => read,
+                _ = silent.wait_for(|silent| *silent) => break,
+            };
+            let Ok(read @ 1..) = read else {
+                return;
+            };
+            if *silent.borrow() {
+                break;
+            }
+            if to.write_all(&buffer[..read]).await.is_err() {
+                return;
+            }
         }
-        if to.write_all(&buffer[..read]).await.is_err() {
-            return;
-        }
+        std::future::pending::<()>().await;
     }
-    std::future::pending::<()>().await;
 }

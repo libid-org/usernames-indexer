@@ -54,6 +54,8 @@ use common::{
         Proof,
     },
     ChainWatch,
+    Reads,
+    Seed,
     PATIENCE,
 };
 use relay::Relay;
@@ -101,7 +103,9 @@ impl Chain {
         }
 
         let pool = db::connect_and_migrate(&url).await.expect("database");
-        common::clear_chain(&pool, chain_id as i64).await;
+        ChainStore::new(pool.clone(), chain_id as i64)
+            .forget()
+            .await;
         let store = ChainStore::new(pool.clone(), chain_id as i64);
 
         let node = Node::spawn(chain_id);
@@ -112,11 +116,7 @@ impl Chain {
 
         let lease = store.acquire_writer().await.expect("writer lease");
         let writer = store
-            .prepare(
-                &lease,
-                *libid.registry.address(),
-                Some(*libid.escrow.address()),
-            )
+            .prepare(&lease, libid.contracts())
             .await
             .expect("prepare");
         Some(Self {
@@ -133,8 +133,7 @@ impl Chain {
     /// `confirmations` behind the head, on short intervals.
     fn config(&self, confirmations: u64) -> IndexerConfig {
         IndexerConfig {
-            contract: *self.libid.registry.address(),
-            escrow: Some(*self.libid.escrow.address()),
+            contracts: self.libid.contracts(),
             confirmations,
             source: LogSource::Subscribe,
             poll_interval: Duration::from_millis(100),
@@ -201,12 +200,13 @@ impl Chain {
 
     /// Who `handle` on X resolves to, or the refusal's status.
     async fn resolve(&self, handle: &str) -> Result<Address, StatusCode> {
-        let reply = common::get_on::<HandleResolution>(
-            &self.pool,
-            self.writer.store().chain_id(),
-            &format!("/v1/resolve/handle/x/{handle}"),
-        )
-        .await;
+        let reply = self
+            .pool
+            .get_on::<HandleResolution>(
+                self.writer.store().chain_id(),
+                &format!("/v1/resolve/handle/x/{handle}"),
+            )
+            .await;
         if reply.status.is_success() {
             Ok(reply.answer().bindings[0].owner)
         } else {
@@ -216,13 +216,14 @@ impl Chain {
 
     /// The events of `handle` on X, oldest first, each with its block.
     async fn history(&self, handle: &str) -> Vec<(u64, HistoryEvent)> {
-        let history: HandleHistory = common::get_on(
-            &self.pool,
-            self.writer.store().chain_id(),
-            &format!("/v1/history/handle/x/{handle}"),
-        )
-        .await
-        .answer();
+        let history: HandleHistory = self
+            .pool
+            .get_on(
+                self.writer.store().chain_id(),
+                &format!("/v1/history/handle/x/{handle}"),
+            )
+            .await
+            .answer();
         history
             .entries
             .into_iter()
@@ -414,7 +415,7 @@ async fn an_indexer_whose_chain_was_taken_stops() {
         .execute(&chain.pool)
         .await
         .expect("the lease's session ends");
-    common::writer(store).await;
+    store.writer().await;
     chain.mine(2).await;
 
     let stopped = tokio::time::timeout(PATIENCE, running.task)

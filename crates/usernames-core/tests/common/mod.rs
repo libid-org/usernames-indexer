@@ -60,6 +60,10 @@ use usernames_core::{
         KnownPlatform,
     },
 };
+pub use usernames_fixtures::{
+    IdNode,
+    Seed,
+};
 
 /// `DATABASE_URL`, or `None` to skip the test; under CI, where the job
 /// provides Postgres, its absence fails the test instead.
@@ -105,9 +109,10 @@ impl Suite {
             .await
             .expect("DATABASE_URL is set but connecting failed");
         db::MIGRATOR.run(&pool).await.expect("migrations failed");
-        clear_chain(&pool, chain).await;
+        let store = ChainStore::new(pool.clone(), chain);
+        store.forget().await;
         Some(Self {
-            writer: writer(&ChainStore::new(pool.clone(), chain)).await,
+            writer: store.writer().await,
             pool,
             lock,
         })
@@ -118,19 +123,19 @@ impl Suite {
         self.writer.store()
     }
 
-    /// [`apply_tx`] on the suite's chain.
+    /// [`Writes::apply_tx`] on the suite's chain.
     pub async fn apply_tx(&self, block: u64, events: Vec<NamesEvent>) {
-        apply_tx(&self.writer, block, events).await;
+        self.writer.apply_tx(block, events).await;
     }
 
-    /// [`apply`] on the suite's chain.
+    /// [`Writes::apply`] on the suite's chain.
     pub async fn apply(&self, block: u64, event: NamesEvent) {
-        apply(&self.writer, block, event).await;
+        self.writer.apply(block, event).await;
     }
 
     /// One GET on the suite's chain.
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Reply<T> {
-        get_on(&self.pool, self.store().chain_id(), path).await
+        self.pool.get_on(self.store().chain_id(), path).await
     }
 
     /// The test is done with the database; the suite's next test may take it.
@@ -140,134 +145,176 @@ impl Suite {
     }
 }
 
-/// Delete every row the store holds for `chain`.
-pub async fn clear_chain(pool: &PgPool, chain: i64) {
-    ChainStore::new(pool.clone(), chain).forget().await;
+/// A chain written through its window, the way the indexer writes it.
+pub trait Writes {
+    /// Apply one transaction's events at `block`, in log order, and commit
+    /// like a window. A block's time is its number past a constant, so a
+    /// later block is later in time too.
+    async fn apply_tx(&self, block: u64, events: Vec<NamesEvent>);
+
+    /// Apply one event alone in its block.
+    async fn apply(&self, block: u64, event: NamesEvent);
 }
 
-/// The node `id` is bound under on `platform`, as libid-identity derives it.
-pub fn id_node(platform: KnownPlatform, id: &str) -> B256 {
-    let spec =
-        libid_identity::platforms::platform(platform.key()).expect("a libid platform");
-    B256::from(spec.id_node(id).expect("an id"))
+impl Writes for ChainWriter {
+    async fn apply_tx(&self, block: u64, events: Vec<NamesEvent>) {
+        let mut window = self.begin_window().await.expect("begin");
+        for (log_index, event) in (0u64..).zip(events) {
+            let pos = LogPosition {
+                block_number: block,
+                log_index,
+                tx_hash: B256::left_padding_from(&block.to_be_bytes()),
+                block_time: 1_700_000_000 + block,
+            };
+            window.apply(&event, &pos).await.expect("apply");
+        }
+        window.commit(block).await.expect("commit");
+    }
+
+    async fn apply(&self, block: u64, event: NamesEvent) {
+        self.apply_tx(block, vec![event]).await;
+    }
 }
 
-/// The registry a chain these suites write is prepared for.
-pub const REGISTRY: Address = Address::repeat_byte(0x1D);
+/// What a suite reads through the database: the API's answers, and rows
+/// the API does not serve.
+pub trait Reads {
+    /// One GET on the real router.
+    async fn get<T: DeserializeOwned>(&self, path: &str) -> Reply<T>;
 
-/// The right to write `store`'s chain, taken the way an indexer takes it at
-/// startup: under the chain's lease, prepared for [`REGISTRY`]. The lease
-/// goes back at once; the writer stays good until the chain is prepared
-/// again.
-pub async fn writer(store: &ChainStore) -> ChainWriter {
-    let lease = store.acquire_writer().await.expect("the writer lease");
-    let writer = store
-        .prepare(&lease, REGISTRY, None)
-        .await
-        .expect("the chain is prepared");
-    lease.release().await.expect("the lease goes back");
-    writer
+    /// One GET scoped to `chain`: `?chain=` appended (`&` when the path
+    /// already has a query).
+    async fn get_on<T: DeserializeOwned>(&self, chain: i64, path: &str) -> Reply<T>;
+
+    /// The text the chain disclosed for the node on `chain`, when it did.
+    async fn disclosed(&self, chain: i64, handle_node: B256) -> Option<String>;
 }
 
-/// Apply one transaction's events at `block`, in log order, and commit
-/// like a window. A block's time is its number past a constant, so a later
-/// block is later in time too.
-pub async fn apply_tx(writer: &ChainWriter, block: u64, events: Vec<NamesEvent>) {
-    let mut window = writer.begin_window().await.expect("begin");
-    for (log_index, event) in (0u64..).zip(events) {
-        let pos = LogPosition {
-            block_number: block,
-            log_index,
-            tx_hash: B256::left_padding_from(&block.to_be_bytes()),
-            block_time: 1_700_000_000 + block,
+impl Reads for PgPool {
+    async fn get<T: DeserializeOwned>(&self, path: &str) -> Reply<T> {
+        let response = api::AppState::new(Store::new(self.clone()))
+            .router()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .expect("request");
+        let status = response.status();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let text = || String::from_utf8_lossy(&bytes).into_owned();
+        let body = if status.is_success() {
+            Ok(serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                panic!("{status}: not the answer's shape ({e}): {}", text())
+            }))
+        } else {
+            Err(serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                panic!("{status}: not the error shape ({e}): {}", text())
+            }))
         };
-        window.apply(&event, &pos).await.expect("apply");
+        Reply { status, body }
     }
-    window.commit(block).await.expect("commit");
-}
 
-/// Apply one event alone in its block.
-pub async fn apply(writer: &ChainWriter, block: u64, event: NamesEvent) {
-    apply_tx(writer, block, vec![event]).await;
-}
-
-/// The text the chain disclosed for the node on `chain`, when it did.
-pub async fn disclosed(pool: &PgPool, chain: i64, handle_node: B256) -> Option<String> {
-    sqlx::query_scalar(
-        "SELECT handle FROM names.handle_nodes WHERE chain_id = $1 AND handle_node = $2 AND handle IS NOT NULL",
-    )
-    .bind(chain)
-    .bind(handle_node)
-    .fetch_optional(pool)
-    .await
-    .expect("a disclosure read")
-}
-
-/// A bind's events, as the contract emits them: `IdentityBound`, and when
-/// the ceremony disclosed the handle as the holder's name, `HandleRevealed`
-/// and `HandlePublished`.
-pub fn bind(
-    holder: Address,
-    platform: KnownPlatform,
-    id: &str,
-    handle: &str,
-    observed_at: u64,
-    disclosed: bool,
-) -> Vec<NamesEvent> {
-    let mut events = vec![NamesEvent::IdentityBound {
-        holder,
-        id_node: id_node(platform, id),
-        handle_node: platform.handle_node(handle).expect("a handle"),
-        platform_id: platform.id(),
-        observed_at,
-        ceremony_version: 1,
-    }];
-    if disclosed {
-        events.extend(publish(holder, platform, handle));
+    async fn get_on<T: DeserializeOwned>(&self, chain: i64, path: &str) -> Reply<T> {
+        let separator = if path.contains('?') { '&' } else { '?' };
+        self.get(&format!("{path}{separator}chain={chain}")).await
     }
-    events
+
+    async fn disclosed(&self, chain: i64, handle_node: B256) -> Option<String> {
+        sqlx::query_scalar(include_str!("disclosed.sql"))
+            .bind(chain)
+            .bind(handle_node)
+            .fetch_optional(self)
+            .await
+            .expect("a disclosure read")
+    }
 }
 
-/// `publish(handle)`'s events: the text, then the name.
-pub fn publish(
-    holder: Address,
-    platform: KnownPlatform,
-    handle: &str,
-) -> Vec<NamesEvent> {
-    let handle_node = platform.handle_node(handle).expect("a handle");
-    vec![
-        revealed(platform, handle),
-        NamesEvent::HandlePublished {
+/// The events the contracts emit, as the suites write them.
+pub trait Events: Sized {
+    /// A bind's events, as the contract emits them: `IdentityBound`, and
+    /// when the ceremony disclosed the handle as the holder's name,
+    /// `HandleRevealed` and `HandlePublished`.
+    fn bind(
+        holder: Address,
+        platform: KnownPlatform,
+        id: &str,
+        handle: &str,
+        observed_at: u64,
+        disclosed: bool,
+    ) -> Vec<Self>;
+
+    /// `publish(handle)`'s events: the text, then the name.
+    fn publish(holder: Address, platform: KnownPlatform, handle: &str) -> Vec<Self>;
+
+    /// The `HandleRevealed` of the handle as typed: from `reveal`, `publish`
+    /// or a disclosing bind, or from a `depositToHandle`.
+    fn revealed(platform: KnownPlatform, typed: &str) -> Self;
+
+    /// A bind's retirement of the handle `holder` held.
+    fn retire(platform: KnownPlatform, handle: &str, holder: Address) -> Self;
+
+    /// A withdrawal of `holder`'s name.
+    fn unpublish(holder: Address) -> Self;
+}
+
+impl Events for NamesEvent {
+    fn bind(
+        holder: Address,
+        platform: KnownPlatform,
+        id: &str,
+        handle: &str,
+        observed_at: u64,
+        disclosed: bool,
+    ) -> Vec<Self> {
+        let mut events = vec![Self::IdentityBound {
             holder,
+            id_node: platform.id_node(id),
+            handle_node: platform.handle_node(handle).expect("a handle"),
+            platform_id: platform.id(),
+            observed_at,
+            ceremony_version: 1,
+        }];
+        if disclosed {
+            events.extend(Self::publish(holder, platform, handle));
+        }
+        events
+    }
+
+    fn publish(holder: Address, platform: KnownPlatform, handle: &str) -> Vec<Self> {
+        let handle_node = platform.handle_node(handle).expect("a handle");
+        vec![
+            Self::revealed(platform, handle),
+            Self::HandlePublished {
+                holder,
+                platform_id: platform.id(),
+                handle_node,
+            },
+        ]
+    }
+
+    fn revealed(platform: KnownPlatform, typed: &str) -> Self {
+        let (_, handle_node) = platform.folded_handle_node(typed);
+        Self::HandleRevealed {
             platform_id: platform.id(),
             handle_node,
-        },
-    ]
-}
-
-/// The `HandleRevealed` of the handle as typed: from `reveal`, `publish` or a
-/// disclosing bind, or from a `depositToHandle`.
-pub fn revealed(platform: KnownPlatform, typed: &str) -> NamesEvent {
-    let (_, handle_node) = platform.folded_handle_node(typed);
-    NamesEvent::HandleRevealed {
-        platform_id: platform.id(),
-        handle_node,
-        handle: DisclosedHandle::verify(platform, handle_node, typed),
+            handle: DisclosedHandle::verify(platform, handle_node, typed),
+        }
     }
-}
 
-/// A bind's retirement of the handle `holder` held.
-pub fn retire(platform: KnownPlatform, handle: &str, holder: Address) -> NamesEvent {
-    NamesEvent::HandleRetired {
-        platform_id: platform.id(),
-        handle_node: platform.handle_node(handle).expect("a handle"),
-        holder,
+    fn retire(platform: KnownPlatform, handle: &str, holder: Address) -> Self {
+        Self::HandleRetired {
+            platform_id: platform.id(),
+            handle_node: platform.handle_node(handle).expect("a handle"),
+            holder,
+        }
     }
-}
 
-/// A withdrawal of `holder`'s name.
-pub fn unpublish(holder: Address) -> NamesEvent {
-    NamesEvent::HandleUnpublished { holder }
+    fn unpublish(holder: Address) -> Self {
+        Self::HandleUnpublished { holder }
+    }
 }
 
 /// How long a suite waits for the indexer to do something.
@@ -330,9 +377,16 @@ impl ChainWatch {
     }
 }
 
-/// A history's events, in the order served.
-pub fn events(entries: &[HistoryEntry]) -> Vec<&HistoryEvent> {
-    entries.iter().map(|entry| &entry.event).collect()
+/// A history page's entries.
+pub trait Entries {
+    /// The entries' events, in the order served.
+    fn events(&self) -> Vec<&HistoryEvent>;
+}
+
+impl Entries for [HistoryEntry] {
+    fn events(&self) -> Vec<&HistoryEvent> {
+        self.iter().map(|entry| &entry.event).collect()
+    }
 }
 
 /// What one GET came back with: the answer in its type, or the refusal.
@@ -360,43 +414,4 @@ impl<T: Debug> Reply<T> {
             Ok(answer) => panic!("answered {}: {answer:?}", self.status),
         }
     }
-}
-
-/// One GET scoped to `chain`.
-pub async fn get_on<T: DeserializeOwned>(
-    pool: &PgPool,
-    chain: i64,
-    path: &str,
-) -> Reply<T> {
-    let separator = if path.contains('?') { '&' } else { '?' };
-    get(pool, &format!("{path}{separator}chain={chain}")).await
-}
-
-/// One GET against the same axum router a caller would hit, decoded into the
-/// type the API answers with — or, off the success range, into the error
-/// envelope. A body in neither shape is a failed test, not a value.
-pub async fn get<T: DeserializeOwned>(pool: &PgPool, path: &str) -> Reply<T> {
-    let state = api::AppState::new(Store::new(pool.clone()));
-    let response = api::router(state)
-        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
-        .await
-        .expect("request");
-    let status = response.status();
-    let bytes = response
-        .into_body()
-        .collect()
-        .await
-        .expect("body")
-        .to_bytes();
-    let text = || String::from_utf8_lossy(&bytes).into_owned();
-    let body = if status.is_success() {
-        Ok(serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-            panic!("{status}: not the answer's shape ({e}): {}", text())
-        }))
-    } else {
-        Err(serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-            panic!("{status}: not the error shape ({e}): {}", text())
-        }))
-    };
-    Reply { status, body }
 }

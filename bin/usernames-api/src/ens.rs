@@ -597,14 +597,16 @@ impl GatewayState {
 /// silently swallows any future two-segment API route.
 pub const ROUTE_PREFIX: &str = "/ens";
 
-/// The ERC-3668 route, and the status beside it. `{sender}` and `{data}` are
-/// the placeholders the resolver's `urls` carry; the `.json` suffix is
-/// conventional and tolerated either way.
-pub fn router(state: GatewayState) -> Router {
-    Router::new()
-        .route("/{sender}/{data}", get(resolve))
-        .route("/status", get(status))
-        .with_state(state)
+impl GatewayState {
+    /// The ERC-3668 route, and the status beside it. `{sender}` and `{data}` are
+    /// the placeholders the resolver's `urls` carry; the `.json` suffix is
+    /// conventional and tolerated either way.
+    pub fn router(self) -> Router {
+        Router::new()
+            .route("/{sender}/{data}", get(resolve))
+            .route("/status", get(status))
+            .with_state(self)
+    }
 }
 
 /// One served chain, as supervision should see it.

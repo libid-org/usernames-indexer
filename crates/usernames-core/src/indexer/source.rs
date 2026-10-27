@@ -69,7 +69,7 @@ impl LogSource {
             Self::Subscribe => {
                 // One refused reconnect and alloy closes the subscription,
                 // rather than retrying ten times, three seconds apart.
-                let socket = WsConnect::new(websocket(rpc)?).with_max_retries(1);
+                let socket = WsConnect::new(rpc.websocket()?).with_max_retries(1);
                 let client = ClientBuilder::default().pubsub(Unretried(socket)).await?;
                 Ok(RootProvider::new(client))
             }
@@ -94,23 +94,30 @@ impl FromStr for LogSource {
     }
 }
 
-/// `rpc` as a WebSocket URL: `http` becomes `ws`, `https` becomes `wss`, and
-/// a WebSocket URL stays as it is.
-fn websocket(rpc: &Url) -> TransportResult<Url> {
-    let scheme = match rpc.scheme() {
-        "http" | "ws" => "ws",
-        "https" | "wss" => "wss",
-        other => {
-            return Err(TransportErrorKind::custom_str(&format!(
-                "a head subscription needs an http(s) or ws(s) RPC URL, not {other}"
-            )));
-        }
-    };
-    let mut socket = rpc.clone();
-    socket
-        .set_scheme(scheme)
-        .map_err(|()| TransportErrorKind::custom_str("the RPC URL takes no ws scheme"))?;
-    Ok(socket)
+/// An RPC endpoint's WebSocket twin.
+trait WebSocket {
+    /// The URL as a WebSocket URL: `http` becomes `ws`, `https` becomes
+    /// `wss`, and a WebSocket URL stays as it is.
+    fn websocket(&self) -> TransportResult<Url>;
+}
+
+impl WebSocket for Url {
+    fn websocket(&self) -> TransportResult<Url> {
+        let scheme = match self.scheme() {
+            "http" | "ws" => "ws",
+            "https" | "wss" => "wss",
+            other => {
+                return Err(TransportErrorKind::custom_str(&format!(
+                    "a head subscription needs an http(s) or ws(s) RPC URL, not {other}"
+                )));
+            }
+        };
+        let mut socket = self.clone();
+        socket.set_scheme(scheme).map_err(|()| {
+            TransportErrorKind::custom_str("the RPC URL takes no ws scheme")
+        })?;
+        Ok(socket)
+    }
 }
 
 /// A WebSocket that stays down once it drops. alloy reconnects a dropped
@@ -245,12 +252,15 @@ mod tests {
         to_raw_value(&head).unwrap()
     }
 
-    async fn wake(feed: &mut Feed) -> anyhow::Result<Wake> {
-        feed.wait(
-            Instant::now() + Duration::from_secs(60),
-            &CancellationToken::new(),
-        )
-        .await
+    impl Feed {
+        /// The next wake, a minute out at most.
+        async fn wake(&mut self) -> anyhow::Result<Wake> {
+            self.wait(
+                Instant::now() + Duration::from_secs(60),
+                &CancellationToken::new(),
+            )
+            .await
+        }
     }
 
     #[tokio::test]
@@ -258,7 +268,7 @@ mod tests {
         let (pushes, mut feed) = heads(8);
         pushes.send(head(12)).unwrap();
         assert!(
-            matches!(wake(&mut feed).await.unwrap(), Wake::Head(head) if head.number == 12)
+            matches!(feed.wake().await.unwrap(), Wake::Head(head) if head.number == 12)
         );
     }
 
@@ -287,14 +297,14 @@ mod tests {
         let (pushes, mut feed) = heads(1);
         pushes.send(head(10)).unwrap();
         pushes.send(head(11)).unwrap();
-        assert!(wake(&mut feed).await.is_err());
+        assert!(feed.wake().await.is_err());
     }
 
     #[tokio::test]
     async fn a_closed_stream_ends_the_session() {
         let (pushes, mut feed) = heads(8);
         drop(pushes);
-        assert!(wake(&mut feed).await.is_err());
+        assert!(feed.wake().await.is_err());
     }
 
     #[tokio::test]
@@ -333,13 +343,14 @@ mod tests {
             ("ws://127.0.0.1:8546/", "ws://127.0.0.1:8546/"),
         ];
         for (rpc, expected) in cases {
-            let socket = websocket(&rpc.parse().unwrap()).unwrap();
+            let socket = rpc.parse::<Url>().unwrap().websocket().unwrap();
             assert_eq!(socket.as_str(), expected, "{rpc}");
         }
     }
 
     #[test]
     fn an_endpoint_without_a_websocket_twin_is_refused() {
-        assert!(websocket(&"file:///tmp/geth.ipc".parse().unwrap()).is_err());
+        let ipc: Url = "file:///tmp/geth.ipc".parse().unwrap();
+        assert!(ipc.websocket().is_err());
     }
 }

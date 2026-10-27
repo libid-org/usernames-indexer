@@ -431,105 +431,111 @@ pub(crate) mod plans {
         explain,
         Plan,
     };
+    /// The histories' reads, planned.
+    pub(crate) trait HistoryPlans {
+        /// The histories' lookups and the indexer's reads, in every shape they are
+        /// asked in.
+        async fn history_plans(&mut self) -> Vec<Plan>;
+    }
 
-    /// The histories' lookups and the indexer's reads, in every shape they are
-    /// asked in.
-    pub(crate) async fn all(conn: &mut PgConnection) -> Vec<Plan> {
-        let (address, node) = (Address::repeat_byte(2), B256::repeat_byte(1));
-        let cursor = Some(HistoryCursor {
-            block_time: 1_700_000_000,
-            chain_id: 1,
-            block_number: 10,
-            log_index: 0,
-        });
-        let page = |chain, before| Page {
-            chain,
-            before,
-            limit: 20,
-        };
-        let across: &[&str] = &["address_events_history_idx"];
-        let one: &[&str] = &["address_events_pkey"];
-        let handle: &[&str] = &["events_handle_history_idx"];
-        let mut plans = Vec::new();
-        for (name, seeks, statement) in [
-            (
-                "address history",
-                across,
-                page(None, None).address_lookup("EXPLAIN ", address),
-            ),
-            (
-                "address history, past a cursor",
-                across,
-                page(None, cursor).address_lookup("EXPLAIN ", address),
-            ),
-            (
-                "address history, one chain",
-                one,
-                page(Some(1), None).address_lookup("EXPLAIN ", address),
-            ),
-            (
-                "address history, one chain, past a cursor",
-                one,
-                page(Some(1), cursor).address_lookup("EXPLAIN ", address),
-            ),
-            (
-                "handle history",
-                handle,
-                page(None, None).node_lookup("EXPLAIN ", node),
-            ),
-            (
-                "handle history, past a cursor",
-                handle,
-                page(None, cursor).node_lookup("EXPLAIN ", node),
-            ),
-            (
-                "handle history, one chain",
-                handle,
-                page(Some(1), None).node_lookup("EXPLAIN ", node),
-            ),
-            (
-                "handle history, one chain, past a cursor",
-                handle,
-                page(Some(1), cursor).node_lookup("EXPLAIN ", node),
-            ),
-        ] {
-            plans.push(Plan::of(conn, name, Some(seeks), statement).await);
-        }
-
-        let reads = [
-            (
-                "previous holders",
-                &[
-                    "handles_pkey|handles_node_chain_idx",
-                    "ids_pkey|ids_node_chain_idx",
-                ][..],
-                sqlx::query_scalar::<_, String>(&explain(sql::PREVIOUS_HOLDERS))
-                    .bind(1i64)
-                    .bind(node)
-                    .bind(node)
-                    .fetch_all(&mut *conn)
-                    .await,
-            ),
-            (
-                "the senders a claim takes from",
-                &["escrow_refundable_slot_idx"][..],
-                sqlx::query_scalar(&explain(sql::CLAIMED_SENDERS))
-                    .bind(1i64)
-                    .bind(node)
-                    .bind(address)
-                    .fetch_all(&mut *conn)
-                    .await,
-            ),
-        ];
-        for (name, seeks, text) in reads {
-            let text: Vec<String> = text.unwrap_or_else(|e| panic!("{name}: {e}"));
-            plans.push(Plan {
-                name,
-                seeks: Some(seeks),
-                text: text.join("\n"),
+    impl HistoryPlans for PgConnection {
+        async fn history_plans(&mut self) -> Vec<Plan> {
+            let (address, node) = (Address::repeat_byte(2), B256::repeat_byte(1));
+            let cursor = Some(HistoryCursor {
+                block_time: 1_700_000_000,
+                chain_id: 1,
+                block_number: 10,
+                log_index: 0,
             });
+            let page = |chain, before| Page {
+                chain,
+                before,
+                limit: 20,
+            };
+            let across: &[&str] = &["address_events_history_idx"];
+            let one: &[&str] = &["address_events_pkey"];
+            let handle: &[&str] = &["events_handle_history_idx"];
+            let mut plans = Vec::new();
+            for (name, seeks, statement) in [
+                (
+                    "address history",
+                    across,
+                    page(None, None).address_lookup("EXPLAIN ", address),
+                ),
+                (
+                    "address history, past a cursor",
+                    across,
+                    page(None, cursor).address_lookup("EXPLAIN ", address),
+                ),
+                (
+                    "address history, one chain",
+                    one,
+                    page(Some(1), None).address_lookup("EXPLAIN ", address),
+                ),
+                (
+                    "address history, one chain, past a cursor",
+                    one,
+                    page(Some(1), cursor).address_lookup("EXPLAIN ", address),
+                ),
+                (
+                    "handle history",
+                    handle,
+                    page(None, None).node_lookup("EXPLAIN ", node),
+                ),
+                (
+                    "handle history, past a cursor",
+                    handle,
+                    page(None, cursor).node_lookup("EXPLAIN ", node),
+                ),
+                (
+                    "handle history, one chain",
+                    handle,
+                    page(Some(1), None).node_lookup("EXPLAIN ", node),
+                ),
+                (
+                    "handle history, one chain, past a cursor",
+                    handle,
+                    page(Some(1), cursor).node_lookup("EXPLAIN ", node),
+                ),
+            ] {
+                plans.push(Plan::of(self, name, Some(seeks), statement).await);
+            }
+
+            let reads = [
+                (
+                    "previous holders",
+                    &[
+                        "handles_pkey|handles_node_chain_idx",
+                        "ids_pkey|ids_node_chain_idx",
+                    ][..],
+                    sqlx::query_scalar::<_, String>(&explain(sql::PREVIOUS_HOLDERS))
+                        .bind(1i64)
+                        .bind(node)
+                        .bind(node)
+                        .fetch_all(&mut *self)
+                        .await,
+                ),
+                (
+                    "the senders a claim takes from",
+                    &["escrow_refundable_slot_idx"][..],
+                    sqlx::query_scalar(&explain(sql::CLAIMED_SENDERS))
+                        .bind(1i64)
+                        .bind(node)
+                        .bind(address)
+                        .fetch_all(&mut *self)
+                        .await,
+                ),
+            ];
+            for (name, seeks, text) in reads {
+                let text: Vec<String> = text.unwrap_or_else(|e| panic!("{name}: {e}"));
+                plans.push(Plan {
+                    name,
+                    seeks: Some(seeks),
+                    text: text.join("\n"),
+                });
+            }
+            plans
         }
-        plans
     }
 }
 

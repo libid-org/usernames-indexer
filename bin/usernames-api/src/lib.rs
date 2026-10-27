@@ -164,34 +164,39 @@ pub async fn run() -> anyhow::Result<()> {
     }
 }
 
-/// Every route the binary serves, with the middleware over the whole of it.
-///
-/// Separate from [`run`] so a test can exercise what is actually served. The
-/// halves were only ever built apart — `api::router` in one suite,
-/// `ens::router` in another — so the merge itself, and the layering over it,
-/// had no coverage at all.
-pub fn build_router(state: api::AppState, gateway: Option<ens::Config>) -> Router {
-    let mut app = api::router(state);
-    if let Some(gateway) = gateway {
-        app = app.nest(
-            ens::ROUTE_PREFIX,
-            ens::router(ens::GatewayState::new(gateway)),
-        );
+/// Everything the binary serves: the read API, and the ENS gateway when one
+/// is configured.
+pub struct Service {
+    /// The read API's state.
+    pub api: api::AppState,
+    /// The gateway's configuration, when this deployment runs one.
+    pub gateway: Option<ens::Config>,
+}
+
+impl Service {
+    /// Every route, with the middleware over the whole of it: what a test
+    /// exercises to see what is actually served, the merge and the layering
+    /// included.
+    pub fn router(self) -> Router {
+        let mut app = self.api.router();
+        if let Some(gateway) = self.gateway {
+            app = app.nest(ens::ROUTE_PREFIX, ens::GatewayState::new(gateway).router());
+        }
+        // ONE layer, over the whole router, after every route is on it. A `layer`
+        // wraps only what is already mounted, so applying it inside `api::router`
+        // both missed the gateway route — a browser ERC-3668 client would get no
+        // `Access-Control-Allow-Origin` while `/v1/*` worked from the same page —
+        // and, once a second layer was added to cover it, ran the CORS middleware
+        // twice on every `/v1` response.
+        //
+        // A read-only public resolver: any origin may GET. This is what lets a
+        // browser UI (handle.link) call the API cross-origin at all.
+        app.layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([Method::GET]),
+        )
     }
-    // ONE layer, over the whole router, after every route is on it. A `layer`
-    // wraps only what is already mounted, so applying it inside `api::router`
-    // both missed the gateway route — a browser ERC-3668 client would get no
-    // `Access-Control-Allow-Origin` while `/v1/*` worked from the same page —
-    // and, once a second layer was added to cover it, ran the CORS middleware
-    // twice on every `/v1` response.
-    //
-    // A read-only public resolver: any origin may GET. This is what lets a
-    // browser UI (handle.link) call the API cross-origin at all.
-    app.layer(
-        CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods([Method::GET]),
-    )
 }
 
 /// The resolver's `MAX_LIFETIME`. It rejects any `expires` further out than
@@ -239,7 +244,11 @@ impl Config {
                 )
             }
         }
-        let app = build_router(api::AppState::new(store), gateway);
+        let app = Service {
+            api: api::AppState::new(store),
+            gateway,
+        }
+        .router();
 
         let listener = TcpListener::bind(self.listen_addr).await?;
         tracing::info!(addr = %self.listen_addr, "read API listening");

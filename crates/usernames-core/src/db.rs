@@ -29,6 +29,7 @@ use sqlx::{
 };
 
 use crate::{
+    chain::Contracts,
     ens::ChainName,
     events::{
         LogPosition,
@@ -465,8 +466,7 @@ impl ChainStore {
     pub async fn prepare(
         &self,
         lease: &WriterLease,
-        contract: Address,
-        escrow: Option<Address>,
+        contracts: Contracts,
     ) -> Result<ChainWriter, sqlx::Error> {
         assert_eq!(
             lease.chain_id, self.chain_id,
@@ -484,8 +484,8 @@ impl ChainStore {
             .await?
             .unwrap_or_default();
         if known.indexer_version.as_deref() == Some(INDEXER_VERSION)
-            && known.contract == Some(contract)
-            && known.escrow == escrow
+            && known.contract == Some(contracts.registry)
+            && known.escrow == contracts.escrow
         {
             let writer = sqlx::query_scalar(sql::CLAIM_CHAIN)
                 .bind(self.chain_id)
@@ -502,9 +502,9 @@ impl ChainStore {
             version_from = known.indexer_version.as_deref().unwrap_or("<none>"),
             version_to = INDEXER_VERSION,
             contract_from = ?known.contract,
-            contract_to = %contract,
+            contract_to = %contracts.registry,
             escrow_from = ?known.escrow,
-            escrow_to = ?escrow,
+            escrow_to = ?contracts.escrow,
             "read-model shape or a watched contract changed; clearing this chain for a full replay"
         );
         sqlx::query(sql::CLEAR_CHAIN)
@@ -517,12 +517,12 @@ impl ChainStore {
             .bind(self.chain_id)
             .execute(&mut *tx)
             .await?;
-        let deploy_block = known.deploy_block_of(contract);
+        let deploy_block = known.deploy_block_of(contracts.registry);
         let writer = sqlx::query_scalar(sql::RESET_CHAIN)
             .bind(self.chain_id)
             .bind(INDEXER_VERSION)
-            .bind(contract)
-            .bind(escrow)
+            .bind(contracts.registry)
+            .bind(contracts.escrow)
             .bind(deploy_block)
             .fetch_one(&mut *tx)
             .await?;
@@ -1083,7 +1083,7 @@ impl Store {
     /// from, and a 404 would claim more than the store knows.
     pub async fn synced(&self, chain: Option<i64>) -> Result<bool, sqlx::Error> {
         let mut statement = QueryBuilder::new(sql::SYNCED);
-        scoped(&mut statement, "chain_id", chain);
+        statement.scoped("chain_id", chain);
         statement.push(" LIMIT 1");
         let found: Option<bool> = statement
             .build_query_scalar()
@@ -1185,14 +1185,17 @@ impl ChainStore {
 
 type Statement = QueryBuilder<'static, Postgres>;
 
-/// `AND column = chain`, when a chain is named.
-fn scoped(statement: &mut Statement, column: &'static str, chain: Option<i64>) {
-    if let Some(chain) = chain {
-        statement
-            .push(" AND ")
-            .push(column)
-            .push(" = ")
-            .push_bind(chain);
+/// A lookup narrowed, or not, to one chain.
+trait Scoped {
+    /// `AND column = chain`, when a chain is named.
+    fn scoped(&mut self, column: &'static str, chain: Option<i64>);
+}
+
+impl Scoped for Statement {
+    fn scoped(&mut self, column: &'static str, chain: Option<i64>) {
+        if let Some(chain) = chain {
+            self.push(" AND ").push(column).push(" = ").push_bind(chain);
+        }
     }
 }
 
@@ -1202,7 +1205,7 @@ fn handle_lookup(prefix: &str, chain: Option<i64>, handle_node: B256) -> Stateme
         sql::HANDLE_PROJECTION
     ));
     statement.push_bind(handle_node);
-    scoped(&mut statement, "h.chain_id", chain);
+    statement.scoped("h.chain_id", chain);
     statement.push(" ORDER BY h.chain_id");
     statement
 }
@@ -1213,7 +1216,7 @@ fn id_lookup(prefix: &str, chain: Option<i64>, id_node: B256) -> Statement {
         sql::IDENTITY_PROJECTION
     ));
     statement.push_bind(id_node);
-    scoped(&mut statement, "i.chain_id", chain);
+    statement.scoped("i.chain_id", chain);
     statement.push(" ORDER BY i.chain_id");
     statement
 }
@@ -1224,7 +1227,7 @@ fn identities_lookup(prefix: &str, chain: Option<i64>, owner: Address) -> Statem
         sql::IDENTITY_PROJECTION
     ));
     statement.push_bind(owner);
-    scoped(&mut statement, "i.chain_id", chain);
+    statement.scoped("i.chain_id", chain);
     statement.push(" ORDER BY i.chain_id, i.platform_id, i.id_node");
     statement
 }
@@ -1243,7 +1246,7 @@ fn search_lookup(
     offset: i64,
 ) -> Statement {
     let mut statement = QueryBuilder::new(format!("{prefix}{}", sql::SEARCH_PROJECTION));
-    scoped(&mut statement, "h.chain_id", chain);
+    statement.scoped("h.chain_id", chain);
     if let Some(platform_id) = platform_id {
         statement
             .push(" AND v.platform_id = ")
@@ -1375,6 +1378,10 @@ pub(crate) mod plan_tests {
     use sqlx::PgConnection;
 
     use super::*;
+    use crate::db::{
+        escrow::plans::EscrowPlans,
+        history::plans::HistoryPlans,
+    };
 
     /// Rows in the shape production holds them, on the chain every probe
     /// names; the file says how they are shaped.
@@ -1410,133 +1417,139 @@ pub(crate) mod plan_tests {
     pub(crate) fn explain(sql: &str) -> String {
         format!("EXPLAIN {sql}")
     }
+    /// The store's lookups, planned.
+    pub(crate) trait StorePlans {
+        /// The resolution and search lookups, in every shape the API asks them.
+        async fn store_plans(&mut self) -> Vec<Plan>;
+    }
 
-    /// The resolution and search lookups, in every shape the API asks them.
-    async fn plans(conn: &mut PgConnection) -> Vec<Plan> {
-        let platform = B256::repeat_byte(1);
-        let node = B256::repeat_byte(3);
-        let owner = Address::repeat_byte(2);
-        let mut plans = Vec::new();
-        for (name, seeks, statement) in [
-            (
-                "handle node, any chain",
-                Some(&["handles_node_chain_idx"][..]),
-                handle_lookup("EXPLAIN ", None, node),
-            ),
-            (
-                "handle node, one chain",
-                Some(&["handles_pkey|handles_node_chain_idx"][..]),
-                handle_lookup("EXPLAIN ", Some(1), node),
-            ),
-            (
-                "id node, any chain",
-                Some(&["ids_node_chain_idx"][..]),
-                id_lookup("EXPLAIN ", None, node),
-            ),
-            (
-                "id node, one chain",
-                Some(&["ids_pkey|ids_node_chain_idx"][..]),
-                id_lookup("EXPLAIN ", Some(1), node),
-            ),
-            (
-                "wallet, any chain",
-                Some(&["ids_owner_chain_idx"][..]),
-                identities_lookup("EXPLAIN ", None, owner),
-            ),
-            (
-                "wallet, one chain",
-                Some(&["ids_owner_chain_idx"][..]),
-                identities_lookup("EXPLAIN ", Some(1), owner),
-            ),
-            (
-                "search by wallet, any chain",
-                Some(&["handles_owner_chain_node_idx"][..]),
-                search_lookup("EXPLAIN ", None, None, Some(owner), None, 10, 0),
-            ),
-            (
-                "search by wallet on a platform, one chain",
-                Some(&["handles_owner_chain_node_idx"][..]),
-                search_lookup(
-                    "EXPLAIN ",
-                    Some(1),
-                    Some(platform),
-                    Some(owner),
-                    None,
-                    10,
-                    0,
+    impl StorePlans for PgConnection {
+        async fn store_plans(&mut self) -> Vec<Plan> {
+            let platform = B256::repeat_byte(1);
+            let node = B256::repeat_byte(3);
+            let owner = Address::repeat_byte(2);
+            let mut plans = Vec::new();
+            for (name, seeks, statement) in [
+                (
+                    "handle node, any chain",
+                    Some(&["handles_node_chain_idx"][..]),
+                    handle_lookup("EXPLAIN ", None, node),
                 ),
-            ),
-            (
-                "search by text, any chain",
-                Some(&["handle_nodes_handle_trgm_idx"][..]),
-                search_lookup("EXPLAIN ", None, None, None, Some("ali"), 10, 0),
-            ),
-            (
-                "search by text on a platform, one chain",
-                Some(&["handle_nodes_handle_trgm_idx"][..]),
-                search_lookup(
-                    "EXPLAIN ",
-                    Some(1),
-                    Some(platform),
-                    None,
-                    Some("ali"),
-                    10,
-                    0,
+                (
+                    "handle node, one chain",
+                    Some(&["handles_pkey|handles_node_chain_idx"][..]),
+                    handle_lookup("EXPLAIN ", Some(1), node),
                 ),
-            ),
-        ] {
-            plans.push(Plan::of(conn, name, seeks, statement).await);
-        }
+                (
+                    "id node, any chain",
+                    Some(&["ids_node_chain_idx"][..]),
+                    id_lookup("EXPLAIN ", None, node),
+                ),
+                (
+                    "id node, one chain",
+                    Some(&["ids_pkey|ids_node_chain_idx"][..]),
+                    id_lookup("EXPLAIN ", Some(1), node),
+                ),
+                (
+                    "wallet, any chain",
+                    Some(&["ids_owner_chain_idx"][..]),
+                    identities_lookup("EXPLAIN ", None, owner),
+                ),
+                (
+                    "wallet, one chain",
+                    Some(&["ids_owner_chain_idx"][..]),
+                    identities_lookup("EXPLAIN ", Some(1), owner),
+                ),
+                (
+                    "search by wallet, any chain",
+                    Some(&["handles_owner_chain_node_idx"][..]),
+                    search_lookup("EXPLAIN ", None, None, Some(owner), None, 10, 0),
+                ),
+                (
+                    "search by wallet on a platform, one chain",
+                    Some(&["handles_owner_chain_node_idx"][..]),
+                    search_lookup(
+                        "EXPLAIN ",
+                        Some(1),
+                        Some(platform),
+                        Some(owner),
+                        None,
+                        10,
+                        0,
+                    ),
+                ),
+                (
+                    "search by text, any chain",
+                    Some(&["handle_nodes_handle_trgm_idx"][..]),
+                    search_lookup("EXPLAIN ", None, None, None, Some("ali"), 10, 0),
+                ),
+                (
+                    "search by text on a platform, one chain",
+                    Some(&["handle_nodes_handle_trgm_idx"][..]),
+                    search_lookup(
+                        "EXPLAIN ",
+                        Some(1),
+                        Some(platform),
+                        None,
+                        Some("ali"),
+                        10,
+                        0,
+                    ),
+                ),
+            ] {
+                plans.push(Plan::of(self, name, seeks, statement).await);
+            }
 
-        let reads = [
-            (
-                "the gateway's answer",
-                &["handles_pkey|handles_node_chain_idx"][..],
-                sqlx::query_scalar::<_, String>(&explain(sql::ENS_ANSWER))
-                    .bind(1i64)
-                    .bind(node)
-                    .fetch_all(&mut *conn)
-                    .await,
-            ),
-            (
-                "a withdrawn name",
-                &["published_pkey"][..],
-                sqlx::query_scalar(&explain(sql::WITHDRAW_NAME))
-                    .bind(1i64)
-                    .bind(owner)
-                    .fetch_all(&mut *conn)
-                    .await,
-            ),
-            (
-                "the name an unpublish withdraws",
-                &["published_pkey"][..],
-                sqlx::query_scalar(&explain(sql::PUBLISHED_NAME))
-                    .bind(1i64)
-                    .bind(owner)
-                    .fetch_all(&mut *conn)
-                    .await,
-            ),
-            (
-                "a name published over another",
-                &["published_pkey"][..],
-                sqlx::query_scalar(&explain(sql::PUBLISH))
-                    .bind(1i64)
-                    .bind(owner)
-                    .bind(platform)
-                    .bind(node)
-                    .fetch_all(&mut *conn)
-                    .await,
-            ),
-        ];
-        for (name, seeks, text) in reads {
-            let text: Vec<String> = text.unwrap_or_else(|e| panic!("{name}: {e}"));
-            plans.push(Plan {
-                name,
-                seeks: Some(seeks),
-                text: text.join("\n"),
-            });
+            let reads = [
+                (
+                    "the gateway's answer",
+                    &["handles_pkey|handles_node_chain_idx"][..],
+                    sqlx::query_scalar::<_, String>(&explain(sql::ENS_ANSWER))
+                        .bind(1i64)
+                        .bind(node)
+                        .fetch_all(&mut *self)
+                        .await,
+                ),
+                (
+                    "a withdrawn name",
+                    &["published_pkey"][..],
+                    sqlx::query_scalar(&explain(sql::WITHDRAW_NAME))
+                        .bind(1i64)
+                        .bind(owner)
+                        .fetch_all(&mut *self)
+                        .await,
+                ),
+                (
+                    "the name an unpublish withdraws",
+                    &["published_pkey"][..],
+                    sqlx::query_scalar(&explain(sql::PUBLISHED_NAME))
+                        .bind(1i64)
+                        .bind(owner)
+                        .fetch_all(&mut *self)
+                        .await,
+                ),
+                (
+                    "a name published over another",
+                    &["published_pkey"][..],
+                    sqlx::query_scalar(&explain(sql::PUBLISH))
+                        .bind(1i64)
+                        .bind(owner)
+                        .bind(platform)
+                        .bind(node)
+                        .fetch_all(&mut *self)
+                        .await,
+                ),
+            ];
+            for (name, seeks, text) in reads {
+                let text: Vec<String> = text.unwrap_or_else(|e| panic!("{name}: {e}"));
+                plans.push(Plan {
+                    name,
+                    seeks: Some(seeks),
+                    text: text.join("\n"),
+                });
+            }
+            plans
         }
-        plans
     }
 
     /// Every read over the big tables seeks the index built for it, in every
@@ -1570,9 +1583,9 @@ pub(crate) mod plan_tests {
             .await
             .expect("the volume loads");
 
-        let mut all = plans(&mut conn).await;
-        all.extend(history::plans::all(&mut conn).await);
-        all.extend(escrow::plans::all(&mut conn).await);
+        let mut all = conn.store_plans().await;
+        all.extend(conn.history_plans().await);
+        all.extend(conn.escrow_plans().await);
         for plan in all {
             let Plan { name, seeks, text } = plan;
             for index in seeks.unwrap_or_default() {

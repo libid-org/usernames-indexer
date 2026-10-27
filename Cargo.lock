@@ -5849,6 +5849,7 @@ dependencies = [
  "tracing",
  "url",
  "usernames-core",
+ "usernames-fixtures",
 ]
 
 [[package]]
@@ -5883,6 +5884,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "usernames-core",
+ "usernames-fixtures",
 ]
 
 [[package]]

@@ -1,5 +1,6 @@
-//! Chain access: deployment-block discovery, windowed log fetching, and the
-//! one contract read the indexer makes.
+//! The contracts an indexer follows, and what it reads of them from the
+//! chain: their checks at startup, the registry's deployment block, and
+//! their logs window by window.
 
 use alloy::{
     contract,
@@ -17,65 +18,160 @@ use libid_contracts::bindings::{
     identity::IdentityRegistry,
 };
 
-/// Binary search for the block at which a contract was deployed: the first
-/// block where `eth_getCode` returns non-empty bytecode. `Ok(None)` means the
-/// contract has no code at `latest_block` — absence is an answer. An RPC
-/// failure is an `Err`, kept apart so a transient flake cannot masquerade as
-/// "not deployed" and end up cached as if it were a fact.
-///
-/// Cost: about log2(latest_block) RPC calls (~26 for 50M blocks).
-pub async fn find_deployment_block(
-    provider: &impl Provider,
-    address: Address,
-    latest_block: u64,
-) -> Result<Option<u64>, TransportError> {
-    let code = provider
-        .get_code_at(address)
-        .block_id(BlockNumberOrTag::Number(latest_block).into())
-        .await?;
-    if code.is_empty() {
-        return Ok(None);
-    }
+use crate::events::{
+    DecodeError,
+    LogPosition,
+    NamesEvent,
+};
 
-    let code_at_zero = provider
-        .get_code_at(address)
-        .block_id(BlockNumberOrTag::Number(0).into())
-        .await?;
-    if !code_at_zero.is_empty() {
-        return Ok(Some(0));
-    }
-
-    let mut lo: u64 = 0;
-    let mut hi: u64 = latest_block;
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        let code = provider
-            .get_code_at(address)
-            .block_id(BlockNumberOrTag::Number(mid).into())
-            .await?;
-        if code.is_empty() {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    Ok(Some(lo))
+/// The libid contracts one indexer follows on its chain: the registry, and
+/// the escrow when it watches one. Each is the ERC1967 proxy, the address
+/// that emits; the implementation behind it changes on upgrade.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Contracts {
+    /// The IdentityRegistry.
+    pub registry: Address,
+    /// The HandleEscrow, when the indexer watches one.
+    pub escrow: Option<Address>,
 }
 
-/// One `eth_getLogs` window, inclusive on both ends. The caller sizes windows
-/// with its `max_block_range`; a failure fails the window so the cursor stays
-/// put and the same blocks are retried next cycle.
-pub async fn fetch_logs(
-    provider: &impl Provider,
-    filter: &Filter,
-    from: u64,
-    to: u64,
-) -> Result<Vec<Log>, TransportError> {
-    let f = filter
-        .clone()
-        .from_block(BlockNumberOrTag::Number(from))
-        .to_block(BlockNumberOrTag::Number(to));
-    provider.get_logs(&f).await
+impl Contracts {
+    /// Every contract whose logs the indexer reads.
+    pub fn watched(&self) -> Vec<Address> {
+        std::iter::once(self.registry).chain(self.escrow).collect()
+    }
+
+    /// Decode a log by the contract that emitted it: each contract's topics
+    /// mean something only from that contract. The filter admits no other
+    /// emitter, so one would be an RPC answering a different question.
+    pub fn decode(
+        &self,
+        log: &Log,
+    ) -> Result<Option<(NamesEvent, LogPosition)>, DecodeError> {
+        let emitter = log.address();
+        if emitter == self.registry {
+            NamesEvent::from_registry(log)
+        } else if Some(emitter) == self.escrow {
+            NamesEvent::from_escrow(log)
+        } else {
+            tracing::warn!(
+                %emitter,
+                "a log from a contract the filter does not name; skipped"
+            );
+            Ok(None)
+        }
+    }
+
+    /// Binary search for the block at which the registry was deployed: the
+    /// first block where `eth_getCode` returns non-empty bytecode. `Ok(None)`
+    /// means the contract has no code at `latest_block` — absence is an
+    /// answer. An RPC failure is an `Err`, kept apart so a transient flake
+    /// cannot masquerade as "not deployed" and end up cached as if it were a
+    /// fact.
+    ///
+    /// Cost: about log2(latest_block) RPC calls (~26 for 50M blocks).
+    pub async fn deployment_block(
+        &self,
+        provider: &impl Provider,
+        latest_block: u64,
+    ) -> Result<Option<u64>, TransportError> {
+        let address = self.registry;
+        let code = provider
+            .get_code_at(address)
+            .block_id(BlockNumberOrTag::Number(latest_block).into())
+            .await?;
+        if code.is_empty() {
+            return Ok(None);
+        }
+
+        let code_at_zero = provider
+            .get_code_at(address)
+            .block_id(BlockNumberOrTag::Number(0).into())
+            .await?;
+        if !code_at_zero.is_empty() {
+            return Ok(Some(0));
+        }
+
+        let mut lo: u64 = 0;
+        let mut hi: u64 = latest_block;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let code = provider
+                .get_code_at(address)
+                .block_id(BlockNumberOrTag::Number(mid).into())
+                .await?;
+            if code.is_empty() {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(Some(lo))
+    }
+
+    /// The watched contracts' logs in one `eth_getLogs` window, inclusive
+    /// on both ends. The caller sizes windows with its `max_block_range`; a
+    /// failure fails the window so the cursor stays put and the same blocks
+    /// are retried next cycle.
+    pub async fn logs(
+        &self,
+        provider: &impl Provider,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<Log>, TransportError> {
+        let filter = Filter::new()
+            .address(self.watched())
+            .from_block(BlockNumberOrTag::Number(from))
+            .to_block(BlockNumberOrTag::Number(to));
+        provider.get_logs(&filter).await
+    }
+
+    /// Refuse a registry whose events this build would misread: one not
+    /// keyed by circuit nodes. Checked once, at startup, before a row is
+    /// touched.
+    pub async fn check_registry(
+        &self,
+        provider: &impl Provider,
+    ) -> Result<(), RegistryRefused> {
+        let registry = self.registry;
+        let keyed = IdentityRegistry::new(registry, provider)
+            .nodeKeyed()
+            .call()
+            .await
+            .map_err(|source| RegistryRefused::Unread { registry, source })?;
+        if keyed {
+            Ok(())
+        } else {
+            Err(RegistryRefused::NotNodeKeyed { registry })
+        }
+    }
+
+    /// Refuse an escrow that does not resolve holders through the registry;
+    /// without an escrow there is nothing to refuse. An escrow keeps its
+    /// registry for life, so an indexer checks once, at startup, before it
+    /// touches a row.
+    pub async fn check_escrow(
+        &self,
+        provider: &impl Provider,
+    ) -> Result<(), EscrowRefused> {
+        let Some(escrow) = self.escrow else {
+            return Ok(());
+        };
+        let resolves = HandleEscrow::new(escrow, provider)
+            .registry()
+            .call()
+            .await
+            .map_err(|source| EscrowRefused::Unread { escrow, source })?;
+        if resolves == self.registry {
+            Ok(())
+        } else {
+            Err(EscrowRefused::OtherRegistry {
+                escrow,
+                registry: resolves,
+                indexed: self.registry,
+            })
+        }
+    }
 }
 
 /// Why a registry is refused.
@@ -83,7 +179,7 @@ pub async fn fetch_logs(
 pub enum RegistryRefused {
     /// `nodeKeyed()` could not be read: not a node-keyed registry.
     #[error(
-        "registry {registry}: nodeKeyed(): {source}; point it at a libID-contracts 0.19 IdentityRegistry"
+        "registry {registry}: nodeKeyed(): {source}; point it at a libID-contracts 0.21 IdentityRegistry"
     )]
     Unread {
         /// The registry asked.
@@ -98,24 +194,6 @@ pub enum RegistryRefused {
         /// The registry asked.
         registry: Address,
     },
-}
-
-/// Refuse a registry whose events this build would misread: one not keyed
-/// by circuit nodes. Checked once, at startup, before a row is touched.
-pub async fn check_registry(
-    provider: &impl Provider,
-    registry: Address,
-) -> Result<(), RegistryRefused> {
-    let keyed = IdentityRegistry::new(registry, provider)
-        .nodeKeyed()
-        .call()
-        .await
-        .map_err(|source| RegistryRefused::Unread { registry, source })?;
-    if keyed {
-        Ok(())
-    } else {
-        Err(RegistryRefused::NotNodeKeyed { registry })
-    }
 }
 
 /// Why an escrow is refused beside the registry an indexer follows.
@@ -142,28 +220,4 @@ pub enum EscrowRefused {
         /// The registry the indexer follows.
         indexed: Address,
     },
-}
-
-/// Refuse an escrow that does not resolve holders through `registry`. An
-/// escrow keeps its registry for life, so an indexer checks once, at startup,
-/// before it touches a row.
-pub async fn check_escrow(
-    provider: &impl Provider,
-    escrow: Address,
-    registry: Address,
-) -> Result<(), EscrowRefused> {
-    let resolves = HandleEscrow::new(escrow, provider)
-        .registry()
-        .call()
-        .await
-        .map_err(|source| EscrowRefused::Unread { escrow, source })?;
-    if resolves == registry {
-        Ok(())
-    } else {
-        Err(EscrowRefused::OtherRegistry {
-            escrow,
-            registry: resolves,
-            indexed: registry,
-        })
-    }
 }

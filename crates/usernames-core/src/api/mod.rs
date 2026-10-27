@@ -85,41 +85,115 @@ impl AppState {
             Err(ApiError::not_synced(chain))
         }
     }
-}
 
-/// The routes, without middleware.
-///
-/// No CORS layer here: a `layer` wraps only the routes already on
-/// the router it is called on, so one applied inside this function cannot
-/// cover anything a caller merges afterwards. The binary mounts every route
-/// first and applies CORS once over the whole thing.
-pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health))
-        .route("/v1/status", get(status))
-        .route(
-            "/v1/resolve/handle/{platform}/{handle}",
-            get(resolve_handle),
-        )
-        .route(
-            "/v1/resolve/handle-node/{handle_node}",
-            get(resolve_handle_node),
-        )
-        .route("/v1/resolve/id-node/{id_node}", get(resolve_id_node))
-        .route("/v1/resolve/address/{address}", get(resolve_address))
-        .route("/v1/search", get(search))
-        .route("/v1/history/address/{address}", get(history::address))
-        .route(
-            "/v1/history/handle/{platform}/{handle}",
-            get(history::handle),
-        )
-        .route("/v1/history/node/{node}", get(history::node))
-        .route("/v1/escrow/claimable/{address}", get(escrow::claimable))
-        .route("/v1/escrow/refundable/{address}", get(escrow::refundable))
-        .route("/v1/escrow/handle/{platform}/{handle}", get(escrow::handle))
-        .route("/v1/escrow/node/{node}", get(escrow::node))
-        .route("/v1/escrow/unclaimed", get(escrow::unclaimed))
-        .with_state(state)
+    /// The routes, without middleware.
+    ///
+    /// No CORS layer here: a `layer` wraps only the routes already on
+    /// the router it is called on, so one applied inside this function cannot
+    /// cover anything a caller merges afterwards. The binary mounts every route
+    /// first and applies CORS once over the whole thing.
+    pub fn router(self) -> Router {
+        Router::new()
+            .route("/health", get(health))
+            .route("/v1/status", get(status))
+            .route(
+                "/v1/resolve/handle/{platform}/{handle}",
+                get(resolve_handle),
+            )
+            .route(
+                "/v1/resolve/handle-node/{handle_node}",
+                get(resolve_handle_node),
+            )
+            .route("/v1/resolve/id-node/{id_node}", get(resolve_id_node))
+            .route("/v1/resolve/address/{address}", get(resolve_address))
+            .route("/v1/search", get(search))
+            .route("/v1/history/address/{address}", get(history::address))
+            .route(
+                "/v1/history/handle/{platform}/{handle}",
+                get(history::handle),
+            )
+            .route("/v1/history/node/{node}", get(history::node))
+            .route("/v1/escrow/claimable/{address}", get(escrow::claimable))
+            .route("/v1/escrow/refundable/{address}", get(escrow::refundable))
+            .route("/v1/escrow/handle/{platform}/{handle}", get(escrow::handle))
+            .route("/v1/escrow/node/{node}", get(escrow::node))
+            .route("/v1/escrow/unclaimed", get(escrow::unclaimed))
+            .with_state(self)
+    }
+
+    async fn handle_resolution(
+        &self,
+        chain: Option<i64>,
+        handle_node: B256,
+    ) -> Result<Json<HandleResolution>, ApiError> {
+        let rows = self.store.resolve_handle(chain, handle_node).await?;
+        let Some(first) = rows.first() else {
+            return Err(ApiError::not_found(
+                ErrorCode::HandleNotBound,
+                "nothing is bound under this node",
+            ));
+        };
+        let platform_id = first.platform_id;
+        let bindings: Vec<HandleBinding> = rows
+            .into_iter()
+            .filter_map(|row| {
+                Some(HandleBinding {
+                    chain_id: row.chain_id,
+                    owner: row.owner?,
+                    observed_at: row.observed_at,
+                    ceremony_version: row.ceremony_version,
+                    id_node: row.id_node,
+                    handle: row.handle,
+                })
+            })
+            .collect();
+        if bindings.is_empty() {
+            return Err(ApiError::not_found(
+                ErrorCode::HandleRetired,
+                "the handle was retired: its account proved a different handle",
+            ));
+        }
+        Ok(Json(HandleResolution {
+            platform: nodes::Platform::known_of(platform_id),
+            platform_id,
+            handle_node,
+            bindings,
+        }))
+    }
+
+    /// `resolveId` takes no platform and never reverts, so a miss is
+    /// `id_not_bound` whatever the platform.
+    async fn id_resolution(
+        &self,
+        chain: Option<i64>,
+        id_node: B256,
+    ) -> Result<Json<IdResolution>, ApiError> {
+        let rows = self.store.resolve_id(chain, id_node).await?;
+        let Some(first) = rows.first() else {
+            return Err(ApiError::not_found(
+                ErrorCode::IdNotBound,
+                "nothing is bound under this node",
+            ));
+        };
+        let platform_id = first.platform_id;
+        Ok(Json(IdResolution {
+            platform: nodes::Platform::known_of(platform_id),
+            platform_id,
+            id_node,
+            bindings: rows
+                .iter()
+                .map(|row| IdBinding {
+                    chain_id: row.chain_id,
+                    owner: row.owner,
+                    observed_at: row.observed_at,
+                    ceremony_version: row.ceremony_version,
+                    handle: row.presentable_handle().map(str::to_string),
+                    handle_node: row.handle_node,
+                    published: row.displayed(),
+                })
+                .collect(),
+        }))
+    }
 }
 
 /// One error shape for the whole API: a status, a stable code, and prose.
@@ -291,7 +365,7 @@ struct PageParams {
 impl PageParams {
     fn page<C: FromStr<Err = InvalidCursor>>(self) -> Result<Page<C>, ApiError> {
         Ok(Page {
-            chain: ChainFilter { chain: self.chain }.parse()?,
+            chain: ChainFilter { chain: self.chain }.chain_id()?,
             before: self.before.as_deref().map(str::parse).transpose()?,
             limit: parse_count(self.limit.as_deref(), "limit")?
                 .unwrap_or(PAGE_DEFAULT_LIMIT)
@@ -397,7 +471,8 @@ struct ChainFilter {
 }
 
 impl ChainFilter {
-    fn parse(&self) -> Result<Option<i64>, ApiError> {
+    /// The chain `?chain=` names, if it names one.
+    fn chain_id(&self) -> Result<Option<i64>, ApiError> {
         self.chain
             .as_deref()
             .map(|raw| {
@@ -495,10 +570,10 @@ async fn resolve_handle(
     ApiQuery(filter): ApiQuery<ChainFilter>,
 ) -> Result<Json<HandleResolution>, ApiError> {
     let platform = parse_known_platform(&platform)?;
-    let chain = filter.parse()?;
+    let chain = filter.chain_id()?;
     state.synced(chain).await?;
     let handle_node = platform.handle_node(&handle)?;
-    handle_resolution(&state, chain, handle_node).await
+    state.handle_resolution(chain, handle_node).await
 }
 
 /// `GET /v1/resolve/handle-node/{handleNode}?chain=` — the same, by node.
@@ -508,49 +583,9 @@ async fn resolve_handle_node(
     ApiQuery(filter): ApiQuery<ChainFilter>,
 ) -> Result<Json<HandleResolution>, ApiError> {
     let handle_node = parse_node(&handle_node)?;
-    let chain = filter.parse()?;
+    let chain = filter.chain_id()?;
     state.synced(chain).await?;
-    handle_resolution(&state, chain, handle_node).await
-}
-
-async fn handle_resolution(
-    state: &AppState,
-    chain: Option<i64>,
-    handle_node: B256,
-) -> Result<Json<HandleResolution>, ApiError> {
-    let rows = state.store.resolve_handle(chain, handle_node).await?;
-    let Some(first) = rows.first() else {
-        return Err(ApiError::not_found(
-            ErrorCode::HandleNotBound,
-            "nothing is bound under this node",
-        ));
-    };
-    let platform_id = first.platform_id;
-    let bindings: Vec<HandleBinding> = rows
-        .into_iter()
-        .filter_map(|row| {
-            Some(HandleBinding {
-                chain_id: row.chain_id,
-                owner: row.owner?,
-                observed_at: row.observed_at,
-                ceremony_version: row.ceremony_version,
-                id_node: row.id_node,
-                handle: row.handle,
-            })
-        })
-        .collect();
-    if bindings.is_empty() {
-        return Err(ApiError::not_found(
-            ErrorCode::HandleRetired,
-            "the handle was retired: its account proved a different handle",
-        ));
-    }
-    Ok(Json(HandleResolution {
-        platform: nodes::Platform::known_of(platform_id),
-        platform_id,
-        handle_node,
-        bindings,
-    }))
+    state.handle_resolution(chain, handle_node).await
 }
 
 /// `GET /v1/resolve/id-node/{idNode}?chain=` — the wallet an id node resolves
@@ -562,43 +597,9 @@ async fn resolve_id_node(
     ApiQuery(filter): ApiQuery<ChainFilter>,
 ) -> Result<Json<IdResolution>, ApiError> {
     let id_node = parse_node(&id_node)?;
-    let chain = filter.parse()?;
+    let chain = filter.chain_id()?;
     state.synced(chain).await?;
-    id_resolution(&state, chain, id_node).await
-}
-
-/// `resolveId` takes no platform and never reverts, so a miss is
-/// `id_not_bound` whatever the platform.
-async fn id_resolution(
-    state: &AppState,
-    chain: Option<i64>,
-    id_node: B256,
-) -> Result<Json<IdResolution>, ApiError> {
-    let rows = state.store.resolve_id(chain, id_node).await?;
-    let Some(first) = rows.first() else {
-        return Err(ApiError::not_found(
-            ErrorCode::IdNotBound,
-            "nothing is bound under this node",
-        ));
-    };
-    let platform_id = first.platform_id;
-    Ok(Json(IdResolution {
-        platform: nodes::Platform::known_of(platform_id),
-        platform_id,
-        id_node,
-        bindings: rows
-            .iter()
-            .map(|row| IdBinding {
-                chain_id: row.chain_id,
-                owner: row.owner,
-                observed_at: row.observed_at,
-                ceremony_version: row.ceremony_version,
-                handle: row.presentable_handle().map(str::to_string),
-                handle_node: row.handle_node,
-                published: row.displayed(),
-            })
-            .collect(),
-    }))
+    state.id_resolution(chain, id_node).await
 }
 
 /// `GET /v1/resolve/address/{address}?chain=` — every identity a wallet
@@ -610,7 +611,7 @@ async fn resolve_address(
     ApiQuery(filter): ApiQuery<ChainFilter>,
 ) -> Result<Json<AddressResolution>, ApiError> {
     let address = parse_address(&address)?;
-    let chain = filter.parse()?;
+    let chain = filter.chain_id()?;
     state.synced(chain).await?;
 
     let rows = state.store.identities_of(chain, address).await?;
@@ -671,7 +672,7 @@ async fn search(
     let chain = ChainFilter {
         chain: params.chain,
     }
-    .parse()?;
+    .chain_id()?;
     let query = match params.q.as_deref() {
         Some(raw) => {
             reject_nul(raw, "q")?;
@@ -751,7 +752,8 @@ mod tests {
     async fn refusal(path: &str) -> (StatusCode, ErrorCode) {
         let pool =
             PgPool::connect_lazy("postgres://localhost/unread").expect("lazy pool");
-        let response = router(AppState::new(Store::new(pool)))
+        let response = AppState::new(Store::new(pool))
+            .router()
             .oneshot(
                 Request::builder()
                     .uri(path)

@@ -17,8 +17,6 @@ use alloy::{
     },
 };
 use axum::http::StatusCode;
-use serde::de::DeserializeOwned;
-use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use usernames_core::{
     api::model::{
@@ -36,7 +34,10 @@ use usernames_core::{
         Status,
         Unclaimed,
     },
-    chain,
+    chain::{
+        self,
+        Contracts,
+    },
     db::{
         self,
         ChainStore,
@@ -51,7 +52,6 @@ use usernames_core::{
 
 mod common;
 use common::{
-    events,
     libid::{
         Disclose,
         Handle,
@@ -60,14 +60,10 @@ use common::{
         Proof,
         CEREMONY_VERSION,
     },
-    Reply,
+    Entries,
+    IdNode,
+    Reads,
 };
-
-/// A request scoped to `chain`: the database is shared with the read-model
-/// suite's chains.
-async fn get<T: DeserializeOwned>(pool: &PgPool, chain: u64, path: &str) -> Reply<T> {
-    common::get_on(pool, chain as i64, path).await
-}
 
 /// The polled chain. Not 31337: the read-model tests use anvil's default id
 /// against the same database, and chain_id keying is the isolation this
@@ -106,7 +102,9 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
     let store = ChainStore::new(pool.clone(), chain_id as i64);
     // A previous run of this test left rows under this chain id; the loop
     // must start from a clean slate to make block-number assertions exact.
-    common::clear_chain(&pool, chain_id as i64).await;
+    ChainStore::new(pool.clone(), chain_id as i64)
+        .forget()
+        .await;
 
     let node = Node::spawn(chain_id);
     let provider = &node.provider;
@@ -177,30 +175,36 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
     // What the binary does before its loop: check both contracts, take the
     // chain's writer lease and prepare the chain, which records the contracts
     // the rows come from.
-    chain::check_escrow(provider, escrow, registry)
+    let contracts = Contracts {
+        registry,
+        escrow: Some(escrow),
+    };
+    contracts
+        .check_escrow(provider)
         .await
         .expect("the escrow resolves holders through the registry");
-    chain::check_registry(provider, registry)
+    contracts
+        .check_registry(provider)
         .await
         .expect("the registry is keyed by nodes");
     // The escrow has no `nodeKeyed`: an indexer pointed at it refuses.
+    let escrow_as_registry = Contracts {
+        registry: escrow,
+        escrow: None,
+    };
     assert!(matches!(
-        chain::check_registry(provider, escrow).await,
+        escrow_as_registry.check_registry(provider).await,
         Err(chain::RegistryRefused::Unread { .. })
     ));
     let lease = store.acquire_writer().await.expect("writer lease");
-    let writer = store
-        .prepare(&lease, registry, Some(escrow))
-        .await
-        .expect("prepare");
+    let writer = store.prepare(&lease, contracts).await.expect("prepare");
 
     // Run the real loop: no start override (detection must find the deploy
     // block), a tiny window so catch-up spans several chunks, and the one
     // confirmation a subscription needs.
     let cancel = CancellationToken::new();
     let config = indexer::IndexerConfig {
-        contract: registry,
-        escrow: Some(escrow),
+        contracts,
         confirmations: 1,
         source,
         poll_interval: Duration::from_millis(20),
@@ -229,12 +233,13 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
     assert_eq!(x.handle_node("bob_x").unwrap(), libid.node(bob_x).await);
 
     // alice_1 retired, alice_2 resolves, and the id followed the rename.
-    let (status, _) =
-        get::<HandleResolution>(&pool, chain_id, "/v1/resolve/handle/x/alice_1")
-            .await
-            .refusal();
+    let (status, _) = pool
+        .get_on::<HandleResolution>(chain_id as i64, "/v1/resolve/handle/x/alice_1")
+        .await
+        .refusal();
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let resolved: HandleResolution = get(&pool, chain_id, "/v1/resolve/handle/x/alice_2")
+    let resolved: HandleResolution = pool
+        .get_on(chain_id as i64, "/v1/resolve/handle/x/alice_2")
         .await
         .answer();
     let binding = &resolved.bindings[0];
@@ -242,25 +247,25 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
     assert_eq!(binding.owner, alice);
     assert_eq!(binding.ceremony_version, i64::from(CEREMONY_VERSION));
     assert_eq!(binding.handle.as_deref(), Some("alice_2"));
-    let resolved: IdResolution = get(
-        &pool,
-        chain_id,
-        &format!("/v1/resolve/id-node/{}", common::id_node(x, "111")),
-    )
-    .await
-    .answer();
+    let resolved: IdResolution = pool
+        .get_on(
+            chain_id as i64,
+            &format!("/v1/resolve/id-node/{}", x.id_node("111")),
+        )
+        .await
+        .answer();
     assert_eq!(resolved.bindings[0].handle.as_deref(), Some("alice_2"));
 
     // The registry folded the Google address it was given; the API finds it
     // through the URL-encoded raw form, and the text it disclosed still comes
     // back after the name was withdrawn.
-    let resolved: HandleResolution = get(
-        &pool,
-        chain_id,
-        "/v1/resolve/handle/google/A.B%2Btag%40Example.COM",
-    )
-    .await
-    .answer();
+    let resolved: HandleResolution = pool
+        .get_on(
+            chain_id as i64,
+            "/v1/resolve/handle/google/A.B%2Btag%40Example.COM",
+        )
+        .await
+        .answer();
     assert_eq!(
         resolved.handle_node,
         google.handle_node("a.b+tag@example.com").unwrap()
@@ -269,20 +274,14 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
         resolved.bindings[0].handle.as_deref(),
         Some("a.b+tag@example.com")
     );
-    assert_eq!(
-        resolved.bindings[0].id_node,
-        common::id_node(google, GOOGLE_USER_ID)
-    );
-    let resolved: IdResolution = get(
-        &pool,
-        chain_id,
-        &format!(
-            "/v1/resolve/id-node/{}",
-            common::id_node(google, GOOGLE_USER_ID)
-        ),
-    )
-    .await
-    .answer();
+    assert_eq!(resolved.bindings[0].id_node, google.id_node(GOOGLE_USER_ID));
+    let resolved: IdResolution = pool
+        .get_on(
+            chain_id as i64,
+            &format!("/v1/resolve/id-node/{}", google.id_node(GOOGLE_USER_ID)),
+        )
+        .await
+        .answer();
     assert_eq!(resolved.bindings[0].owner, alice);
     assert_eq!(
         resolved.bindings[0].handle.as_deref(),
@@ -291,10 +290,10 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
 
     // Reverse: both identities, neither the name: Google's replaced X's, and
     // was withdrawn.
-    let resolved: AddressResolution =
-        get(&pool, chain_id, &format!("/v1/resolve/address/{alice}"))
-            .await
-            .answer();
+    let resolved: AddressResolution = pool
+        .get_on(chain_id as i64, &format!("/v1/resolve/address/{alice}"))
+        .await
+        .answer();
     assert_eq!(resolved.identities.len(), 2, "{resolved:?}");
     // Platform ids order the identities: X's sorts before Google's.
     let displayed: Vec<_> = resolved
@@ -313,7 +312,8 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
     );
 
     // Search sees the current handle, not the retired one.
-    let results: SearchResults = get(&pool, chain_id, "/v1/search?q=alice&platform=x")
+    let results: SearchResults = pool
+        .get_on(chain_id as i64, "/v1/search?q=alice&platform=x")
         .await
         .answer();
     let handles: Vec<&str> = results.hits.iter().map(|h| h.handle.as_str()).collect();
@@ -321,7 +321,7 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
 
     // Ops metadata filled from the admin events, on this chain's entry of
     // the status.
-    let status: Status = common::get(&pool, "/v1/status").await.answer();
+    let status: Status = pool.get("/v1/status").await.answer();
     let chain = status
         .chains
         .iter()
@@ -371,12 +371,13 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
     // Both emitters' logs, in one history: the handle's from the deposit made
     // while nobody held it, through the bind and its ceremony, to the claim,
     // each dated by its block.
-    let history: HandleHistory = get(&pool, chain_id, "/v1/history/handle/x/bob_x")
+    let history: HandleHistory = pool
+        .get_on(chain_id as i64, "/v1/history/handle/x/bob_x")
         .await
         .answer();
     assert!(
         matches!(
-            events(&history.entries)[..],
+            history.entries.events()[..],
             [
                 HistoryEvent::Claimed { .. },
                 HistoryEvent::CeremonyBound { .. },
@@ -388,13 +389,13 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
     );
     assert!(history.entries.iter().all(|e| e.block_time > 0));
     // The payer's history ends with Bob's claim taking its deposit.
-    let history: AddressHistory =
-        get(&pool, chain_id, &format!("/v1/history/address/{payer}"))
-            .await
-            .answer();
+    let history: AddressHistory = pool
+        .get_on(chain_id as i64, &format!("/v1/history/address/{payer}"))
+        .await
+        .answer();
     assert!(
         matches!(
-            events(&history.entries)[..],
+            history.entries.events()[..],
             [
                 HistoryEvent::Claimed { .. },
                 HistoryEvent::Deposited { .. },
@@ -406,10 +407,10 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
     );
     assert_eq!(history.entries[0].roles, [Role::Sender]);
     assert_eq!(history.entries[3].roles, [Role::Sender]);
-    let history: AddressHistory =
-        get(&pool, chain_id, &format!("/v1/history/address/{alice}"))
-            .await
-            .answer();
+    let history: AddressHistory = pool
+        .get_on(chain_id as i64, &format!("/v1/history/address/{alice}"))
+        .await
+        .answer();
     assert_eq!(history.entries[0].roles, [Role::Holder]);
     assert!(matches!(
         history.entries[0].event,
@@ -429,13 +430,13 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
             .and_then(|handle| handle.handle.as_deref()),
         Some("alice_1")
     );
-    let history: AddressHistory =
-        get(&pool, chain_id, &format!("/v1/history/address/{refunder}"))
-            .await
-            .answer();
+    let history: AddressHistory = pool
+        .get_on(chain_id as i64, &format!("/v1/history/address/{refunder}"))
+        .await
+        .answer();
     assert!(
         matches!(
-            events(&history.entries)[..],
+            history.entries.events()[..],
             [
                 HistoryEvent::Deposited { .. },
                 HistoryEvent::Refunded { .. },
@@ -448,26 +449,29 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
     // The books match the escrow's own: Bob's slot is empty, and what waits
     // for @carol_x is what each payer could take back, from the date the
     // escrow set.
-    let bobs: AddressAmounts =
-        get(&pool, chain_id, &format!("/v1/escrow/claimable/{bob}"))
-            .await
-            .answer();
+    let bobs: AddressAmounts = pool
+        .get_on(chain_id as i64, &format!("/v1/escrow/claimable/{bob}"))
+        .await
+        .answer();
     assert!(bobs.amounts.is_empty(), "{bobs:?}");
     assert_eq!(libid.escrowed(bob_x).await, U256::ZERO);
-    let carols: HandleAmounts = get(&pool, chain_id, "/v1/escrow/handle/x/carol_x")
+    let carols: HandleAmounts = pool
+        .get_on(chain_id as i64, "/v1/escrow/handle/x/carol_x")
         .await
         .answer();
     assert_eq!(carols.amounts.len(), 1, "{carols:?}");
     assert_eq!(carols.amounts[0].amount, libid.escrowed(carol_x).await);
     assert_eq!(carols.amounts[0].amount, U256::from(45u64));
-    let unclaimed: Unclaimed =
-        get(&pool, chain_id, "/v1/escrow/unclaimed").await.answer();
+    let unclaimed: Unclaimed = pool
+        .get_on(chain_id as i64, "/v1/escrow/unclaimed")
+        .await
+        .answer();
     assert_eq!(unclaimed.amounts, carols.amounts);
     for (sender, put_in) in [(payer, 30u64), (refunder, 15)] {
-        let refundable: AddressContributions =
-            get(&pool, chain_id, &format!("/v1/escrow/refundable/{sender}"))
-                .await
-                .answer();
+        let refundable: AddressContributions = pool
+            .get_on(chain_id as i64, &format!("/v1/escrow/refundable/{sender}"))
+            .await
+            .answer();
         assert_eq!(refundable.amounts.len(), 1, "{refundable:?}");
         let served = &refundable.amounts[0];
         let (booked, refundable_at) = libid.contribution(carol_x, sender).await;
@@ -492,7 +496,12 @@ async fn an_escrow_of_another_registry_is_refused() {
     let other = Libid::registry(provider, owner).await;
     let escrow = Libid::escrow(provider, owner, other).await;
 
-    let refused = chain::check_escrow(provider, escrow, indexed).await;
+    let refused = Contracts {
+        registry: indexed,
+        escrow: Some(escrow),
+    }
+    .check_escrow(provider)
+    .await;
     assert!(
         matches!(
             refused,

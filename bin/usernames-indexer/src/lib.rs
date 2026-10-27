@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use usernames_core::{
-    chain,
+    chain::Contracts,
     db::{
         self,
         Superseded,
@@ -111,11 +111,19 @@ pub struct Config {
 }
 
 impl Config {
+    /// The contracts this indexer follows.
+    fn contracts(&self) -> Contracts {
+        Contracts {
+            registry: self.identity_names_address,
+            escrow: self.handle_escrow_address,
+        }
+    }
+
     /// The indexer this configuration describes, under its chain's writer
     /// lease: endpoints checked, the schema migrated, the chain prepared and
     /// its names declared.
     async fn start(self) -> anyhow::Result<(WriterLease, indexer::Indexer)> {
-        let contract = self.identity_names_address;
+        let contracts = self.contracts();
         // Pure configuration, checked before anything is touched: `prepare`
         // below may wipe the chain's rows on a version bump, and a refusal has
         // to come before that, not after.
@@ -138,17 +146,16 @@ impl Config {
             anyhow::anyhow!("chain id {reported} does not fit in a BIGINT")
         })?;
         // Before `prepare` too: an older registry's events would be misread.
-        chain::check_registry(&provider, contract)
+        contracts
+            .check_registry(&provider)
             .await
             .context("IDENTITY_NAMES_ADDRESS")?;
-        let escrow = self.handle_escrow_address;
-        if let Some(escrow) = escrow {
-            // Before `prepare`, which clears the chain when the escrow changes: a
-            // misconfiguration refuses without touching the rows.
-            chain::check_escrow(&provider, escrow, contract)
-                .await
-                .context("HANDLE_ESCROW_ADDRESS")?;
-        }
+        // Before `prepare`, which clears the chain when the escrow changes: a
+        // misconfiguration refuses without touching the rows.
+        contracts
+            .check_escrow(&provider)
+            .await
+            .context("HANDLE_ESCROW_ADDRESS")?;
 
         // The indexer migrates because the indexer writes. The read API connects
         // to whatever schema it finds.
@@ -159,7 +166,7 @@ impl Config {
         // the lease is a parameter there, so a version-bump replay cannot race a
         // still-running older pod.
         let lease = store.acquire_writer().await?;
-        let writer = store.prepare(&lease, contract, escrow).await?;
+        let writer = store.prepare(&lease, contracts).await?;
         store.set_chain_names(&lease, &self.chain_names).await?;
 
         // Startup's own connection: every session of the loop opens its own.
@@ -168,8 +175,7 @@ impl Config {
             writer,
             self.rpc_url,
             indexer::IndexerConfig {
-                contract,
-                escrow,
+                contracts,
                 confirmations,
                 source: self.log_source,
                 poll_interval: self.poll_interval,
@@ -178,7 +184,7 @@ impl Config {
                 stale_after,
             },
         );
-        tracing::info!(chain_id, %contract, ?escrow, "indexing");
+        tracing::info!(chain_id, ?contracts, "indexing");
         Ok((lease, indexer))
     }
 
@@ -247,16 +253,15 @@ pub async fn run() -> anyhow::Result<()> {
             return Ok(());
         }
     };
-    let cancel = CancellationToken::new();
-    let mut task = tokio::spawn(indexer.run(cancel.clone()));
+    let mut indexing = Indexing::start(indexer);
 
     let stopped = tokio::select! {
         () = signals.received() => {
             tracing::info!("shutting down");
-            stop(&cancel, &mut task, LEASE_CHECK).await;
+            indexing.stop(LEASE_CHECK).await;
             Ok(())
         }
-        r = &mut task => match r {
+        r = &mut indexing.task => match r {
             Ok(Ok(())) => Err(anyhow::anyhow!("indexer task exited unexpectedly")),
             // The lease's session is most likely gone, and releasing a dead
             // one fails or hangs; dropping the lease closes it either way.
@@ -266,7 +271,7 @@ pub async fn run() -> anyhow::Result<()> {
         // Another instance may take the chain once the lock is gone, so this
         // one stops writing and exits for its supervisor to restart.
         lost = lease.lost(LEASE_CHECK) => {
-            stop(&cancel, &mut task, LEASE_CHECK).await;
+            indexing.stop(LEASE_CHECK).await;
             return Err(anyhow::Error::new(lost).context("the writer lease was lost"));
         }
     };
@@ -282,19 +287,30 @@ pub async fn run() -> anyhow::Result<()> {
     stopped
 }
 
-/// Cancel the loop and give it `within` to finish its window. A loop stuck in
-/// a write to a silent database is aborted: its transaction commits whole or
-/// not at all, before any later writer's prepare, and the writer generation
-/// keeps anything after from landing.
-async fn stop(
-    cancel: &CancellationToken,
-    task: &mut JoinHandle<Result<(), Superseded>>,
-    within: Duration,
-) {
-    cancel.cancel();
-    if tokio::time::timeout(within, &mut *task).await.is_err() {
-        tracing::warn!(?within, "the indexer did not stop in time; aborting it");
-        task.abort();
+/// The indexer loop running as a task, and the token that stops it.
+struct Indexing {
+    cancel: CancellationToken,
+    task: JoinHandle<Result<(), Superseded>>,
+}
+
+impl Indexing {
+    /// Run `indexer` until it is stopped.
+    fn start(indexer: indexer::Indexer) -> Self {
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(indexer.run(cancel.clone()));
+        Self { cancel, task }
+    }
+
+    /// Cancel the loop and give it `within` to finish its window. A loop
+    /// stuck in a write to a silent database is aborted: its transaction
+    /// commits whole or not at all, before any later writer's prepare, and
+    /// the writer generation keeps anything after from landing.
+    async fn stop(&mut self, within: Duration) {
+        self.cancel.cancel();
+        if tokio::time::timeout(within, &mut self.task).await.is_err() {
+            tracing::warn!(?within, "the indexer did not stop in time; aborting it");
+            self.task.abort();
+        }
     }
 }
 
@@ -414,26 +430,28 @@ mod help_tests {
 }
 
 #[cfg(test)]
-mod stop_tests {
+mod indexing_tests {
     use std::time::Duration;
 
     use tokio_util::sync::CancellationToken;
 
-    use super::stop;
+    use super::Indexing;
 
     /// A loop that never reaches its next cancellation check is aborted
     /// once its time is up, so the process can exit.
     #[tokio::test]
     async fn a_loop_that_does_not_stop_is_aborted() {
-        let cancel = CancellationToken::new();
-        let mut task = tokio::spawn(std::future::pending());
+        let mut indexing = Indexing {
+            cancel: CancellationToken::new(),
+            task: tokio::spawn(std::future::pending()),
+        };
         tokio::time::timeout(
             Duration::from_secs(5),
-            stop(&cancel, &mut task, Duration::from_millis(50)),
+            indexing.stop(Duration::from_millis(50)),
         )
         .await
         .expect("stop returns");
-        let ended = tokio::time::timeout(Duration::from_secs(1), task)
+        let ended = tokio::time::timeout(Duration::from_secs(1), indexing.task)
             .await
             .expect("the loop ended");
         assert!(ended.unwrap_err().is_cancelled());

@@ -14,15 +14,11 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use alloy::{
-    primitives::Address,
     providers::{
         Provider,
         RootProvider,
     },
-    rpc::types::{
-        Filter,
-        Log,
-    },
+    rpc::types::Log,
 };
 use anyhow::Context;
 use tokio_util::sync::CancellationToken;
@@ -40,17 +36,11 @@ use self::{
     },
 };
 use crate::{
-    chain,
+    chain::Contracts,
     db::{
         ChainWriter,
         Superseded,
         WindowError,
-    },
-    events::{
-        self,
-        DecodeError,
-        LogPosition,
-        NamesEvent,
     },
 };
 
@@ -58,15 +48,10 @@ use crate::{
 /// [`ChainWriter`] the [`Indexer`] is built over.
 #[derive(Debug, Clone)]
 pub struct IndexerConfig {
-    /// The IdentityRegistry ERC1967 proxy — the address to watch. The
-    /// implementation behind it changes on upgrade; the proxy is the one that
-    /// emits.
-    pub contract: Address,
-    /// The HandleEscrow ERC1967 proxy that resolves through `contract`, when
-    /// the chain has one. Its events share the registry's windows and cursor:
-    /// it is deployed after the registry it names, so the registry's
-    /// deployment block covers it.
-    pub escrow: Option<Address>,
+    /// The contracts to watch. The escrow's events share the registry's
+    /// windows and cursor: it is deployed after the registry it names, so
+    /// the registry's deployment block covers it.
+    pub contracts: Contracts,
     /// Blocks behind the head this indexer stays. The loop never commits past
     /// `latest - confirmations`, so a reorg shallower than this cannot leave
     /// the read model holding events the canonical chain never emitted. At
@@ -75,8 +60,8 @@ pub struct IndexerConfig {
     pub confirmations: u64,
     /// How the loop learns of new blocks.
     pub source: LogSource,
-    /// The loop's cadence: a poll cycle, or with a subscription how often it
-    /// checks that heads still arrive. Also the retry delay after a failure.
+    /// The retry delay after a failure, and with [`LogSource::Poll`] the poll
+    /// cycle.
     pub poll_interval: Duration,
     /// Largest `eth_getLogs` window, sized to the RPC provider's limits.
     pub max_block_range: u64,
@@ -94,11 +79,6 @@ pub struct IndexerConfig {
 }
 
 impl IndexerConfig {
-    /// The contracts whose logs the loop follows.
-    fn watched(&self) -> Vec<Address> {
-        std::iter::once(self.contract).chain(self.escrow).collect()
-    }
-
     /// The last block of the `eth_getLogs` window that starts at `from`, at
     /// most `through`.
     fn window_end(&self, from: u64, through: u64) -> u64 {
@@ -114,40 +94,15 @@ pub struct Indexer {
     writer: ChainWriter,
     rpc: Url,
     config: IndexerConfig,
-    filter: Filter,
 }
 
 impl Indexer {
-    /// Build the indexer; the log filter is derived from the watched contracts
-    /// once, here, instead of at every fetch.
+    /// The indexer of `writer`'s chain over `rpc`.
     pub fn new(writer: ChainWriter, rpc: Url, config: IndexerConfig) -> Self {
-        let filter = Filter::new().address(config.watched());
         Self {
             writer,
             rpc,
             config,
-            filter,
-        }
-    }
-
-    /// Decode a log by the contract that emitted it: each contract's topics
-    /// mean something only from that contract. The filter admits no other
-    /// emitter, so one would be an RPC answering a different question.
-    fn decode(
-        &self,
-        log: &Log,
-    ) -> Result<Option<(NamesEvent, LogPosition)>, DecodeError> {
-        let emitter = log.address();
-        if emitter == self.config.contract {
-            events::decode_registry(log)
-        } else if Some(emitter) == self.config.escrow {
-            events::decode_escrow(log)
-        } else {
-            tracing::warn!(
-                %emitter,
-                "a log from a contract the filter does not name; skipped"
-            );
-            Ok(None)
         }
     }
 
@@ -160,7 +115,7 @@ impl Indexer {
         let mut window = self.writer.begin_window().await?;
         let mut applied = 0usize;
         for log in logs {
-            match self.decode(log) {
+            match self.config.contracts.decode(log) {
                 Ok(Some((event, position))) => {
                     if window.apply(&event, &position).await? {
                         applied += 1;
@@ -202,8 +157,7 @@ impl Indexer {
     /// resumes from the cursor.
     pub async fn run(self, cancel: CancellationToken) -> Result<(), Superseded> {
         tracing::info!(
-            contract = %self.config.contract,
-            escrow = ?self.config.escrow,
+            contracts = ?self.config.contracts,
             chain_id = self.writer.store().chain_id(),
             confirmations = self.config.confirmations,
             source = %self.config.source,
@@ -235,7 +189,11 @@ impl Indexer {
                     // integrity over progress — and a stall must be visible
                     // somewhere a monitor actually looks.
                     self.writer.set_window_error(Some(&error)).await;
-                    sleep_or_cancel(&cancel, self.config.poll_interval).await;
+                    cancel
+                        .run_until_cancelled(tokio::time::sleep(
+                            self.config.poll_interval,
+                        ))
+                        .await;
                 }
             }
         }
@@ -297,7 +255,7 @@ impl<'a> Session<'a> {
     /// report never renewed.
     async fn follow(mut self, cancel: &CancellationToken) -> anyhow::Result<Ended> {
         let config = &self.indexer.config;
-        let watched = config.watched();
+        let watched = config.contracts.watched();
         let quiet = config.stale_after / 2;
         let mut seen = self.catch_up(cancel).await?;
         let mut heads = Heads::default();
@@ -419,7 +377,8 @@ impl<'a> Session<'a> {
 
     /// One `eth_getLogs` window, inclusive on both ends, in chain order.
     async fn fetch(&self, from: u64, to: u64) -> anyhow::Result<Vec<Log>> {
-        let mut logs = chain::fetch_logs(&self.provider, &self.indexer.filter, from, to)
+        let mut logs = (self.indexer.config.contracts)
+            .logs(&self.provider, from, to)
             .await
             .with_context(|| format!("eth_getLogs {from}..{to}"))?;
         // Every log has to sit in the window the cursor will pass.
@@ -459,11 +418,16 @@ impl<'a> Session<'a> {
     /// genesis scans forever.
     async fn resolve_start_block(&self) -> Option<u64> {
         let indexer = self.indexer;
-        let contract = indexer.config.contract;
+        let contracts = indexer.config.contracts;
         if let Some(block) = indexer.config.start_block {
             return Some(block);
         }
-        match indexer.writer.store().deploy_block(contract).await {
+        match indexer
+            .writer
+            .store()
+            .deploy_block(contracts.registry)
+            .await
+        {
             Ok(Some(block)) => return Some(block),
             Ok(None) => {}
             Err(e) => tracing::warn!(%e, "failed to read the cached deployment block"),
@@ -475,7 +439,7 @@ impl<'a> Session<'a> {
                 return None;
             }
         };
-        match chain::find_deployment_block(&self.provider, contract, latest).await {
+        match contracts.deployment_block(&self.provider, latest).await {
             Ok(Some(block)) => {
                 tracing::info!(block, "detected contract deployment block");
                 if let Err(e) = indexer.writer.set_deploy_block(block).await {
@@ -501,15 +465,9 @@ impl<'a> Session<'a> {
     }
 }
 
-async fn sleep_or_cancel(cancel: &CancellationToken, interval: Duration) {
-    tokio::select! {
-        _ = cancel.cancelled() => {}
-        _ = tokio::time::sleep(interval) => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::Address;
     use sqlx::PgPool;
 
     use super::*;
@@ -524,8 +482,10 @@ mod tests {
                 .parse()
                 .unwrap(),
             IndexerConfig {
-                contract: Address::ZERO,
-                escrow: None,
+                contracts: Contracts {
+                    registry: Address::ZERO,
+                    escrow: None,
+                },
                 confirmations: 3,
                 source: LogSource::Subscribe,
                 poll_interval: Duration::from_secs(5),

@@ -51,7 +51,10 @@ use libid_contracts::{
     Artifacts,
 };
 use url::Url;
-use usernames_core::nodes::KnownPlatform;
+use usernames_core::{
+    chain::Contracts,
+    nodes::KnownPlatform,
+};
 
 /// The Proof Verifier's slot each platform's stub fills.
 const VERIFIER_VERSION: u16 = 1;
@@ -142,6 +145,14 @@ pub struct Libid {
 }
 
 impl Libid {
+    /// The deployed registry and escrow, as an indexer follows them.
+    pub fn contracts(&self) -> Contracts {
+        Contracts {
+            registry: *self.registry.address(),
+            escrow: Some(*self.escrow.address()),
+        }
+    }
+
     /// Deploy and wire the contracts, owned by `owner`: X and Google, each
     /// verified by a stub.
     pub async fn deploy(provider: &DynProvider, owner: Address) -> Self {
@@ -165,7 +176,7 @@ impl Libid {
         let wire = registry
             .setProofVerifier(*proof_verifier.address())
             .into_transaction_request();
-        mined(provider, wire).await;
+        provider.mined(wire).await;
 
         let mut stubs = Vec::new();
         for platform in PLATFORMS {
@@ -181,7 +192,7 @@ impl Libid {
             let wire = proof_verifier
                 .setVerifier(platform.id(), VERIFIER_VERSION, stub)
                 .into_transaction_request();
-            mined(provider, wire).await;
+            provider.mined(wire).await;
             stubs.push((platform, StubPlatformVerifier::new(stub, provider.clone())));
         }
 
@@ -245,18 +256,18 @@ impl Libid {
             .find(|(p, _)| *p == platform)
             .expect("a stub verifies the platform");
         let provider = self.registry.provider();
-        mined(
-            provider,
-            stub.set(proof.id.into(), handle.into())
-                .into_transaction_request(),
-        )
-        .await;
-        mined(
-            provider,
-            stub.setObservedAt(proof.observed_at)
-                .into_transaction_request(),
-        )
-        .await;
+        provider
+            .mined(
+                stub.set(proof.id.into(), handle.into())
+                    .into_transaction_request(),
+            )
+            .await;
+        provider
+            .mined(
+                stub.setObservedAt(proof.observed_at)
+                    .into_transaction_request(),
+            )
+            .await;
 
         stub_payload(&StubPayload {
             ceremonyVersion: CEREMONY_VERSION,
@@ -419,25 +430,31 @@ impl Libid {
 
     /// Send `request`; the block it landed in.
     async fn send(&self, request: TransactionRequest) -> u64 {
-        mined(self.registry.provider(), request)
+        self.registry
+            .provider()
+            .mined(request)
             .await
             .block_number
             .expect("a mined transaction")
     }
 }
 
-/// Send a transaction and wait for its block; a revert fails the test.
-async fn mined(
-    provider: &DynProvider,
-    request: TransactionRequest,
-) -> TransactionReceipt {
-    let receipt = provider
-        .send_transaction(request)
-        .await
-        .expect("the transaction is accepted")
-        .get_receipt()
-        .await
-        .expect("the transaction is mined");
-    assert!(receipt.status(), "reverted: {receipt:?}");
-    receipt
+/// Transactions a suite sends.
+pub trait Mined {
+    /// Send a transaction and wait for its block; a revert fails the test.
+    async fn mined(&self, request: TransactionRequest) -> TransactionReceipt;
+}
+
+impl Mined for DynProvider {
+    async fn mined(&self, request: TransactionRequest) -> TransactionReceipt {
+        let receipt = self
+            .send_transaction(request)
+            .await
+            .expect("the transaction is accepted")
+            .get_receipt()
+            .await
+            .expect("the transaction is mined");
+        assert!(receipt.status(), "reverted: {receipt:?}");
+        receipt
+    }
 }
