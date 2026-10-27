@@ -10,13 +10,15 @@
 CREATE SCHEMA IF NOT EXISTS names;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
--- One row per chain an indexer has prepared: the read-model version it
--- writes and the contracts it watches, the registry's cached deployment
--- block, how far it got and how far the chain has grown, its last report
--- and window error, and the Proof Verifier the registry was pointed at.
--- The API's status is read from here.
+-- One row per chain an indexer has prepared: the generation of the writer
+-- that prepared it last, which every later write names; the read-model
+-- version it writes and the contracts it watches; the registry's cached
+-- deployment block; how far it got and how far the chain has grown; its
+-- last report and window error; and the Proof Verifier the registry was
+-- pointed at. The API's status is read from here.
 CREATE TABLE IF NOT EXISTS names.chains (
     chain_id        BIGINT PRIMARY KEY,
+    writer          BIGINT NOT NULL CHECK (writer > 0),
     indexer_version TEXT,
     contract        BYTEA,
     escrow          BYTEA,

@@ -188,9 +188,9 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
         chain::check_registry(provider, escrow).await,
         Err(chain::RegistryRefused::Unread { .. })
     ));
-    let writer = store.acquire_writer().await.expect("writer lease");
-    store
-        .prepare(&writer, registry, Some(escrow))
+    let lease = store.acquire_writer().await.expect("writer lease");
+    let writer = store
+        .prepare(&lease, registry, Some(escrow))
         .await
         .expect("prepare");
 
@@ -210,13 +210,13 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
         stale_after: Duration::from_secs(120),
     };
     let task = tokio::spawn(
-        indexer::Indexer::new(store.clone(), node.rpc(), config).run(cancel.clone()),
+        indexer::Indexer::new(writer, node.rpc(), config).run(cancel.clone()),
     );
 
     common::wait_for_cursor(&store, latest).await;
     cancel.cancel();
     let _ = task.await;
-    writer.release().await.expect("the lease releases");
+    lease.release().await.expect("the lease releases");
 
     // Detection ran once and its answer was cached — and it is the right one.
     let cached = store.deploy_block(registry).await.expect("metadata");

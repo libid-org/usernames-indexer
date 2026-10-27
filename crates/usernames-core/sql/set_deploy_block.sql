@@ -1,2 +1,1 @@
-INSERT INTO names.chains (chain_id, deploy_block) VALUES ($1, $2)
-ON CONFLICT (chain_id) DO UPDATE SET deploy_block = EXCLUDED.deploy_block
+UPDATE names.chains SET deploy_block = $3 WHERE chain_id = $1 AND writer = $2

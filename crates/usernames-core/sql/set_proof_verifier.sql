@@ -1,2 +1,2 @@
-INSERT INTO names.chains (chain_id, proof_verifier) VALUES ($1, $2)
-ON CONFLICT (chain_id) DO UPDATE SET proof_verifier = EXCLUDED.proof_verifier
+-- Under the window's hold on the row.
+UPDATE names.chains SET proof_verifier = $2 WHERE chain_id = $1

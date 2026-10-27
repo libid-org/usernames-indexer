@@ -9,7 +9,8 @@ follows the contracts' events — from pushed heads, or polled —
 and indexes their storage from those events alone, and `usernames-api`,
 which serves what the loop wrote. They are separate because
 they scale and fail differently — one writer per chain holds a Postgres
-advisory lease, while readers are stateless and horizontal — and because a
+advisory lease, and its writes stop landing once another instance takes the
+chain, while readers are stateless and horizontal — and because a
 stalled indexer must not hide behind a healthy-looking endpoint.
 
 Neither binary contains logic: both stand on the `usernames-core` library,

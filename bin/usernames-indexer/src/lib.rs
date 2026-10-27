@@ -202,15 +202,15 @@ pub async fn run() -> anyhow::Result<()> {
     // may write the chain, no other instance may. prepare runs under it —
     // the lease is a parameter there, so a version-bump replay cannot race a
     // still-running older pod.
-    let mut writer = store.acquire_writer().await?;
-    store.prepare(&writer, contract, escrow).await?;
-    store.set_chain_names(&writer, &config.chain_names).await?;
+    let mut lease = store.acquire_writer().await?;
+    let writer = store.prepare(&lease, contract, escrow).await?;
+    store.set_chain_names(&lease, &config.chain_names).await?;
 
     let cancel = CancellationToken::new();
     // Startup's own connection: every session of the loop opens its own.
     drop(provider);
     let indexer = indexer::Indexer::new(
-        store,
+        writer,
         config.rpc_url,
         indexer::IndexerConfig {
             contract,
@@ -239,14 +239,14 @@ pub async fn run() -> anyhow::Result<()> {
         },
         // Another instance may take the chain once the lock is gone, so this
         // one stops writing and exits for its supervisor to restart.
-        lost = writer.lost(config.poll_interval) => {
+        lost = lease.lost(config.poll_interval) => {
             cancel.cancel();
             let _ = task.await;
             return Err(anyhow::Error::new(lost).context("the writer lease was lost"));
         }
     };
     // The loop no longer writes: the chain is the next instance's.
-    writer.release().await?;
+    lease.release().await?;
     stopped
 }
 

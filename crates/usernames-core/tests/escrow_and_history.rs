@@ -987,10 +987,10 @@ async fn the_status_names_the_escrow_the_chain_was_indexed_from() {
         return;
     };
     let (registry, escrow) = (addr(0x11), addr(0x22));
-    let writer = suite.store.acquire_writer().await.expect("lease");
+    let lease = suite.store().acquire_writer().await.expect("lease");
     suite
-        .store
-        .prepare(&writer, registry, Some(escrow))
+        .store()
+        .prepare(&lease, registry, Some(escrow))
         .await
         .expect("prepare");
 
@@ -1002,7 +1002,7 @@ async fn the_status_names_the_escrow_the_chain_was_indexed_from() {
         .unwrap_or_else(|| panic!("chain {CHAIN} is listed: {status:?}"));
     assert_eq!(chain.escrow, Some(escrow));
     assert_eq!(chain.contract, Some(registry));
-    writer.release().await.expect("release");
+    lease.release().await.expect("release");
     suite.done();
 }
 
@@ -1014,18 +1014,18 @@ async fn another_escrow_replays_the_chain_and_the_same_one_keeps_it() {
     };
     let registry = addr(0x11);
     let (escrow, other_escrow) = (addr(0x22), addr(0x33));
-    let writer = suite.store.acquire_writer().await.expect("lease");
-    suite
-        .store
-        .prepare(&writer, registry, Some(escrow))
+    let lease = suite.store().acquire_writer().await.expect("lease");
+    let writer = suite
+        .store()
+        .prepare(&lease, registry, Some(escrow))
         .await
         .expect("prepare");
     let payer = addr(0xC0);
-    suite.apply(1, deposited("h1", NATIVE, payer, 1)).await;
+    common::apply(&writer, 1, deposited("h1", NATIVE, payer, 1)).await;
 
     suite
-        .store
-        .prepare(&writer, registry, Some(escrow))
+        .store()
+        .prepare(&lease, registry, Some(escrow))
         .await
         .expect("prepare again");
     let kept: Unclaimed = suite.get("/v1/escrow/unclaimed").await.answer();
@@ -1034,8 +1034,8 @@ async fn another_escrow_replays_the_chain_and_the_same_one_keeps_it() {
     // Another escrow clears the chain, cursor included: nothing is served
     // until the replay commits its first window.
     suite
-        .store
-        .prepare(&writer, registry, Some(other_escrow))
+        .store()
+        .prepare(&lease, registry, Some(other_escrow))
         .await
         .expect("prepare another");
     let refusal = suite
@@ -1046,7 +1046,7 @@ async fn another_escrow_replays_the_chain_and_the_same_one_keeps_it() {
         refusal,
         (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::NotSynced)
     );
-    writer.release().await.expect("release");
+    lease.release().await.expect("release");
     suite.done();
 }
 
@@ -1066,7 +1066,7 @@ async fn a_ceremony_and_a_fee_take_only_their_own_transactions_bind() {
         tx_hash: B256::repeat_byte(tx),
         block_time: 1_700_000_001,
     };
-    let mut window = suite.store.begin_window().await.expect("a window");
+    let mut window = suite.writer.begin_window().await.expect("a window");
     for (log_index, event) in (0u64..).zip(bind(alice, X, "111", "ann_1", 1_000, true)) {
         window
             .apply(&event, &at(log_index, 0x0A))
@@ -1274,7 +1274,7 @@ async fn a_refund_releasing_less_than_was_booked_fails_the_window() {
         tx_hash: B256::repeat_byte(0x02),
         block_time: 1_700_000_002,
     };
-    let mut window = suite.store.begin_window().await.expect("a window");
+    let mut window = suite.writer.begin_window().await.expect("a window");
     let refused = window.apply(&refunded("short", dave, 0, 5), &at).await;
     assert!(
         matches!(refused, Err(ApplyError::Books { .. })),

@@ -73,7 +73,7 @@ struct Harness {
     libid: Libid,
     cancel: CancellationToken,
     indexer: JoinHandle<()>,
-    writer: WriterLease,
+    lease: WriterLease,
 }
 
 impl Harness {
@@ -95,15 +95,15 @@ impl Harness {
         let libid = Libid::deploy(&node.provider, node.accounts()[0]).await;
         let (registry, escrow) = (*libid.registry.address(), *libid.escrow.address());
 
-        let writer = store.acquire_writer().await.expect("writer lease");
-        store
-            .prepare(&writer, registry, Some(escrow))
+        let lease = store.acquire_writer().await.expect("writer lease");
+        let writer = store
+            .prepare(&lease, registry, Some(escrow))
             .await
             .expect("prepare");
         let cancel = CancellationToken::new();
         let indexer = tokio::spawn(
             indexer::Indexer::new(
-                store.clone(),
+                writer,
                 node.rpc(),
                 indexer::IndexerConfig {
                     contract: registry,
@@ -127,7 +127,7 @@ impl Harness {
             libid,
             cancel,
             indexer,
-            writer,
+            lease,
         })
     }
 
@@ -135,7 +135,7 @@ impl Harness {
     async fn close(self) {
         self.cancel.cancel();
         let _ = self.indexer.await;
-        self.writer.release().await.expect("the lease releases");
+        self.lease.release().await.expect("the lease releases");
     }
 
     /// The answer to one GET on the read API, scoped to this chain.

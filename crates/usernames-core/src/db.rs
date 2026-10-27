@@ -1,8 +1,9 @@
 //! Postgres, behind types that carry the invariants.
 //!
 //! [`ChainStore`] fuses the pool with the chain it scopes every query to, so
-//! no call site can pass the wrong chain id or forget it. [`Window`] is an
-//! open window: applying events and committing-with-cursor are its only
+//! no call site can pass the wrong chain id or forget it. [`ChainWriter`] is
+//! the right to write one chain, which only a prepare under the writer lease
+//! hands out. [`Window`] is an open window: applying events and committing-with-cursor are its only
 //! operations, which makes "the cursor and the writes it stands for commit
 //! together or not at all" a fact of the type rather than caller discipline.
 //! The journal's `(chain, block, log)` conflict gates every write in
@@ -294,6 +295,21 @@ pub enum ChainNamesError {
     Db(#[from] sqlx::Error),
 }
 
+/// Why a window could not open.
+#[derive(Debug, thiserror::Error)]
+pub enum WindowError {
+    /// A later prepare named another writer in the chain's row: this one's
+    /// lease was lost, and the chain is the other writer's.
+    #[error("chain {chain_id} was prepared by a newer writer")]
+    Superseded {
+        /// The chain.
+        chain_id: i64,
+    },
+    /// The database refused or the connection failed.
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
 /// A held per-chain writer lease. One process indexes one chain at a time:
 /// the Postgres advisory lock lives on this dedicated connection for the
 /// process's lifetime, so a second instance — a rolling-deploy overlap, a
@@ -410,7 +426,9 @@ impl ChainStore {
     ///
     /// The lease parameter is the safety argument in the signature: without
     /// the chain's writer lock, the check-clear-stamp sequence could race a
-    /// still-running older instance.
+    /// still-running older instance. The writer it returns is the next
+    /// generation in the chain's row, so whatever an earlier writer still
+    /// tries to write after its lease was lost lands nowhere.
     ///
     /// A lease for a DIFFERENT chain is a hard panic, not a debug assert:
     /// proceeding would clear this chain's rows without the lock that makes
@@ -419,21 +437,40 @@ impl ChainStore {
     /// not bad input.
     pub async fn prepare(
         &self,
-        writer: &WriterLease,
+        lease: &WriterLease,
         contract: Address,
         escrow: Option<Address>,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<ChainWriter, sqlx::Error> {
         assert_eq!(
-            writer.chain_id, self.chain_id,
+            lease.chain_id, self.chain_id,
             "writer lease locks chain {}, but this store prepares chain {}",
-            writer.chain_id, self.chain_id
+            lease.chain_id, self.chain_id
         );
-        let known = self.state().await?;
+        let mut tx = self.pool.begin().await?;
+        let previous: Option<i64> = sqlx::query_scalar(sql::LOCK_CHAIN)
+            .bind(self.chain_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let writer = ChainWriter {
+            store: self.clone(),
+            writer: previous.map_or(1, |previous| previous + 1),
+        };
+        let known: ChainState = sqlx::query_as(sql::CHAIN_STATE)
+            .bind(self.chain_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .unwrap_or_default();
         if known.indexer_version.as_deref() == Some(INDEXER_VERSION)
             && known.contract == Some(contract)
             && known.escrow == escrow
         {
-            return Ok(());
+            sqlx::query(sql::CLAIM_CHAIN)
+                .bind(self.chain_id)
+                .bind(writer.writer)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            return Ok(writer);
         }
         tracing::warn!(
             chain_id = self.chain_id,
@@ -445,7 +482,6 @@ impl ChainStore {
             escrow_to = ?escrow,
             "read-model shape or a watched contract changed; clearing this chain for a full replay"
         );
-        let mut tx = self.pool.begin().await?;
         sqlx::query(sql::CLEAR_CHAIN)
             .bind(self.chain_id)
             .execute(&mut *tx)
@@ -459,6 +495,7 @@ impl ChainStore {
         let deploy_block = known.deploy_block_of(contract);
         sqlx::query(sql::RESET_CHAIN)
             .bind(self.chain_id)
+            .bind(writer.writer)
             .bind(INDEXER_VERSION)
             .bind(contract)
             .bind(escrow)
@@ -471,78 +508,7 @@ impl ChainStore {
             version = INDEXER_VERSION,
             "replay armed; starts next cycle"
         );
-        Ok(())
-    }
-
-    /// Record how far the chain itself has grown; `/v1/status` reports the
-    /// gap between this and the cursor as lag. Best effort, outside any
-    /// window.
-    pub async fn set_chain_head(&self, head: u64) {
-        let written = sqlx::query(sql::SET_CHAIN_HEAD)
-            .bind(self.chain_id)
-            .bind(i64::try_from(head).unwrap_or(i64::MAX))
-            .execute(&self.pool)
-            .await;
-        if let Err(e) = written {
-            tracing::warn!(%e, "failed to record the chain head");
-        }
-    }
-
-    /// Record the block the cursor is actually chasing: the head minus the
-    /// confirmation depth.
-    ///
-    /// Separate from [`Self::set_chain_head`] because the two answer different
-    /// questions. The head is how far the CHAIN has grown, which is what
-    /// `/v1/status` reports. This is how far the indexer INTENDS to get, and
-    /// it is the only honest thing to measure a cursor against: the cursor is
-    /// never advanced past it, so a fully caught-up index sits exactly here
-    /// and `CONFIRMATIONS` blocks behind the head. Comparing the cursor to the
-    /// head instead makes a healthy index look permanently late by the
-    /// confirmation depth.
-    ///
-    /// Record the target, when it was reported, and how long readers may
-    /// trust that report — `valid_for` from now, by the database's clock. One statement, so the three cannot disagree: a report must
-    /// never vouch for a target write that failed, and no host's clock
-    /// enters into it.
-    ///
-    /// Returns whether the write landed, so a caller renewing the report
-    /// later in the same cycle can decline to vouch for a target that never
-    /// made it.
-    pub async fn set_chain_target(&self, target: u64, valid_for: Duration) -> bool {
-        let written = sqlx::query(sql::SET_CHAIN_TARGET)
-            .bind(self.chain_id)
-            .bind(i64::try_from(target).unwrap_or(i64::MAX))
-            .bind(Self::valid_for_bind(valid_for))
-            .execute(&self.pool)
-            .await;
-        match written {
-            Ok(_) => true,
-            Err(e) => {
-                tracing::warn!(%e, "failed to record the chain target");
-                false
-            }
-        }
-    }
-
-    /// Renew the report without moving the target. A long catch-up commits
-    /// chunk by chunk under one target, and every committed chunk is proof
-    /// that the loop is alive and the chain reachable; without this a healthy
-    /// backfill would expire.
-    pub async fn touch_chain_target(&self, valid_for: Duration) {
-        let touched = sqlx::query(sql::TOUCH_CHAIN_TARGET)
-            .bind(self.chain_id)
-            .bind(Self::valid_for_bind(valid_for))
-            .execute(&self.pool)
-            .await;
-        if let Err(e) = touched {
-            tracing::warn!(%e, "failed to renew the chain target's report");
-        }
-    }
-
-    /// The validity the store will write for a report, in the whole seconds
-    /// the SQL adds to its clock.
-    fn valid_for_bind(valid_for: Duration) -> i64 {
-        i64::try_from(valid_for.as_secs()).unwrap_or(i64::MAX)
+        Ok(writer)
     }
 
     /// Declare the names this chain goes by in an ENS name, replacing whatever
@@ -599,8 +565,8 @@ impl ChainStore {
 
     /// Set when the report expires, as absolute Unix seconds: how a suite
     /// stands up an indexer that stopped reporting. Production writes
-    /// validity through [`Self::set_chain_target`] and
-    /// [`Self::touch_chain_target`], relative to the database's clock.
+    /// validity through [`ChainWriter::set_chain_target`] and
+    /// [`ChainWriter::touch_chain_target`], relative to the database's clock.
     #[cfg(feature = "test-seams")]
     pub async fn set_chain_target_valid_until(&self, secs: u64) {
         sqlx::query(sql::SET_VALID_UNTIL)
@@ -640,24 +606,9 @@ impl ChainStore {
     /// Where the index stands, in one read: the target, the cursor, when the
     /// indexer last reported and how long that report is still good — the
     /// last by the database's clock, the same one that stamped it. One
-    /// statement, so the four are a snapshot and one round trip on the
-    /// gateway's hot path.
+    /// statement, so the four are a snapshot.
     pub async fn index_position(&self) -> Result<IndexPosition, sqlx::Error> {
         Ok(self.state().await?.position())
-    }
-
-    /// Record (or clear, with `None`) the last window failure, so a stalled
-    /// loop is visible in `/v1/status` instead of only in the logs. Best
-    /// effort.
-    pub async fn set_window_error(&self, error: Option<&str>) {
-        let written = sqlx::query(sql::SET_WINDOW_ERROR)
-            .bind(self.chain_id)
-            .bind(error)
-            .execute(&self.pool)
-            .await;
-        if let Err(e) = written {
-            tracing::warn!(%e, "failed to record the window error state");
-        }
     }
 
     /// The last fully-processed block, if any window ever committed.
@@ -673,26 +624,153 @@ impl ChainStore {
     ) -> Result<Option<u64>, sqlx::Error> {
         Ok(block(self.state().await?.deploy_block_of(contract)))
     }
+}
+
+/// The right to write one chain, from [`ChainStore::prepare`]. The chain's
+/// row names the writer generation that prepared it last, and a write lands
+/// only while the row names this one: an instance whose lease was lost
+/// cannot write over the chain of the instance that took it.
+#[derive(Clone)]
+pub struct ChainWriter {
+    store: ChainStore,
+    /// The generation `prepare` wrote into the chain's row.
+    writer: i64,
+}
+
+impl ChainWriter {
+    /// The chain this writer writes, for reading it.
+    pub fn store(&self) -> &ChainStore {
+        &self.store
+    }
+
+    /// Record how far the chain itself has grown; `/v1/status` reports the
+    /// gap between this and the cursor as lag. Best effort, outside any
+    /// window.
+    pub async fn set_chain_head(&self, head: u64) {
+        let written = sqlx::query(sql::SET_CHAIN_HEAD)
+            .bind(self.store.chain_id)
+            .bind(self.writer)
+            .bind(i64::try_from(head).unwrap_or(i64::MAX))
+            .execute(&self.store.pool)
+            .await;
+        if let Err(e) = written {
+            tracing::warn!(%e, "failed to record the chain head");
+        }
+    }
+
+    /// Record the block the cursor is actually chasing: the head minus the
+    /// confirmation depth.
+    ///
+    /// Separate from [`Self::set_chain_head`] because the two answer different
+    /// questions. The head is how far the CHAIN has grown, which is what
+    /// `/v1/status` reports. This is how far the indexer INTENDS to get, and
+    /// it is the only honest thing to measure a cursor against: the cursor is
+    /// never advanced past it, so a fully caught-up index sits exactly here
+    /// and `CONFIRMATIONS` blocks behind the head. Comparing the cursor to the
+    /// head instead makes a healthy index look permanently late by the
+    /// confirmation depth.
+    ///
+    /// Record the target, when it was reported, and how long readers may
+    /// trust that report — `valid_for` from now, by the database's clock.
+    /// One statement, so the three cannot disagree: a report must never
+    /// vouch for a target write that failed, and no host's clock enters
+    /// into it.
+    ///
+    /// Returns whether the write landed, so a caller renewing the report
+    /// later in the same cycle can decline to vouch for a target that never
+    /// made it.
+    pub async fn set_chain_target(&self, target: u64, valid_for: Duration) -> bool {
+        let written = sqlx::query(sql::SET_CHAIN_TARGET)
+            .bind(self.store.chain_id)
+            .bind(self.writer)
+            .bind(i64::try_from(target).unwrap_or(i64::MAX))
+            .bind(Self::valid_for_bind(valid_for))
+            .execute(&self.store.pool)
+            .await;
+        match written {
+            Ok(done) => done.rows_affected() == 1,
+            Err(e) => {
+                tracing::warn!(%e, "failed to record the chain target");
+                false
+            }
+        }
+    }
+
+    /// Renew the report without moving the target. A long catch-up commits
+    /// chunk by chunk under one target, and every committed chunk is proof
+    /// that the loop is alive and the chain reachable; without this a healthy
+    /// backfill would expire.
+    pub async fn touch_chain_target(&self, valid_for: Duration) {
+        let touched = sqlx::query(sql::TOUCH_CHAIN_TARGET)
+            .bind(self.store.chain_id)
+            .bind(self.writer)
+            .bind(Self::valid_for_bind(valid_for))
+            .execute(&self.store.pool)
+            .await;
+        if let Err(e) = touched {
+            tracing::warn!(%e, "failed to renew the chain target's report");
+        }
+    }
+
+    /// The validity the store will write for a report, in the whole seconds
+    /// the SQL adds to its clock.
+    fn valid_for_bind(valid_for: Duration) -> i64 {
+        i64::try_from(valid_for.as_secs()).unwrap_or(i64::MAX)
+    }
+
+    /// Record (or clear, with `None`) the last window failure, so a stalled
+    /// loop is visible in `/v1/status` instead of only in the logs. Best
+    /// effort.
+    pub async fn set_window_error(&self, error: Option<&str>) {
+        let written = sqlx::query(sql::SET_WINDOW_ERROR)
+            .bind(self.store.chain_id)
+            .bind(self.writer)
+            .bind(error)
+            .execute(&self.store.pool)
+            .await;
+        if let Err(e) = written {
+            tracing::warn!(%e, "failed to record the window error state");
+        }
+    }
 
     /// Cache a detected deployment block so a re-index does not redo the
     /// binary search. The chain's row names the contract it belongs to.
     pub async fn set_deploy_block(&self, block: u64) -> Result<(), sqlx::Error> {
         sqlx::query(sql::SET_DEPLOY_BLOCK)
-            .bind(self.chain_id)
+            .bind(self.store.chain_id)
+            .bind(self.writer)
             .bind(i64::try_from(block).unwrap_or(i64::MAX))
-            .execute(&self.pool)
+            .execute(&self.store.pool)
             .await?;
         Ok(())
     }
 
     /// Open a window. Everything applied through it commits atomically
     /// with the cursor when [`Window::commit`] runs, or not at all.
-    pub async fn begin_window(&self) -> Result<Window, sqlx::Error> {
+    pub async fn begin_window(&self) -> Result<Window, WindowError> {
+        let chain_id = self.store.chain_id;
+        let mut tx = self.store.pool.begin().await?;
+        let held: Option<bool> = sqlx::query_scalar(sql::HOLD_CHAIN)
+            .bind(chain_id)
+            .bind(self.writer)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if held.is_none() {
+            return Err(WindowError::Superseded { chain_id });
+        }
         Ok(Window {
-            tx: self.pool.begin().await?,
-            chain_id: self.chain_id,
+            tx,
+            chain_id,
             bind: None,
         })
+    }
+}
+
+#[cfg(test)]
+impl ChainWriter {
+    /// A writer no chain's row names, so nothing it writes lands.
+    pub(crate) fn unprepared(store: ChainStore) -> Self {
+        Self { store, writer: 0 }
     }
 }
 
@@ -1203,7 +1281,10 @@ mod sql {
     pub const CHAIN_STATE: &str = include_str!("../sql/chain_state.sql");
     pub const CHAIN_STATUSES: &str = include_str!("../sql/chain_statuses.sql");
     pub const INDEXED_CHAINS: &str = include_str!("../sql/indexed_chains.sql");
+    pub const LOCK_CHAIN: &str = include_str!("../sql/lock_chain.sql");
+    pub const CLAIM_CHAIN: &str = include_str!("../sql/claim_chain.sql");
     pub const RESET_CHAIN: &str = include_str!("../sql/reset_chain.sql");
+    pub const HOLD_CHAIN: &str = include_str!("../sql/hold_chain.sql");
     pub const SET_CURSOR: &str = include_str!("../sql/set_cursor.sql");
     pub const SET_CHAIN_HEAD: &str = include_str!("../sql/set_chain_head.sql");
     pub const SET_DEPLOY_BLOCK: &str = include_str!("../sql/set_deploy_block.sql");

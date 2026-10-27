@@ -112,19 +112,19 @@ async fn gateway_parts(
     // production, and previously invisible here because "unknown" was read as
     // "fresh".
     for id in chains {
-        let store = ChainStore::new(pool.clone(), *id);
-        store
+        let writer = writer(&ChainStore::new(pool.clone(), *id)).await;
+        writer
             .begin_window()
             .await
             .expect("begin")
             .commit(1)
             .await
             .expect("commit");
-        store.set_chain_head(1).await;
+        writer.set_chain_head(1).await;
         // The gate measures the cursor against the TARGET — what the indexer
         // intends to reach — not the raw head, so a fixture that records only
         // the head reads as "cannot tell" and refuses every query.
-        store.set_chain_target(1, Duration::from_secs(120)).await;
+        writer.set_chain_target(1, Duration::from_secs(120)).await;
     }
 
     let store = ChainStore::new(pool.clone(), chains[0]);
@@ -540,7 +540,8 @@ async fn a_stale_index_refuses_rather_than_signing_a_null() {
     bind(&store, "alice", Address::from([0xbe; 20])).await;
     // Far ahead of the cursor, as the TARGET: that is the quantity the gate
     // compares, and the head alone no longer moves it.
-    store
+    writer(&store)
+        .await
         .set_chain_target(10_000, Duration::from_secs(120))
         .await;
 
@@ -787,7 +788,7 @@ async fn a_chain_that_appears_in_the_store_is_served_without_a_restart() {
     );
 
     // An indexer for it commits its first window and reports.
-    let other = ChainStore::new(pool.clone(), OTHER);
+    let other = writer(&ChainStore::new(pool.clone(), OTHER)).await;
     other
         .begin_window()
         .await
@@ -798,7 +799,7 @@ async fn a_chain_that_appears_in_the_store_is_served_without_a_restart() {
     other.set_chain_head(1).await;
     other.set_chain_target(1, Duration::from_secs(120)).await;
     let there = Address::from([0xed; 20]);
-    bind(&other, "alice", there).await;
+    bind(other.store(), "alice", there).await;
 
     // The same router, untouched, now answers for it.
     let (status, body) = ask(&router, RESOLVER, &call).await;

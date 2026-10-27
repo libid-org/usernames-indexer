@@ -41,7 +41,7 @@ use self::{
 };
 use crate::{
     chain,
-    db::ChainStore,
+    db::ChainWriter,
     events::{
         self,
         DecodeError,
@@ -51,7 +51,7 @@ use crate::{
 };
 
 /// The loop's knobs, resolved by the CLI. The chain itself is carried by the
-/// [`ChainStore`] the [`Indexer`] is built over.
+/// [`ChainWriter`] the [`Indexer`] is built over.
 #[derive(Debug, Clone)]
 pub struct IndexerConfig {
     /// The IdentityRegistry ERC1967 proxy — the address to watch. The
@@ -98,10 +98,11 @@ impl IndexerConfig {
     }
 }
 
-/// One chain's indexer: the store, the RPC endpoint and the knobs fused, so
-/// the loop's operations take only what actually varies between calls.
+/// One chain's indexer: the chain's writer, the RPC endpoint and the knobs
+/// fused, so the loop's operations take only what actually varies between
+/// calls.
 pub struct Indexer {
-    store: ChainStore,
+    writer: ChainWriter,
     rpc: Url,
     config: IndexerConfig,
     filter: Filter,
@@ -110,13 +111,13 @@ pub struct Indexer {
 impl Indexer {
     /// Build the indexer; the log filter is derived from the watched contracts
     /// once, here, instead of at every fetch.
-    pub fn new(store: ChainStore, rpc: Url, config: IndexerConfig) -> Self {
+    pub fn new(writer: ChainWriter, rpc: Url, config: IndexerConfig) -> Self {
         let watched: Vec<Address> = std::iter::once(config.contract)
             .chain(config.escrow)
             .collect();
         let filter = Filter::new().address(watched);
         Self {
-            store,
+            writer,
             rpc,
             config,
             filter,
@@ -150,7 +151,7 @@ impl Indexer {
     /// replayed journal rows are skipped by the window and not counted, so
     /// the caller's log line stays honest.
     async fn commit(&self, logs: &[Log], through: u64) -> anyhow::Result<usize> {
-        let mut window = self.store.begin_window().await?;
+        let mut window = self.writer.begin_window().await?;
         let mut applied = 0usize;
         for log in logs {
             match self.decode(log) {
@@ -196,7 +197,7 @@ impl Indexer {
         tracing::info!(
             contract = %self.config.contract,
             escrow = ?self.config.escrow,
-            chain_id = self.store.chain_id(),
+            chain_id = self.writer.store().chain_id(),
             confirmations = self.config.confirmations,
             source = %self.config.source,
             "usernames indexer starting"
@@ -211,7 +212,7 @@ impl Indexer {
                 // undecodable log, say) stalls the cursor by design —
                 // integrity over progress — and a stall must be visible
                 // somewhere a monitor actually looks.
-                self.store.set_window_error(Some(&error)).await;
+                self.writer.set_window_error(Some(&error)).await;
                 sleep_or_cancel(&cancel, self.config.poll_interval).await;
             }
         }
@@ -293,8 +294,8 @@ impl<'a> Session<'a> {
         // A reader measuring staleness must use the second — the cursor is
         // never advanced past it.
         let ((), vouched) = tokio::join!(
-            indexer.store.set_chain_head(head),
-            indexer.store.set_chain_target(target, config.stale_after)
+            indexer.writer.set_chain_head(head),
+            indexer.writer.set_chain_target(target, config.stale_after)
         );
 
         let mut total = 0usize;
@@ -304,12 +305,12 @@ impl<'a> Session<'a> {
             // is the slow part, and a report expiring during it would refuse
             // a loop that is busy catching up.
             if vouched {
-                indexer.store.touch_chain_target(config.stale_after).await;
+                indexer.writer.touch_chain_target(config.stale_after).await;
             }
             total += self.commit_fetched(from, to).await?;
             from = to + 1;
         }
-        indexer.store.set_window_error(None).await;
+        indexer.writer.set_window_error(None).await;
         if total > 0 {
             tracing::info!(events = total, through_block = target, "indexed");
         }
@@ -344,9 +345,9 @@ impl<'a> Session<'a> {
             }
         }
         tokio::join!(
-            indexer.store.set_chain_head(head),
-            indexer.store.set_chain_target(target, config.stale_after),
-            indexer.store.set_window_error(None),
+            indexer.writer.set_chain_head(head),
+            indexer.writer.set_chain_target(target, config.stale_after),
+            indexer.writer.set_window_error(None),
         );
         Ok(())
     }
@@ -389,7 +390,8 @@ impl<'a> Session<'a> {
     async fn next_block(&self) -> anyhow::Result<u64> {
         match self
             .indexer
-            .store
+            .writer
+            .store()
             .cursor()
             .await
             .context("reading the cursor")?
@@ -414,7 +416,7 @@ impl<'a> Session<'a> {
         if let Some(block) = indexer.config.start_block {
             return Some(block);
         }
-        match indexer.store.deploy_block(contract).await {
+        match indexer.writer.store().deploy_block(contract).await {
             Ok(Some(block)) => return Some(block),
             Ok(None) => {}
             Err(e) => tracing::warn!(%e, "failed to read the cached deployment block"),
@@ -429,7 +431,7 @@ impl<'a> Session<'a> {
         match chain::find_deployment_block(&self.provider, contract, latest).await {
             Ok(Some(block)) => {
                 tracing::info!(block, "detected contract deployment block");
-                if let Err(e) = indexer.store.set_deploy_block(block).await {
+                if let Err(e) = indexer.writer.set_deploy_block(block).await {
                     tracing::warn!(%e, "failed to cache the deployment block");
                 }
                 Some(block)
@@ -464,12 +466,13 @@ mod tests {
     use sqlx::PgPool;
 
     use super::*;
+    use crate::db::ChainStore;
 
     #[tokio::test]
     async fn a_stored_error_names_the_rpc_url_by_its_setting() {
         let pool = PgPool::connect_lazy("postgres://localhost/unused").unwrap();
         let indexer = Indexer::new(
-            ChainStore::new(pool, 1),
+            ChainWriter::unprepared(ChainStore::new(pool, 1)),
             "https://eth-mainnet.g.alchemy.com/v2/secret"
                 .parse()
                 .unwrap(),

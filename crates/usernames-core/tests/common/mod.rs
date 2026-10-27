@@ -47,6 +47,7 @@ use usernames_core::{
     db::{
         self,
         ChainStore,
+        ChainWriter,
         Store,
     },
     events::{
@@ -88,7 +89,8 @@ pub fn anvil_available() -> bool {
 /// an earlier run left there, and held under the suite's lock until
 /// [`Suite::done`].
 pub struct Suite {
-    pub store: ChainStore,
+    /// The right to write the suite's chain, from [`writer`].
+    pub writer: ChainWriter,
     pub pool: PgPool,
     lock: MutexGuard<'static, ()>,
 }
@@ -104,25 +106,30 @@ impl Suite {
         db::MIGRATOR.run(&pool).await.expect("migrations failed");
         clear_chain(&pool, chain).await;
         Some(Self {
-            store: ChainStore::new(pool.clone(), chain),
+            writer: writer(&ChainStore::new(pool.clone(), chain)).await,
             pool,
             lock,
         })
     }
 
+    /// The suite's chain.
+    pub fn store(&self) -> &ChainStore {
+        self.writer.store()
+    }
+
     /// [`apply_tx`] on the suite's chain.
     pub async fn apply_tx(&self, block: u64, events: Vec<NamesEvent>) {
-        apply_tx(&self.store, block, events).await;
+        apply_tx(&self.writer, block, events).await;
     }
 
     /// [`apply`] on the suite's chain.
     pub async fn apply(&self, block: u64, event: NamesEvent) {
-        apply(&self.store, block, event).await;
+        apply(&self.writer, block, event).await;
     }
 
     /// One GET on the suite's chain.
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Reply<T> {
-        get_on(&self.pool, self.store.chain_id(), path).await
+        get_on(&self.pool, self.store().chain_id(), path).await
     }
 
     /// The test is done with the database; the suite's next test may take it.
@@ -137,11 +144,28 @@ pub async fn clear_chain(pool: &PgPool, chain: i64) {
     ChainStore::new(pool.clone(), chain).forget().await;
 }
 
+/// The registry a chain these suites write is prepared for.
+pub const REGISTRY: Address = Address::repeat_byte(0x1D);
+
+/// The right to write `store`'s chain, taken the way an indexer takes it at
+/// startup: under the chain's lease, prepared for [`REGISTRY`]. The lease
+/// goes back at once; the writer stays good until the chain is prepared
+/// again.
+pub async fn writer(store: &ChainStore) -> ChainWriter {
+    let lease = store.acquire_writer().await.expect("the writer lease");
+    let writer = store
+        .prepare(&lease, REGISTRY, None)
+        .await
+        .expect("the chain is prepared");
+    lease.release().await.expect("the lease goes back");
+    writer
+}
+
 /// Apply one transaction's events at `block`, in log order, and commit
 /// like a window. A block's time is its number past a constant, so a later
 /// block is later in time too.
-pub async fn apply_tx(store: &ChainStore, block: u64, events: Vec<NamesEvent>) {
-    let mut window = store.begin_window().await.expect("begin");
+pub async fn apply_tx(writer: &ChainWriter, block: u64, events: Vec<NamesEvent>) {
+    let mut window = writer.begin_window().await.expect("begin");
     for (log_index, event) in (0u64..).zip(events) {
         let pos = LogPosition {
             block_number: block,
@@ -155,8 +179,8 @@ pub async fn apply_tx(store: &ChainStore, block: u64, events: Vec<NamesEvent>) {
 }
 
 /// Apply one event alone in its block.
-pub async fn apply(store: &ChainStore, block: u64, event: NamesEvent) {
-    apply_tx(store, block, vec![event]).await;
+pub async fn apply(writer: &ChainWriter, block: u64, event: NamesEvent) {
+    apply_tx(writer, block, vec![event]).await;
 }
 
 /// The text the chain disclosed for the node on `chain`, when it did.

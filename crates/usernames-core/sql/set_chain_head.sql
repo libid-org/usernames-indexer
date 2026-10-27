@@ -1,2 +1,1 @@
-INSERT INTO names.chains (chain_id, head) VALUES ($1, $2)
-ON CONFLICT (chain_id) DO UPDATE SET head = EXCLUDED.head
+UPDATE names.chains SET head = $3 WHERE chain_id = $1 AND writer = $2

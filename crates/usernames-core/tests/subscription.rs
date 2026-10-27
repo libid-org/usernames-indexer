@@ -31,6 +31,7 @@ use usernames_core::{
     db::{
         self,
         ChainStore,
+        ChainWriter,
         IndexPosition,
         WriterLease,
     },
@@ -65,8 +66,8 @@ struct Chain {
     libid: Libid,
     relay: Relay,
     pool: PgPool,
-    store: ChainStore,
-    writer: WriterLease,
+    writer: ChainWriter,
+    lease: WriterLease,
 }
 
 /// The indexer task a test runs, and the token that stops it.
@@ -108,10 +109,10 @@ impl Chain {
         node.provider.anvil_mine(Some(8), None).await.expect("mine");
         let relay = Relay::start(node.ws()).await;
 
-        let writer = store.acquire_writer().await.expect("writer lease");
-        store
+        let lease = store.acquire_writer().await.expect("writer lease");
+        let writer = store
             .prepare(
-                &writer,
+                &lease,
                 *libid.registry.address(),
                 Some(*libid.escrow.address()),
             )
@@ -122,8 +123,8 @@ impl Chain {
             libid,
             relay,
             pool,
-            store,
             writer,
+            lease,
         })
     }
 
@@ -145,7 +146,7 @@ impl Chain {
     /// Run the indexer over the relay.
     fn run(&self, config: IndexerConfig) -> Running {
         let cancel = CancellationToken::new();
-        let indexer = Indexer::new(self.store.clone(), self.relay.url(), config);
+        let indexer = Indexer::new(self.writer.clone(), self.relay.url(), config);
         let task = tokio::spawn(indexer.run(cancel.clone()));
         Running { cancel, task }
     }
@@ -186,7 +187,11 @@ impl Chain {
 
     /// Where the index stands.
     async fn position(&self) -> IndexPosition {
-        self.store.index_position().await.expect("position")
+        self.writer
+            .store()
+            .index_position()
+            .await
+            .expect("position")
     }
 
     /// Wait until the index stands at `block` or past it: the cursor
@@ -211,7 +216,7 @@ impl Chain {
     async fn resolve(&self, handle: &str) -> Result<Address, StatusCode> {
         let reply = common::get_on::<HandleResolution>(
             &self.pool,
-            self.store.chain_id(),
+            self.writer.store().chain_id(),
             &format!("/v1/resolve/handle/x/{handle}"),
         )
         .await;
@@ -226,7 +231,7 @@ impl Chain {
     async fn history(&self, handle: &str) -> Vec<(u64, HistoryEvent)> {
         let history: HandleHistory = common::get_on(
             &self.pool,
-            self.store.chain_id(),
+            self.writer.store().chain_id(),
             &format!("/v1/history/handle/x/{handle}"),
         )
         .await
@@ -252,7 +257,7 @@ impl Chain {
     async fn stop(self, running: Running) {
         running.cancel.cancel();
         running.task.await.expect("the indexer stops cleanly");
-        self.writer.release().await.expect("the lease releases");
+        self.lease.release().await.expect("the lease releases");
     }
 }
 

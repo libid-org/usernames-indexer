@@ -1,4 +1,3 @@
 -- Writes only a change, so a healthy loop's every cycle writes nothing.
-INSERT INTO names.chains (chain_id, window_error) VALUES ($1, $2)
-ON CONFLICT (chain_id) DO UPDATE SET window_error = EXCLUDED.window_error
-WHERE names.chains.window_error IS DISTINCT FROM EXCLUDED.window_error
+UPDATE names.chains SET window_error = $3
+WHERE chain_id = $1 AND writer = $2 AND window_error IS DISTINCT FROM $3

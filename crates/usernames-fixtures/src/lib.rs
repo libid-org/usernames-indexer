@@ -13,8 +13,9 @@
 //! - [`addr_call`] and [`legacy_addr_call`]: the record request, in the
 //!   ENSIP-11 multichain form and in the older form that means coin type 60.
 //! - [`resolve_call`]: the wrapped call the gateway receives.
-//! - [`bind`] and [`bind_private`]: one binding written into the store the gateway answers from,
-//!   with its chain marked synced.
+//! - [`bind`] and [`bind_private`]: one binding written into the store the
+//!   gateway answers from, with its chain marked synced.
+//! - [`writer`]: the right to write a chain, as an indexer takes it.
 //!
 //! `gateway.rs` drives the router in process with these; `end_to_end.rs`
 //! deploys the real `HandleResolver` on anvil and walks the protocol with
@@ -44,7 +45,10 @@ use alloy::{
     sol_types::SolCall,
 };
 use usernames_core::{
-    db::ChainStore,
+    db::{
+        ChainStore,
+        ChainWriter,
+    },
     ens::Name,
     events::{
         LogPosition,
@@ -128,6 +132,23 @@ pub async fn bind(store: &ChainStore, handle: &str, holder: Address) {
     seed(store, handle, holder, true).await;
 }
 
+/// The registry a chain these fixtures write is prepared for.
+pub const REGISTRY: Address = Address::repeat_byte(0x1D);
+
+/// The right to write `store`'s chain, taken the way an indexer takes it at
+/// startup: under the chain's lease, prepared for [`REGISTRY`]. The lease
+/// goes back at once; the writer stays good until the chain is prepared
+/// again.
+pub async fn writer(store: &ChainStore) -> ChainWriter {
+    let lease = store.acquire_writer().await.expect("the writer lease");
+    let writer = store
+        .prepare(&lease, REGISTRY, None)
+        .await
+        .expect("the chain is prepared");
+    lease.release().await.expect("the lease goes back");
+    writer
+}
+
 /// [`bind`] without the `HandleRevealed` and `HandlePublished`: a private
 /// binding.
 pub async fn bind_private(store: &ChainStore, handle: &str, holder: Address) {
@@ -157,7 +178,8 @@ async fn seed(store: &ChainStore, handle: &str, holder: Address, disclosed: bool
             handle_node,
         });
     }
-    let mut window = store.begin_window().await.expect("begin");
+    let writer = writer(store).await;
+    let mut window = writer.begin_window().await.expect("begin");
     for (log_index, event) in (0u64..).zip(&events) {
         window
             .apply(
@@ -177,6 +199,6 @@ async fn seed(store: &ChainStore, handle: &str, holder: Address, disclosed: bool
     // from an index that cannot say how far behind it is. Staleness is measured
     // against the TARGET — the block the cursor chases — so that is the one a
     // fixture must record.
-    store.set_chain_head(1).await;
-    store.set_chain_target(1, Duration::from_secs(120)).await;
+    writer.set_chain_head(1).await;
+    writer.set_chain_target(1, Duration::from_secs(120)).await;
 }
