@@ -75,32 +75,45 @@ const OTHER_CHAIN: i64 = 31338;
 
 static DB_LOCK: Mutex<()> = Mutex::const_new(());
 
-async fn test_store() -> Option<(ChainStore, PgPool, MutexGuard<'static, ()>)> {
-    test_store_with(1).await
+/// The suite's two chains in the database the suites share: emptied of
+/// whatever an earlier run left there, and held under the suite's lock until
+/// [`Chains::done`]. Scoped to the suite's own chains, so no suite depends on
+/// cargo running test binaries one at a time.
+struct Chains {
+    /// The suite's chain.
+    store: ChainStore,
+    /// The database the suites share.
+    pool: PgPool,
+    lock: MutexGuard<'static, ()>,
 }
 
-/// The same, with room for more than one connection.
-///
-/// Not needed by the lease any more — it opens its own session outside the pool
-/// precisely so it cannot starve one — but kept for a test that wants
-/// concurrent queries of its own.
-async fn test_store_with(
-    max_connections: u32,
-) -> Option<(ChainStore, PgPool, MutexGuard<'static, ()>)> {
-    let guard = DB_LOCK.lock().await;
-    let url = database_url()?;
-    let pool = PgPoolOptions::new()
-        .max_connections(max_connections)
-        .connect(&url)
-        .await
-        .expect("DATABASE_URL is set but connecting failed");
-    db::MIGRATOR.run(&pool).await.expect("migrations failed");
-    // Scoped to this suite's chain, like the anvil suite scopes to its own:
-    // neither depends on cargo happening to run test binaries sequentially.
-    for chain in [CHAIN, OTHER_CHAIN] {
-        ChainStore::new(pool.clone(), chain).forget().await;
+impl Chains {
+    /// The suite's chains, emptied, over a pool of `connections`; `None`
+    /// when `DATABASE_URL` is unset.
+    async fn open(connections: u32) -> Option<Self> {
+        let lock = DB_LOCK.lock().await;
+        let url = database_url()?;
+        let pool = PgPoolOptions::new()
+            .max_connections(connections)
+            .connect(&url)
+            .await
+            .expect("DATABASE_URL is set but connecting failed");
+        db::MIGRATOR.run(&pool).await.expect("migrations failed");
+        for chain in [CHAIN, OTHER_CHAIN] {
+            ChainStore::new(pool.clone(), chain).forget().await;
+        }
+        Some(Self {
+            store: ChainStore::new(pool.clone(), CHAIN),
+            pool,
+            lock,
+        })
     }
-    Some((ChainStore::new(pool.clone(), CHAIN), pool, guard))
+
+    /// The test is done with the database; the suite's next test may take it.
+    fn done(self) {
+        let Self { lock, .. } = self;
+        drop(lock);
+    }
 }
 
 /// The one item a list holds in these single-chain scenarios.
@@ -215,18 +228,19 @@ impl Seeded for ChainWriter {
 
 #[tokio::test]
 async fn bind_resolves_all_three_directions() {
-    let Some((store, pool, guard)) = test_store().await else {
+    let Some(chains) = Chains::open(1).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = store.writer().await;
+    let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     let alice = Address::repeat_byte(0xA1);
     writer
         .apply_tx(1, NamesEvent::bind(alice, x, "111", "alice_1", 1000, true))
         .await;
 
-    let resolved: HandleResolution = pool
+    let resolved: HandleResolution = chains
+        .pool
         .get_on(CHAIN, "/v1/resolve/handle/x/alice_1")
         .await
         .answer();
@@ -238,20 +252,23 @@ async fn bind_resolves_all_three_directions() {
     assert_eq!(binding.ceremony_version, 1);
 
     // The path is hashed the way the circuit hashed it: case folds.
-    let resolved: HandleResolution = pool
+    let resolved: HandleResolution = chains
+        .pool
         .get_on(CHAIN, "/v1/resolve/handle/x/Alice_1")
         .await
         .answer();
     assert_eq!(resolved.handle_node, x.handle_node("alice_1").unwrap());
     assert_eq!(resolved.platform, Some(KnownPlatform::X));
 
-    let resolved: IdResolution = pool.get_on(CHAIN, &x.id_route("111")).await.answer();
+    let resolved: IdResolution =
+        chains.pool.get_on(CHAIN, &x.id_route("111")).await.answer();
     let binding = resolved.bindings.only();
     assert_eq!(binding.owner, alice);
     assert_eq!(binding.handle.as_deref(), Some("alice_1"));
     assert!(binding.published);
 
-    let resolved: AddressResolution = pool
+    let resolved: AddressResolution = chains
+        .pool
         .get_on(CHAIN, &format!("/v1/resolve/address/{alice}"))
         .await
         .answer();
@@ -259,16 +276,16 @@ async fn bind_resolves_all_three_directions() {
     assert_eq!(identity.handle.as_deref(), Some("alice_1"));
     assert!(identity.published);
     assert!(identity.resolves);
-    drop(guard);
+    chains.done();
 }
 
 #[tokio::test]
 async fn rename_retires_the_previous_handle() {
-    let Some((store, pool, guard)) = test_store().await else {
+    let Some(chains) = Chains::open(1).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = store.writer().await;
+    let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     let alice = Address::repeat_byte(0xA1);
     writer
@@ -284,19 +301,22 @@ async fn rename_retires_the_previous_handle() {
 
     // The code is the machine-readable half: a UI renders "retired"
     // differently from "never claimed" without parsing prose.
-    let refusal = pool
+    let refusal = chains
+        .pool
         .get_on::<HandleResolution>(CHAIN, "/v1/resolve/handle/x/alice_1")
         .await
         .refusal();
     assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::HandleRetired));
 
-    let resolved: HandleResolution = pool
+    let resolved: HandleResolution = chains
+        .pool
         .get_on(CHAIN, "/v1/resolve/handle/x/alice_2")
         .await
         .answer();
     assert_eq!(resolved.bindings.only().owner, alice);
 
-    let resolved: IdResolution = pool.get_on(CHAIN, &x.id_route("111")).await.answer();
+    let resolved: IdResolution =
+        chains.pool.get_on(CHAIN, &x.id_route("111")).await.answer();
     assert_eq!(resolved.bindings.only().handle.as_deref(), Some("alice_2"));
 
     // The retired node keeps its watermark, mirroring the contract's
@@ -306,20 +326,20 @@ async fn rename_retires_the_previous_handle() {
     )
     .bind(CHAIN)
     .bind(x.handle_node("alice_1").unwrap())
-    .fetch_one(&pool)
+    .fetch_one(&chains.pool)
     .await
     .expect("watermark row");
     assert_eq!(watermark, 1000);
-    drop(guard);
+    chains.done();
 }
 
 #[tokio::test]
 async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
-    let Some((store, pool, guard)) = test_store().await else {
+    let Some(chains) = Chains::open(1).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = store.writer().await;
+    let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     let (alice, bob) = (Address::repeat_byte(0xA1), Address::repeat_byte(0xB2));
     // Alice holds the handle, renames her platform account, re-proves under
@@ -333,7 +353,8 @@ async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
         .await;
 
     // The handle resolves to Bob now, paired with Bob's id.
-    let resolved: HandleResolution = pool
+    let resolved: HandleResolution = chains
+        .pool
         .get_on(CHAIN, "/v1/resolve/handle/x/popular")
         .await
         .answer();
@@ -343,11 +364,12 @@ async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
 
     // Alice's id still resolves to her wallet, but the handle is no longer
     // hers to display: the node points at Bob's id.
-    let resolved: IdResolution = pool.get_on(CHAIN, &x.id_route("111")).await.answer();
+    let resolved: IdResolution =
+        chains.pool.get_on(CHAIN, &x.id_route("111")).await.answer();
     let binding = resolved.bindings.only();
     assert_eq!(binding.owner, alice);
     assert_eq!(binding.handle, None);
-    drop(guard);
+    chains.done();
 }
 
 /// Another identity proving a handle withdraws its previous holder's name for
@@ -355,11 +377,11 @@ async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
 /// under the new holder, whether that bind disclosed it or not.
 #[tokio::test]
 async fn a_takeover_keeps_the_disclosed_text() {
-    let Some((store, pool, guard)) = test_store().await else {
+    let Some(chains) = Chains::open(1).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = store.writer().await;
+    let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     let (tom, uma, val) = (
         Address::repeat_byte(0xC1),
@@ -385,14 +407,20 @@ async fn a_takeover_keeps_the_disclosed_text() {
     let mut takeover = vec![NamesEvent::unpublish(tom)];
     takeover.extend(NamesEvent::bind(uma, x, "556", "lee1", 2_000, false));
     writer.apply_tx(2, takeover).await;
-    let resolved: HandleResolution = pool
+    let resolved: HandleResolution = chains
+        .pool
         .get_on(CHAIN, "/v1/resolve/handle/x/lee1")
         .await
         .answer();
     assert_eq!(holder_text(&resolved), (uma, Some("lee1".into())));
-    let found: SearchResults = pool.get_on(CHAIN, "/v1/search?q=lee1").await.answer();
+    let found: SearchResults = chains
+        .pool
+        .get_on(CHAIN, "/v1/search?q=lee1")
+        .await
+        .answer();
     assert_eq!(hits_of(&found), [("lee1".to_string(), uma, false)]);
-    let umas: AddressResolution = pool
+    let umas: AddressResolution = chains
+        .pool
         .get_on(CHAIN, &format!("/v1/resolve/address/{uma}"))
         .await
         .answer();
@@ -407,18 +435,27 @@ async fn a_takeover_keeps_the_disclosed_text() {
     let mut takeover = vec![NamesEvent::unpublish(tom)];
     takeover.extend(NamesEvent::bind(val, x, "557", "lee2", 4_000, true));
     writer.apply_tx(4, takeover).await;
-    let resolved: HandleResolution = pool
+    let resolved: HandleResolution = chains
+        .pool
         .get_on(CHAIN, "/v1/resolve/handle/x/lee2")
         .await
         .answer();
     assert_eq!(holder_text(&resolved), (val, Some("lee2".into())));
-    let found: SearchResults = pool.get_on(CHAIN, "/v1/search?q=lee2").await.answer();
+    let found: SearchResults = chains
+        .pool
+        .get_on(CHAIN, "/v1/search?q=lee2")
+        .await
+        .answer();
     // The exact match ranks first; lee1 follows as a fuzzy neighbor.
     assert_eq!(hits_of(&found)[0], ("lee2".to_string(), val, true));
     let lee2 = x.handle_node("lee2").unwrap();
-    assert_eq!(pool.disclosed(CHAIN, lee2).await.as_deref(), Some("lee2"));
+    assert_eq!(
+        chains.pool.disclosed(CHAIN, lee2).await.as_deref(),
+        Some("lee2")
+    );
     // Tom's account no longer holds either handle, so it shows neither.
-    let toms: AddressResolution = pool
+    let toms: AddressResolution = chains
+        .pool
         .get_on(CHAIN, &format!("/v1/resolve/address/{tom}"))
         .await
         .answer();
@@ -428,7 +465,7 @@ async fn a_takeover_keeps_the_disclosed_text() {
             .all(|i| i.handle.is_none() && !i.published),
         "{toms:?}"
     );
-    drop(guard);
+    chains.done();
 }
 
 /// `publish` over a name overwrites it and logs no `HandleUnpublished`; the
@@ -436,11 +473,11 @@ async fn a_takeover_keeps_the_disclosed_text() {
 /// someone else too.
 #[tokio::test]
 async fn publishing_another_name_keeps_the_one_it_replaces_disclosed() {
-    let Some((store, pool, guard)) = test_store().await else {
+    let Some(chains) = Chains::open(1).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = store.writer().await;
+    let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     let (alice, bob) = (Address::repeat_byte(0xD1), Address::repeat_byte(0xD2));
     writer
@@ -453,14 +490,18 @@ async fn publishing_another_name_keeps_the_one_it_replaces_disclosed() {
         .apply_tx(3, NamesEvent::publish(alice, x, "lee"))
         .await;
     let kim = x.handle_node("kim").unwrap();
-    assert_eq!(pool.disclosed(CHAIN, kim).await.as_deref(), Some("kim"));
+    assert_eq!(
+        chains.pool.disclosed(CHAIN, kim).await.as_deref(),
+        Some("kim")
+    );
 
     // Bob's account takes kim privately: Alice's name is lee, so the bind
     // withdraws nothing on chain.
     writer
         .apply_tx(4, NamesEvent::bind(bob, x, "71", "kim", 3_000, false))
         .await;
-    let resolved: HandleResolution = pool
+    let resolved: HandleResolution = chains
+        .pool
         .get_on(CHAIN, "/v1/resolve/handle/x/kim")
         .await
         .answer();
@@ -469,28 +510,31 @@ async fn publishing_another_name_keeps_the_one_it_replaces_disclosed() {
         (binding.owner, binding.handle.as_deref()),
         (bob, Some("kim"))
     );
-    let found: SearchResults = pool.get_on(CHAIN, "/v1/search?q=kim").await.answer();
+    let found: SearchResults =
+        chains.pool.get_on(CHAIN, "/v1/search?q=kim").await.answer();
     assert_eq!(found.handles(), ["kim"]);
     assert_eq!(found.hits.only().owner, bob);
-    let bobs: AddressResolution = pool
+    let bobs: AddressResolution = chains
+        .pool
         .get_on(CHAIN, &format!("/v1/resolve/address/{bob}"))
         .await
         .answer();
     assert_eq!(bobs.identities.only().handle.as_deref(), Some("kim"));
-    let found: SearchResults = pool.get_on(CHAIN, "/v1/search?q=lee").await.answer();
+    let found: SearchResults =
+        chains.pool.get_on(CHAIN, "/v1/search?q=lee").await.answer();
     assert_eq!(found.handles(), ["lee"]);
-    drop(guard);
+    chains.done();
 }
 
 /// `HandleUnpublished` clears the displayed name; the text it disclosed
 /// still shows everywhere, histories included.
 #[tokio::test]
 async fn a_withdrawn_name_is_no_longer_published_but_still_shows() {
-    let Some((store, pool, guard)) = test_store().await else {
+    let Some(chains) = Chains::open(1).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = store.writer().await;
+    let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     let alice = Address::repeat_byte(0xA1);
     writer
@@ -506,7 +550,7 @@ async fn a_withdrawn_name_is_no_longer_published_but_still_shows() {
     writer.apply_tx(2, rename).await;
 
     let address = format!("/v1/resolve/address/{alice}");
-    let resolved: AddressResolution = pool.get_on(CHAIN, &address).await.answer();
+    let resolved: AddressResolution = chains.pool.get_on(CHAIN, &address).await.answer();
     let identity = resolved.identities.only();
     assert!(!identity.published);
     assert_eq!(identity.handle, None, "a private bind shows no text");
@@ -515,26 +559,32 @@ async fn a_withdrawn_name_is_no_longer_published_but_still_shows() {
     writer
         .apply_tx(3, NamesEvent::publish(alice, x, "alice_2"))
         .await;
-    let resolved: AddressResolution = pool.get_on(CHAIN, &address).await.answer();
+    let resolved: AddressResolution = chains.pool.get_on(CHAIN, &address).await.answer();
     let identity = resolved.identities.only();
     assert!(identity.published);
     assert_eq!(identity.handle.as_deref(), Some("alice_2"));
 
     // HandleUnpublished takes the name down; the text stays.
     writer.apply(4, NamesEvent::unpublish(alice)).await;
-    let resolved: AddressResolution = pool.get_on(CHAIN, &address).await.answer();
+    let resolved: AddressResolution = chains.pool.get_on(CHAIN, &address).await.answer();
     let identity = resolved.identities.only();
     assert!(!identity.published);
     assert_eq!(identity.handle.as_deref(), Some("alice_2"));
-    let resolved: HandleResolution = pool
+    let resolved: HandleResolution = chains
+        .pool
         .get_on(CHAIN, "/v1/resolve/handle/x/alice_2")
         .await
         .answer();
     assert_eq!(resolved.bindings.only().handle.as_deref(), Some("alice_2"));
-    let found: SearchResults = pool.get_on(CHAIN, "/v1/search?q=alice_2").await.answer();
+    let found: SearchResults = chains
+        .pool
+        .get_on(CHAIN, "/v1/search?q=alice_2")
+        .await
+        .answer();
     assert_eq!(found.handles(), ["alice_2"]);
     assert!(!found.hits.only().published);
-    let history: AddressHistory = pool
+    let history: AddressHistory = chains
+        .pool
         .get_on(CHAIN, &format!("/v1/history/address/{alice}"))
         .await
         .answer();
@@ -545,7 +595,7 @@ async fn a_withdrawn_name_is_no_longer_published_but_still_shows() {
         .collect();
     assert!(texts.contains(&"alice_1"), "{history:?}");
     assert!(texts.contains(&"alice_2"), "{history:?}");
-    drop(guard);
+    chains.done();
 }
 
 /// A holder has one name: a name on GitHub replaces the one on X, and
@@ -553,11 +603,11 @@ async fn a_withdrawn_name_is_no_longer_published_but_still_shows() {
 /// handle again moves the name back.
 #[tokio::test]
 async fn a_name_on_another_platform_replaces_the_one_before() {
-    let Some((store, pool, guard)) = test_store().await else {
+    let Some(chains) = Chains::open(1).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = store.writer().await;
+    let writer = chains.store.writer().await;
     let (x, github) = (KnownPlatform::X, KnownPlatform::GitHub);
     let eve = Address::repeat_byte(0xE1);
     writer
@@ -571,10 +621,10 @@ async fn a_name_on_another_platform_replaces_the_one_before() {
         .await;
 
     let address = format!("/v1/resolve/address/{eve}");
-    let resolved: AddressResolution = pool.get_on(CHAIN, &address).await.answer();
+    let resolved: AddressResolution = chains.pool.get_on(CHAIN, &address).await.answer();
     assert_eq!(resolved.identities.len(), 2, "{resolved:?}");
     assert_eq!(resolved.named_platforms(), [Some(github)]);
-    assert_eq!(pool.names_held(eve).await, 1);
+    assert_eq!(chains.pool.names_held(eve).await, 1);
     let flags = |found: &SearchResults| -> Vec<(String, bool)> {
         let mut flags: Vec<_> = found
             .hits
@@ -584,7 +634,8 @@ async fn a_name_on_another_platform_replaces_the_one_before() {
         flags.sort();
         flags
     };
-    let found: SearchResults = pool
+    let found: SearchResults = chains
+        .pool
         .get_on(CHAIN, &format!("/v1/search?owner={eve}"))
         .await
         .answer();
@@ -592,16 +643,18 @@ async fn a_name_on_another_platform_replaces_the_one_before() {
         flags(&found),
         [("eve_gh".to_string(), true), ("eve_x".to_string(), false)]
     );
-    let resolved: IdResolution = pool.get_on(CHAIN, &x.id_route("81")).await.answer();
+    let resolved: IdResolution =
+        chains.pool.get_on(CHAIN, &x.id_route("81")).await.answer();
     assert!(!resolved.bindings.only().published);
 
     writer
         .apply_tx(3, NamesEvent::publish(eve, x, "eve_x"))
         .await;
-    let resolved: AddressResolution = pool.get_on(CHAIN, &address).await.answer();
+    let resolved: AddressResolution = chains.pool.get_on(CHAIN, &address).await.answer();
     assert_eq!(resolved.named_platforms(), [Some(x)]);
-    assert_eq!(pool.names_held(eve).await, 1);
-    let found: SearchResults = pool
+    assert_eq!(chains.pool.names_held(eve).await, 1);
+    let found: SearchResults = chains
+        .pool
         .get_on(CHAIN, &format!("/v1/search?owner={eve}"))
         .await
         .answer();
@@ -609,18 +662,18 @@ async fn a_name_on_another_platform_replaces_the_one_before() {
         flags(&found),
         [("eve_gh".to_string(), false), ("eve_x".to_string(), true)]
     );
-    drop(guard);
+    chains.done();
 }
 
 /// `HandleUnpublished` names no platform: it clears the holder's name
 /// wherever it is, and the other platform's identity shows none either.
 #[tokio::test]
 async fn a_withdrawal_clears_the_name_whatever_its_platform() {
-    let Some((store, pool, guard)) = test_store().await else {
+    let Some(chains) = Chains::open(1).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = store.writer().await;
+    let writer = chains.store.writer().await;
     let (x, github) = (KnownPlatform::X, KnownPlatform::GitHub);
     let eve = Address::repeat_byte(0xE2);
     writer
@@ -634,20 +687,22 @@ async fn a_withdrawal_clears_the_name_whatever_its_platform() {
         .await;
     writer.apply(3, NamesEvent::unpublish(eve)).await;
 
-    let resolved: AddressResolution = pool
+    let resolved: AddressResolution = chains
+        .pool
         .get_on(CHAIN, &format!("/v1/resolve/address/{eve}"))
         .await
         .answer();
     assert_eq!(resolved.identities.len(), 2, "{resolved:?}");
     assert_eq!(resolved.named_platforms(), []);
-    assert_eq!(pool.names_held(eve).await, 0);
-    let found: SearchResults = pool
+    assert_eq!(chains.pool.names_held(eve).await, 0);
+    let found: SearchResults = chains
+        .pool
         .get_on(CHAIN, &format!("/v1/search?owner={eve}"))
         .await
         .answer();
     assert_eq!(found.hits.len(), 2, "{found:?}");
     assert!(found.hits.iter().all(|hit| !hit.published), "{found:?}");
-    drop(guard);
+    chains.done();
 }
 
 /// Every `HandleRevealed` fills one map from node to text, whichever
@@ -656,11 +711,11 @@ async fn a_withdrawal_clears_the_name_whatever_its_platform() {
 /// a name.
 #[tokio::test]
 async fn every_reveal_fills_one_map_and_sets_no_name() {
-    let Some((store, pool, guard)) = test_store().await else {
+    let Some(chains) = Chains::open(1).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = store.writer().await;
+    let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     let (eve, fay) = (Address::repeat_byte(0xE3), Address::repeat_byte(0xE5));
     let mut reveal_only = NamesEvent::bind(eve, x, "91", "eve_r", 1_000, false);
@@ -673,29 +728,37 @@ async fn every_reveal_fills_one_map_and_sets_no_name() {
 
     for (holder, handle) in [(eve, "eve_r"), (fay, "fay_e")] {
         let node = x.handle_node(handle).unwrap();
-        assert_eq!(pool.disclosed(CHAIN, node).await.as_deref(), Some(handle));
-        let resolved: AddressResolution = pool
+        assert_eq!(
+            chains.pool.disclosed(CHAIN, node).await.as_deref(),
+            Some(handle)
+        );
+        let resolved: AddressResolution = chains
+            .pool
             .get_on(CHAIN, &format!("/v1/resolve/address/{holder}"))
             .await
             .answer();
         let identity = resolved.identities.only();
         assert_eq!(identity.handle.as_deref(), Some(handle));
         assert!(!identity.published, "{resolved:?}");
-        assert_eq!(pool.names_held(holder).await, 0);
+        assert_eq!(chains.pool.names_held(holder).await, 0);
     }
-    let found: SearchResults = pool.get_on(CHAIN, "/v1/search?q=fay_e").await.answer();
+    let found: SearchResults = chains
+        .pool
+        .get_on(CHAIN, "/v1/search?q=fay_e")
+        .await
+        .answer();
     assert_eq!(found.handles(), ["fay_e"]);
     assert_eq!(found.hits.only().owner, fay);
-    drop(guard);
+    chains.done();
 }
 
 #[tokio::test]
 async fn search_ranks_exact_prefix_substring() {
-    let Some((store, pool, guard)) = test_store().await else {
+    let Some(chains) = Chains::open(1).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = store.writer().await;
+    let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     let github = KnownPlatform::GitHub;
     writer
@@ -740,7 +803,8 @@ async fn search_ranks_exact_prefix_substring() {
         .apply(7, NamesEvent::unpublish(Address::repeat_byte(3)))
         .await;
 
-    let results: SearchResults = pool.get_on(CHAIN, "/v1/search?q=ali").await.answer();
+    let results: SearchResults =
+        chains.pool.get_on(CHAIN, "/v1/search?q=ali").await.answer();
     // Exact first, then prefix alphabetically, then substring.
     assert_eq!(results.handles(), ["ali", "alice_1", "alicorn", "malice"]);
     assert!(!results.hits[3].published);
@@ -753,20 +817,23 @@ async fn search_ranks_exact_prefix_substring() {
     assert_eq!(results.query.as_deref(), Some("ali"));
 
     // Pages walk the same ranked list; a short page is the last one.
-    let page: SearchResults = pool
+    let page: SearchResults = chains
+        .pool
         .get_on(CHAIN, "/v1/search?q=ali&limit=2&offset=1")
         .await
         .answer();
     assert_eq!((page.limit, page.offset), (2, 1));
     assert_eq!(page.handles(), ["alice_1", "alicorn"]);
-    let page: SearchResults = pool
+    let page: SearchResults = chains
+        .pool
         .get_on(CHAIN, "/v1/search?q=ali&limit=2&offset=3")
         .await
         .answer();
     assert_eq!(page.hits.len(), 1, "{page:?}");
 
     // The platform filter narrows to that keyspace.
-    let results: SearchResults = pool
+    let results: SearchResults = chains
+        .pool
         .get_on(CHAIN, "/v1/search?q=ali&platform=github")
         .await
         .answer();
@@ -774,11 +841,16 @@ async fn search_ranks_exact_prefix_substring() {
     assert_eq!(results.hits[0].platform, Some(KnownPlatform::GitHub));
 
     // Search folds the way normalization does: case and a leading @ vanish.
-    let results: SearchResults = pool.get_on(CHAIN, "/v1/search?q=%40ALI").await.answer();
+    let results: SearchResults = chains
+        .pool
+        .get_on(CHAIN, "/v1/search?q=%40ALI")
+        .await
+        .answer();
     assert_eq!(results.hits.len(), 4);
 
     // A wallet's handles, alone or narrowed by text; the two intersect.
-    let results: SearchResults = pool
+    let results: SearchResults = chains
+        .pool
         .get_on(
             CHAIN,
             &format!("/v1/search?owner={}", Address::repeat_byte(2)),
@@ -788,7 +860,8 @@ async fn search_ranks_exact_prefix_substring() {
     assert_eq!(results.handles(), ["alice_1"]);
     assert_eq!(results.owner, Some(Address::repeat_byte(2)));
     assert_eq!(results.query, None);
-    let results: SearchResults = pool
+    let results: SearchResults = chains
+        .pool
         .get_on(
             CHAIN,
             &format!("/v1/search?q=ali&owner={}", Address::repeat_byte(1)),
@@ -796,7 +869,8 @@ async fn search_ranks_exact_prefix_substring() {
         .await
         .answer();
     assert_eq!(results.handles(), ["ali"]);
-    let results: SearchResults = pool
+    let results: SearchResults = chains
+        .pool
         .get_on(
             CHAIN,
             &format!("/v1/search?q=bob&owner={}", Address::repeat_byte(1)),
@@ -806,7 +880,8 @@ async fn search_ranks_exact_prefix_substring() {
     assert!(results.hits.is_empty(), "{results:?}");
 
     // Neither text nor wallet is not a question, and a wallet must parse.
-    let refusal = pool
+    let refusal = chains
+        .pool
         .get_on::<SearchResults>(CHAIN, "/v1/search")
         .await
         .refusal();
@@ -814,7 +889,8 @@ async fn search_ranks_exact_prefix_substring() {
         refusal,
         (StatusCode::BAD_REQUEST, ErrorCode::InvalidArgument)
     );
-    let refusal = pool
+    let refusal = chains
+        .pool
         .get_on::<SearchResults>(CHAIN, "/v1/search?owner=nobody")
         .await
         .refusal();
@@ -835,26 +911,30 @@ async fn search_ranks_exact_prefix_substring() {
             ],
         )
         .await;
-    let results: SearchResults =
-        pool.get_on(CHAIN, "/v1/search?q=alice_1").await.answer();
+    let results: SearchResults = chains
+        .pool
+        .get_on(CHAIN, "/v1/search?q=alice_1")
+        .await
+        .answer();
     let handles = results.handles();
     assert!(!handles.contains(&"alice_1"), "{handles:?}");
     assert!(!handles.is_empty(), "fuzzy neighbors should still match");
 
     // LIKE metacharacters match themselves, not everything.
-    let results: SearchResults = pool.get_on(CHAIN, "/v1/search?q=%25").await.answer();
+    let results: SearchResults =
+        chains.pool.get_on(CHAIN, "/v1/search?q=%25").await.answer();
     assert!(results.hits.is_empty());
 
-    drop(guard);
+    chains.done();
 }
 
 #[tokio::test]
 async fn replay_converges_instead_of_duplicating() {
-    let Some((store, pool, guard)) = test_store().await else {
+    let Some(chains) = Chains::open(1).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = store.writer().await;
+    let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     let alice = Address::repeat_byte(0xA1);
     let events = NamesEvent::bind(alice, x, "111", "alice_1", 1000, true);
@@ -864,12 +944,13 @@ async fn replay_converges_instead_of_duplicating() {
     let journal: i64 =
         sqlx::query_scalar("SELECT count(*) FROM names.events WHERE chain_id = $1")
             .bind(CHAIN)
-            .fetch_one(&pool)
+            .fetch_one(&chains.pool)
             .await
             .expect("count");
     // The bind, its reveal and its name.
     assert_eq!(journal, 3);
-    let resolved: HandleResolution = pool
+    let resolved: HandleResolution = chains
+        .pool
         .get_on(CHAIN, "/v1/resolve/handle/x/alice_1")
         .await
         .answer();
@@ -878,20 +959,20 @@ async fn replay_converges_instead_of_duplicating() {
     let disclosures: i64 =
         sqlx::query_scalar("SELECT count(*) FROM names.handle_nodes WHERE chain_id = $1 AND handle IS NOT NULL")
             .bind(CHAIN)
-            .fetch_one(&pool)
+            .fetch_one(&chains.pool)
             .await
             .expect("count");
     assert_eq!(disclosures, 1);
-    drop(guard);
+    chains.done();
 }
 
 #[tokio::test]
 async fn unclaimed_names_on_a_configured_platform_are_coded_404s() {
-    let Some((store, pool, guard)) = test_store().await else {
+    let Some(chains) = Chains::open(1).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = store.writer().await;
+    let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     // Something was bound on the platform — the branch the absent-platform
     // test cannot reach, and the one that once shipped a decode 500.
@@ -909,29 +990,32 @@ async fn unclaimed_names_on_a_configured_platform_are_coded_404s() {
         )
         .await;
 
-    let refusal = pool
+    let refusal = chains
+        .pool
         .get_on::<HandleResolution>(CHAIN, "/v1/resolve/handle/x/zzz")
         .await
         .refusal();
     assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::HandleNotBound));
 
-    let refusal = pool
+    let refusal = chains
+        .pool
         .get_on::<IdResolution>(CHAIN, &x.id_route("999999"))
         .await
         .refusal();
     assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::IdNotBound));
-    drop(guard);
+    chains.done();
 }
 
 #[tokio::test]
 async fn api_refuses_to_answer_before_the_first_window() {
-    let Some((_store, pool, guard)) = test_store().await else {
+    let Some(chains) = Chains::open(1).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
     // No window ever committed: resolution must say "not synced", never an
     // authoritative-looking "not bound".
-    let refusal = pool
+    let refusal = chains
+        .pool
         .get_on::<HandleResolution>(CHAIN, "/v1/resolve/handle/x/alice_1")
         .await
         .refusal();
@@ -939,28 +1023,29 @@ async fn api_refuses_to_answer_before_the_first_window() {
         refusal,
         (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::NotSynced)
     );
-    let (status, _) = pool
+    let (status, _) = chains
+        .pool
         .get_on::<SearchResults>(CHAIN, "/v1/search?q=ali")
         .await
         .refusal();
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     // Status still answers — it is how a caller learns the sync state: the
     // chain is simply not among those the store holds.
-    let status: Status = pool.get("/v1/status").await.answer();
+    let status: Status = chains.pool.get("/v1/status").await.answer();
     assert!(
         status.chains.iter().all(|c| c.chain_id != CHAIN),
         "{status:?}"
     );
-    drop(guard);
+    chains.done();
 }
 
 #[tokio::test]
 async fn a_nul_byte_in_a_query_is_refused_not_a_500() {
-    let Some((store, pool, guard)) = test_store().await else {
+    let Some(chains) = Chains::open(1).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = store.writer().await;
+    let writer = chains.store.writer().await;
     writer
         .apply_tx(
             1,
@@ -975,7 +1060,8 @@ async fn a_nul_byte_in_a_query_is_refused_not_a_500() {
         )
         .await;
     // No platform issues a handle holding NUL.
-    let refusal = pool
+    let refusal = chains
+        .pool
         .get_on::<HandleResolution>(CHAIN, "/v1/resolve/handle/x/evil%00")
         .await
         .refusal();
@@ -983,21 +1069,22 @@ async fn a_nul_byte_in_a_query_is_refused_not_a_500() {
         refusal,
         (StatusCode::NOT_FOUND, ErrorCode::HandleImpossible)
     );
-    let (status, _) = pool
+    let (status, _) = chains
+        .pool
         .get_on::<SearchResults>(CHAIN, "/v1/search?q=evil%00")
         .await
         .refusal();
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    drop(guard);
+    chains.done();
 }
 
 #[tokio::test]
 async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
-    let Some((store, pool, guard)) = test_store().await else {
+    let Some(chains) = Chains::open(1).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = store.writer().await;
+    let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     let digest = B256::repeat_byte(0xD1);
     writer
@@ -1032,7 +1119,7 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
 
     // The Proof Verifier is the chain's one verification component; the
     // status reports it so an operator need not ask the RPC.
-    let status: Status = pool.get("/v1/status").await.answer();
+    let status: Status = chains.pool.get("/v1/status").await.answer();
     let chain = status
         .chains
         .iter()
@@ -1043,7 +1130,8 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
     // The ceremony's own events are journaled with what an operator asks
     // by — read back here through the histories of the addresses they name —
     // and bind nothing.
-    let holder: AddressHistory = pool
+    let holder: AddressHistory = chains
+        .pool
         .get_on(
             CHAIN,
             &format!("/v1/history/address/{}", Address::repeat_byte(0xA1)),
@@ -1062,7 +1150,8 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
             client_identifier: Bytes::from_static(b"client-a"),
         }
     );
-    let receiver: AddressHistory = pool
+    let receiver: AddressHistory = chains
+        .pool
         .get_on(
             CHAIN,
             &format!("/v1/history/address/{}", Address::repeat_byte(0xFE)),
@@ -1083,20 +1172,20 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
     let bound: i64 =
         sqlx::query_scalar("SELECT count(*) FROM names.ids WHERE chain_id = $1")
             .bind(CHAIN)
-            .fetch_one(&pool)
+            .fetch_one(&chains.pool)
             .await
             .expect("ids count");
     assert_eq!(bound, 0, "a ceremony event alone binds nothing");
-    drop(guard);
+    chains.done();
 }
 
 #[tokio::test]
 async fn unbound_handle_and_impossible_text_name_their_codes() {
-    let Some((store, pool, guard)) = test_store().await else {
+    let Some(chains) = Chains::open(1).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = store.writer().await;
+    let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     writer
         .apply_tx(
@@ -1107,24 +1196,28 @@ async fn unbound_handle_and_impossible_text_name_their_codes() {
 
     // A known platform's unbound handle is `handle_not_bound`, whether or
     // not anything was ever bound on it; an id misses as unbound the same way.
-    let refusal = pool
+    let refusal = chains
+        .pool
         .get_on::<HandleResolution>(CHAIN, "/v1/resolve/handle/x/alice")
         .await
         .refusal();
     assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::HandleNotBound));
-    let refusal = pool
+    let refusal = chains
+        .pool
         .get_on::<HandleResolution>(CHAIN, "/v1/resolve/handle/github/alice")
         .await
         .refusal();
     assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::HandleNotBound));
-    let refusal = pool
+    let refusal = chains
+        .pool
         .get_on::<IdResolution>(CHAIN, &KnownPlatform::GitHub.id_route("111"))
         .await
         .refusal();
     assert_eq!(refusal, (StatusCode::NOT_FOUND, ErrorCode::IdNotBound));
     // A platform this build has no tags for cannot hash text at all.
     let foreign = B256::repeat_byte(7);
-    let refusal = pool
+    let refusal = chains
+        .pool
         .get_on::<HandleResolution>(
             CHAIN,
             &format!("/v1/resolve/handle/{foreign}/alice_1"),
@@ -1139,7 +1232,8 @@ async fn unbound_handle_and_impossible_text_name_their_codes() {
     // Text no circuit hashes (a quote) mirrors the contract's deliberate
     // zero-address answer: "no such handle can exist", a 404 with its own
     // code — not "you asked wrong".
-    let refusal = pool
+    let refusal = chains
+        .pool
         .get_on::<HandleResolution>(CHAIN, "/v1/resolve/handle/x/a%22b")
         .await
         .refusal();
@@ -1147,7 +1241,7 @@ async fn unbound_handle_and_impossible_text_name_their_codes() {
         refusal,
         (StatusCode::NOT_FOUND, ErrorCode::HandleImpossible)
     );
-    drop(guard);
+    chains.done();
 }
 
 /// A wallet is the same address on every chain; its bindings are not. With
@@ -1155,12 +1249,14 @@ async fn unbound_handle_and_impossible_text_name_their_codes() {
 /// result says which one it is from; `?chain=` narrows to one.
 #[tokio::test]
 async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
-    let Some((store, pool, guard)) = test_store().await else {
+    let Some(chains) = Chains::open(1).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    let writer = store.writer().await;
-    let other = ChainStore::new(pool.clone(), OTHER_CHAIN).writer().await;
+    let writer = chains.store.writer().await;
+    let other = ChainStore::new(chains.pool.clone(), OTHER_CHAIN)
+        .writer()
+        .await;
     let x = KnownPlatform::X;
     let (alice, bob) = (Address::repeat_byte(0xA1), Address::repeat_byte(0xB2));
     // The same handle, held by different wallets on the two chains.
@@ -1172,8 +1268,11 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
         .await;
 
     // Other suites share the store, so only this suite's chains are read.
-    let resolved: HandleResolution =
-        pool.get("/v1/resolve/handle/x/alice_1").await.answer();
+    let resolved: HandleResolution = chains
+        .pool
+        .get("/v1/resolve/handle/x/alice_1")
+        .await
+        .answer();
     let ours: Vec<(i64, Address)> = resolved
         .bindings
         .iter()
@@ -1182,14 +1281,16 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
         .collect();
     assert_eq!(ours, [(CHAIN, alice), (OTHER_CHAIN, bob)], "{resolved:?}");
 
-    let resolved: HandleResolution = pool
+    let resolved: HandleResolution = chains
+        .pool
         .get(&format!("/v1/resolve/handle/x/alice_1?chain={OTHER_CHAIN}"))
         .await
         .answer();
     assert_eq!(resolved.bindings.only().owner, bob);
 
     // An address is asked without a chain; each identity names its own.
-    let resolved: AddressResolution = pool
+    let resolved: AddressResolution = chains
+        .pool
         .get(&format!("/v1/resolve/address/{bob}"))
         .await
         .answer();
@@ -1206,8 +1307,11 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
     );
 
     // Search too, and a hit says where it lives.
-    let results: SearchResults =
-        pool.get("/v1/search?q=alice_1&platform=x").await.answer();
+    let results: SearchResults = chains
+        .pool
+        .get("/v1/search?q=alice_1&platform=x")
+        .await
+        .answer();
     let hit_chains: Vec<i64> = results
         .hits
         .iter()
@@ -1221,7 +1325,8 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
 
     // A chain nobody indexed is not an error to ask about; it has nothing
     // to answer from, and says so.
-    let refusal = pool
+    let refusal = chains
+        .pool
         .get::<HandleResolution>("/v1/resolve/handle/x/alice_1?chain=424242")
         .await
         .refusal();
@@ -1229,12 +1334,13 @@ async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
         refusal,
         (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::NotSynced)
     );
-    let refusal = pool
+    let refusal = chains
+        .pool
         .get::<HandleResolution>("/v1/resolve/handle/x/alice_1?chain=eden")
         .await
         .refusal();
     assert_eq!(refusal, (StatusCode::BAD_REQUEST, ErrorCode::InvalidChain));
-    drop(guard);
+    chains.done();
 }
 
 // ─── The replay gate ────────────────────────────────────────────────────────
@@ -1251,11 +1357,12 @@ fn a_contract() -> Address {
 
 #[tokio::test]
 async fn preparing_an_unchanged_chain_keeps_everything() {
-    let Some((store, _pool, guard)) = test_store_with(2).await else {
+    let Some(chains) = Chains::open(2).await else {
         return;
     };
-    let lease = store.acquire_writer().await.expect("lease");
-    let writer = store
+    let lease = chains.store.acquire_writer().await.expect("lease");
+    let writer = chains
+        .store
         .prepare(
             &lease,
             Contracts {
@@ -1268,7 +1375,8 @@ async fn preparing_an_unchanged_chain_keeps_everything() {
     writer.seed().await;
 
     // Same version, same contract: nothing to replay.
-    store
+    chains
+        .store
         .prepare(
             &lease,
             Contracts {
@@ -1279,11 +1387,12 @@ async fn preparing_an_unchanged_chain_keeps_everything() {
         .await
         .expect("second");
     assert!(
-        store.cursor().await.unwrap().is_some(),
+        chains.store.cursor().await.unwrap().is_some(),
         "the cursor survived"
     );
     assert!(
-        store
+        chains
+            .store
             .ens_answer(KnownPlatform::X.handle_node("alice").unwrap())
             .await
             .unwrap()
@@ -1292,18 +1401,19 @@ async fn preparing_an_unchanged_chain_keeps_everything() {
         "the binding survived"
     );
     lease.release().await.expect("the lease releases");
-    drop(guard);
+    chains.done();
 }
 
 #[tokio::test]
 async fn watching_another_contract_clears_the_chain() {
     // The old contract's bindings are not the new contract's bindings, so
     // inheriting them would answer for an account nobody bound here.
-    let Some((store, _pool, guard)) = test_store_with(2).await else {
+    let Some(chains) = Chains::open(2).await else {
         return;
     };
-    let lease = store.acquire_writer().await.expect("lease");
-    let writer = store
+    let lease = chains.store.acquire_writer().await.expect("lease");
+    let writer = chains
+        .store
         .prepare(
             &lease,
             Contracts {
@@ -1322,7 +1432,8 @@ async fn watching_another_contract_clears_the_chain() {
     };
     writer.apply(2, verifier).await;
 
-    store
+    chains
+        .store
         .prepare(
             &lease,
             Contracts {
@@ -1334,14 +1445,14 @@ async fn watching_another_contract_clears_the_chain() {
         .expect("repoint");
 
     assert!(
-        store.cursor().await.unwrap().is_none(),
+        chains.store.cursor().await.unwrap().is_none(),
         "the cursor must be gone so the scan restarts"
     );
     // Everything the chain's row held about the old contract goes with it.
     assert_eq!(
-        store.state().await.unwrap(),
+        chains.store.state().await.unwrap(),
         ChainState {
-            chain_id: store.chain_id(),
+            chain_id: chains.store.chain_id(),
             indexer_version: Some(db::INDEXER_VERSION.to_string()),
             contract: Some(OTHER_CONTRACT),
             escrow: Some(OTHER_ESCROW),
@@ -1349,7 +1460,8 @@ async fn watching_another_contract_clears_the_chain() {
         }
     );
     assert!(
-        store
+        chains
+            .store
             .ens_answer(KnownPlatform::X.handle_node("alice").unwrap())
             .await
             .unwrap()
@@ -1358,7 +1470,7 @@ async fn watching_another_contract_clears_the_chain() {
         "the previous contract's binding must not survive"
     );
     lease.release().await.expect("the lease releases");
-    drop(guard);
+    chains.done();
 }
 
 #[tokio::test]
@@ -1366,11 +1478,12 @@ async fn the_deployment_block_survives_a_replay_of_the_same_registry() {
     // A replay restarts from the registry's deployment block; losing it would
     // re-run the binary search over the whole chain. Another registry has
     // another deployment block.
-    let Some((store, _pool, guard)) = test_store_with(2).await else {
+    let Some(chains) = Chains::open(2).await else {
         return;
     };
-    let lease = store.acquire_writer().await.expect("lease");
-    let writer = store
+    let lease = chains.store.acquire_writer().await.expect("lease");
+    let writer = chains
+        .store
         .prepare(
             &lease,
             Contracts {
@@ -1384,7 +1497,8 @@ async fn the_deployment_block_survives_a_replay_of_the_same_registry() {
 
     // A newly watched escrow replays the chain from the same registry.
     let escrow = Address::repeat_byte(0xE5);
-    store
+    chains
+        .store
         .prepare(
             &lease,
             Contracts {
@@ -1394,10 +1508,17 @@ async fn the_deployment_block_survives_a_replay_of_the_same_registry() {
         )
         .await
         .expect("an escrow added");
-    assert!(store.cursor().await.unwrap().is_none(), "the chain replays");
-    assert_eq!(store.deploy_block(a_contract()).await.unwrap(), Some(4321));
+    assert!(
+        chains.store.cursor().await.unwrap().is_none(),
+        "the chain replays"
+    );
+    assert_eq!(
+        chains.store.deploy_block(a_contract()).await.unwrap(),
+        Some(4321)
+    );
 
-    store
+    chains
+        .store
         .prepare(
             &lease,
             Contracts {
@@ -1407,9 +1528,12 @@ async fn the_deployment_block_survives_a_replay_of_the_same_registry() {
         )
         .await
         .expect("repoint");
-    assert_eq!(store.deploy_block(OTHER_CONTRACT).await.unwrap(), None);
+    assert_eq!(
+        chains.store.deploy_block(OTHER_CONTRACT).await.unwrap(),
+        None
+    );
     lease.release().await.expect("the lease releases");
-    drop(guard);
+    chains.done();
 }
 
 /// A lease whose session ends — a database restart, a failover, an idle
@@ -1417,10 +1541,10 @@ async fn the_deployment_block_survives_a_replay_of_the_same_registry() {
 /// session lives, it is not lost.
 #[tokio::test]
 async fn a_lease_whose_session_ends_reports_itself_lost() {
-    let Some((store, pool, guard)) = test_store_with(2).await else {
+    let Some(chains) = Chains::open(2).await else {
         return;
     };
-    let mut lease = store.acquire_writer().await.expect("lease");
+    let mut lease = chains.store.acquire_writer().await.expect("lease");
     assert!(
         tokio::time::timeout(
             Duration::from_secs(1),
@@ -1431,8 +1555,8 @@ async fn a_lease_whose_session_ends_reports_itself_lost() {
         "a live session's lease is held"
     );
     sqlx::query(include_str!("sql/end_writer_session.sql"))
-        .bind(store.chain_id())
-        .execute(&pool)
+        .bind(chains.store.chain_id())
+        .execute(&chains.pool)
         .await
         .expect("the lease's session ends");
     let lost = tokio::time::timeout(
@@ -1442,7 +1566,7 @@ async fn a_lease_whose_session_ends_reports_itself_lost() {
     .await
     .expect("the lease reports itself lost");
     assert!(matches!(lost, LeaseLost::Ended(_)), "{lost:?}");
-    drop(guard);
+    chains.done();
 }
 
 /// A lease whose session stops answering — a half-open socket, a hung
@@ -1450,7 +1574,7 @@ async fn a_lease_whose_session_ends_reports_itself_lost() {
 /// lost within two intervals instead of waiting on the socket.
 #[tokio::test]
 async fn a_lease_whose_session_goes_silent_reports_itself_lost() {
-    let Some((_store, _pool, guard)) = test_store_with(2).await else {
+    let Some(chains) = Chains::open(2).await else {
         return;
     };
     let database = database_url().expect("the database is set");
@@ -1470,7 +1594,7 @@ async fn a_lease_whose_session_goes_silent_reports_itself_lost() {
     .await
     .expect("the lease reports itself lost");
     assert!(matches!(lost, LeaseLost::Silent(_)), "{lost:?}");
-    drop(guard);
+    chains.done();
 }
 
 /// The lease must give the lock back, not merely stop being referenced.
@@ -1482,21 +1606,22 @@ async fn a_lease_whose_session_goes_silent_reports_itself_lost() {
 /// smallest thing that would have caught it.
 #[tokio::test]
 async fn a_released_lease_frees_the_chain_for_the_next_holder() {
-    let Some((store, _pool, guard)) = test_store_with(2).await else {
+    let Some(chains) = Chains::open(2).await else {
         return;
     };
-    let first = store.acquire_writer().await.expect("first lease");
+    let first = chains.store.acquire_writer().await.expect("first lease");
     first.release().await.expect("release");
 
     // Bounded, because the failure mode is a block rather than an error: on
     // the old code this waits for the pool's idle timeout, not forever, and an
     // unbounded await would look like a hung test rather than a broken lock.
-    let second = tokio::time::timeout(Duration::from_secs(5), store.acquire_writer())
-        .await
-        .expect("the second lease was still blocked on the first")
-        .expect("second lease");
+    let second =
+        tokio::time::timeout(Duration::from_secs(5), chains.store.acquire_writer())
+            .await
+            .expect("the second lease was still blocked on the first")
+            .expect("second lease");
     second.release().await.expect("release");
-    drop(guard);
+    chains.done();
 }
 
 /// A writer whose chain was prepared again since (its lease lost, another
@@ -1504,13 +1629,13 @@ async fn a_released_lease_frees_the_chain_for_the_next_holder() {
 /// the chain under the writer that took it.
 #[tokio::test]
 async fn a_writer_whose_chain_was_prepared_again_writes_nothing() {
-    let Some((store, _pool, guard)) = test_store_with(2).await else {
+    let Some(chains) = Chains::open(2).await else {
         return;
     };
-    let stale = store.writer().await;
+    let stale = chains.store.writer().await;
     stale.seed().await;
-    let before = store.state().await.unwrap();
-    let current = store.writer().await;
+    let before = chains.store.state().await.unwrap();
+    let current = chains.store.writer().await;
 
     let refused = stale.begin_window().await.err();
     assert!(
@@ -1531,26 +1656,26 @@ async fn a_writer_whose_chain_was_prepared_again_writes_nothing() {
         .set_deploy_block(9)
         .await
         .expect("a write that lands nowhere");
-    assert_eq!(store.state().await.unwrap(), before);
+    assert_eq!(chains.store.state().await.unwrap(), before);
 
     // The writer that prepared the chain last writes as before.
     current
         .apply(2, NamesEvent::unpublish(Address::repeat_byte(1)))
         .await;
-    assert_eq!(store.cursor().await.unwrap(), Some(2));
-    drop(guard);
+    assert_eq!(chains.store.cursor().await.unwrap(), Some(2));
+    chains.done();
 }
 
 /// A chain whose row was deleted and prepared again names a writer no
 /// earlier writer could hold, so one from before the delete stays shut out.
 #[tokio::test]
 async fn a_writer_from_before_its_chain_row_was_deleted_writes_nothing() {
-    let Some((store, _pool, guard)) = test_store_with(2).await else {
+    let Some(chains) = Chains::open(2).await else {
         return;
     };
-    let stale = store.writer().await;
-    store.forget().await;
-    store.writer().await;
+    let stale = chains.store.writer().await;
+    chains.store.forget().await;
+    chains.store.writer().await;
 
     let refused = stale.begin_window().await.err();
     assert!(
@@ -1560,7 +1685,7 @@ async fn a_writer_from_before_its_chain_row_was_deleted_writes_nothing() {
         ),
         "{refused:?}"
     );
-    drop(guard);
+    chains.done();
 }
 
 /// A replay waits for a window the writer before it still has open, then
@@ -1568,10 +1693,10 @@ async fn a_writer_from_before_its_chain_row_was_deleted_writes_nothing() {
 /// instance it replaced was mid-window.
 #[tokio::test]
 async fn a_replay_waits_for_the_window_in_flight_and_clears_it() {
-    let Some((store, pool, guard)) = test_store_with(3).await else {
+    let Some(chains) = Chains::open(3).await else {
         return;
     };
-    let stale = store.writer().await;
+    let stale = chains.store.writer().await;
     let mut window = stale.begin_window().await.expect("a window");
     let events = NamesEvent::bind(
         Address::repeat_byte(1),
@@ -1595,12 +1720,16 @@ async fn a_replay_waits_for_the_window_in_flight_and_clears_it() {
     // wait and no other session's.
     const REPLAY: &str = "replay under test";
     let replaying = ChainStore::new(
-        PgPool::connect_with((*pool.connect_options()).clone().application_name(REPLAY))
-            .await
-            .expect("the replay's pool"),
+        PgPool::connect_with(
+            (*chains.pool.connect_options())
+                .clone()
+                .application_name(REPLAY),
+        )
+        .await
+        .expect("the replay's pool"),
         CHAIN,
     );
-    let lease = store.acquire_writer().await.expect("lease");
+    let lease = chains.store.acquire_writer().await.expect("lease");
     let replay = tokio::spawn(async move {
         replaying
             .prepare(
@@ -1614,7 +1743,7 @@ async fn a_replay_waits_for_the_window_in_flight_and_clears_it() {
             .expect("the replay is prepared");
         lease
     });
-    pool.waits_on_a_lock(REPLAY).await;
+    chains.pool.waits_on_a_lock(REPLAY).await;
     window
         .commit(1)
         .await
@@ -1622,12 +1751,13 @@ async fn a_replay_waits_for_the_window_in_flight_and_clears_it() {
     let lease = replay.await.expect("the replay task");
 
     assert_eq!(
-        store.cursor().await.unwrap(),
+        chains.store.cursor().await.unwrap(),
         None,
         "the replay starts over"
     );
     assert!(
-        store
+        chains
+            .store
             .ens_answer(KnownPlatform::X.handle_node("alice").unwrap())
             .await
             .unwrap()
@@ -1636,7 +1766,7 @@ async fn a_replay_waits_for_the_window_in_flight_and_clears_it() {
         "what the window committed is cleared"
     );
     lease.release().await.expect("the lease releases");
-    drop(guard);
+    chains.done();
 }
 
 /// The report the indexer makes beside the target expires on its own
@@ -1644,23 +1774,33 @@ async fn a_replay_waits_for_the_window_in_flight_and_clears_it() {
 /// moving the target — which is what keeps a long catch-up alive.
 #[tokio::test]
 async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
-    let Some((store, _pool, guard)) = test_store().await else {
+    let Some(chains) = Chains::open(1).await else {
         return;
     };
-    let writer = store.writer().await;
+    let writer = chains.store.writer().await;
     assert!(
         writer.set_chain_target(5, Duration::from_secs(1)).await,
         "the target write landed"
     );
     // The report expires on the database's clock, which counts in whole
     // seconds: past what it says is left, and a second more.
-    let left = store.state().await.expect("the chain's row").position();
+    let left = chains
+        .store
+        .state()
+        .await
+        .expect("the chain's row")
+        .position();
     let left = left
         .valid_for
         .and_then(|d| d.to_std().ok())
         .unwrap_or_default();
     tokio::time::sleep(left + Duration::from_secs(1)).await;
-    let position = store.state().await.expect("the chain's row").position();
+    let position = chains
+        .store
+        .state()
+        .await
+        .expect("the chain's row")
+        .position();
     assert!(
         position.valid_for.is_some_and(|d| d < TimeDelta::zero()),
         "{position:?}"
@@ -1668,7 +1808,12 @@ async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
     assert_eq!(position.target, Some(5));
 
     writer.touch_chain_target(Duration::from_secs(120)).await;
-    let position = store.state().await.expect("the chain's row").position();
+    let position = chains
+        .store
+        .state()
+        .await
+        .expect("the chain's row")
+        .position();
     assert_eq!(
         position.target,
         Some(5),
@@ -1679,7 +1824,7 @@ async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
         "{position:?}"
     );
     assert!(position.reported_at.is_some(), "{position:?}");
-    drop(guard);
+    chains.done();
 }
 
 /// A chain's names are its indexer's declaration: a set, replaced whole on
@@ -1687,13 +1832,14 @@ async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
 /// `/v1/status`.
 #[tokio::test]
 async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
-    let Some((store, pool, guard)) = test_store_with(2).await else {
+    let Some(chains) = Chains::open(2).await else {
         return;
     };
     let name = |s: &str| s.parse::<ens::ChainName>().unwrap();
-    let lease = store.acquire_writer().await.expect("lease");
+    let lease = chains.store.acquire_writer().await.expect("lease");
     // In the indexer's order: the chain is prepared, then named.
-    store
+    chains
+        .store
         .prepare(
             &lease,
             Contracts {
@@ -1703,30 +1849,35 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
         )
         .await
         .expect("prepared");
-    store
+    chains
+        .store
         .set_chain_names(
             &lease,
             &[name("alpha"), name("alpha-testnet"), name("alpha")],
         )
         .await
         .expect("declared");
-    assert_eq!(pool.names_of(CHAIN).await, ["alpha", "alpha-testnet"]);
+    assert_eq!(
+        chains.pool.names_of(CHAIN).await,
+        ["alpha", "alpha-testnet"]
+    );
 
     // Both names resolve to this chain.
-    let reader = db::Store::new(pool.clone());
+    let reader = db::Store::new(chains.pool.clone());
     for declared in ["alpha", "alpha-testnet"] {
         assert_eq!(reader.chain_named(declared).await.unwrap(), Some(CHAIN));
     }
 
     // Declaring again replaces the set.
-    store
+    chains
+        .store
         .set_chain_names(&lease, &[name("alpha")])
         .await
         .expect("declared again");
-    assert_eq!(pool.names_of(CHAIN).await, ["alpha"]);
+    assert_eq!(chains.pool.names_of(CHAIN).await, ["alpha"]);
 
     // Another chain cannot take a name this one holds, and writes nothing.
-    let other = ChainStore::new(pool.clone(), OTHER_CHAIN);
+    let other = ChainStore::new(chains.pool.clone(), OTHER_CHAIN);
     let other_lease = other.acquire_writer().await.expect("other lease");
     let refused = other
         .set_chain_names(&other_lease, &[name("beta"), name("alpha")])
@@ -1746,7 +1897,7 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
     assert_eq!(reader.chain_named("beta").await.unwrap(), None);
 
     // Supervision sees the declaration.
-    let status: Status = pool.get_on(CHAIN, "/v1/status").await.answer();
+    let status: Status = chains.pool.get_on(CHAIN, "/v1/status").await.answer();
     let row = status
         .chains
         .iter()
@@ -1756,5 +1907,5 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
 
     other_lease.release().await.expect("release");
     lease.release().await.expect("release");
-    drop(guard);
+    chains.done();
 }
