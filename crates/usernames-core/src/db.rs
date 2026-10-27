@@ -310,6 +310,19 @@ pub enum WindowError {
     Db(#[from] sqlx::Error),
 }
 
+/// Why a writer lease is lost. Either way another instance may take the
+/// chain, and this one is no longer its writer.
+#[derive(Debug, thiserror::Error)]
+pub enum LeaseLost {
+    /// The lease's session failed a query: it ended, and the lock with it.
+    #[error("the writer lease's session ended")]
+    Ended(#[from] sqlx::Error),
+    /// The lease's session did not answer in time, which its client cannot
+    /// tell from an ended one.
+    #[error("the writer lease's session did not answer within {0:?}")]
+    Silent(Duration),
+}
+
 /// A held per-chain writer lease. One process indexes one chain at a time:
 /// the Postgres advisory lock lives on this dedicated connection for the
 /// process's lifetime, so a second instance — a rolling-deploy overlap, a
@@ -329,14 +342,17 @@ pub struct WriterLease {
 }
 
 impl WriterLease {
-    /// Return once the lease is lost: its session ended, and the lock with
-    /// it, so another instance may now write the chain. Checked every
-    /// `interval`, which also keeps the session from idling out.
-    pub async fn lost(&mut self, interval: Duration) -> sqlx::Error {
+    /// Return once the lease is lost: its session ended or stopped
+    /// answering. Asked every `every`, with as long again to answer; the
+    /// asking also keeps the session from idling out.
+    pub async fn lost(&mut self, every: Duration) -> LeaseLost {
         loop {
-            tokio::time::sleep(interval).await;
-            if let Err(e) = sqlx::query(sql::WRITER_ALIVE).execute(&mut self.conn).await {
-                return e;
+            tokio::time::sleep(every).await;
+            let alive = sqlx::query(sql::WRITER_ALIVE).execute(&mut self.conn);
+            match tokio::time::timeout(every, alive).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => return LeaseLost::Ended(e),
+                Err(_) => return LeaseLost::Silent(every),
             }
         }
     }

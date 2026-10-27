@@ -7,6 +7,7 @@
 //! broken migration cannot masquerade as "no database around".
 
 mod common;
+mod proxy;
 
 use std::{
     fmt::Debug,
@@ -59,6 +60,7 @@ use usernames_core::{
         ChainState,
         ChainStore,
         ChainWriter,
+        LeaseLost,
         WindowError,
     },
     ens,
@@ -1167,24 +1169,58 @@ async fn the_deployment_block_survives_a_replay_of_the_same_registry() {
 }
 
 /// A lease whose session ends — a database restart, a failover, an idle
-/// timeout — has lost its lock, and says so within an interval.
+/// timeout — has lost its lock, and says so within an interval; while the
+/// session lives, it is not lost.
 #[tokio::test]
 async fn a_lease_whose_session_ends_reports_itself_lost() {
     let Some((store, pool, guard)) = test_store_with(2).await else {
         return;
     };
     let mut lease = store.acquire_writer().await.expect("lease");
+    let every = Duration::from_millis(20);
+    assert!(
+        tokio::time::timeout(every * 10, lease.lost(every))
+            .await
+            .is_err(),
+        "a live session's lease is held"
+    );
     sqlx::query(include_str!("common/end_writer_session.sql"))
         .bind(store.chain_id())
         .execute(&pool)
         .await
         .expect("the lease's session ends");
-    tokio::time::timeout(
+    let lost = tokio::time::timeout(Duration::from_secs(5), lease.lost(every))
+        .await
+        .expect("the lease reports itself lost");
+    assert!(matches!(lost, LeaseLost::Ended(_)), "{lost:?}");
+    drop(guard);
+}
+
+/// A lease whose session stops answering — a half-open socket, a hung
+/// server — cannot be told from one whose session ended, and is reported
+/// lost within two intervals instead of waiting on the socket.
+#[tokio::test]
+async fn a_lease_whose_session_goes_silent_reports_itself_lost() {
+    let Some((_store, _pool, guard)) = test_store_with(2).await else {
+        return;
+    };
+    let database = common::database_url().expect("the database is set");
+    let proxy = proxy::Proxy::start(&database).await;
+    let through = PgPool::connect(proxy.url())
+        .await
+        .expect("the proxy relays");
+    let mut lease = ChainStore::new(through, CHAIN)
+        .acquire_writer()
+        .await
+        .expect("lease");
+    proxy.silence();
+    let lost = tokio::time::timeout(
         Duration::from_secs(5),
-        lease.lost(Duration::from_millis(20)),
+        lease.lost(Duration::from_millis(50)),
     )
     .await
     .expect("the lease reports itself lost");
+    assert!(matches!(lost, LeaseLost::Silent(_)), "{lost:?}");
     drop(guard);
 }
 

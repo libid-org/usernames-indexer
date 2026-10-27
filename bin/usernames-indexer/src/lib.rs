@@ -145,6 +145,10 @@ impl Config {
     }
 }
 
+/// How often the indexer asks its writer lease's session whether it still
+/// answers, and how long the session has to answer.
+const LEASE_CHECK: Duration = Duration::from_secs(5);
+
 /// Parse the environment, connect everything, and index until ctrl-c.
 pub async fn run() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
@@ -239,7 +243,7 @@ pub async fn run() -> anyhow::Result<()> {
         },
         // Another instance may take the chain once the lock is gone, so this
         // one stops writing and exits for its supervisor to restart.
-        lost = lease.lost(config.poll_interval) => {
+        lost = lease.lost(LEASE_CHECK) => {
             cancel.cancel();
             let _ = task.await;
             return Err(anyhow::Error::new(lost).context("the writer lease was lost"));
