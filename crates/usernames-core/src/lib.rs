@@ -25,3 +25,4 @@ pub mod ens;
 pub mod events;
 pub mod indexer;
 pub mod nodes;
+pub mod stop;

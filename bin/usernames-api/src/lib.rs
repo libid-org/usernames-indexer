@@ -44,6 +44,7 @@ use usernames_core::{
         Domain,
         DEFAULT_DOMAIN,
     },
+    stop::StopSignals,
 };
 
 /// Everything comes from flags or the environment; a `.env` file is read
@@ -110,7 +111,7 @@ pub struct Config {
     pub ens_max_lag_blocks: u64,
 }
 
-/// Parse the environment, connect, and serve until ctrl-c.
+/// Parse the environment, connect, and serve until ctrl-c or SIGTERM.
 pub async fn run() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()
@@ -155,8 +156,9 @@ pub async fn run() -> anyhow::Result<()> {
             .await
     });
 
+    let mut signals = StopSignals::listen()?;
     tokio::select! {
-        r = tokio::signal::ctrl_c() => {
+        r = signals.received() => {
             tracing::info!("shutting down");
             cancel.cancel();
             let _ = task.await;

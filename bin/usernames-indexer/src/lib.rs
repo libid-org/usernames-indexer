@@ -30,6 +30,7 @@ use usernames_core::{
         self,
         LogSource,
     },
+    stop::StopSignals,
 };
 
 /// Everything comes from flags or the environment; a `.env` file is read
@@ -153,7 +154,8 @@ impl Config {
 /// answers, and how long the session has to answer.
 const LEASE_CHECK: Duration = Duration::from_secs(5);
 
-/// Parse the environment, connect everything, and index until ctrl-c.
+/// Parse the environment, connect everything, and index until ctrl-c or
+/// SIGTERM.
 pub async fn run() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()
@@ -234,8 +236,9 @@ pub async fn run() -> anyhow::Result<()> {
     tracing::info!(chain_id, %contract, ?escrow, "indexing");
     let mut task = tokio::spawn(indexer.run(cancel.clone()));
 
+    let mut signals = StopSignals::listen()?;
     let stopped = tokio::select! {
-        r = tokio::signal::ctrl_c() => {
+        r = signals.received() => {
             tracing::info!("shutting down");
             stop(&cancel, &mut task, LEASE_CHECK).await;
             r.map_err(anyhow::Error::from)
