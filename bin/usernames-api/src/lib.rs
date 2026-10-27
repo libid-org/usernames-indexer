@@ -123,31 +123,17 @@ pub async fn run() -> anyhow::Result<()> {
 
     let config = Config::parse();
 
-    // `connect`, not `connect_and_migrate`: the schema belongs to the writer.
-    let pool = db::connect(&config.database_url).await?;
-    let store = db::Store::new(pool.clone());
+    // From the start, so a stop request during startup ends the process.
+    let mut signals = StopSignals::listen()?;
+    let (listener, app) = tokio::select! {
+        started = config.start() => started?,
+        r = signals.received() => {
+            tracing::info!("stopped before serving");
+            return r.map_err(anyhow::Error::from);
+        }
+    };
 
     let cancel = CancellationToken::new();
-
-    // Configured BEFORE the port opens: it can refuse to start, and binding
-    // first would accept connections the process is not yet able to serve.
-    let gateway = config.gateway(pool).await?;
-    match &gateway {
-        Some(g) => tracing::info!(
-            domain = %g.domain,
-            resolver = %g.resolver,
-            ens_chain = g.ens_chain,
-            route = %format!("{}/{{sender}}/{{data}}", ens::ROUTE_PREFIX),
-            "ENS gateway configured"
-        ),
-        None => {
-            tracing::info!("ENS gateway not configured; the CCIP-Read route is absent")
-        }
-    }
-    let app = build_router(api::AppState::new(store), gateway);
-
-    let listener = TcpListener::bind(config.listen_addr).await?;
-    tracing::info!(addr = %config.listen_addr, "read API listening");
 
     let shutdown = cancel.clone();
     let mut task = tokio::spawn(async move {
@@ -156,7 +142,6 @@ pub async fn run() -> anyhow::Result<()> {
             .await
     });
 
-    let mut signals = StopSignals::listen()?;
     tokio::select! {
         r = signals.received() => {
             tracing::info!("shutting down");
@@ -224,6 +209,37 @@ const BLOCK_TIMESTAMP_SLACK: Duration = Duration::from_secs(300);
 const MAX_TTL: Duration = RESOLVER_MAX_LIFETIME.saturating_sub(BLOCK_TIMESTAMP_SLACK);
 
 impl Config {
+    /// The socket and the routes this configuration serves: the store
+    /// connected, the gateway configured, the port bound.
+    async fn start(self) -> anyhow::Result<(TcpListener, Router)> {
+        // `connect`, not `connect_and_migrate`: the schema belongs to the writer.
+        let pool = db::connect(&self.database_url).await?;
+        let store = db::Store::new(pool.clone());
+
+        // Configured BEFORE the port opens: it can refuse to start, and binding
+        // first would accept connections the process is not yet able to serve.
+        let gateway = self.gateway(pool).await?;
+        match &gateway {
+            Some(g) => tracing::info!(
+                domain = %g.domain,
+                resolver = %g.resolver,
+                ens_chain = g.ens_chain,
+                route = %format!("{}/{{sender}}/{{data}}", ens::ROUTE_PREFIX),
+                "ENS gateway configured"
+            ),
+            None => {
+                tracing::info!(
+                    "ENS gateway not configured; the CCIP-Read route is absent"
+                )
+            }
+        }
+        let app = build_router(api::AppState::new(store), gateway);
+
+        let listener = TcpListener::bind(self.listen_addr).await?;
+        tracing::info!(addr = %self.listen_addr, "read API listening");
+        Ok((listener, app))
+    }
+
     /// Where the gateway's key lives, and the resolver it signs for.
     ///
     /// `None` when no gateway runs: the key is what turns the route on. A key

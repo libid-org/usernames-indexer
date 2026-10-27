@@ -24,6 +24,7 @@ use usernames_core::{
     db::{
         self,
         Superseded,
+        WriterLease,
     },
     ens::ChainName,
     indexer::{
@@ -111,6 +112,77 @@ pub struct Config {
 }
 
 impl Config {
+    /// The indexer this configuration describes, under its chain's writer
+    /// lease: endpoints checked, the schema migrated, the chain prepared and
+    /// its names declared.
+    async fn start(self) -> anyhow::Result<(WriterLease, indexer::Indexer)> {
+        let contract = self.identity_names_address;
+        // Pure configuration, checked before anything is touched: `prepare`
+        // below may wipe the chain's rows on a version bump, and a refusal has
+        // to come before that, not after.
+        let stale_after = self.report_validity()?;
+        let confirmations = self.confirmations()?;
+
+        // The same transport the loop will use, so an endpoint that serves no
+        // WebSocket refuses here, at startup, instead of in every session.
+        let provider = self.log_source.connect(&self.rpc_url).await.map_err(|e| {
+            anyhow::anyhow!("RPC_URL over LOG_SOURCE={}: {e}", self.log_source)
+        })?;
+        let reported = provider.get_chain_id().await?;
+        if let Some(expected) = self.chain_id {
+            anyhow::ensure!(
+                reported == expected,
+                "RPC reports chain id {reported}, config expects {expected}"
+            );
+        }
+        let chain_id = i64::try_from(reported).map_err(|_| {
+            anyhow::anyhow!("chain id {reported} does not fit in a BIGINT")
+        })?;
+        // Before `prepare` too: an older registry's events would be misread.
+        chain::check_registry(&provider, contract)
+            .await
+            .context("IDENTITY_NAMES_ADDRESS")?;
+        let escrow = self.handle_escrow_address;
+        if let Some(escrow) = escrow {
+            // Before `prepare`, which clears the chain when the escrow changes: a
+            // misconfiguration refuses without touching the rows.
+            chain::check_escrow(&provider, escrow, contract)
+                .await
+                .context("HANDLE_ESCROW_ADDRESS")?;
+        }
+
+        // The indexer migrates because the indexer writes. The read API connects
+        // to whatever schema it finds.
+        let pool = db::connect_and_migrate(&self.database_url).await?;
+        let store = db::ChainStore::new(pool, chain_id);
+        // The writer lease outlives the indexer: as long as this process may
+        // write the chain, no other instance may. prepare runs under it —
+        // the lease is a parameter there, so a version-bump replay cannot race a
+        // still-running older pod.
+        let lease = store.acquire_writer().await?;
+        let writer = store.prepare(&lease, contract, escrow).await?;
+        store.set_chain_names(&lease, &self.chain_names).await?;
+
+        // Startup's own connection: every session of the loop opens its own.
+        drop(provider);
+        let indexer = indexer::Indexer::new(
+            writer,
+            self.rpc_url,
+            indexer::IndexerConfig {
+                contract,
+                escrow,
+                confirmations,
+                source: self.log_source,
+                poll_interval: self.poll_interval,
+                max_block_range: self.max_block_range,
+                start_block: self.start_block,
+                stale_after,
+            },
+        );
+        tracing::info!(chain_id, %contract, ?escrow, "indexing");
+        Ok((lease, indexer))
+    }
+
     /// How many blocks behind the head to stay: `CONFIRMATIONS`, refused at
     /// zero with a subscription. An endpoint can push a head before it
     /// serves that block's logs, and fetching them then would find none.
@@ -166,77 +238,19 @@ pub async fn run() -> anyhow::Result<()> {
         .init();
 
     let config = Config::parse();
-    let contract = config.identity_names_address;
-    // Pure configuration, checked before anything is touched: `prepare`
-    // below may wipe the chain's rows on a version bump, and a refusal has
-    // to come before that, not after.
-    let stale_after = config.report_validity()?;
-    let confirmations = config.confirmations()?;
-
-    // The same transport the loop will use, so an endpoint that serves no
-    // WebSocket refuses here, at startup, instead of in every session.
-    let provider = config
-        .log_source
-        .connect(&config.rpc_url)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!("RPC_URL over LOG_SOURCE={}: {e}", config.log_source)
-        })?;
-    let reported = provider.get_chain_id().await?;
-    if let Some(expected) = config.chain_id {
-        anyhow::ensure!(
-            reported == expected,
-            "RPC reports chain id {reported}, config expects {expected}"
-        );
-    }
-    let chain_id = i64::try_from(reported)
-        .map_err(|_| anyhow::anyhow!("chain id {reported} does not fit in a BIGINT"))?;
-    // Before `prepare` too: an older registry's events would be misread.
-    chain::check_registry(&provider, contract)
-        .await
-        .context("IDENTITY_NAMES_ADDRESS")?;
-    let escrow = config.handle_escrow_address;
-    if let Some(escrow) = escrow {
-        // Before `prepare`, which clears the chain when the escrow changes: a
-        // misconfiguration refuses without touching the rows.
-        chain::check_escrow(&provider, escrow, contract)
-            .await
-            .context("HANDLE_ESCROW_ADDRESS")?;
-    }
-
-    // The indexer migrates because the indexer writes. The read API connects
-    // to whatever schema it finds.
-    let pool = db::connect_and_migrate(&config.database_url).await?;
-    let store = db::ChainStore::new(pool, chain_id);
-    // The writer lease outlives everything below: as long as this process
-    // may write the chain, no other instance may. prepare runs under it —
-    // the lease is a parameter there, so a version-bump replay cannot race a
-    // still-running older pod.
-    let mut lease = store.acquire_writer().await?;
-    let writer = store.prepare(&lease, contract, escrow).await?;
-    store.set_chain_names(&lease, &config.chain_names).await?;
-
+    // From the start, so a stop request during a long startup (waiting on
+    // another instance's lease, say) ends the process.
+    let mut signals = StopSignals::listen()?;
+    let (mut lease, indexer) = tokio::select! {
+        started = config.start() => started?,
+        r = signals.received() => {
+            tracing::info!("stopped before indexing");
+            return r.map_err(anyhow::Error::from);
+        }
+    };
     let cancel = CancellationToken::new();
-    // Startup's own connection: every session of the loop opens its own.
-    drop(provider);
-    let indexer = indexer::Indexer::new(
-        writer,
-        config.rpc_url,
-        indexer::IndexerConfig {
-            contract,
-            escrow,
-            confirmations,
-            source: config.log_source,
-            poll_interval: config.poll_interval,
-            max_block_range: config.max_block_range,
-            start_block: config.start_block,
-            stale_after,
-        },
-    );
-    tracing::info!(chain_id, %contract, ?escrow, "indexing");
     let mut task = tokio::spawn(indexer.run(cancel.clone()));
 
-    let mut signals = StopSignals::listen()?;
     let stopped = tokio::select! {
         r = signals.received() => {
             tracing::info!("shutting down");
