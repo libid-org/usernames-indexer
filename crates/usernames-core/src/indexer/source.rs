@@ -4,6 +4,7 @@
 use std::{
     fmt,
     str::FromStr,
+    time::Duration,
 };
 
 use alloy::{
@@ -30,6 +31,8 @@ use anyhow::Context;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use url::Url;
+
+use super::deadline::Deadline;
 
 /// How the loop learns of new logs, configured as `subscribe` or `poll`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,21 +62,33 @@ impl LogSource {
         }
     }
 
-    /// A connection to `rpc` for one session. A subscription needs a
-    /// WebSocket, so an `http(s)` endpoint is dialled as `ws(s)` on the same
-    /// host and path, where Alchemy serves it; an endpoint whose WebSocket
-    /// sits elsewhere is given as a `ws(s)` URL.
-    pub async fn connect(self, rpc: &Url) -> TransportResult<RootProvider> {
-        match self {
-            Self::Poll => RootProvider::connect(rpc.as_str()).await,
+    /// A connection to `rpc` for one session, each of its calls failing
+    /// once unanswered for `patience`, the WebSocket handshake too. A
+    /// subscription needs a WebSocket, so an `http(s)` endpoint is dialled as
+    /// `ws(s)` on the same host and path, where Alchemy serves it; an
+    /// endpoint whose WebSocket sits elsewhere is given as a `ws(s)` URL.
+    pub(crate) async fn connect(
+        self,
+        rpc: &Url,
+        patience: Duration,
+    ) -> TransportResult<RootProvider> {
+        let client = ClientBuilder::default().layer(Deadline(patience));
+        let client = match self {
+            Self::Poll => client.connect(rpc.as_str()).await?,
             Self::Subscribe => {
                 // One refused reconnect and alloy closes the subscription,
                 // rather than retrying ten times, three seconds apart.
                 let socket = WsConnect::new(rpc.websocket()?).with_max_retries(1);
-                let client = ClientBuilder::default().pubsub(Unretried(socket)).await?;
-                Ok(RootProvider::new(client))
+                tokio::time::timeout(patience, client.pubsub(Unretried(socket)))
+                    .await
+                    .map_err(|_| {
+                        TransportErrorKind::custom_str(&format!(
+                            "no WebSocket handshake within {patience:?}"
+                        ))
+                    })??
             }
-        }
+        };
+        Ok(RootProvider::new(client))
     }
 }
 

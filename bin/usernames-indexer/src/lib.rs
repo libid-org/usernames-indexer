@@ -127,12 +127,19 @@ impl Config {
         // Pure configuration, checked before anything is touched: `prepare`
         // below may wipe the chain's rows on a version bump, and a refusal has
         // to come before that, not after.
-        let stale_after = self.report_validity()?;
-        let confirmations = self.confirmations()?;
+        let config = indexer::IndexerConfig {
+            contracts,
+            confirmations: self.confirmations()?,
+            source: self.log_source,
+            poll_interval: self.poll_interval,
+            max_block_range: self.max_block_range,
+            start_block: self.start_block,
+            stale_after: self.report_validity()?,
+        };
 
         // The same transport the loop will use, so an endpoint that serves no
         // WebSocket refuses here, at startup, instead of in every session.
-        let provider = self.log_source.connect(&self.rpc_url).await.map_err(|e| {
+        let provider = config.connect(&self.rpc_url).await.map_err(|e| {
             anyhow::anyhow!("RPC_URL over LOG_SOURCE={}: {e}", self.log_source)
         })?;
         let reported = provider.get_chain_id().await?;
@@ -171,19 +178,7 @@ impl Config {
 
         // Startup's own connection: every session of the loop opens its own.
         drop(provider);
-        let indexer = indexer::Indexer::new(
-            writer,
-            self.rpc_url,
-            indexer::IndexerConfig {
-                contracts,
-                confirmations,
-                source: self.log_source,
-                poll_interval: self.poll_interval,
-                max_block_range: self.max_block_range,
-                start_block: self.start_block,
-                stale_after,
-            },
-        );
+        let indexer = indexer::Indexer::new(writer, self.rpc_url, config);
         tracing::info!(
             chain_id,
             contract = %contracts.registry,

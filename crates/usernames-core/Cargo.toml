@@ -14,7 +14,7 @@ publish = false
 test-seams = []
 
 [dependencies]
-alloy = { workspace = true, features = ["provider-ws"] }
+alloy = { workspace = true, features = ["json-rpc", "provider-ws"] }
 alloy-primitives.workspace = true
 anyhow.workspace = true
 axum.workspace = true
@@ -27,6 +27,7 @@ serde_with.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+tower = "0.5"
 thiserror = "2"
 tracing.workspace = true
 url.workspace = true

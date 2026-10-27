@@ -405,6 +405,46 @@ async fn a_silent_socket_is_left_and_the_next_session_catches_up() {
     chain.stop(running).await;
 }
 
+/// An endpoint that keeps its socket open but stops answering would hold a
+/// session forever; a call left unanswered for the loop's patience fails,
+/// the failure is stored where a monitor looks, and once the endpoint
+/// answers again the next session catches up from the cursor.
+#[tokio::test]
+async fn a_deaf_endpoint_is_left_and_the_next_session_catches_up() {
+    let Some(mut chain) = Chain::start(43141).await else {
+        return;
+    };
+    let running = chain.run(IndexerConfig {
+        stale_after: Duration::from_secs(2),
+        ..chain.config(2)
+    });
+    chain.wait_for_index(chain.head().await - 2).await;
+
+    let mut watch = ChainWatch::new(&chain.pool, chain.writer.store()).await;
+    // No head arrives, so the session asks for the head at its quiet
+    // deadline, and nothing answers.
+    chain.relay.deafen(true);
+    let stored = tokio::time::timeout(PATIENCE, async {
+        loop {
+            if let Some(error) = watch.next().await.window_error {
+                return error;
+            }
+        }
+    })
+    .await
+    .expect("the unanswered call failed and its error was stored");
+    assert!(stored.contains("no answer within"), "{stored}");
+
+    chain.relay.deafen(false);
+    let holder = chain.accounts()[0];
+    let bound = chain.bind("deafened_1", holder).await;
+    chain.mine(3).await;
+    chain.wait_for_index(bound).await;
+
+    assert_eq!(chain.resolve("deafened_1").await, Ok(holder));
+    chain.stop(running).await;
+}
+
 /// An indexer whose chain another instance took stops at its next window,
 /// rather than retrying a chain that is no longer its to write.
 #[tokio::test]

@@ -1,6 +1,6 @@
 //! A WebSocket relay between the indexer and anvil: it records the JSON-RPC
 //! methods the indexer calls, and on demand cuts every connection and holds
-//! new ones until it reopens, or keeps the socket open but silent.
+//! new ones until it reopens, or keeps the socket open but silent or deaf.
 
 use std::{
     net::SocketAddr,
@@ -37,8 +37,6 @@ pub struct Relay {
     open: watch::Sender<bool>,
     /// How many connections are being relayed right now.
     live: watch::Sender<usize>,
-    /// Whether subscription pushes are dropped, the socket left open.
-    silent: watch::Sender<bool>,
 }
 
 /// What every relayed connection reads and writes.
@@ -48,6 +46,11 @@ struct Shared {
     /// Whether `eth_getLogs` answers lose their `blockTimestamp`, as an
     /// endpoint that does not serve the field answers.
     timeless: watch::Sender<bool>,
+    /// Whether subscription pushes are dropped, the socket left open.
+    silent: watch::Sender<bool>,
+    /// Whether every answer and push is dropped, the socket left open and
+    /// its pings answered.
+    deaf: watch::Sender<bool>,
 }
 
 /// A JSON-RPC answer carrying logs.
@@ -75,25 +78,24 @@ impl Relay {
         let shared = Arc::new(Shared {
             calls: watch::Sender::new(Vec::new()),
             timeless: watch::Sender::new(false),
+            silent: watch::Sender::new(false),
+            deaf: watch::Sender::new(false),
         });
         let (open, _) = watch::channel(true);
         let (live, _) = watch::channel(0);
-        let (silent, _) = watch::channel(false);
         let relay = Self {
             addr,
             shared: shared.clone(),
             open: open.clone(),
             live: live.clone(),
-            silent: silent.clone(),
         };
         tokio::spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
-                let (upstream, shared, mut open, live, silent) = (
+                let (upstream, shared, mut open, live) = (
                     upstream.clone(),
                     shared.clone(),
                     open.subscribe(),
                     live.clone(),
-                    silent.subscribe(),
                 );
                 tokio::spawn(async move {
                     // A connection made while the relay is cut waits for it to
@@ -101,7 +103,7 @@ impl Relay {
                     let reopened = open.wait_for(|open| *open).await.is_ok();
                     if reopened {
                         live.send_modify(|live| *live += 1);
-                        shared.pipe(socket, upstream, open, silent).await;
+                        shared.pipe(socket, upstream, open).await;
                         live.send_modify(|live| *live -= 1);
                     }
                 });
@@ -136,7 +138,13 @@ impl Relay {
     /// Drop every subscription push from now on, or stop dropping them; the
     /// sockets stay open and answer calls.
     pub fn silence(&self, silent: bool) {
-        self.silent.send_replace(silent);
+        self.shared.silent.send_replace(silent);
+    }
+
+    /// Drop every answer and push from now on, or stop dropping them; the
+    /// sockets stay open and answer pings.
+    pub fn deafen(&self, deaf: bool) {
+        self.shared.deaf.send_replace(deaf);
     }
 
     /// Answer `eth_getLogs` without `blockTimestamp` from now on, or with
@@ -166,14 +174,13 @@ impl Relay {
 
 impl Shared {
     /// Relay one connection both ways, recording each request's method and
-    /// dropping pushes while silenced, until either side closes or the relay is
-    /// cut.
+    /// dropping pushes while silenced, answers too while deafened, until
+    /// either side closes or the relay is cut.
     async fn pipe(
         &self,
         socket: TcpStream,
         upstream: Url,
         mut open: watch::Receiver<bool>,
-        silent: watch::Receiver<bool>,
     ) {
         let Ok(client) = accept_async(socket).await else {
             return;
@@ -202,12 +209,7 @@ impl Shared {
                     if *self.timeless.borrow() {
                         message = Self::timeless(message);
                     }
-                    let push = match &message {
-                        Message::Text(text) => serde_json::from_str::<Call>(text.as_str())
-                            .is_ok_and(|call| call.method == "eth_subscription"),
-                        _ => false,
-                    };
-                    if push && *silent.borrow() {
+                    if self.drops(&message) {
                         continue;
                     }
                     if to_client.send(message).await.is_err() {
@@ -216,6 +218,18 @@ impl Shared {
                 }
             }
         }
+    }
+
+    /// Whether `message`, from the endpoint, is dropped: every answer and
+    /// push while deafened, pushes while silenced.
+    fn drops(&self, message: &Message) -> bool {
+        let Message::Text(text) = message else {
+            return false;
+        };
+        *self.deaf.borrow()
+            || (*self.silent.borrow()
+                && serde_json::from_str::<Call>(text.as_str())
+                    .is_ok_and(|call| call.method == "eth_subscription"))
     }
 
     /// `message` without the block times of the logs it answers with.

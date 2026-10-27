@@ -6,6 +6,7 @@
 //! of resuming inside one, and the journal's conflict gates every write, so
 //! the replay converges.
 
+mod deadline;
 mod heads;
 mod source;
 
@@ -19,6 +20,7 @@ use alloy::{
         RootProvider,
     },
     rpc::types::Log,
+    transports::TransportResult,
 };
 use anyhow::Context;
 use tokio_util::sync::CancellationToken;
@@ -73,12 +75,25 @@ pub struct IndexerConfig {
     /// target and renewed per committed chunk; a reader that finds it expired
     /// treats the index as stale. It has to cover a poll interval, a slow
     /// chunk and a missed cycle, which is why the CLI derives it from
-    /// `poll_interval` when nothing sets it. A subscription that hears no
-    /// head for half of it reconnects.
+    /// `poll_interval` when nothing sets it.
     pub stale_after: Duration,
 }
 
 impl IndexerConfig {
+    /// A connection to `rpc` as this loop's sessions use it: over the
+    /// configured source, each call failing once unanswered for
+    /// [`Self::patience`].
+    pub async fn connect(&self, rpc: &Url) -> TransportResult<RootProvider> {
+        self.source.connect(rpc, self.patience()).await
+    }
+
+    /// How long a session waits on its endpoint, for an answer or for the
+    /// next pushed head, before the session ends and the next one
+    /// reconnects: half the report's life.
+    fn patience(&self) -> Duration {
+        self.stale_after / 2
+    }
+
     /// The last block of the `eth_getLogs` window that starts at `from`, at
     /// most `through`.
     fn window_end(&self, from: u64, through: u64) -> u64 {
@@ -233,7 +248,8 @@ impl<'a> Session<'a> {
     /// Connect, and open what the configured source follows the chain with.
     async fn open(indexer: &'a Indexer) -> anyhow::Result<Self> {
         let source = indexer.config.source;
-        let provider = source
+        let provider = indexer
+            .config
             .connect(&indexer.rpc)
             .await
             .context("connecting to the RPC")?;
@@ -250,14 +266,14 @@ impl<'a> Session<'a> {
     /// Catch up, then follow: a poll catches up again every interval; a
     /// subscription commits through each pushed head's confirmation depth,
     /// fetching only the blocks its heads cannot vouch are free of watched
-    /// logs. A subscription that hears no head for half the report's life
-    /// ends the session, so the next one reconnects and catches up: an open
-    /// but silent socket would otherwise leave the index frozen and the
-    /// report never renewed.
+    /// logs. A subscription that hears no head for the loop's patience ends
+    /// the session, so the next one reconnects and catches up: an open but
+    /// silent socket would otherwise leave the index frozen and the report
+    /// never renewed.
     async fn follow(mut self, cancel: &CancellationToken) -> anyhow::Result<Ended> {
         let config = &self.indexer.config;
         let watched = config.contracts.watched();
-        let quiet = config.stale_after / 2;
+        let quiet = config.patience();
         let mut seen = self.catch_up(cancel).await?;
         let mut heads = Heads::default();
         let mut heard = Instant::now();

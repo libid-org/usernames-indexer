@@ -61,7 +61,7 @@ indexer's settings.
 | `CONFIRMATIONS` | indexer | `5` | Blocks behind the head to stay (shallow-reorg protection). At least 1 with `LOG_SOURCE=subscribe` |
 | `LOG_SOURCE` | indexer | `subscribe` | How the indexer learns of new blocks: `subscribe` holds an `eth_subscribe("newHeads")` stream on a WebSocket; `poll` reads the head and asks with `eth_getLogs` every `POLL_INTERVAL`, for an endpoint without WebSocket. See [Log sources](#log-sources) |
 | `POLL_INTERVAL` | indexer | `5s` | The retry delay after a failure, and with `LOG_SOURCE=poll` the poll cycle |
-| `STALE_AFTER` | indexer | four poll intervals + 1m | How long readers may trust this indexer's last report; the ENS gateway refuses this chain once it expires. Must exceed `POLL_INTERVAL`, and at most a year. With a subscription, keep it above twice the chain's block time: the report renews on pushed heads, and a session that hears none for half of it reconnects |
+| `STALE_AFTER` | indexer | four poll intervals + 1m | How long readers may trust this indexer's last report; the ENS gateway refuses this chain once it expires. Must exceed `POLL_INTERVAL`, and at most a year. With a subscription, keep it above twice the chain's block time: the report renews on pushed heads, and a session that hears none for half of it reconnects. Half of it also bounds every RPC call, in either mode |
 | `MAX_BLOCK_RANGE` | indexer | `10000` | Largest `eth_getLogs` window |
 | `START_BLOCK` | indexer | unset | Where a FRESH scan starts — consulted only when no cursor exists (new database, or right after a re-index). Unset means the deployment block is found by binary search over `eth_getCode`; only a successful detection is cached, and an RPC failure mid-search retries next cycle |
 | `LISTEN_ADDR` | api | `127.0.0.1:8080` | Read-API listen address |
@@ -80,7 +80,9 @@ that fetch, as in polling. Any socket drop, stream overflow or RPC error
 ends the session, and the next one catches up from the cursor, so nothing
 the socket missed is lost. A socket that pushes no head for half of
 `STALE_AFTER` is left the same way; the report is renewed only by pushed
-heads, so a silent socket cannot keep a frozen index looking fresh.
+heads, so a silent socket cannot keep a frozen index looking fresh. In
+either mode, a call left unanswered for half of `STALE_AFTER` is an RPC
+error.
 
 **Poll** asks for every window with `eth_getLogs` and re-reads the head
 each `POLL_INTERVAL`, which costs RPC calls per block whether or not
