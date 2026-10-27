@@ -65,7 +65,7 @@ pub struct IndexerConfig {
 impl IndexerConfig {
     /// A client for `rpc` as this loop uses it, each call failing once
     /// unanswered for half of [`Self::stale_after`].
-    pub fn connect(&self, rpc: &RpcUrl) -> RootProvider {
+    pub fn provider(&self, rpc: &RpcUrl) -> RootProvider {
         rpc.provider(self.patience())
     }
 
@@ -210,7 +210,7 @@ struct Session<'a> {
 impl<'a> Session<'a> {
     /// A session over `indexer`'s endpoint.
     fn open(indexer: &'a Indexer) -> Self {
-        let provider = indexer.config.connect(&indexer.rpc);
+        let provider = indexer.config.provider(&indexer.rpc);
         Self { indexer, provider }
     }
 

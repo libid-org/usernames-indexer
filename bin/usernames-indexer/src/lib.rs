@@ -125,7 +125,7 @@ impl Config {
             stale_after: self.report_validity()?,
         };
 
-        let provider = config.connect(&self.rpc_url);
+        let provider = config.provider(&self.rpc_url);
         let reported = provider.get_chain_id().await.context("eth_chainId")?;
         if let Some(expected) = self.chain_id {
             anyhow::ensure!(
@@ -290,6 +290,8 @@ impl Indexing {
 
 #[cfg(test)]
 mod help_tests {
+    use std::time::Duration;
+
     use clap::{
         CommandFactory,
         Parser,
@@ -384,7 +386,7 @@ mod help_tests {
         assert!(config("0s").poll_interval().is_err());
         assert_eq!(
             config("1s").poll_interval().ok(),
-            Some(std::time::Duration::from_secs(1))
+            Some(Duration::from_secs(1))
         );
     }
 }
