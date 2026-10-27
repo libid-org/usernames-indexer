@@ -239,8 +239,8 @@ pub async fn run() -> anyhow::Result<()> {
         }
         r = &mut task => match r {
             Ok(Ok(())) => Err(anyhow::anyhow!("indexer task exited unexpectedly")),
-            // Another instance holds the lock, so this lease's session is
-            // already gone: nothing to release.
+            // The lease's session is most likely gone, and releasing a dead
+            // one fails or hangs; dropping the lease closes it either way.
             Ok(Err(superseded)) => return Err(superseded.into()),
             Err(e) => Err(anyhow::anyhow!("indexer task died: {e}")),
         },

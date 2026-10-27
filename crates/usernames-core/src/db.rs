@@ -297,7 +297,7 @@ pub enum ChainNamesError {
 }
 
 /// The chain's row no longer names this writer: a later prepare took the
-/// chain, or the row is gone. Either way the writer's lease was lost.
+/// chain, or the row is gone.
 #[derive(Clone, Copy, Debug, thiserror::Error)]
 #[error("chain {chain_id} is no longer this writer's to write")]
 pub struct Superseded {
