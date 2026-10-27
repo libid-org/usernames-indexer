@@ -1429,6 +1429,18 @@ async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
     drop(guard);
 }
 
+/// The names `chain` goes by, as its status lists them.
+async fn names_of(pool: &PgPool, chain: i64) -> Vec<String> {
+    db::Store::new(pool.clone())
+        .chain_statuses()
+        .await
+        .expect("the statuses")
+        .into_iter()
+        .find(|row| row.state.chain_id == chain)
+        .map(|row| row.names)
+        .unwrap_or_default()
+}
+
 /// A chain's names are its indexer's declaration: a set, replaced whole on
 /// each start, owned by one chain across the store, and listed on
 /// `/v1/status`.
@@ -1451,10 +1463,7 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
         )
         .await
         .expect("declared");
-    assert_eq!(
-        store.chain_names().await.unwrap(),
-        ["alpha", "alpha-testnet"]
-    );
+    assert_eq!(names_of(&pool, CHAIN).await, ["alpha", "alpha-testnet"]);
 
     // Both names resolve to this chain.
     let reader = db::Store::new(pool.clone());
@@ -1467,7 +1476,7 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
         .set_chain_names(&lease, &[name("alpha")])
         .await
         .expect("declared again");
-    assert_eq!(store.chain_names().await.unwrap(), ["alpha"]);
+    assert_eq!(names_of(&pool, CHAIN).await, ["alpha"]);
 
     // Another chain cannot take a name this one holds, and writes nothing.
     let other = ChainStore::new(pool.clone(), OTHER_CHAIN);
@@ -1483,7 +1492,7 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
         ),
         "{refused:?}"
     );
-    assert_eq!(other.chain_names().await.unwrap(), Vec::<String>::new());
+    assert_eq!(names_of(&pool, OTHER_CHAIN).await, Vec::<String>::new());
 
     // A dropped name resolves to no chain, like one nobody declared.
     assert_eq!(reader.chain_named("alpha").await.unwrap(), Some(CHAIN));

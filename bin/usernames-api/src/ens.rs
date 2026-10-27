@@ -382,23 +382,13 @@ impl Config {
         let chains = rows
             .into_iter()
             .map(|(chain_id, row)| {
-                let position = row.state.position();
-                let lag = Lag::of(Some(position));
                 // What the gate sees: a chain sharing its coin type with
                 // another in the store is refused for that coin type however
                 // fresh either is.
                 let ambiguous = ids
                     .iter()
                     .any(|other| CoinType::shared_by(chain_id, *other));
-                ChainStatus {
-                    chain_id,
-                    names: row.names,
-                    lag_blocks: lag.blocks(),
-                    indexer_reported_at: position.reported_at,
-                    report_valid_for: position.valid_for_seconds(),
-                    ambiguous,
-                    stale: ambiguous || lag.staleness(self.max_lag_blocks).is_some(),
-                }
+                ChainStatus::of(chain_id, row, ambiguous, self.max_lag_blocks)
             })
             .collect();
         Ok(GatewayStatus { chains })
@@ -639,6 +629,28 @@ pub struct ChainStatus {
     /// Whether a query for this chain would be refused right now, for any of
     /// the reasons above.
     pub stale: bool,
+}
+
+impl ChainStatus {
+    /// A chain's status from its row, as the gate decides on it.
+    fn of(
+        chain_id: u64,
+        row: ChainStatusRow,
+        ambiguous: bool,
+        max_lag_blocks: u64,
+    ) -> Self {
+        let position = row.state.position();
+        let lag = Lag::of(Some(position));
+        Self {
+            chain_id,
+            names: row.names,
+            lag_blocks: lag.blocks(),
+            indexer_reported_at: position.reported_at,
+            report_valid_for: position.valid_for_seconds(),
+            ambiguous,
+            stale: ambiguous || lag.staleness(max_lag_blocks).is_some(),
+        }
+    }
 }
 
 /// `GET /ens/status`: every chain the gateway serves.

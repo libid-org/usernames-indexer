@@ -205,8 +205,8 @@ impl Store {
     }
 
     /// Every chain an indexer has prepared, cursor or not, with its names:
-    /// what `/v1/status` lists, so a chain still in its first window is
-    /// visible there.
+    /// what `/v1/status` and the gateway's `/ens/status` list, so a chain
+    /// still in its first window is visible there.
     pub async fn chain_statuses(&self) -> Result<Vec<ChainStatusRow>, sqlx::Error> {
         sqlx::query_as(sql::CHAIN_STATUSES)
             .fetch_all(&self.pool)
@@ -576,14 +576,6 @@ impl ChainStore {
         }
         tx.commit().await?;
         Ok(())
-    }
-
-    /// The names this chain goes by, as its indexer declared them.
-    pub async fn chain_names(&self) -> Result<Vec<String>, sqlx::Error> {
-        sqlx::query_scalar(sql::CHAIN_NAMES)
-            .bind(self.chain_id)
-            .fetch_all(&self.pool)
-            .await
     }
 
     /// Set when the report expires, as absolute Unix seconds: how a suite
@@ -1331,7 +1323,6 @@ mod sql {
     /// The names the chain goes by in an ENS name.
     pub const CLEAR_CHAIN_NAMES: &str = include_str!("../sql/clear_chain_names.sql");
     pub const INSERT_CHAIN_NAME: &str = include_str!("../sql/insert_chain_name.sql");
-    pub const CHAIN_NAMES: &str = include_str!("../sql/chain_names.sql");
     pub const CHAIN_NAMED: &str = include_str!("../sql/chain_named.sql");
     pub const SYNCED: &str = include_str!("../sql/synced.sql");
     /// The projection every `names.ids` read shares: the row itself, the
