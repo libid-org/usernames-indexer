@@ -125,11 +125,6 @@ impl Node {
         self.instance.endpoint_url()
     }
 
-    /// The WebSocket endpoint.
-    pub fn ws(&self) -> Url {
-        self.instance.ws_endpoint_url()
-    }
-
     /// The dev accounts; the first deploys.
     pub fn accounts(&self) -> &[Address] {
         self.instance.addresses()

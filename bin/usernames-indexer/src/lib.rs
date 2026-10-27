@@ -18,7 +18,6 @@ use anyhow::Context;
 use clap::Parser;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use url::Url;
 use usernames_core::{
     chain::Contracts,
     db::{
@@ -31,7 +30,7 @@ use usernames_core::{
     indexer::{
         Indexer,
         IndexerConfig,
-        LogSource,
+        RpcUrl,
     },
     stop::StopSignals,
 };
@@ -45,19 +44,9 @@ pub struct Config {
     #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
     pub database_url: String,
 
-    /// JSON-RPC endpoint of the chain to follow. With the `subscribe` log
-    /// source an `http(s)` URL is dialled as `ws(s)` on the same host and
-    /// path, which suits Alchemy; a node or provider whose WebSocket sits on
-    /// another port or path takes a `ws(s)` URL here.
+    /// JSON-RPC endpoint of the chain to follow, `http` or `https`.
     #[arg(long, env = "RPC_URL", hide_env_values = true)]
-    pub rpc_url: Url,
-
-    /// How the indexer learns of new blocks: `subscribe` holds an
-    /// `eth_subscribe("newHeads")` stream on a WebSocket; `poll` reads the
-    /// head and asks with `eth_getLogs` every `POLL_INTERVAL`, for an
-    /// endpoint that serves no WebSocket.
-    #[arg(long, env = "LOG_SOURCE", default_value = "subscribe")]
-    pub log_source: LogSource,
+    pub rpc_url: RpcUrl,
 
     /// The IdentityRegistry ERC1967 proxy address. Typed as an address so
     /// garbage is a usage error before anything connects, not a mid-startup
@@ -85,13 +74,11 @@ pub struct Config {
     #[arg(long, env = "CHAIN_NAMES", value_delimiter = ',', required = true)]
     pub chain_names: Vec<ChainName>,
 
-    /// Blocks behind the head to stay; shallow-reorg protection. At least one
-    /// with the `subscribe` log source.
+    /// Blocks behind the head to stay; shallow-reorg protection.
     #[arg(long, env = "CONFIRMATIONS", default_value_t = 5)]
     pub confirmations: u64,
 
-    /// The retry delay after a failure, and with `LOG_SOURCE=poll` the poll
-    /// cycle: `5s`, `1500ms`.
+    /// The poll cycle, and the retry delay after a failure: `5s`, `1500ms`.
     #[arg(long, env = "POLL_INTERVAL", default_value = "5s", value_parser = humantime::parse_duration)]
     pub poll_interval: Duration,
 
@@ -131,19 +118,14 @@ impl Config {
         // to come before that, not after.
         let config = IndexerConfig {
             contracts,
-            confirmations: self.confirmations()?,
-            source: self.log_source,
-            poll_interval: self.poll_interval,
+            confirmations: self.confirmations,
+            poll_interval: self.poll_interval()?,
             max_block_range: self.max_block_range,
             start_block: self.start_block,
             stale_after: self.report_validity()?,
         };
 
-        // The same transport the loop will use, so an endpoint that serves no
-        // WebSocket refuses here, at startup, instead of in every session.
-        let provider = config.connect(&self.rpc_url).await.map_err(|e| {
-            anyhow::anyhow!("RPC_URL over LOG_SOURCE={}: {e}", self.log_source)
-        })?;
+        let provider = config.provider(&self.rpc_url);
         let reported = provider.get_chain_id().await.context("eth_chainId")?;
         if let Some(expected) = self.chain_id {
             anyhow::ensure!(
@@ -190,16 +172,16 @@ impl Config {
         Ok((lease, indexer))
     }
 
-    /// How many blocks behind the head to stay: `CONFIRMATIONS`, refused at
-    /// zero with a subscription. An endpoint can push a head before it
-    /// serves that block's logs, and fetching them then would find none.
-    fn confirmations(&self) -> anyhow::Result<u64> {
+    /// How long the loop waits between polls and before a retry:
+    /// `POLL_INTERVAL`, refused at zero, which would poll and retry back to
+    /// back.
+    fn poll_interval(&self) -> anyhow::Result<Duration> {
         anyhow::ensure!(
-            self.confirmations > 0 || self.log_source == LogSource::Poll,
-            "LOG_SOURCE=subscribe needs CONFIRMATIONS of at least 1: an endpoint \
-             can push a head before it serves that block's logs"
+            !self.poll_interval.is_zero(),
+            "POLL_INTERVAL must be above zero, or the loop polls and retries \
+             back to back"
         );
-        Ok(self.confirmations)
+        Ok(self.poll_interval)
     }
 
     /// How long readers may trust a report: `STALE_AFTER`, or four poll
@@ -308,15 +290,14 @@ impl Indexing {
 
 #[cfg(test)]
 mod help_tests {
+    use std::time::Duration;
+
     use clap::{
         CommandFactory,
         Parser,
     };
 
-    use super::{
-        Config,
-        LogSource,
-    };
+    use super::Config;
 
     /// clap renders `[env: NAME=value]` in `--help` for every argument bound
     /// to a variable, and `.env` is read before parsing, so without
@@ -365,58 +346,47 @@ mod help_tests {
         }
     }
 
-    /// Without a setting the indexer subscribes; `poll` is the opt-out, and
-    /// any other name stops the process before anything connects.
-    #[test]
-    fn the_log_source_defaults_to_a_subscription() {
-        let args = |extra: &[&str]| {
-            let required = [
-                "usernames-indexer",
-                "--database-url",
-                "postgres://localhost/usernames",
-                "--rpc-url",
-                "http://127.0.0.1:8545",
-                "--identity-registry-address",
-                "0x0000000000000000000000000000000000000001",
-                "--chain-names",
-                "eden",
-            ];
-            Config::try_parse_from(required.iter().chain(extra))
-        };
-        assert_eq!(
-            args(&[]).expect("defaults").log_source,
-            LogSource::Subscribe
-        );
-        assert_eq!(
-            args(&["--log-source", "poll"]).expect("poll").log_source,
-            LogSource::Poll
-        );
-        assert!(args(&["--log-source", "websocket"]).is_err());
+    /// The configuration of `rpc` and `poll_interval`, as clap reads it.
+    fn polling(rpc: &str, poll_interval: &str) -> Result<Config, clap::Error> {
+        Config::try_parse_from([
+            "usernames-indexer",
+            "--database-url",
+            "postgres://localhost/usernames",
+            "--rpc-url",
+            rpc,
+            "--identity-registry-address",
+            "0x0000000000000000000000000000000000000001",
+            "--chain-names",
+            "eden",
+            "--poll-interval",
+            poll_interval,
+        ])
     }
 
-    /// A subscription needs a confirmation; a poll may run at the head.
+    /// The loop polls over HTTP, so a WebSocket URL is a usage error before
+    /// anything connects.
     #[test]
-    fn a_subscription_refuses_zero_confirmations() {
-        let args = |extra: &[&str]| {
-            let required = [
-                "usernames-indexer",
-                "--database-url",
-                "postgres://localhost/usernames",
-                "--rpc-url",
-                "http://127.0.0.1:8545",
-                "--identity-registry-address",
-                "0x0000000000000000000000000000000000000001",
-                "--chain-names",
-                "eden",
-                "--confirmations",
-                "0",
-            ];
-            Config::try_parse_from(required.iter().chain(extra)).expect("parses")
-        };
-        assert!(args(&[]).confirmations().is_err());
+    fn a_websocket_rpc_url_is_refused_at_parse() {
+        assert!(polling("https://node.example/rpc", "5s").is_ok());
+        for rpc in ["wss://node.example/rpc", "ws://127.0.0.1:8546"] {
+            let refused = polling(rpc, "5s").expect_err(rpc);
+            assert_eq!(
+                refused.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{rpc}"
+            );
+        }
+    }
+
+    /// A zero interval would poll and retry back to back.
+    #[test]
+    fn a_zero_poll_interval_is_refused() {
+        let config =
+            |interval| polling("http://127.0.0.1:8545", interval).expect("parses");
+        assert!(config("0s").poll_interval().is_err());
         assert_eq!(
-            args(&["--log-source", "poll"]).confirmations().ok(),
-            Some(0)
+            config("1s").poll_interval().ok(),
+            Some(Duration::from_secs(1))
         );
     }
 }

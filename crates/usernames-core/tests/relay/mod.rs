@@ -1,56 +1,72 @@
-//! A WebSocket relay between the indexer and anvil: it records the JSON-RPC
-//! methods the indexer calls, and on demand cuts every connection and holds
-//! new ones until it reopens, or keeps the socket open but silent or deaf.
+//! An HTTP relay between the indexer and anvil: it records the JSON-RPC
+//! methods the indexer calls and when, and on demand stops answering,
+//! refuses every call, or answers `eth_getLogs` without the logs' block
+//! times.
 
 use std::{
     net::SocketAddr,
     sync::Arc,
+    time::Instant,
 };
 
-use alloy::rpc::types::Log;
-use futures_util::{
-    SinkExt,
-    StreamExt,
+use alloy::{
+    rpc::types::Log,
+    transports::http::reqwest,
+};
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::{
+        header::CONTENT_TYPE,
+        StatusCode,
+    },
+    response::{
+        IntoResponse,
+        Response,
+    },
+    routing::post,
+    Router,
 };
 use serde::{
     Deserialize,
     Serialize,
 };
 use tokio::{
-    net::{
-        TcpListener,
-        TcpStream,
-    },
+    net::TcpListener,
     sync::watch,
 };
-use tokio_tungstenite::{
-    accept_async,
-    connect_async,
-    tungstenite::Message,
-};
 use url::Url;
+use usernames_core::indexer::RpcUrl;
 
 /// The relay's listening end, its switches, and what it saw.
 pub struct Relay {
     addr: SocketAddr,
     shared: Arc<Shared>,
-    open: watch::Sender<bool>,
-    /// How many connections are being relayed right now.
-    live: watch::Sender<usize>,
 }
 
-/// What every relayed connection reads and writes.
+/// What every relayed call reads and writes.
 struct Shared {
-    /// Every method the indexer called, in order, announced as it grows.
-    calls: watch::Sender<Vec<String>>,
+    /// Where calls are relayed to.
+    upstream: Url,
+    client: reqwest::Client,
+    /// Every call the indexer made, in order.
+    calls: watch::Sender<Vec<Called>>,
     /// Whether `eth_getLogs` answers lose their `blockTimestamp`, as an
     /// endpoint that does not serve the field answers.
     timeless: watch::Sender<bool>,
-    /// Whether subscription pushes are dropped, the socket left open.
-    silent: watch::Sender<bool>,
-    /// Whether every answer and push is dropped, the socket left open and
-    /// its pings answered.
+    /// Whether calls go unanswered, held open until the relay hears again.
     deaf: watch::Sender<bool>,
+    /// Whether every call is answered `503 Service Unavailable`.
+    refused: watch::Sender<bool>,
+}
+
+/// One call the indexer made, and when the relay took it.
+#[derive(Clone, Debug)]
+pub struct Called {
+    /// The JSON-RPC method.
+    pub method: String,
+    /// When the relay took the call.
+    pub at: Instant,
 }
 
 /// A JSON-RPC answer carrying logs.
@@ -61,90 +77,50 @@ struct LogsAnswer {
     result: Vec<Log>,
 }
 
-/// The part of a JSON-RPC message the relay reads: a request's method, or
-/// `eth_subscription` on a push.
+/// The part of a JSON-RPC request the relay reads.
 #[derive(Deserialize)]
 struct Call {
     method: String,
 }
 
 impl Relay {
-    /// Listen on a free local port, relaying every connection to `upstream`.
+    /// Listen on a free local port, relaying every call to `upstream`.
     pub async fn start(upstream: Url) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("a local port");
         let addr = listener.local_addr().expect("the bound address");
         let shared = Arc::new(Shared {
+            upstream,
+            client: reqwest::Client::new(),
             calls: watch::Sender::new(Vec::new()),
             timeless: watch::Sender::new(false),
-            silent: watch::Sender::new(false),
             deaf: watch::Sender::new(false),
+            refused: watch::Sender::new(false),
         });
-        let (open, _) = watch::channel(true);
-        let (live, _) = watch::channel(0);
-        let relay = Self {
-            addr,
-            shared: shared.clone(),
-            open: open.clone(),
-            live: live.clone(),
-        };
-        tokio::spawn(async move {
-            while let Ok((socket, _)) = listener.accept().await {
-                let (upstream, shared, mut open, live) = (
-                    upstream.clone(),
-                    shared.clone(),
-                    open.subscribe(),
-                    live.clone(),
-                );
-                tokio::spawn(async move {
-                    // A connection made while the relay is cut waits for it to
-                    // reopen, its handshake stalled as on an unreachable host.
-                    let reopened = open.wait_for(|open| *open).await.is_ok();
-                    if reopened {
-                        live.send_modify(|live| *live += 1);
-                        shared.pipe(socket, upstream, open).await;
-                        live.send_modify(|live| *live -= 1);
-                    }
-                });
-            }
-        });
-        relay
+        let app = Router::new()
+            .route("/", post(Shared::relay))
+            .with_state(shared.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        Self { addr, shared }
     }
 
-    /// The endpoint the indexer is given: `http`, so the indexer derives the
-    /// WebSocket URL it dials.
-    pub fn url(&self) -> Url {
-        format!("http://{}", self.addr).parse().expect("a URL")
+    /// The endpoint the indexer is given.
+    pub fn url(&self) -> RpcUrl {
+        format!("http://{}", self.addr)
+            .parse()
+            .expect("an http URL")
     }
 
-    /// Drop every relayed connection and hold new ones until reopened.
-    /// Returns once the last relayed connection is closed.
-    pub async fn cut(&self) {
-        self.open.send_replace(false);
-        self.live
-            .subscribe()
-            .wait_for(|live| *live == 0)
-            .await
-            .map(drop)
-            .expect("the relay outlives its connections");
-    }
-
-    /// Relay again, the held connections first.
-    pub fn reopen(&self) {
-        self.open.send_replace(true);
-    }
-
-    /// Drop every subscription push from now on, or stop dropping them; the
-    /// sockets stay open and answer calls.
-    pub fn silence(&self, silent: bool) {
-        self.shared.silent.send_replace(silent);
-    }
-
-    /// Drop every answer and push from now on, or stop dropping them; the
-    /// sockets stay open and answer pings.
+    /// Leave every call unanswered from now on, or answer again.
     pub fn deafen(&self, deaf: bool) {
         self.shared.deaf.send_replace(deaf);
+    }
+
+    /// Answer every call `503 Service Unavailable` from now on, or relay
+    /// again.
+    pub fn refuse(&self, refused: bool) {
+        self.shared.refused.send_replace(refused);
     }
 
     /// Answer `eth_getLogs` without `blockTimestamp` from now on, or with
@@ -153,9 +129,20 @@ impl Relay {
         self.shared.timeless.send_replace(strip);
     }
 
-    /// Every method the indexer called through the relay, in order.
-    pub fn calls(&self) -> Vec<String> {
-        self.shared.calls.borrow().clone()
+    /// How many times the indexer has called `method` through the relay.
+    pub fn count(&self, method: &str) -> usize {
+        self.times(method).len()
+    }
+
+    /// When the relay took each call of `method`, in order.
+    pub fn times(&self, method: &str) -> Vec<Instant> {
+        self.shared
+            .calls
+            .borrow()
+            .iter()
+            .filter(|called| called.method == method)
+            .map(|called| called.at)
+            .collect()
     }
 
     /// Return once the indexer has called `method` `times` times.
@@ -164,7 +151,11 @@ impl Relay {
             .calls
             .subscribe()
             .wait_for(|calls| {
-                calls.iter().filter(|called| *called == method).count() >= times
+                calls
+                    .iter()
+                    .filter(|called| called.method == method)
+                    .count()
+                    >= times
             })
             .await
             .map(drop)
@@ -173,80 +164,57 @@ impl Relay {
 }
 
 impl Shared {
-    /// Relay one connection both ways, recording each request's method and
-    /// dropping pushes while silenced, answers too while deafened, until
-    /// either side closes or the relay is cut.
-    async fn pipe(
-        &self,
-        socket: TcpStream,
-        upstream: Url,
-        mut open: watch::Receiver<bool>,
-    ) {
-        let Ok(client) = accept_async(socket).await else {
-            return;
+    /// Relay one call, recording its method. A deaf relay holds the call
+    /// until it hears again, and the caller gives up first.
+    async fn relay(State(shared): State<Arc<Self>>, call: Bytes) -> Response {
+        if let Ok(Call { method }) = serde_json::from_slice(&call) {
+            let at = Instant::now();
+            shared
+                .calls
+                .send_modify(|calls| calls.push(Called { method, at }));
+        }
+        if *shared.refused.borrow() {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        if *shared.deaf.borrow() {
+            shared
+                .deaf
+                .subscribe()
+                .wait_for(|deaf| !*deaf)
+                .await
+                .map(drop)
+                .expect("the relay outlives its calls");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        let answered = shared
+            .client
+            .post(shared.upstream.clone())
+            .header(CONTENT_TYPE, "application/json")
+            .body(call)
+            .send()
+            .await;
+        let answer = match answered {
+            Ok(answer) => answer.bytes().await,
+            Err(error) => Err(error),
         };
-        let Ok((server, _)) = connect_async(upstream.as_str()).await else {
-            return;
-        };
-        let (mut to_client, mut from_client) = client.split();
-        let (mut to_server, mut from_server) = server.split();
-        loop {
-            tokio::select! {
-                _ = async { open.wait_for(|open| !*open).await.map(drop) } => return,
-                message = from_client.next() => {
-                    let Some(Ok(message)) = message else { return };
-                    if let Message::Text(text) = &message {
-                        if let Ok(call) = serde_json::from_str::<Call>(text.as_str()) {
-                            self.calls.send_modify(|calls| calls.push(call.method));
-                        }
-                    }
-                    if to_server.send(message).await.is_err() {
-                        return;
-                    }
-                }
-                message = from_server.next() => {
-                    let Some(Ok(mut message)) = message else { return };
-                    if *self.timeless.borrow() {
-                        message = Self::timeless(message);
-                    }
-                    if self.drops(&message) {
-                        continue;
-                    }
-                    if to_client.send(message).await.is_err() {
-                        return;
-                    }
-                }
+        match answer {
+            Ok(answer) if *shared.timeless.borrow() => {
+                ([(CONTENT_TYPE, "application/json")], Self::timeless(answer))
+                    .into_response()
             }
+            Ok(answer) => ([(CONTENT_TYPE, "application/json")], answer).into_response(),
+            Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
         }
     }
 
-    /// Whether `message`, from the endpoint, is dropped: every answer and
-    /// push while deafened, pushes while silenced.
-    fn drops(&self, message: &Message) -> bool {
-        let Message::Text(text) = message else {
-            return false;
+    /// `answer` without the block times of the logs it carries.
+    fn timeless(answer: Bytes) -> Bytes {
+        let Ok(mut logs) = serde_json::from_slice::<LogsAnswer>(&answer) else {
+            return answer;
         };
-        *self.deaf.borrow()
-            || (*self.silent.borrow()
-                && serde_json::from_str::<Call>(text.as_str())
-                    .is_ok_and(|call| call.method == "eth_subscription"))
-    }
-
-    /// `message` without the block times of the logs it answers with.
-    fn timeless(message: Message) -> Message {
-        let Message::Text(text) = &message else {
-            return message;
-        };
-        let Ok(mut answer) = serde_json::from_str::<LogsAnswer>(text.as_str()) else {
-            return message;
-        };
-        for log in &mut answer.result {
+        for log in &mut logs.result {
             log.block_timestamp = None;
         }
-        Message::Text(
-            serde_json::to_string(&answer)
-                .expect("logs serialize")
-                .into(),
-        )
+        serde_json::to_vec(&logs).expect("logs serialize").into()
     }
 }
