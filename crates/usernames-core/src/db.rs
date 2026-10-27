@@ -1366,12 +1366,12 @@ mod sql {
     /// caller narrows, orders and pages.
     pub const ESCROW_SLOT_PROJECTION: &str =
         include_str!("../sql/escrow_slot_projection.sql");
-    /// A holder's handles, which the claimable slots are read from; the
-    /// caller narrows them.
-    pub const CLAIMABLE_HANDLES: &str = include_str!("../sql/claimable_handles.sql");
-    /// The same shape, driven from the handles an address holds.
-    pub const CLAIMABLE_PROJECTION: &str =
-        include_str!("../sql/claimable_projection.sql");
+    /// The slots a holder may claim, read per handle; the caller narrows
+    /// and caps them.
+    pub const CLAIMABLE_SLOTS: &str = include_str!("../sql/claimable_slots.sql");
+    /// The holder whose handles a claimable read walks; the caller narrows
+    /// the chain and the cursor.
+    pub const CLAIMABLE_HOLDER: &str = include_str!("../sql/claimable_holder.sql");
     /// One sender's contributions in the same shape, with their refund dates.
     pub const REFUNDABLE_PROJECTION: &str =
         include_str!("../sql/refundable_projection.sql");

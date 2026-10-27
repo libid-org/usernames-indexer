@@ -365,45 +365,49 @@ impl Page<SlotCursor> {
     /// the order of its handles and their tokens.
     pub(crate) fn claimable_lookup(&self, prefix: &str, holder: Address) -> Statement {
         let mut statement =
-            QueryBuilder::new(format!("{prefix}{}", sql::CLAIMABLE_HANDLES));
-        statement.push_bind(holder);
-        if let Some(chain) = self.chain {
-            statement.push(" AND chain_id = ").push_bind(chain);
-        }
+            QueryBuilder::new(format!("{prefix}{}", sql::CLAIMABLE_SLOTS));
         if let Some(before) = self.before {
             match self.chain {
                 Some(_) => statement
-                    .push(" AND handle_node <= ")
-                    .push_bind(before.handle_node),
-                None => statement
-                    .push(" AND (chain_id, handle_node) <= (")
-                    .push_bind(before.chain_id)
-                    .push(", ")
+                    .push(" AND (h.handle_node < ")
                     .push_bind(before.handle_node)
-                    .push(")"),
-            };
-        }
-        statement.push(")\n").push(sql::CLAIMABLE_PROJECTION);
-        if let Some(before) = self.before {
-            match self.chain {
-                Some(_) => statement
-                    .push(" AND (e.handle_node, e.token) < (")
-                    .push_bind(before.handle_node)
-                    .push(", ")
+                    .push(" OR e.token < ")
                     .push_bind(before.token)
                     .push(")"),
                 None => statement
-                    .push(" AND (e.chain_id, e.handle_node, e.token) < (")
+                    .push(" AND ((h.chain_id, h.handle_node) < (")
                     .push_bind(before.chain_id)
                     .push(", ")
                     .push_bind(before.handle_node)
-                    .push(", ")
+                    .push(") OR e.token < ")
                     .push_bind(before.token)
                     .push(")"),
             };
         }
         statement
-            .push(" ORDER BY e.chain_id DESC, e.handle_node DESC, e.token DESC LIMIT ")
+            .push(" ORDER BY e.token DESC LIMIT ")
+            .push_bind(self.fetch())
+            .push(") e\n")
+            .push(sql::CLAIMABLE_HOLDER)
+            .push_bind(holder);
+        if let Some(chain) = self.chain {
+            statement.push(" AND h.chain_id = ").push_bind(chain);
+        }
+        if let Some(before) = self.before {
+            match self.chain {
+                Some(_) => statement
+                    .push(" AND h.handle_node <= ")
+                    .push_bind(before.handle_node),
+                None => statement
+                    .push(" AND (h.chain_id, h.handle_node) <= (")
+                    .push_bind(before.chain_id)
+                    .push(", ")
+                    .push_bind(before.handle_node)
+                    .push(")"),
+            };
+        }
+        statement
+            .push(" ORDER BY h.chain_id DESC, h.handle_node DESC, e.token DESC LIMIT ")
             .push_bind(self.fetch());
         statement
     }
@@ -585,11 +589,12 @@ pub(crate) mod plans {
                 chain_id: 1,
                 handle_node: high,
             });
-            // The slots drive the page; a holder's handle is checked by either
-            // index, at equal cost.
+            // The holder's handles drive the page through the owner index, and
+            // each one's slots are looked up by its node.
             let claimable: &[&str] = &[
-                "handles_owner_chain_node_idx|handles_node_chain_idx",
+                "handles_owner_chain_node_idx",
                 "escrow_held_node_idx|escrow_held_pkey",
+                "handle_node = h.handle_node",
             ];
             let refundable: &[&str] = &["escrow_refundable_pkey"];
             let slots: &[&str] = &["escrow_held_node_idx"];
