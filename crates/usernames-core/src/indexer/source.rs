@@ -4,7 +4,6 @@
 use std::{
     fmt,
     str::FromStr,
-    time::Duration,
 };
 
 use alloy::{
@@ -28,6 +27,7 @@ use alloy::{
     },
 };
 use anyhow::Context;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -148,7 +148,7 @@ pub(crate) enum Feed {
 pub(crate) enum Wake {
     /// The loop was cancelled.
     Cancelled,
-    /// The interval ran out.
+    /// The time waited for came.
     Tick,
     /// The endpoint pushed a head.
     Head(Box<Header>),
@@ -177,20 +177,20 @@ impl Feed {
         }
     }
 
-    /// Wait for the next head, or `interval`, or cancellation, in that
-    /// order when more than one is ready: a head already pushed is never
-    /// taken for a quiet tick. A stream that closed, overflowed or pushed
+    /// Wait for cancellation, the next head, or `until`, in that order when
+    /// more than one is ready: a head already pushed is never taken for the
+    /// time running out. A stream that closed, overflowed or pushed
     /// something unreadable is an error: heads may be lost, and only the next
     /// session's catch-up covers them.
     pub(crate) async fn wait(
         &mut self,
-        interval: Duration,
+        until: Instant,
         cancel: &CancellationToken,
     ) -> anyhow::Result<Wake> {
         match self {
             Self::Poll => tokio::select! {
                 _ = cancel.cancelled() => Ok(Wake::Cancelled),
-                _ = tokio::time::sleep(interval) => Ok(Wake::Tick),
+                _ = tokio::time::sleep_until(until) => Ok(Wake::Tick),
             },
             Self::Subscribe(heads) => tokio::select! {
                 biased;
@@ -201,7 +201,7 @@ impl Feed {
                         .context("the head subscription pushed something that is not a head")?;
                     Ok(Wake::Head(Box::new(head)))
                 }
-                _ = tokio::time::sleep(interval) => Ok(Wake::Tick),
+                _ = tokio::time::sleep_until(until) => Ok(Wake::Tick),
             },
         }
     }
@@ -218,6 +218,8 @@ mod tests {
         RawValue,
     };
     use tokio::sync::broadcast;
+
+    use std::time::Duration;
 
     use super::*;
 
@@ -244,8 +246,11 @@ mod tests {
     }
 
     async fn wake(feed: &mut Feed) -> anyhow::Result<Wake> {
-        feed.wait(Duration::from_secs(60), &CancellationToken::new())
-            .await
+        feed.wait(
+            Instant::now() + Duration::from_secs(60),
+            &CancellationToken::new(),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -264,7 +269,8 @@ mod tests {
         let (pushes, mut feed) = heads(8);
         let cancel = CancellationToken::new();
         for height in 0..32 {
-            let mut wait = std::pin::pin!(feed.wait(Duration::from_secs(1), &cancel));
+            let until = Instant::now() + Duration::from_secs(1);
+            let mut wait = std::pin::pin!(feed.wait(until, &cancel));
             assert!(futures_util::poll!(&mut wait).is_pending());
             pushes.send(head(height)).unwrap();
             tokio::time::advance(Duration::from_secs(2)).await;
@@ -295,7 +301,10 @@ mod tests {
     async fn an_idle_feed_wakes_when_the_interval_ends() {
         let (_pushes, mut feed) = heads(8);
         let woke = feed
-            .wait(Duration::from_millis(20), &CancellationToken::new())
+            .wait(
+                Instant::now() + Duration::from_millis(20),
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert_eq!(woke, Wake::Tick);

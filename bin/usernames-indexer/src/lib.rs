@@ -88,9 +88,8 @@ pub struct Config {
     #[arg(long, env = "CONFIRMATIONS", default_value_t = 5)]
     pub confirmations: u64,
 
-    /// The loop's cadence, and the retry delay after a failure: `5s`,
-    /// `1500ms`. A poll cycle; with a subscription, how often it checks that
-    /// heads still arrive.
+    /// The retry delay after a failure, and with `LOG_SOURCE=poll` the poll
+    /// cycle: `5s`, `1500ms`.
     #[arg(long, env = "POLL_INTERVAL", default_value = "5s", value_parser = humantime::parse_duration)]
     pub poll_interval: Duration,
 

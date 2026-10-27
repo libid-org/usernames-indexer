@@ -303,18 +303,21 @@ impl<'a> Session<'a> {
         let mut heads = Heads::default();
         let mut heard = Instant::now();
         loop {
-            match self.feed.wait(config.poll_interval, cancel).await? {
+            let until = match self.feed {
+                Feed::Poll => Instant::now() + config.poll_interval,
+                Feed::Subscribe(_) => heard + quiet,
+            };
+            match self.feed.wait(until, cancel).await? {
                 Wake::Cancelled => return Ok(Ended::Cancelled),
                 Wake::Tick => match self.feed {
                     Feed::Poll => {
                         self.catch_up(cancel).await?;
                     }
-                    Feed::Subscribe(_) if heard.elapsed() >= quiet => {
+                    Feed::Subscribe(_) => {
                         let silent = heard.elapsed();
                         let grown = self.head().await?.saturating_sub(seen);
                         return Ok(Ended::Quiet { silent, grown });
                     }
-                    Feed::Subscribe(_) => {}
                 },
                 Wake::Head(head) => {
                     heard = Instant::now();
