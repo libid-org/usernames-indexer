@@ -47,9 +47,11 @@ use usernames_core::{
     nodes::KnownPlatform,
 };
 
-mod common;
 mod relay;
-use common::{
+use relay::Relay;
+use usernames_fixtures::{
+    anvil_available,
+    database_url,
     libid::{
         Disclose,
         Handle,
@@ -62,7 +64,6 @@ use common::{
     Seed,
     PATIENCE,
 };
-use relay::Relay;
 
 /// One test's chain: anvil with the libid contracts deployed, the relay the
 /// indexer dials, and the store it writes under the chain's writer lease.
@@ -97,11 +98,11 @@ impl Chain {
     /// A fresh chain with id `chain_id` and its rows cleared, or `None` where
     /// the suite skips.
     async fn start(chain_id: u64) -> Option<Self> {
-        let Some(url) = common::database_url() else {
+        let Some(url) = database_url() else {
             eprintln!("skipping: DATABASE_URL not set");
             return None;
         };
-        if !common::anvil_available() {
+        if !anvil_available() {
             eprintln!("skipping: anvil not on PATH");
             return None;
         }
@@ -458,7 +459,7 @@ async fn an_indexer_whose_chain_was_taken_stops() {
     // Another instance takes the chain: this lease's session ends, and the
     // next holder's prepare names a new writer.
     let store = chain.writer.store();
-    sqlx::query(include_str!("common/end_writer_session.sql"))
+    sqlx::query(include_str!("sql/end_writer_session.sql"))
         .bind(store.chain_id())
         .execute(&chain.pool)
         .await

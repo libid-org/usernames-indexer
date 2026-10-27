@@ -1,12 +1,6 @@
-//! Plumbing the integration suites share: a suite's chain in the database
-//! they share, events applied through the indexer's own window, and one
-//! request driven through the real router, answered in the type the API
-//! declares for it.
-
-// Every suite compiles its own copy of this module and uses part of it.
-#![allow(dead_code)]
-
-pub mod libid;
+//! A suite's chain in the database the suites share, events applied through
+//! the indexer's own window, and one request driven through the real router,
+//! answered in the type the API declares for it.
 
 use alloy::primitives::{
     Address,
@@ -27,6 +21,7 @@ use sqlx::{
 };
 use std::{
     fmt::Debug,
+    future::Future,
     time::Duration,
 };
 use tokio::sync::{
@@ -60,7 +55,8 @@ use usernames_core::{
         KnownPlatform,
     },
 };
-pub use usernames_fixtures::{
+
+use crate::{
     IdNode,
     Seed,
 };
@@ -96,6 +92,7 @@ pub fn anvil_available() -> bool {
 pub struct Suite {
     /// The right to write the suite's chain, from [`Seed::writer`].
     pub writer: ChainWriter,
+    /// The database the suites share.
     pub pool: PgPool,
     lock: MutexGuard<'static, ()>,
 }
@@ -150,10 +147,14 @@ pub trait Writes {
     /// Apply one transaction's events at `block`, in log order, and commit
     /// like a window. A block's time is its number past a constant, so a
     /// later block is later in time too.
-    async fn apply_tx(&self, block: u64, events: Vec<NamesEvent>);
+    fn apply_tx(
+        &self,
+        block: u64,
+        events: Vec<NamesEvent>,
+    ) -> impl Future<Output = ()> + Send;
 
     /// Apply one event alone in its block.
-    async fn apply(&self, block: u64, event: NamesEvent);
+    fn apply(&self, block: u64, event: NamesEvent) -> impl Future<Output = ()> + Send;
 }
 
 impl Writes for ChainWriter {
@@ -180,14 +181,25 @@ impl Writes for ChainWriter {
 /// the API does not serve.
 pub trait Reads {
     /// One GET on the real router.
-    async fn get<T: DeserializeOwned>(&self, path: &str) -> Reply<T>;
+    fn get<T: DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> impl Future<Output = Reply<T>> + Send;
 
     /// One GET scoped to `chain`: `?chain=` appended (`&` when the path
     /// already has a query).
-    async fn get_on<T: DeserializeOwned>(&self, chain: i64, path: &str) -> Reply<T>;
+    fn get_on<T: DeserializeOwned>(
+        &self,
+        chain: i64,
+        path: &str,
+    ) -> impl Future<Output = Reply<T>> + Send;
 
     /// The text the chain disclosed for the node on `chain`, when it did.
-    async fn disclosed(&self, chain: i64, handle_node: B256) -> Option<String>;
+    fn disclosed(
+        &self,
+        chain: i64,
+        handle_node: B256,
+    ) -> impl Future<Output = Option<String>> + Send;
 }
 
 impl Reads for PgPool {
@@ -395,7 +407,9 @@ impl Entries for [HistoryEntry] {
 
 /// What one GET came back with: the answer in its type, or the refusal.
 pub struct Reply<T> {
+    /// The status the router answered with.
     pub status: StatusCode,
+    /// The answer in its type, or the refusal in the API's error envelope.
     pub body: Result<T, ErrorBody>,
 }
 

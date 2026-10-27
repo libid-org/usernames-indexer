@@ -7,9 +7,6 @@
 //! set: there a missing one fails. Everything past those checks panics on
 //! failure.
 
-#[path = "../../../crates/usernames-core/tests/common/mod.rs"]
-mod common;
-
 use std::{
     fmt::Debug,
     time::Duration,
@@ -21,18 +18,6 @@ use alloy::{
         U256,
     },
     providers::Provider,
-};
-use common::{
-    libid::{
-        Disclose,
-        Handle,
-        Libid,
-        Node,
-        Proof,
-    },
-    IdNode,
-    Reads,
-    Reply,
 };
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
@@ -55,6 +40,21 @@ use usernames_core::{
     },
     indexer,
     nodes::KnownPlatform,
+};
+use usernames_fixtures::{
+    anvil_available,
+    database_url,
+    libid::{
+        Disclose,
+        Handle,
+        Libid,
+        Node,
+        Proof,
+    },
+    ChainWatch,
+    IdNode,
+    Reads,
+    Reply,
 };
 
 /// This suite's chain, apart from every other suite's.
@@ -82,11 +82,11 @@ struct Harness {
 impl Harness {
     /// A fresh `chain`, indexed; `None` when the suite skips.
     async fn open(chain: u64) -> Option<Self> {
-        let Some(url) = common::database_url() else {
+        let Some(url) = database_url() else {
             eprintln!("skipping: DATABASE_URL not set");
             return None;
         };
-        if !common::anvil_available() {
+        if !anvil_available() {
             eprintln!("skipping: anvil not on PATH");
             return None;
         }
@@ -147,7 +147,7 @@ impl Harness {
     /// Wait for the indexer to commit every block mined so far.
     async fn settle(&self) {
         let latest = self.node.provider.get_block_number().await.expect("latest");
-        common::ChainWatch::new(&self.pool, &self.store)
+        ChainWatch::new(&self.pool, &self.store)
             .await
             .cursor_at(latest)
             .await;

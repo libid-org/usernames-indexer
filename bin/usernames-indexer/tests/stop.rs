@@ -1,9 +1,6 @@
 //! The indexer binary as a supervisor runs it: stopped by SIGTERM while it
 //! waits for its chain's lease, and while it indexes.
 
-#[path = "../../../crates/usernames-core/tests/common/mod.rs"]
-mod common;
-
 use std::{
     process::{
         ExitStatus,
@@ -12,14 +9,6 @@ use std::{
     time::Duration,
 };
 
-use common::{
-    libid::{
-        Libid,
-        Node,
-    },
-    ChainWatch,
-    PATIENCE,
-};
 use sqlx::PgPool;
 use tokio::{
     io::{
@@ -35,6 +24,16 @@ use tokio::{
 use usernames_core::db::{
     self,
     ChainStore,
+};
+use usernames_fixtures::{
+    anvil_available,
+    database_url,
+    libid::{
+        Libid,
+        Node,
+    },
+    ChainWatch,
+    PATIENCE,
 };
 
 /// How long a stopped indexer may take to exit: one lease check, and the
@@ -60,11 +59,11 @@ struct Running {
 impl Chain {
     /// `chain` on a fresh anvil; `None` when the suite skips.
     async fn start(chain: u64) -> Option<Self> {
-        let Some(database) = common::database_url() else {
+        let Some(database) = database_url() else {
             eprintln!("skipping: DATABASE_URL not set");
             return None;
         };
-        if !common::anvil_available() {
+        if !anvil_available() {
             eprintln!("skipping: anvil not on PATH");
             return None;
         }

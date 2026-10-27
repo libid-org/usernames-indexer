@@ -1,6 +1,6 @@
 //! End to end against a real chain: anvil runs the libid contracts a
 //! deployment runs, with a stub in place of each platform's proof check (see
-//! `common::libid`). The indexer's own loop, deployment-block detection
+//! `usernames_fixtures::libid`). The indexer's own loop, deployment-block detection
 //! included, indexes the registry and the escrow into Postgres, where the API
 //! answers. The scenario runs once per log source, each on a chain of its own.
 //!
@@ -50,8 +50,9 @@ use usernames_core::{
     nodes::KnownPlatform,
 };
 
-mod common;
-use common::{
+use usernames_fixtures::{
+    anvil_available,
+    database_url,
     libid::{
         Disclose,
         Handle,
@@ -61,6 +62,7 @@ use common::{
         Transacts,
         CEREMONY_VERSION,
     },
+    ChainWatch,
     Entries,
     IdNode,
     Reads,
@@ -90,11 +92,11 @@ async fn indexes_a_real_chain_end_to_end_from_a_subscription() {
 /// The scenario, sent before the indexer starts and indexed through
 /// `source`: deployment detection, catch-up and the API's answers.
 async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
-    let Some(url) = common::database_url() else {
+    let Some(url) = database_url() else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
     };
-    if !common::anvil_available() {
+    if !anvil_available() {
         eprintln!("skipping: anvil not on PATH");
         return;
     }
@@ -218,10 +220,7 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
         indexer::Indexer::new(writer, node.rpc(), config).run(cancel.clone()),
     );
 
-    common::ChainWatch::new(&pool, &store)
-        .await
-        .cursor_at(latest)
-        .await;
+    ChainWatch::new(&pool, &store).await.cursor_at(latest).await;
     cancel.cancel();
     let _ = task.await;
     lease.release().await.expect("the lease releases");
@@ -487,7 +486,7 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
 
 #[tokio::test]
 async fn an_escrow_of_another_registry_is_refused() {
-    if !common::anvil_available() {
+    if !anvil_available() {
         eprintln!("skipping: anvil not on PATH");
         return;
     }

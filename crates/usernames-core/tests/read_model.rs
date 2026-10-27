@@ -6,7 +6,6 @@
 //! legitimate reason. Everything past that check panics on failure, so a
 //! broken migration cannot masquerade as "no database around".
 
-mod common;
 mod proxy;
 
 use std::{
@@ -23,13 +22,6 @@ use alloy::primitives::{
     U256,
 };
 use axum::http::StatusCode;
-use common::{
-    Events,
-    IdNode,
-    Reads,
-    Seed,
-    Writes,
-};
 use sqlx::{
     postgres::PgPoolOptions,
     PgPool,
@@ -66,7 +58,15 @@ use usernames_core::{
     },
     nodes::KnownPlatform,
 };
-use usernames_fixtures::LockWaits;
+use usernames_fixtures::{
+    database_url,
+    Events,
+    IdNode,
+    LockWaits,
+    Reads,
+    Seed,
+    Writes,
+};
 
 /// One chain id for every test; arbitrary, only consistency matters.
 const CHAIN: i64 = 31337;
@@ -88,7 +88,7 @@ async fn test_store_with(
     max_connections: u32,
 ) -> Option<(ChainStore, PgPool, MutexGuard<'static, ()>)> {
     let guard = DB_LOCK.lock().await;
-    let url = common::database_url()?;
+    let url = database_url()?;
     let pool = PgPoolOptions::new()
         .max_connections(max_connections)
         .connect(&url)
@@ -1430,7 +1430,7 @@ async fn a_lease_whose_session_ends_reports_itself_lost() {
         .is_err(),
         "a live session's lease is held"
     );
-    sqlx::query(include_str!("common/end_writer_session.sql"))
+    sqlx::query(include_str!("sql/end_writer_session.sql"))
         .bind(store.chain_id())
         .execute(&pool)
         .await
@@ -1453,7 +1453,7 @@ async fn a_lease_whose_session_goes_silent_reports_itself_lost() {
     let Some((_store, _pool, guard)) = test_store_with(2).await else {
         return;
     };
-    let database = common::database_url().expect("the database is set");
+    let database = database_url().expect("the database is set");
     let proxy = proxy::Proxy::start(&database).await;
     let through = PgPool::connect(proxy.url())
         .await

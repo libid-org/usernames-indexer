@@ -35,9 +35,7 @@ url.workspace = true
 [dev-dependencies]
 usernames-core = { workspace = true, features = ["test-seams"] }
 usernames-fixtures.workspace = true
-libid-contracts = { workspace = true, features = ["testing"] }
 libid-profiles.workspace = true
-alloy = { workspace = true, features = ["node-bindings", "signer-local"] }
 futures-util = { version = "0.3", features = ["sink"] }
 http-body-util = "0.1"
 serde_json.workspace = true

@@ -5,8 +5,6 @@
 //! Skips silently when `DATABASE_URL` is unset; everything past that check
 //! panics on failure. The suite's chain and handles are its own.
 
-mod common;
-
 use std::{
     collections::BTreeMap,
     fmt::Debug,
@@ -20,12 +18,6 @@ use alloy::primitives::{
     U256,
 };
 use axum::http::StatusCode;
-use common::{
-    Entries,
-    Events,
-    Suite,
-    Writes,
-};
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
 use usernames_core::{
@@ -53,6 +45,12 @@ use usernames_core::{
         NamesEvent,
     },
     nodes::KnownPlatform,
+};
+use usernames_fixtures::{
+    Entries,
+    Events,
+    Suite,
+    Writes,
 };
 
 const CHAIN: i64 = 31401;
@@ -245,8 +243,24 @@ impl Shape for AddressHistory {
     }
 }
 
-impl Suite {
+/// What the escrow tests seed on the suite's chain and read back.
+trait EscrowSuite {
     /// Six slots over three tokens, one deposit each.
+    async fn six_unclaimed_slots(&self);
+
+    /// Every page of a list one row at a time, following each page's cursor
+    /// until the last hands out none: the keys in the order served.
+    async fn every_page<T: DeserializeOwned + Debug>(
+        &self,
+        path: &str,
+        page: impl Fn(T) -> (Vec<EscrowAmount>, Option<String>),
+    ) -> Vec<(i64, B256, Address)>;
+
+    /// The slot's amounts, round included, as `/v1/escrow/node` serves them.
+    async fn slot(&self, handle: &str) -> Vec<(U256, U256)>;
+}
+
+impl EscrowSuite for Suite {
     async fn six_unclaimed_slots(&self) {
         let payer = Address::repeat_byte(0xC0);
         let deposits = [
@@ -263,8 +277,6 @@ impl Suite {
         }
     }
 
-    /// Every page of a list one row at a time, following each page's cursor
-    /// until the last hands out none: the keys in the order served.
     async fn every_page<T: DeserializeOwned + Debug>(
         &self,
         path: &str,
@@ -286,7 +298,6 @@ impl Suite {
         }
     }
 
-    /// The slot's amounts, round included, as `/v1/escrow/node` serves them.
     async fn slot(&self, handle: &str) -> Vec<(U256, U256)> {
         let held: HandleAmounts = self
             .get(&format!("/v1/escrow/node/{}", node(handle)))

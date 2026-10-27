@@ -3,6 +3,8 @@
 //! behind their proxies, with the crate's `StubPlatformVerifier` (feature
 //! `testing`) standing in for each platform's proof check.
 
+use std::future::Future;
+
 use alloy::{
     node_bindings::{
         Anvil,
@@ -80,8 +82,11 @@ pub struct Handle(pub KnownPlatform, pub &'static str);
 /// when the platform was read.
 #[derive(Debug, Clone, Copy)]
 pub struct Proof {
+    /// The handle the account goes by.
     pub handle: Handle,
+    /// The account's user id on the platform.
     pub id: &'static str,
+    /// When the platform was read, in seconds since the epoch.
     pub observed_at: u64,
 }
 
@@ -99,6 +104,7 @@ pub enum Disclose {
 /// Anvil on one chain id, and a provider whose wallet holds every dev
 /// account's key.
 pub struct Node {
+    /// A provider that signs as any dev account.
     pub provider: DynProvider,
     instance: AnvilInstance,
 }
@@ -132,8 +138,11 @@ impl Node {
 
 /// The deployed contracts, and the stubs that verify for them.
 pub struct Libid {
+    /// The `IdentityRegistry`, behind its proxy.
     pub registry: IdentityRegistryInstance<DynProvider>,
+    /// The `HandleEscrow`, behind its proxy.
     pub escrow: HandleEscrowInstance<DynProvider>,
+    /// The `CeremonyProofVerifier` the registry checks proofs with.
     pub proof_verifier: Address,
     /// The escrow's address for the chain's own coin.
     pub native: Address,
@@ -409,14 +418,21 @@ impl Libid {
 /// What a suite sends to its chain.
 pub trait Transacts {
     /// Send a transaction and wait for its block; a revert fails the test.
-    async fn mined(&self, request: TransactionRequest) -> TransactionReceipt;
+    fn mined(
+        &self,
+        request: TransactionRequest,
+    ) -> impl Future<Output = TransactionReceipt> + Send;
 
     /// A registry behind its proxy, owned by `owner`.
-    async fn deploy_registry(&self, owner: Address) -> Address;
+    fn deploy_registry(&self, owner: Address) -> impl Future<Output = Address> + Send;
 
     /// An escrow behind its proxy, owned by `owner` and resolving holders
     /// through `registry`.
-    async fn deploy_escrow(&self, owner: Address, registry: Address) -> Address;
+    fn deploy_escrow(
+        &self,
+        owner: Address,
+        registry: Address,
+    ) -> impl Future<Output = Address> + Send;
 }
 
 impl Transacts for DynProvider {

@@ -19,21 +19,24 @@
 //!
 //! `gateway.rs` drives the router in process with these; `end_to_end.rs`
 //! deploys the real `HandleResolver` on anvil and walks the protocol with
-//! them. Neither needs ENS or a network. The core suites, and the
-//! indexer's through them, share the seeding and the waits. It is a crate rather than a
-//! `tests/common` module because each test binary compiles such a module on
-//! its own, and a helper one of them does not call reads as dead code there;
-//! a library's public items never do.
+//! them. Neither needs ENS or a network.
 //!
-//! To test against a real wallet instead of these suites, the resolver ENS
-//! holds for `handles.link` must name your gateway. On Sepolia that resolver
-//! is a `HandleResolver` whose URL is
-//! `http://127.0.0.1:8080/ens/{sender}/{data}.json`: a `usernames-api`
-//! running locally, with a signer the resolver trusts (`setSigner`), answers
-//! it. `setUrls` repoints it; both are calls by the resolver's owner.
+//! The suites that write a chain share the rest:
+//!
+//! - [`Suite`]: a suite's chain in the database the suites share, written
+//!   through the indexer's own window ([`Writes`]) and read through the real
+//!   router ([`Reads`]), its answers typed ([`Reply`]).
+//! - [`Events`]: the events the contracts emit, as the suites write them.
+//! - [`ChainWatch`]: a chain's row, followed through the notices of its
+//!   changes.
+//! - [`libid`]: the libid contracts deployed on anvil, and the calls a
+//!   holder or a payer makes to them.
 
 #![deny(missing_docs)]
 #![deny(dead_code)]
+
+pub mod libid;
+mod suite;
 
 use std::{
     future::Future,
@@ -127,6 +130,19 @@ pub fn legacy_addr_call(labels: &[&str]) -> Vec<u8> {
     }
     .abi_encode()
 }
+
+pub use suite::{
+    anvil_available,
+    database_url,
+    ChainWatch,
+    Entries,
+    Events,
+    Reads,
+    Reply,
+    Suite,
+    Writes,
+    PATIENCE,
+};
 
 /// The registry a chain these fixtures write is prepared for.
 const REGISTRY: Address = Address::repeat_byte(0x1D);
