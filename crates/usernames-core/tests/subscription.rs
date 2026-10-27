@@ -8,6 +8,8 @@
 
 use std::time::Duration;
 
+use std::collections::BTreeSet;
+
 use alloy::{
     primitives::{
         Address,
@@ -17,6 +19,7 @@ use alloy::{
         ext::AnvilApi,
         Provider,
     },
+    rpc::types::Filter,
 };
 use axum::http::StatusCode;
 use sqlx::PgPool;
@@ -300,6 +303,8 @@ async fn pushed_events_commit_once_confirmed_and_empty_blocks_cost_no_fetch() {
         "{:?}",
         chain.relay.calls()
     );
+    // The endpoint serves the logs' block times: no header is asked for.
+    assert_eq!(chain.called("eth_getBlockByHash"), 0);
     chain.stop(running).await;
 }
 
@@ -465,6 +470,22 @@ async fn logs_without_block_times_take_their_blocks_time() {
         .map(|entry| entry.block_time)
         .collect();
     assert!(!times.is_empty());
+    // One header per block that holds a watched log, the contracts'
+    // deployments included.
+    let filter = Filter::new()
+        .address(chain.libid.contracts().watched())
+        .from_block(0)
+        .to_block(bound);
+    let logged: BTreeSet<_> = chain
+        .node
+        .provider
+        .get_logs(&filter)
+        .await
+        .expect("the logs")
+        .into_iter()
+        .filter_map(|log| log.block_hash)
+        .collect();
+    assert_eq!(chain.called("eth_getBlockByHash"), logged.len());
     assert!(
         times
             .iter()

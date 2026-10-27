@@ -16,6 +16,7 @@
 pub mod ens;
 
 use std::{
+    io,
     net::SocketAddr,
     sync::Arc,
     time::Duration,
@@ -117,7 +118,7 @@ pub struct Config {
 /// The API serving as a task, and the token that stops it.
 struct Serving {
     cancel: CancellationToken,
-    task: JoinHandle<std::io::Result<()>>,
+    task: JoinHandle<io::Result<()>>,
 }
 
 impl Serving {
@@ -469,7 +470,10 @@ mod help_tests {
 
 #[cfg(test)]
 mod serving_tests {
-    use std::time::Duration;
+    use std::{
+        sync::Arc,
+        time::Duration,
+    };
 
     use axum::{
         routing::get,
@@ -490,7 +494,7 @@ mod serving_tests {
     /// the process can exit.
     #[tokio::test]
     async fn a_request_that_is_never_answered_is_dropped_in_time() {
-        let entered = std::sync::Arc::new(Notify::new());
+        let entered = Arc::new(Notify::new());
         let app = Router::new().route(
             "/never",
             get({
@@ -509,7 +513,9 @@ mod serving_tests {
             .write_all(b"GET /never HTTP/1.1\r\nHost: test\r\n\r\n")
             .await
             .expect("the request");
-        entered.notified().await;
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the request reached its handler");
 
         tokio::time::timeout(
             Duration::from_secs(5),

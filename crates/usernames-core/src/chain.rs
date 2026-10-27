@@ -3,7 +3,7 @@
 //! their logs window by window.
 
 use std::collections::{
-    hash_map::Entry,
+    BTreeSet,
     HashMap,
 };
 
@@ -12,13 +12,24 @@ use alloy::{
     contract,
     eips::BlockNumberOrTag,
     network::BlockResponse,
-    primitives::Address,
+    primitives::{
+        Address,
+        B256,
+    },
     providers::Provider,
     rpc::types::{
         Filter,
         Log,
     },
-    transports::TransportError,
+    transports::{
+        TransportError,
+        TransportErrorKind,
+    },
+};
+use futures_util::{
+    stream,
+    StreamExt,
+    TryStreamExt,
 };
 use libid_contracts::bindings::{
     escrow::HandleEscrow,
@@ -30,6 +41,10 @@ use crate::events::{
     LogPosition,
     NamesEvent,
 };
+
+/// How many block headers a window asks for at once, when its endpoint
+/// leaves the block times out of the logs.
+const HEADERS_AT_ONCE: usize = 8;
 
 /// The libid contracts one indexer follows on its chain: the registry, and
 /// the escrow when it watches one. Each is the ERC1967 proxy, the address
@@ -122,8 +137,9 @@ impl Contracts {
     /// stays put and the same blocks are retried next cycle.
     ///
     /// `blockTimestamp` is not part of `eth_getLogs`'s standard answer, and
-    /// an endpoint that omits it is asked for the block's header instead,
-    /// once per block and by hash, so the time is the logged block's.
+    /// an endpoint that omits it is asked for the block's header instead:
+    /// once per block, by hash so the time is the logged block's, a few
+    /// blocks at a time.
     pub async fn logs(
         &self,
         provider: &impl Provider,
@@ -135,19 +151,28 @@ impl Contracts {
             .from_block(BlockNumberOrTag::Number(from))
             .to_block(BlockNumberOrTag::Number(to));
         let mut logs = provider.get_logs(&filter).await?;
-        let mut times = HashMap::new();
-        for log in logs.iter_mut().filter(|log| log.block_timestamp.is_none()) {
-            let Some(hash) = log.block_hash else {
-                continue;
-            };
-            let time = match times.entry(hash) {
-                Entry::Occupied(known) => Some(*known.get()),
-                Entry::Vacant(unknown) => provider
-                    .get_block_by_hash(hash)
-                    .await?
-                    .map(|block| *unknown.insert(block.header().timestamp())),
-            };
-            log.block_timestamp = time;
+        let untimed: BTreeSet<B256> = logs
+            .iter()
+            .filter(|log| log.block_timestamp.is_none())
+            .filter_map(|log| log.block_hash)
+            .collect();
+        let times: HashMap<B256, u64> = stream::iter(untimed)
+            .map(|hash| async move {
+                let block = provider.get_block_by_hash(hash).await?.ok_or_else(|| {
+                    TransportErrorKind::custom_str(&format!(
+                        "no block {hash} for the logs logged in it"
+                    ))
+                })?;
+                Ok::<_, TransportError>((hash, block.header().timestamp()))
+            })
+            .buffer_unordered(HEADERS_AT_ONCE)
+            .try_collect()
+            .await?;
+        for log in &mut logs {
+            if log.block_timestamp.is_none() {
+                log.block_timestamp =
+                    log.block_hash.and_then(|hash| times.get(&hash).copied());
+            }
         }
         Ok(logs)
     }

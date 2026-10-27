@@ -19,8 +19,8 @@
 //!
 //! `gateway.rs` drives the router in process with these; `end_to_end.rs`
 //! deploys the real `HandleResolver` on anvil and walks the protocol with
-//! them. Neither needs ENS or a network. The core and indexer suites share
-//! the seeding and the waits. It is a crate rather than a
+//! them. Neither needs ENS or a network. The core suites, and the
+//! indexer's through them, share the seeding and the waits. It is a crate rather than a
 //! `tests/common` module because each test binary compiles such a module on
 //! its own, and a helper one of them does not call reads as dead code there;
 //! a library's public items never do.
@@ -148,8 +148,8 @@ impl IdNode for KnownPlatform {
 /// The sessions of a database, as the suites watch them.
 pub trait LockWaits {
     /// Return once a session of this database named `application` waits on
-    /// a lock. Postgres reports a lock wait only in `pg_stat_activity`, so
-    /// this reads it every few milliseconds, for at most five seconds.
+    /// a lock. Postgres announces no lock wait, so this reads
+    /// `pg_stat_activity` every few milliseconds, for at most five seconds.
     fn waits_on_a_lock(&self, application: &str) -> impl Future<Output = ()> + Send;
 }
 
