@@ -254,14 +254,22 @@ pub async fn run() -> anyhow::Result<()> {
             return Err(anyhow::Error::new(lost).context("the writer lease was lost"));
         }
     };
-    // The loop no longer writes: the chain is the next instance's.
-    lease.release().await?;
+    // The loop no longer writes: the chain is the next instance's. Bounded
+    // like the stop, since the database may be the reason it stopped;
+    // dropping the lease closes its session either way.
+    match tokio::time::timeout(LEASE_CHECK, lease.release()).await {
+        Ok(released) => released?,
+        Err(_) => {
+            tracing::warn!(within = ?LEASE_CHECK, "the writer lease was not released in time")
+        }
+    }
     stopped
 }
 
 /// Cancel the loop and give it `within` to finish its window. A loop stuck in
-/// a write to a silent database is aborted: its transaction never commits,
-/// and the writer generation keeps any later write from landing.
+/// a write to a silent database is aborted: its transaction commits whole or
+/// not at all, before any later writer's prepare, and the writer generation
+/// keeps anything after from landing.
 async fn stop(
     cancel: &CancellationToken,
     task: &mut JoinHandle<Result<(), Superseded>>,
@@ -269,7 +277,7 @@ async fn stop(
 ) {
     cancel.cancel();
     if tokio::time::timeout(within, &mut *task).await.is_err() {
-        tracing::warn!("the indexer did not stop within a lease check; aborting it");
+        tracing::warn!(?within, "the indexer did not stop in time; aborting it");
         task.abort();
     }
 }
