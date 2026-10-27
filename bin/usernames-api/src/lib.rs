@@ -20,7 +20,10 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::net::TcpListener;
+use tokio::{
+    net::TcpListener,
+    task::JoinHandle,
+};
 
 use alloy::primitives::Address;
 use axum::{
@@ -111,6 +114,36 @@ pub struct Config {
     pub ens_max_lag_blocks: u64,
 }
 
+/// The API serving as a task, and the token that stops it.
+struct Serving {
+    cancel: CancellationToken,
+    task: JoinHandle<std::io::Result<()>>,
+}
+
+impl Serving {
+    /// Serve `app` on `listener` until stopped.
+    fn start(listener: TcpListener, app: Router) -> Self {
+        let cancel = CancellationToken::new();
+        let shutdown = cancel.clone();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { shutdown.cancelled().await })
+                .await
+        });
+        Self { cancel, task }
+    }
+
+    /// Stop accepting, and give the requests in flight `within` to be
+    /// answered; the ones still open then are dropped.
+    async fn stop(&mut self, within: Duration) {
+        self.cancel.cancel();
+        if tokio::time::timeout(within, &mut self.task).await.is_err() {
+            tracing::warn!(?within, "requests still in flight; dropping them");
+            self.task.abort();
+        }
+    }
+}
+
 /// How long a stopping API keeps answering the requests in flight: well
 /// inside the grace period a supervisor gives before it kills the process.
 const DRAIN: Duration = Duration::from_secs(10);
@@ -137,26 +170,14 @@ pub async fn run() -> anyhow::Result<()> {
         }
     };
 
-    let cancel = CancellationToken::new();
-
-    let shutdown = cancel.clone();
-    let mut task = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move { shutdown.cancelled().await })
-            .await
-    });
-
+    let mut serving = Serving::start(listener, app);
     tokio::select! {
         () = signals.received() => {
             tracing::info!("shutting down");
-            cancel.cancel();
-            if tokio::time::timeout(DRAIN, &mut task).await.is_err() {
-                tracing::warn!(within = ?DRAIN, "requests still in flight; dropping them");
-                task.abort();
-            }
+            serving.stop(DRAIN).await;
             Ok(())
         }
-        r = &mut task => match r {
+        r = &mut serving.task => match r {
             Ok(Ok(())) => Err(anyhow::anyhow!("API task exited unexpectedly")),
             Ok(Err(e)) => Err(anyhow::anyhow!("API server failed: {e}")),
             Err(e) => Err(anyhow::anyhow!("API task died: {e}")),
@@ -443,5 +464,62 @@ mod help_tests {
                 "{secret} shows its value in --help"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod serving_tests {
+    use std::time::Duration;
+
+    use axum::{
+        routing::get,
+        Router,
+    };
+    use tokio::{
+        io::AsyncWriteExt,
+        net::{
+            TcpListener,
+            TcpStream,
+        },
+        sync::Notify,
+    };
+
+    use super::Serving;
+
+    /// A request that is never answered is dropped once its time is up, so
+    /// the process can exit.
+    #[tokio::test]
+    async fn a_request_that_is_never_answered_is_dropped_in_time() {
+        let entered = std::sync::Arc::new(Notify::new());
+        let app = Router::new().route(
+            "/never",
+            get({
+                let entered = entered.clone();
+                move || async move {
+                    entered.notify_one();
+                    std::future::pending::<()>().await
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+        let addr = listener.local_addr().expect("the port");
+        let mut serving = Serving::start(listener, app);
+        let mut client = TcpStream::connect(addr).await.expect("a connection");
+        client
+            .write_all(b"GET /never HTTP/1.1\r\nHost: test\r\n\r\n")
+            .await
+            .expect("the request");
+        entered.notified().await;
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            serving.stop(Duration::from_millis(50)),
+        )
+        .await
+        .expect("stop returns");
+        let ended = tokio::time::timeout(Duration::from_secs(1), serving.task)
+            .await
+            .expect("the server ended");
+        assert!(ended.unwrap_err().is_cancelled());
     }
 }

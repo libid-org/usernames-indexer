@@ -66,6 +66,7 @@ use usernames_core::{
     },
     nodes::KnownPlatform,
 };
+use usernames_fixtures::LockWaits;
 
 /// One chain id for every test; arbitrary, only consistency matters.
 const CHAIN: i64 = 31337;
@@ -1590,45 +1591,35 @@ async fn a_replay_waits_for_the_window_in_flight_and_clears_it() {
         window.apply(event, &at).await.expect("apply");
     }
 
-    // While the window is open the replay waits for it: one that may wait
-    // only a moment for a lock gives up instead.
-    let lease = store.acquire_writer().await.expect("lease");
-    let hurried = PgPool::connect_with(
-        (*pool.connect_options())
-            .clone()
-            .options([("lock_timeout", "200ms")]),
-    )
-    .await
-    .expect("a pool that waits a moment for a lock");
-    let refused = ChainStore::new(hurried, CHAIN)
-        .prepare(
-            &lease,
-            Contracts {
-                registry: OTHER_CONTRACT,
-                escrow: None,
-            },
-        )
-        .await
-        .err();
-    assert!(
-        matches!(&refused, Some(sqlx::Error::Database(e)) if e.code().as_deref() == Some("55P03")),
-        "{refused:?}"
+    // The replay runs on sessions of its own name, so the wait below is its
+    // wait and no other session's.
+    const REPLAY: &str = "replay under test";
+    let replaying = ChainStore::new(
+        PgPool::connect_with((*pool.connect_options()).clone().application_name(REPLAY))
+            .await
+            .expect("the replay's pool"),
+        CHAIN,
     );
-
+    let lease = store.acquire_writer().await.expect("lease");
+    let replay = tokio::spawn(async move {
+        replaying
+            .prepare(
+                &lease,
+                Contracts {
+                    registry: OTHER_CONTRACT,
+                    escrow: None,
+                },
+            )
+            .await
+            .expect("the replay is prepared");
+        lease
+    });
+    pool.waits_on_a_lock(REPLAY).await;
     window
         .commit(1)
         .await
         .expect("the window in flight commits");
-    store
-        .prepare(
-            &lease,
-            Contracts {
-                registry: OTHER_CONTRACT,
-                escrow: None,
-            },
-        )
-        .await
-        .expect("the replay is prepared");
+    let lease = replay.await.expect("the replay task");
 
     assert_eq!(
         store.cursor().await.unwrap(),

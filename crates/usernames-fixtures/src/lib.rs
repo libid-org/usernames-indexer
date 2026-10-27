@@ -15,6 +15,7 @@
 //! - [`Seed`]: a chain's store seeded the way its indexer writes it — the
 //!   right to write it, and one binding with the chain marked synced.
 //! - [`IdNode`]: a user id's node, as the chain keys it.
+//! - [`LockWaits`]: a session of the database caught waiting on a lock.
 //!
 //! `gateway.rs` drives the router in process with these; `end_to_end.rs`
 //! deploys the real `HandleResolver` on anvil and walks the protocol with
@@ -46,6 +47,7 @@ use alloy::{
     },
     sol_types::SolCall,
 };
+use sqlx::PgPool;
 use usernames_core::{
     chain::Contracts,
     db::{
@@ -139,6 +141,32 @@ impl IdNode for KnownPlatform {
         let spec =
             libid_identity::platforms::platform(self.key()).expect("a libid platform");
         B256::from(spec.id_node(id).expect("an id"))
+    }
+}
+
+/// The sessions of a database, as the suites watch them.
+pub trait LockWaits {
+    /// Return once a session of this database named `application` waits on
+    /// a lock. Postgres reports a lock wait only in `pg_stat_activity`, so
+    /// this reads it every few milliseconds, for at most five seconds.
+    fn waits_on_a_lock(&self, application: &str) -> impl Future<Output = ()> + Send;
+}
+
+impl LockWaits for PgPool {
+    async fn waits_on_a_lock(&self, application: &str) {
+        let waiting = async {
+            while !sqlx::query_scalar::<_, bool>(include_str!("waiting_on_a_lock.sql"))
+                .bind(application)
+                .fetch_one(self)
+                .await
+                .expect("the sessions")
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap_or_else(|_| panic!("{application} never waited on a lock"));
     }
 }
 

@@ -357,9 +357,11 @@ async fn a_silent_socket_is_left_and_the_next_session_catches_up() {
     let Some(mut chain) = Chain::start(43126).await else {
         return;
     };
+    // A poll interval past the suite's patience: only the quiet deadline
+    // can end the silent session in time.
     let running = chain.run(IndexerConfig {
         stale_after: Duration::from_secs(2),
-        poll_interval: Duration::from_millis(500),
+        poll_interval: PATIENCE * 2,
         ..chain.config(2)
     });
     chain.wait_for_index(chain.head().await - 2).await;

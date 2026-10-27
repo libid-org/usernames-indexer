@@ -340,13 +340,17 @@ impl ChainWatch {
         }
     }
 
-    /// The chain's row after its next change.
+    /// The chain's row after its next change. A listener that lost its
+    /// session reconnects and may have missed notices in between, so the
+    /// row is read again then too.
     pub async fn next(&mut self) -> ChainState {
         let chain = self.store.chain_id().to_string();
         loop {
-            let notice = self.listener.recv().await.expect("a notice");
-            if notice.payload() == chain {
-                return self.store.state().await.expect("the chain's row");
+            match self.listener.try_recv().await.expect("a notice") {
+                Some(notice) if notice.payload() != chain => continue,
+                Some(_) | None => {
+                    return self.store.state().await.expect("the chain's row");
+                }
             }
         }
     }

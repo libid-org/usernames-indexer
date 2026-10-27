@@ -11,4 +11,6 @@ publish = false
 [dependencies]
 alloy.workspace = true
 libid-identity.workspace = true
+sqlx.workspace = true
+tokio = { workspace = true, features = ["time"] }
 usernames-core.workspace = true

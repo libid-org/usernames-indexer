@@ -10,10 +10,7 @@
 use std::{
     fmt,
     sync::Arc,
-    time::{
-        Duration,
-        Instant,
-    },
+    time::Duration,
 };
 
 use alloy::{
@@ -693,19 +690,7 @@ async fn a_replay_while_the_gateway_reads_is_refused() {
         let (router, call) = (router.clone(), call.clone());
         async move { router.ask(RESOLVER, &call).await }
     });
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !sqlx::query_scalar::<_, bool>(include_str!("sql/waiting_on_a_lock.sql"))
-        .bind(GATEWAY)
-        .fetch_one(&pool)
-        .await
-        .expect("the waits")
-    {
-        assert!(
-            Instant::now() < deadline,
-            "the gateway never waited on the handles"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    pool.waits_on_a_lock(GATEWAY).await;
     sqlx::query(include_str!("sql/replay_chain.sql"))
         .bind(CHAIN)
         .execute(&mut *replay)

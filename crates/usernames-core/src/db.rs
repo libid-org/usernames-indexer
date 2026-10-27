@@ -182,6 +182,7 @@ impl IndexPosition {
 
 /// The channel every change to a chain's row is announced on, with the
 /// chain's id as the payload, once the change commits.
+#[cfg(feature = "test-seams")]
 pub const CHAIN_CHANNEL: &str = "names_chains";
 
 /// The longest a report may be trusted: a year. The indexer refuses a longer
