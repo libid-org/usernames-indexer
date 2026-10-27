@@ -220,8 +220,8 @@ impl Indexer {
 /// An error and its causes as one line.
 trait OneLine {
     /// Each cause once: a cause is left out when the line already ends with
-    /// it, as it does after an error that prints its cause in its own
-    /// message and also returns it as its source.
+    /// it as a whole part, as it does after an error that prints its cause
+    /// in its own message and also returns it as its source.
     fn one_line(&self) -> String;
 }
 
@@ -230,7 +230,7 @@ impl OneLine for anyhow::Error {
         let mut line = String::new();
         for cause in self.chain() {
             let text = cause.to_string();
-            if line.ends_with(&text) {
+            if text.is_empty() || line == text || line.ends_with(&format!(": {text}")) {
                 continue;
             }
             if !line.is_empty() {
