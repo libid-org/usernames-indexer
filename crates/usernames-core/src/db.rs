@@ -970,8 +970,6 @@ pub struct HandleRow {
     pub chain_id: i64,
     /// The platform the handle lives on.
     pub platform_id: B256,
-    /// The storage key the chain filed this handle under.
-    pub handle_node: B256,
     /// The holder, or `None` after retirement — the contract's `address(0)`.
     pub owner: Option<Address>,
     /// The proof-freshness watermark, kept even through retirement.

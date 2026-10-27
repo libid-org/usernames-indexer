@@ -144,6 +144,13 @@ pub async fn clear_chain(pool: &PgPool, chain: i64) {
     ChainStore::new(pool.clone(), chain).forget().await;
 }
 
+/// The node `id` is bound under on `platform`, as libid-identity derives it.
+pub fn id_node(platform: KnownPlatform, id: &str) -> B256 {
+    let spec =
+        libid_identity::platforms::platform(platform.key()).expect("a libid platform");
+    B256::from(spec.id_node(id).expect("an id"))
+}
+
 /// The registry a chain these suites write is prepared for.
 pub const REGISTRY: Address = Address::repeat_byte(0x1D);
 
@@ -208,7 +215,7 @@ pub fn bind(
 ) -> Vec<NamesEvent> {
     let mut events = vec![NamesEvent::IdentityBound {
         holder,
-        id_node: platform.id_node(id).expect("an id"),
+        id_node: id_node(platform, id),
         handle_node: platform.handle_node(handle).expect("a handle"),
         platform_id: platform.id(),
         observed_at,

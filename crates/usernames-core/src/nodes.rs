@@ -23,7 +23,6 @@ use libid_identity::{
         PLATFORM_X,
     },
     HandleError,
-    IdError,
 };
 use serde_with::{
     DeserializeFromStr,
@@ -91,11 +90,6 @@ impl KnownPlatform {
     pub fn folded_handle_node(self, text: &str) -> (String, B256) {
         let (folded, node) = self.spec().folded_handle_node(text);
         (folded, B256::from(node))
-    }
-
-    /// The node a user id is bound under, or why no id can be.
-    pub fn id_node(self, id: &str) -> Result<B256, IdError> {
-        self.spec().id_node(id).map(B256::from)
     }
 }
 
@@ -275,13 +269,10 @@ mod tests {
     fn nodes_match_the_circuits() {
         let node = KnownPlatform::GitHub.handle_node("OctoCat").unwrap();
         assert_eq!(node[..4], [0x38, 0x1f, 0xb9, 0xd7]);
-        let id = KnownPlatform::GitHub.id_node("583231").unwrap();
-        assert_eq!(id[..4], [0x47, 0x59, 0x02, 0xb2]);
         assert_eq!(
             KnownPlatform::X.handle_node("ali\"ce"),
             Err(HandleError::BadCharacter)
         );
-        assert_eq!(KnownPlatform::X.id_node(" 123"), Err(IdError::BadCharacter));
     }
 
     #[test]

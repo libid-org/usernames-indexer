@@ -269,7 +269,7 @@ index that chain refuses the bare query.
 
 **A name resolves through its node.** The gateway inverts the label to a
 handle, hashes it with `libid-identity` into the SHA-256 handle node, and
-answers that node's holder; `sql/ens_holder.sql` says which bindings it
+answers that node's holder; `sql/ens_answer.sql` says which bindings it
 answers for.
 
 **Where answers come from.** The indexed model, and nothing else: the gateway

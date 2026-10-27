@@ -322,15 +322,6 @@ impl Libid {
         self.send(request).await
     }
 
-    /// `holder` names a handle it holds.
-    pub async fn publish(&self, holder: Address, Handle(platform, handle): Handle) {
-        let request = self
-            .registry
-            .publish(platform.id(), handle.into())
-            .into_transaction_request();
-        self.send(request.from(holder)).await;
-    }
-
     /// `holder` withdraws its name.
     pub async fn unpublish(&self, holder: Address) {
         let request = self.registry.unpublish().into_transaction_request();

@@ -1182,8 +1182,9 @@ async fn a_node_that_is_not_this_name_is_refused() {
 #[tokio::test]
 async fn a_name_outside_the_domain_is_refused_whatever_the_record() {
     let (router, _store, _pool, guard) = gateway_or_skip!(32);
-    let node =
-        ens::Name::from_labels(vec!["vitalik".to_string(), "eth".to_string()]).node();
+    let node = ens::Name::parse(b"\x07vitalik\x03eth\x00")
+        .expect("a name in wire format")
+        .node();
 
     let mut addr = vec![0xf1, 0xcb, 0x7e, 0x06];
     addr.extend_from_slice(node.as_slice());

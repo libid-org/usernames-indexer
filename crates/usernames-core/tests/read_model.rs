@@ -128,7 +128,7 @@ fn only<T: Debug>(bindings: &[T]) -> &T {
 
 /// The id-node route for an id, hashed here as a client would.
 fn id_route(platform: KnownPlatform, id: &str) -> String {
-    format!("/v1/resolve/id-node/{}", platform.id_node(id).unwrap())
+    format!("/v1/resolve/id-node/{}", common::id_node(platform, id))
 }
 
 #[tokio::test]
@@ -147,7 +147,7 @@ async fn bind_resolves_all_three_directions() {
     let binding = only(&resolved.bindings);
     assert_eq!(binding.chain_id, CHAIN);
     assert_eq!(binding.owner, alice);
-    assert_eq!(binding.id_node, x.id_node("111").unwrap());
+    assert_eq!(binding.id_node, common::id_node(x, "111"));
     assert_eq!(binding.handle.as_deref(), Some("alice_1"));
     assert_eq!(binding.ceremony_version, 1);
 
@@ -236,7 +236,7 @@ async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
         get(&pool, "/v1/resolve/handle/x/popular").await.answer();
     let binding = only(&resolved.bindings);
     assert_eq!(binding.owner, bob);
-    assert_eq!(binding.id_node, x.id_node("222").unwrap());
+    assert_eq!(binding.id_node, common::id_node(x, "222"));
 
     // Alice's id still resolves to her wallet, but the handle is no longer
     // hers to display: the node points at Bob's id.
@@ -590,7 +590,7 @@ async fn search_ranks_exact_prefix_substring() {
     // And the hit carries the right binding, not just the right string.
     let exact = &results.hits[0];
     assert_eq!(exact.owner, addr(1));
-    assert_eq!(exact.id_node, x.id_node("1").unwrap());
+    assert_eq!(exact.id_node, common::id_node(x, "1"));
     assert_eq!(exact.handle_node, x.handle_node("ali").unwrap());
     assert!(exact.published);
     assert_eq!(results.query.as_deref(), Some("ali"));

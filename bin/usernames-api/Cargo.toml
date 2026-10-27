@@ -12,13 +12,12 @@ publish = false
 usernames-core.workspace = true
 
 chrono = "0.4"
-alloy = { workspace = true, features = ["signer-local"] }
+alloy.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 hex = "0.4"
 libid-signer.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 clap.workspace = true
 dotenvy.workspace = true
 humantime.workspace = true
@@ -33,7 +32,9 @@ tower-http.workspace = true
 usernames-core = { workspace = true, features = ["test-seams"] }
 usernames-fixtures.workspace = true
 libid-contracts = { workspace = true, features = ["testing"] }
+libid-identity.workspace = true
 alloy = { workspace = true, features = ["signer-local", "node-bindings"] }
 http-body-util = "0.1"
+serde_json.workspace = true
 tower = { version = "0.5", features = ["util"] }
 url.workspace = true

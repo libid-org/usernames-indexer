@@ -5807,6 +5807,7 @@ dependencies = [
  "http-body-util",
  "humantime",
  "libid-contracts",
+ "libid-identity",
  "libid-signer",
  "serde",
  "serde_json",
@@ -5855,6 +5856,7 @@ name = "usernames-fixtures"
 version = "0.5.0"
 dependencies = [
  "alloy",
+ "libid-identity",
  "usernames-core",
 ]
 

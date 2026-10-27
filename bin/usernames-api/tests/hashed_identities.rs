@@ -219,7 +219,7 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
 
     let x = KnownPlatform::X;
     let alice_node = x.handle_node("Alice_1").expect("a handle");
-    let alice_id = x.id_node(ALICE_ID).expect("an id");
+    let alice_id = common::id_node(x, ALICE_ID);
 
     // 1. A private bind of @Alice_1: nodes only, resolved by hashing here,
     //    with no text to show.
@@ -289,7 +289,7 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
     //    escrow's reveal maps the handle to his id node. A private deposit names only
     //    a node, and no platform.
     let bob_node = x.handle_node("bob_2").expect("a handle");
-    let bob_id = x.id_node(BOB_ID).expect("an id");
+    let bob_id = common::id_node(x, BOB_ID);
     let carol_node = x.handle_node("carol_3").expect("a handle");
     h.libid
         .deposit_to_handle(payer, Handle(x, "Bob_2"), 100)

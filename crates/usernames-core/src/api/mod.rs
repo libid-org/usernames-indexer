@@ -1,7 +1,7 @@
 //! The read API. Resolution answers exactly what the contract's resolvers
 //! answer, from the projections; search, the histories and the escrow's
 //! waiting amounts are what the chain cannot list. The answers' shapes live
-//! in [`model`]; the handlers here and in [`history`] and [`escrow`] only
+//! in [`model`]; the handlers here and in the history and escrow modules only
 //! translate HTTP to store calls and rows to those shapes.
 
 mod escrow;

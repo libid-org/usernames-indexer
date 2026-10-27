@@ -10,4 +10,5 @@ publish = false
 
 [dependencies]
 alloy.workspace = true
+libid-identity.workspace = true
 usernames-core.workspace = true

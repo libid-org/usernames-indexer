@@ -167,11 +167,6 @@ impl CoinType {
         Self(U256::from(EVM_COIN_TYPE_BIT | chain_id))
     }
 
-    /// The raw value, as it travels in `addr(bytes32,uint256)`.
-    pub fn raw(self) -> U256 {
-        self.0
-    }
-
     /// Whether this coin type names an EVM chain at all.
     ///
     /// A coin type without the ENSIP-11 bit belongs to another kind of chain
@@ -426,16 +421,6 @@ impl Name {
         Ok(Self { labels })
     }
 
-    /// A name from labels already split — what a test or a builder holds.
-    pub fn from_labels(labels: Vec<String>) -> Self {
-        Self { labels }
-    }
-
-    /// The labels, leftmost first.
-    pub fn labels(&self) -> &[String] {
-        &self.labels
-    }
-
     /// EIP-137 namehash, folded right to left over the labels.
     pub fn node(&self) -> B256 {
         self.labels.iter().rev().fold(B256::ZERO, |parent, label| {
@@ -638,8 +623,16 @@ mod tests {
     /// `alice.x.handles.link`, DNS wire format.
     const ALICE_X: &[u8] = b"\x05alice\x01x\x07handles\x04link\x00";
 
-    fn labels(name: &[u8]) -> Vec<String> {
-        Name::parse(name).unwrap().labels().to_vec()
+    /// The name `labels` spell, parsed from the DNS wire format a wallet
+    /// sends.
+    fn named(labels: &[&str]) -> Name {
+        let mut wire = Vec::new();
+        for label in labels {
+            wire.push(u8::try_from(label.len()).unwrap());
+            wire.extend_from_slice(label.as_bytes());
+        }
+        wire.push(0);
+        Name::parse(&wire).unwrap()
     }
 
     /// The domain the mainnet deployment answers under.
@@ -661,11 +654,6 @@ mod tests {
     // ─── The wire name ──────────────────────────────────────────────
 
     #[test]
-    fn a_wire_name_splits_into_its_labels() {
-        assert_eq!(labels(ALICE_X), ["alice", "x", "handles", "link"]);
-    }
-
-    #[test]
     fn a_truncated_or_overrun_name_is_refused() {
         for bad in [
             &b""[..],                       // no root label
@@ -682,7 +670,8 @@ mod tests {
 
     #[test]
     fn the_short_form_names_a_platform_and_no_chain() {
-        let q = Name::from_labels(labels(ALICE_X))
+        let q = Name::parse(ALICE_X)
+            .unwrap()
             .query(&handles_link())
             .unwrap();
         assert_eq!(handle_of(&q), "alice");
@@ -691,10 +680,10 @@ mod tests {
 
     #[test]
     fn a_chain_label_is_carried_and_never_guessed() {
-        let q =
-            Name::from_labels(labels(b"\x05alice\x01x\x04base\x07handles\x04link\x00"))
-                .query(&handles_link())
-                .unwrap();
+        let q = Name::parse(b"\x05alice\x01x\x04base\x07handles\x04link\x00")
+            .unwrap()
+            .query(&handles_link())
+            .unwrap();
         assert_eq!(handle_of(&q), "alice");
         assert_eq!(q.chain_label.as_deref(), Some("base"));
     }
@@ -702,7 +691,8 @@ mod tests {
     #[test]
     fn a_name_outside_the_domain_is_refused() {
         assert!(matches!(
-            Name::from_labels(labels(b"\x05alice\x01x\x03eth\x00"))
+            Name::parse(b"\x05alice\x01x\x03eth\x00")
+                .unwrap()
                 .query(&handles_link()),
             Err(EnsError::ForeignDomain)
         ));
@@ -711,7 +701,8 @@ mod tests {
     #[test]
     fn a_subname_domain_takes_its_names_and_leaves_the_parents() {
         let alice = b"\x05alice\x01x\x07testnet\x07handles\x04link\x00";
-        let q = Name::from_labels(labels(alice))
+        let q = Name::parse(alice)
+            .unwrap()
             .query(&testnet_handles_link())
             .unwrap();
         assert_eq!(handle_of(&q), "alice");
@@ -719,7 +710,7 @@ mod tests {
 
         // The parent's own names are not this gateway's to speak about.
         assert!(matches!(
-            Name::from_labels(labels(ALICE_X)).query(&testnet_handles_link()),
+            Name::parse(ALICE_X).unwrap().query(&testnet_handles_link()),
             Err(EnsError::ForeignDomain)
         ));
     }
@@ -727,7 +718,8 @@ mod tests {
     #[test]
     fn a_chain_label_sits_before_a_subname_domain_too() {
         let alice = b"\x05alice\x01x\x07sepolia\x07testnet\x07handles\x04link\x00";
-        let q = Name::from_labels(labels(alice))
+        let q = Name::parse(alice)
+            .unwrap()
             .query(&testnet_handles_link())
             .unwrap();
         assert_eq!(handle_of(&q), "alice");
@@ -750,7 +742,9 @@ mod tests {
     #[test]
     fn the_domain_alone_names_nobody() {
         assert!(matches!(
-            Name::from_labels(labels(b"\x07handles\x04link\x00")).query(&handles_link()),
+            Name::parse(b"\x07handles\x04link\x00")
+                .unwrap()
+                .query(&handles_link()),
             Err(EnsError::EmptyName)
         ));
     }
@@ -760,13 +754,7 @@ mod tests {
         // ENS normalization never produces uppercase. A wallet could not have
         // sent this, so it is the caller's error rather than a null answer.
         assert!(matches!(
-            Name::from_labels(vec![
-                "Alice".into(),
-                "x".into(),
-                "handles".into(),
-                "link".into()
-            ])
-            .query(&handles_link()),
+            named(&["Alice", "x", "handles", "link"]).query(&handles_link()),
             Err(EnsError::UnnormalizedLabel(_))
         ));
     }
@@ -777,7 +765,8 @@ mod tests {
     fn x_reverses_its_hyphen_substitution() {
         // `_` -> `-` is a bijection onto its image because X's alphabet holds
         // no hyphen, so this reverses exactly.
-        let q = Name::from_labels(labels(b"\x04a--b\x01x\x07handles\x04link\x00"))
+        let q = Name::parse(b"\x04a--b\x01x\x07handles\x04link\x00")
+            .unwrap()
             .query(&handles_link())
             .unwrap();
         assert_eq!(handle_of(&q), "a__b");
@@ -785,7 +774,8 @@ mod tests {
 
     #[test]
     fn github_labels_are_the_handle_unchanged() {
-        let q = Name::from_labels(labels(b"\x05alice\x06github\x07handles\x04link\x00"))
+        let q = Name::parse(b"\x05alice\x06github\x07handles\x04link\x00")
+            .unwrap()
             .query(&handles_link())
             .unwrap();
         assert_eq!(handle_of(&q), "alice");
@@ -793,10 +783,10 @@ mod tests {
 
     #[test]
     fn gmail_joins_its_labels_and_appends_the_domain_the_platform_implies() {
-        let q =
-            Name::from_labels(labels(b"\x05alice\x01b\x06google\x07handles\x04link\x00"))
-                .query(&handles_link())
-                .unwrap();
+        let q = Name::parse(b"\x05alice\x01b\x06google\x07handles\x04link\x00")
+            .unwrap()
+            .query(&handles_link())
+            .unwrap();
         assert_eq!(handle_of(&q), "alice.b@gmail.com");
     }
 
@@ -806,7 +796,8 @@ mod tests {
         // deliberate: a mapping for characters no account holds would be
         // untested code on a payment path.
         assert!(matches!(
-            Name::from_labels(labels(b"\x06al-ice\x06google\x07handles\x04link\x00"))
+            Name::parse(b"\x06al-ice\x06google\x07handles\x04link\x00")
+                .unwrap()
                 .query(&handles_link()),
             Err(EnsError::UnnormalizedLabel(_))
         ));
@@ -889,10 +880,8 @@ mod tests {
     /// than to itself.
     #[test]
     fn namehash_matches_the_eip137_vectors() {
-        let of = |name: &str| {
-            Name::from_labels(name.split('.').map(String::from).collect()).node()
-        };
-        assert_eq!(Name::from_labels(vec![]).node(), B256::ZERO);
+        let of = |name: &str| named(&name.split('.').collect::<Vec<_>>()).node();
+        assert_eq!(named(&[]).node(), B256::ZERO);
         assert_eq!(
             of("eth").to_string(),
             "0x93cdeb708b7545dc668eb9280176169d1c33cfd8ed6f04690a0bcc88a93fc4ae"
@@ -913,8 +902,8 @@ mod tests {
     /// answer either with the other's address.
     #[test]
     fn a_label_holding_a_dot_is_not_two_labels() {
-        let one = Name::from_labels(vec!["a.b".to_string()]).node();
-        let two = Name::from_labels(vec!["a".to_string(), "b".to_string()]).node();
+        let one = named(&["a.b"]).node();
+        let two = named(&["a", "b"]).node();
         assert_ne!(one, two);
     }
 
@@ -922,8 +911,14 @@ mod tests {
 
     #[test]
     fn a_chain_gets_the_coin_type_ensip11_gives_it() {
-        assert_eq!(CoinType::of_chain(1).raw(), U256::from(0x8000_0001u64));
-        assert_eq!(CoinType::of_chain(8453).raw(), U256::from(0x8000_2105u64)); // Base
+        assert_eq!(
+            CoinType::of_chain(1),
+            CoinType::from(U256::from(0x8000_0001u64))
+        );
+        assert_eq!(
+            CoinType::of_chain(8453), // Base
+            CoinType::from(U256::from(0x8000_2105u64))
+        );
     }
 
     /// Bare `addr(node)` asks for the chain of the registry it went through.
@@ -962,7 +957,7 @@ mod tests {
         const TWIN: u64 = 1_588_445_166; // 0x5EADBFEE
 
         // The coin type a wallet on eden sends, and it names eden exactly.
-        assert_eq!(CoinType::of_chain(EDEN).raw(), U256::from(EDEN));
+        assert_eq!(CoinType::of_chain(EDEN), CoinType::from(U256::from(EDEN)));
         assert_eq!(CoinType::of_chain(EDEN), CoinType::of_chain(TWIN));
         assert!(CoinType::shared_by(EDEN, TWIN));
 
@@ -1006,7 +1001,7 @@ mod tests {
 
     #[test]
     fn the_forwarded_call_decodes_to_a_name_and_a_record() {
-        let node = Name::from_labels(labels(ALICE_X)).node();
+        let node = Name::parse(ALICE_X).unwrap().node();
         let call = resolve_call(ALICE_X, &addr_call(node, 0x8000_2105));
         let ResolveCall { name, record } = ResolveCall::decode(&call).unwrap();
         assert_eq!(name, ALICE_X);

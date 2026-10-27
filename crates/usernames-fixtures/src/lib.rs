@@ -8,8 +8,7 @@
 //! this crate holds one builder per piece, and every suite sends the bytes a
 //! wallet would:
 //!
-//! - [`wire_name`] and [`namehash_of`]: the name as the wire and the resolver
-//!   carry it.
+//! - [`wire_name`]: the name as the wire carries it.
 //! - [`addr_call`] and [`legacy_addr_call`]: the record request, in the
 //!   ENSIP-11 multichain form and in the older form that means coin type 60.
 //! - [`resolve_call`]: the wrapped call the gateway receives.
@@ -90,13 +89,10 @@ pub fn wire_name(labels: &[&str]) -> Vec<u8> {
 }
 
 /// The namehash of the same name, as a wallet sends it beside the wire form.
-pub fn namehash_of(labels: &[&str]) -> B256 {
-    let full: Vec<String> = labels
-        .iter()
-        .map(|l| (*l).to_string())
-        .chain(["handles".to_string(), "link".to_string()])
-        .collect();
-    Name::from_labels(full).node()
+fn namehash_of(labels: &[&str]) -> B256 {
+    Name::parse(&wire_name(labels))
+        .expect("a name in wire format")
+        .node()
 }
 
 /// `resolve(name, data)`, encoded by the same codec the gateway decodes with.
@@ -133,10 +129,10 @@ pub async fn bind(store: &ChainStore, handle: &str, holder: Address) {
 }
 
 /// The registry a chain these fixtures write is prepared for.
-pub const REGISTRY: Address = Address::repeat_byte(0x1D);
+const REGISTRY: Address = Address::repeat_byte(0x1D);
 
 /// The right to write `store`'s chain, taken the way an indexer takes it at
-/// startup: under the chain's lease, prepared for [`REGISTRY`]. The lease
+/// startup: under the chain's lease, prepared for `REGISTRY`. The lease
 /// goes back at once; the writer stays good until the chain is prepared
 /// again.
 pub async fn writer(store: &ChainStore) -> ChainWriter {
@@ -160,7 +156,11 @@ async fn seed(store: &ChainStore, handle: &str, holder: Address, disclosed: bool
     let handle_node = x.handle_node(handle).expect("an X handle");
     let mut events = vec![NamesEvent::IdentityBound {
         holder,
-        id_node: x.id_node("42").expect("an X id"),
+        id_node: B256::from(
+            libid_identity::platforms::platform(x.key())
+                .and_then(|spec| spec.id_node("42").ok())
+                .expect("an X id"),
+        ),
         handle_node,
         platform_id: x.id(),
         observed_at: 1_700_000_000,

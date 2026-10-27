@@ -242,7 +242,7 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
     let resolved: IdResolution = get(
         &pool,
         chain_id,
-        &format!("/v1/resolve/id-node/{}", x.id_node("111").unwrap()),
+        &format!("/v1/resolve/id-node/{}", common::id_node(x, "111")),
     )
     .await
     .answer();
@@ -268,14 +268,14 @@ async fn indexes_a_real_chain_end_to_end(source: LogSource, chain_id: u64) {
     );
     assert_eq!(
         resolved.bindings[0].id_node,
-        google.id_node(GOOGLE_USER_ID).unwrap()
+        common::id_node(google, GOOGLE_USER_ID)
     );
     let resolved: IdResolution = get(
         &pool,
         chain_id,
         &format!(
             "/v1/resolve/id-node/{}",
-            google.id_node(GOOGLE_USER_ID).unwrap()
+            common::id_node(google, GOOGLE_USER_ID)
         ),
     )
     .await
