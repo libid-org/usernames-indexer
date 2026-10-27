@@ -20,13 +20,13 @@ use super::{
         HandleRef,
         Unclaimed,
     },
-    parse_address,
     ApiError,
     ApiPath,
     ApiQuery,
     AppState,
     HandleKey,
     PageParams,
+    Param,
 };
 use crate::db::{
     ContributionRow,
@@ -84,7 +84,7 @@ pub(crate) async fn claimable(
     ApiPath(address): ApiPath<String>,
     ApiQuery(params): ApiQuery<PageParams>,
 ) -> Result<Json<AddressAmounts>, ApiError> {
-    let address = parse_address(&address)?;
+    let address = address.parse_address()?;
     let page = params.page()?;
     state.synced(page.chain).await?;
 
@@ -108,7 +108,7 @@ pub(crate) async fn refundable(
     ApiPath(address): ApiPath<String>,
     ApiQuery(params): ApiQuery<PageParams>,
 ) -> Result<Json<AddressContributions>, ApiError> {
-    let address = parse_address(&address)?;
+    let address = address.parse_address()?;
     let page = params.page()?;
     state.synced(page.chain).await?;
 
@@ -185,7 +185,11 @@ pub(crate) async fn unclaimed(
     State(state): State<AppState>,
     ApiQuery(params): ApiQuery<UnclaimedParams>,
 ) -> Result<Json<Unclaimed>, ApiError> {
-    let token = params.token.as_deref().map(parse_address).transpose()?;
+    let token = params
+        .token
+        .as_deref()
+        .map(str::parse_address)
+        .transpose()?;
     let page = params.page.page()?;
     state.synced(page.chain).await?;
 

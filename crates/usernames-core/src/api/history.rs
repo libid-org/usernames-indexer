@@ -13,13 +13,13 @@ use super::{
         HandleRef,
         HistoryEntry,
     },
-    parse_address,
     ApiError,
     ApiPath,
     ApiQuery,
     AppState,
     HandleKey,
     PageParams,
+    Param,
 };
 use crate::{
     db::{
@@ -86,7 +86,7 @@ pub(crate) async fn address(
     ApiPath(address): ApiPath<String>,
     ApiQuery(params): ApiQuery<PageParams>,
 ) -> Result<Json<AddressHistory>, ApiError> {
-    let address = parse_address(&address)?;
+    let address = address.parse_address()?;
     let page = params.page()?;
     state.synced(page.chain).await?;
 

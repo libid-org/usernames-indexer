@@ -4,60 +4,56 @@
 //! in [`model`]; the handlers here and in the history and escrow modules only
 //! translate HTTP to store calls and rows to those shapes.
 
+mod error;
 mod escrow;
 mod history;
 pub mod model;
+mod params;
 
-use std::{
-    fmt,
-    str::FromStr,
-};
-
-use alloy::primitives::{
-    Address,
-    B256,
-};
+use alloy::primitives::B256;
 use axum::{
-    extract::{
-        rejection::{
-            PathRejection,
-            QueryRejection,
-        },
-        FromRequestParts,
-        Path,
-        Query,
-        State,
-    },
-    http::{
-        request::Parts,
-        StatusCode,
-    },
-    response::{
-        IntoResponse,
-        Response,
-    },
+    extract::State,
     routing::get,
     Json,
     Router,
 };
-use serde::{
-    de::DeserializeOwned,
-    Deserialize,
-};
+use serde::Deserialize;
 
-use self::model::*;
+use self::{
+    error::{
+        ApiError,
+        ApiPath,
+        ApiQuery,
+    },
+    model::{
+        AddressIdentity,
+        AddressResolution,
+        ChainStatus,
+        ErrorCode,
+        HandleBinding,
+        HandleRef,
+        HandleResolution,
+        IdBinding,
+        IdResolution,
+        SearchHit,
+        SearchResults,
+        Status,
+    },
+    params::{
+        ChainFilter,
+        HandleKey,
+        PageParams,
+        Param,
+    },
+};
 use crate::{
     db::{
         self,
         ChainStatusRow,
-        InvalidCursor,
-        Page,
+        Search,
         Store,
     },
-    nodes::{
-        self,
-        KnownPlatform,
-    },
+    nodes,
 };
 
 /// What every handler needs: the store. Which chains it holds, and which
@@ -196,216 +192,6 @@ impl AppState {
     }
 }
 
-/// One error shape for the whole API: a status, a stable code, and prose.
-/// The code is the machine-readable half of the contract — a UI that renders
-/// "retired" differently from "never claimed" branches on it, not on English
-/// sentences that may be reworded.
-struct ApiError {
-    status: StatusCode,
-    code: ErrorCode,
-    message: String,
-    /// The operator-facing cause, logged when the response renders and never
-    /// serialized to the client.
-    source: Option<sqlx::Error>,
-}
-
-impl ApiError {
-    fn not_found(code: ErrorCode, message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            code,
-            message: message.into(),
-            source: None,
-        }
-    }
-
-    fn bad_request(code: ErrorCode, message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            code,
-            message: message.into(),
-            source: None,
-        }
-    }
-
-    /// A stored value this build cannot read back. Logged with `what` where
-    /// it is found; the client gets the same opaque 500 as a database error.
-    fn internal(what: impl fmt::Display) -> Self {
-        tracing::error!(%what, "unreadable stored value");
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: ErrorCode::Internal,
-            message: "internal error".into(),
-            source: None,
-        }
-    }
-
-    fn not_synced(chain: Option<i64>) -> Self {
-        let message = match chain {
-            Some(chain) => {
-                format!("no indexer has finished a first window on chain {chain}")
-            }
-            None => "no indexer has finished a first window on any chain".to_string(),
-        };
-        Self {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: ErrorCode::NotSynced,
-            message,
-            source: None,
-        }
-    }
-}
-
-/// Text the platform could never hold, refused the way the contract's
-/// `resolveHandle` answers it — the zero address, so a 404 and not a 400:
-/// "nobody holds this", not "you asked wrong".
-impl From<libid_identity::HandleError> for ApiError {
-    fn from(e: libid_identity::HandleError) -> Self {
-        Self::not_found(
-            ErrorCode::HandleImpossible,
-            format!("no handle can exist on this platform for this text: {e}"),
-        )
-    }
-}
-
-/// A path segment axum could not take apart, such as invalid UTF-8: a 400 in
-/// the envelope, or the 500 of a route that names no such segment.
-impl From<PathRejection> for ApiError {
-    fn from(rejection: PathRejection) -> Self {
-        if rejection.status().is_server_error() {
-            Self::internal(rejection.body_text())
-        } else {
-            Self::bad_request(ErrorCode::InvalidPath, rejection.body_text())
-        }
-    }
-}
-
-/// A query string axum could not take apart, such as a repeated key.
-impl From<QueryRejection> for ApiError {
-    fn from(rejection: QueryRejection) -> Self {
-        Self::bad_request(ErrorCode::InvalidQuery, rejection.body_text())
-    }
-}
-
-impl From<InvalidCursor> for ApiError {
-    fn from(e: InvalidCursor) -> Self {
-        Self::bad_request(ErrorCode::InvalidCursor, e.to_string())
-    }
-}
-
-impl From<sqlx::Error> for ApiError {
-    // A pure conversion: the logging happens where the error is handled
-    // (IntoResponse), not as a side effect of the type change.
-    fn from(e: sqlx::Error) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: ErrorCode::Internal,
-            message: "internal error".into(),
-            source: Some(e),
-        }
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        if let Some(e) = &self.source {
-            tracing::error!(%e, "query failed");
-        }
-        let body = ErrorBody {
-            error: ErrorDetail {
-                code: self.code,
-                message: self.message,
-            },
-        };
-        (self.status, Json(body)).into_response()
-    }
-}
-
-/// `Path`, refused in the API's envelope instead of axum's plain text.
-struct ApiPath<T>(T);
-
-impl<T, S> FromRequestParts<S> for ApiPath<T>
-where
-    T: DeserializeOwned + Send,
-    S: Send + Sync,
-{
-    type Rejection = ApiError;
-
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
-        let Path(value) = Path::<T>::from_request_parts(parts, state).await?;
-        Ok(Self(value))
-    }
-}
-
-/// `Query`, refused in the API's envelope instead of axum's plain text.
-struct ApiQuery<T>(T);
-
-impl<T, S> FromRequestParts<S> for ApiQuery<T>
-where
-    T: DeserializeOwned,
-    S: Send + Sync,
-{
-    type Rejection = ApiError;
-
-    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
-        let Query(value) = Query::<T>::from_request_parts(parts, state).await?;
-        Ok(Self(value))
-    }
-}
-
-/// `?chain=8453&before=<next>&limit=20`: one page of a list, the cursor the
-/// one the previous page handed out.
-#[derive(Deserialize)]
-struct PageParams {
-    chain: Option<String>,
-    before: Option<String>,
-    limit: Option<String>,
-}
-
-impl PageParams {
-    fn page<C: FromStr<Err = InvalidCursor>>(self) -> Result<Page<C>, ApiError> {
-        Ok(Page {
-            chain: ChainFilter { chain: self.chain }.chain_id()?,
-            before: self.before.as_deref().map(str::parse).transpose()?,
-            limit: parse_count(self.limit.as_deref(), "limit")?
-                .unwrap_or(PAGE_DEFAULT_LIMIT)
-                .clamp(1, PAGE_MAX_LIMIT),
-        })
-    }
-}
-
-/// A handle as a request names it: by its text on a platform, folded and
-/// hashed here the way `depositToHandle` keys it, or by its node.
-enum HandleKey {
-    Text {
-        platform: KnownPlatform,
-        handle_node: B256,
-    },
-    Node(B256),
-}
-
-impl HandleKey {
-    fn of_text(platform: &str, handle: &str) -> Result<Self, ApiError> {
-        let platform = parse_known_platform(platform)?;
-        let (_, handle_node) = platform.folded_handle_node(handle);
-        Ok(Self::Text {
-            platform,
-            handle_node,
-        })
-    }
-
-    fn of_node(node: &str) -> Result<Self, ApiError> {
-        parse_node(node).map(Self::Node)
-    }
-
-    fn node(&self) -> B256 {
-        match self {
-            Self::Text { handle_node, .. } => *handle_node,
-            Self::Node(node) => *node,
-        }
-    }
-}
-
 impl HandleRef {
     /// The handle a request named, completed from `known`: any row about the
     /// node names its platform, and its text once disclosed.
@@ -434,89 +220,6 @@ impl HandleRef {
             handle,
         }
     }
-}
-
-/// A platform text hashes on: one this build has node tags for.
-fn parse_known_platform(raw: &str) -> Result<KnownPlatform, ApiError> {
-    parse_platform(raw)?.known().ok_or_else(|| {
-        ApiError::bad_request(
-            ErrorCode::InvalidPlatform,
-            "this build cannot hash text on that platform: ask by node",
-        )
-    })
-}
-
-fn parse_platform(raw: &str) -> Result<nodes::Platform, ApiError> {
-    raw.parse::<nodes::Platform>()
-        .map_err(|e| ApiError::bad_request(ErrorCode::InvalidPlatform, e.to_string()))
-}
-
-/// Postgres cannot compare TEXT holding a NUL byte, and no stored value ever
-/// holds one, so refuse it at the edge instead of turning it into a 500.
-fn reject_nul(raw: &str, what: &str) -> Result<(), ApiError> {
-    if raw.contains('\0') {
-        return Err(ApiError::bad_request(
-            ErrorCode::InvalidArgument,
-            format!("{what} must not contain a NUL byte"),
-        ));
-    }
-    Ok(())
-}
-
-/// `?chain=8453` narrows a read to one chain; absent, every chain the store
-/// holds answers, and each result says which chain it is from.
-#[derive(Deserialize)]
-struct ChainFilter {
-    chain: Option<String>,
-}
-
-impl ChainFilter {
-    /// The chain `?chain=` names, if it names one.
-    fn chain_id(&self) -> Result<Option<i64>, ApiError> {
-        self.chain
-            .as_deref()
-            .map(|raw| {
-                raw.parse().map_err(|_| {
-                    ApiError::bad_request(
-                        ErrorCode::InvalidChain,
-                        format!("{raw:?} is not a chain id"),
-                    )
-                })
-            })
-            .transpose()
-    }
-}
-
-fn parse_address(raw: &str) -> Result<Address, ApiError> {
-    Address::from_str(raw).map_err(|_| {
-        ApiError::bad_request(
-            ErrorCode::InvalidAddress,
-            format!("{raw:?} is not an address"),
-        )
-    })
-}
-
-/// A count from the query string, refused in the API's envelope: typed as a
-/// number in the extractor, `limit=ten` would get axum's plain-text 400.
-fn parse_count(raw: Option<&str>, name: &str) -> Result<Option<i64>, ApiError> {
-    raw.map(|raw| {
-        raw.parse::<i64>().map_err(|_| {
-            ApiError::bad_request(
-                ErrorCode::InvalidArgument,
-                format!("{name} must be an integer, not {raw:?}"),
-            )
-        })
-    })
-    .transpose()
-}
-
-fn parse_node(raw: &str) -> Result<B256, ApiError> {
-    B256::from_str(raw).map_err(|_| {
-        ApiError::bad_request(
-            ErrorCode::InvalidNode,
-            format!("{raw:?} is not a 0x-hex 32-byte node"),
-        )
-    })
 }
 
 async fn health() -> &'static str {
@@ -569,7 +272,7 @@ async fn resolve_handle(
     ApiPath((platform, handle)): ApiPath<(String, String)>,
     ApiQuery(filter): ApiQuery<ChainFilter>,
 ) -> Result<Json<HandleResolution>, ApiError> {
-    let platform = parse_known_platform(&platform)?;
+    let platform = platform.parse_known_platform()?;
     let chain = filter.chain_id()?;
     state.synced(chain).await?;
     let handle_node = platform.handle_node(&handle)?;
@@ -582,7 +285,7 @@ async fn resolve_handle_node(
     ApiPath(handle_node): ApiPath<String>,
     ApiQuery(filter): ApiQuery<ChainFilter>,
 ) -> Result<Json<HandleResolution>, ApiError> {
-    let handle_node = parse_node(&handle_node)?;
+    let handle_node = handle_node.parse_node()?;
     let chain = filter.chain_id()?;
     state.synced(chain).await?;
     state.handle_resolution(chain, handle_node).await
@@ -596,7 +299,7 @@ async fn resolve_id_node(
     ApiPath(id_node): ApiPath<String>,
     ApiQuery(filter): ApiQuery<ChainFilter>,
 ) -> Result<Json<IdResolution>, ApiError> {
-    let id_node = parse_node(&id_node)?;
+    let id_node = id_node.parse_node()?;
     let chain = filter.chain_id()?;
     state.synced(chain).await?;
     state.id_resolution(chain, id_node).await
@@ -610,7 +313,7 @@ async fn resolve_address(
     ApiPath(address): ApiPath<String>,
     ApiQuery(filter): ApiQuery<ChainFilter>,
 ) -> Result<Json<AddressResolution>, ApiError> {
-    let address = parse_address(&address)?;
+    let address = address.parse_address()?;
     let chain = filter.chain_id()?;
     state.synced(chain).await?;
 
@@ -655,10 +358,6 @@ const SEARCH_DEFAULT_LIMIT: i64 = 10;
 /// database repeats per request; a client that far in wants a narrower
 /// query.
 const SEARCH_MAX_OFFSET: i64 = 10_000;
-/// A list page holds this many entries when the request names no `limit`.
-const PAGE_DEFAULT_LIMIT: i64 = 20;
-/// The most entries one list page holds.
-const PAGE_MAX_LIMIT: i64 = 100;
 
 /// `GET /v1/search?q=gre&platform=x&owner=0x…&chain=8453&limit=10&offset=0`
 /// — live, disclosed handles matching a partial query (exact first, then prefix,
@@ -675,7 +374,7 @@ async fn search(
     .chain_id()?;
     let query = match params.q.as_deref() {
         Some(raw) => {
-            reject_nul(raw, "q")?;
+            raw.refuse_nul("q")?;
             let folded = nodes::fold_search_query(raw);
             if folded.is_empty() {
                 return Err(ApiError::bad_request(
@@ -687,30 +386,49 @@ async fn search(
         }
         None => None,
     };
-    let owner = params.owner.as_deref().map(parse_address).transpose()?;
+    let owner = params
+        .owner
+        .as_deref()
+        .map(str::parse_address)
+        .transpose()?;
     if query.is_none() && owner.is_none() {
         return Err(ApiError::bad_request(
             ErrorCode::InvalidArgument,
             "q or owner is required",
         ));
     }
-    let limit = parse_count(params.limit.as_deref(), "limit")?
+    let limit = params
+        .limit
+        .as_deref()
+        .map(|limit| limit.parse_count("limit"))
+        .transpose()?
         .unwrap_or(SEARCH_DEFAULT_LIMIT)
         .clamp(1, SEARCH_MAX_LIMIT);
-    let offset = parse_count(params.offset.as_deref(), "offset")?
+    let offset = params
+        .offset
+        .as_deref()
+        .map(|offset| offset.parse_count("offset"))
+        .transpose()?
         .unwrap_or(0)
         .clamp(0, SEARCH_MAX_OFFSET);
     let platform_id = params
         .platform
         .as_deref()
-        .map(parse_platform)
+        .map(str::parse_platform)
         .transpose()?
         .map(|p| p.id());
     state.synced(chain).await?;
 
     let rows = state
         .store
-        .search_handles(chain, platform_id, owner, query.as_deref(), limit, offset)
+        .search_handles(&Search {
+            chain,
+            platform_id,
+            owner,
+            folded_query: query.as_deref(),
+            limit,
+            offset,
+        })
         .await?;
     let hits = rows
         .iter()
@@ -737,15 +455,20 @@ async fn search(
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::Address;
     use axum::{
         body::Body,
-        http::Request,
+        http::{
+            Request,
+            StatusCode,
+        },
     };
     use http_body_util::BodyExt;
     use sqlx::PgPool;
     use tower::ServiceExt;
 
     use super::*;
+    use crate::api::model::ErrorBody;
 
     /// The status and code a route refuses `path` with. Every refusal here
     /// comes before the store is read, so the pool never connects.
