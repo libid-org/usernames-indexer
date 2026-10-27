@@ -142,7 +142,7 @@ impl Config {
         // below is signed, and a signature makes it an assertion about a name
         // — so the name has to be one this resolver has standing to speak
         // about, whatever record was asked of it.
-        let name = Name::parse(&call.name).map_err(GatewayError::bad_request)?;
+        let name = Name::decode(&call.name).map_err(GatewayError::bad_request)?;
         let query = name.query(&self.domain);
         // Not a name under this resolver's domain. Refused rather than
         // answered: a signed null is an authoritative "nobody holds this", and
@@ -382,7 +382,7 @@ impl Config {
                 let ambiguous = ids
                     .iter()
                     .any(|other| CoinType::shared_by(chain_id, *other));
-                ChainStatus::of(chain_id, row, ambiguous, self.max_lag_blocks)
+                ServedChain::of(chain_id, row, ambiguous, self.max_lag_blocks)
             })
             .collect();
         Ok(GatewayStatus { chains })
@@ -606,7 +606,7 @@ impl GatewayState {
 /// One served chain, as supervision should see it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ChainStatus {
+pub struct ServedChain {
     /// The chain.
     pub chain_id: u64,
     /// The names the chain goes by in a name, as its indexer declared them.
@@ -627,7 +627,7 @@ pub struct ChainStatus {
     pub stale: bool,
 }
 
-impl ChainStatus {
+impl ServedChain {
     /// A chain's status from its row, as the gate decides on it.
     fn of(
         chain_id: u64,
@@ -653,7 +653,7 @@ impl ChainStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GatewayStatus {
     /// One row per chain the store holds.
-    pub chains: Vec<ChainStatus>,
+    pub chains: Vec<ServedChain>,
 }
 
 /// `GET /status`: one row per chain the store holds. For alerting, never for

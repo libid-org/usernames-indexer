@@ -40,12 +40,12 @@ use tokio::sync::{
 };
 use tower::ServiceExt;
 use usernames_api::ens::{
-    ChainStatus,
     Config,
     GatewayRefusal,
     GatewayResponse,
     GatewayState,
     GatewayStatus,
+    ServedChain,
     ROUTE_PREFIX,
 };
 use usernames_core::{
@@ -211,11 +211,11 @@ impl Ask for Router {
 trait Row {
     /// The status row of one chain; a chain the status does not list fails the
     /// test.
-    fn row(&self, chain_id: i64) -> &ChainStatus;
+    fn row(&self, chain_id: i64) -> &ServedChain;
 }
 
 impl Row for GatewayStatus {
-    fn row(&self, chain_id: i64) -> &ChainStatus {
+    fn row(&self, chain_id: i64) -> &ServedChain {
         self.chains
             .iter()
             .find(|row| i64::try_from(row.chain_id) == Ok(chain_id))
@@ -1234,7 +1234,7 @@ async fn a_name_outside_the_domain_is_refused_whatever_the_record() {
         return;
     };
     let router = gateway.router();
-    let node = ens::Name::parse(b"\x07vitalik\x03eth\x00")
+    let node = ens::Name::decode(b"\x07vitalik\x03eth\x00")
         .expect("a name in wire format")
         .node();
 

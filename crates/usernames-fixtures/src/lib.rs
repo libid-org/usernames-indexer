@@ -115,7 +115,7 @@ impl Labels for [&str] {
     }
 
     fn namehash(&self) -> B256 {
-        Name::parse(&self.wire_name())
+        Name::decode(&self.wire_name())
             .expect("a name in wire format")
             .node()
     }

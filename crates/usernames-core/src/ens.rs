@@ -388,12 +388,12 @@ pub struct Name {
 }
 
 impl Name {
-    /// Split a DNS wire-format name into its labels.
+    /// Decode a DNS wire-format name into its labels.
     ///
     /// `\x05alice\x01x\x07handles\x04link\x00` becomes `["alice", "x",
     /// "handles", "link"]`. The root label terminates; trailing bytes after it
     /// are a malformed name rather than something to ignore.
-    pub fn parse(wire: &[u8]) -> Result<Self, EnsError> {
+    pub fn decode(wire: &[u8]) -> Result<Self, EnsError> {
         let mut labels = Vec::new();
         let mut at = 0usize;
         loop {
@@ -632,7 +632,7 @@ mod tests {
             wire.extend_from_slice(label.as_bytes());
         }
         wire.push(0);
-        Name::parse(&wire).unwrap()
+        Name::decode(&wire).unwrap()
     }
 
     /// The domain the mainnet deployment answers under.
@@ -664,7 +664,7 @@ mod tests {
             &b"\x05alice\x00\x01x\x00"[..], // bytes after the root label
             &b"\x40aaaaaaaa\x00"[..],       // length above the 63-byte ceiling
         ] {
-            assert_eq!(Name::parse(bad), Err(EnsError::MalformedName), "{bad:?}");
+            assert_eq!(Name::decode(bad), Err(EnsError::MalformedName), "{bad:?}");
         }
     }
 
@@ -672,7 +672,7 @@ mod tests {
 
     #[test]
     fn the_short_form_names_a_platform_and_no_chain() {
-        let q = Name::parse(ALICE_X)
+        let q = Name::decode(ALICE_X)
             .unwrap()
             .query(&handles_link())
             .unwrap();
@@ -682,7 +682,7 @@ mod tests {
 
     #[test]
     fn a_chain_label_is_carried_and_never_guessed() {
-        let q = Name::parse(b"\x05alice\x01x\x04base\x07handles\x04link\x00")
+        let q = Name::decode(b"\x05alice\x01x\x04base\x07handles\x04link\x00")
             .unwrap()
             .query(&handles_link())
             .unwrap();
@@ -693,7 +693,7 @@ mod tests {
     #[test]
     fn a_name_outside_the_domain_is_refused() {
         assert!(matches!(
-            Name::parse(b"\x05alice\x01x\x03eth\x00")
+            Name::decode(b"\x05alice\x01x\x03eth\x00")
                 .unwrap()
                 .query(&handles_link()),
             Err(EnsError::ForeignDomain)
@@ -703,7 +703,7 @@ mod tests {
     #[test]
     fn a_subname_domain_takes_its_names_and_leaves_the_parents() {
         let alice = b"\x05alice\x01x\x07testnet\x07handles\x04link\x00";
-        let q = Name::parse(alice)
+        let q = Name::decode(alice)
             .unwrap()
             .query(&testnet_handles_link())
             .unwrap();
@@ -712,7 +712,9 @@ mod tests {
 
         // The parent's own names are not this gateway's to speak about.
         assert!(matches!(
-            Name::parse(ALICE_X).unwrap().query(&testnet_handles_link()),
+            Name::decode(ALICE_X)
+                .unwrap()
+                .query(&testnet_handles_link()),
             Err(EnsError::ForeignDomain)
         ));
     }
@@ -720,7 +722,7 @@ mod tests {
     #[test]
     fn a_chain_label_sits_before_a_subname_domain_too() {
         let alice = b"\x05alice\x01x\x07sepolia\x07testnet\x07handles\x04link\x00";
-        let q = Name::parse(alice)
+        let q = Name::decode(alice)
             .unwrap()
             .query(&testnet_handles_link())
             .unwrap();
@@ -744,7 +746,7 @@ mod tests {
     #[test]
     fn the_domain_alone_names_nobody() {
         assert!(matches!(
-            Name::parse(b"\x07handles\x04link\x00")
+            Name::decode(b"\x07handles\x04link\x00")
                 .unwrap()
                 .query(&handles_link()),
             Err(EnsError::EmptyName)
@@ -767,7 +769,7 @@ mod tests {
     fn x_reverses_its_hyphen_substitution() {
         // `_` -> `-` is a bijection onto its image because X's alphabet holds
         // no hyphen, so this reverses exactly.
-        let q = Name::parse(b"\x04a--b\x01x\x07handles\x04link\x00")
+        let q = Name::decode(b"\x04a--b\x01x\x07handles\x04link\x00")
             .unwrap()
             .query(&handles_link())
             .unwrap();
@@ -776,7 +778,7 @@ mod tests {
 
     #[test]
     fn github_labels_are_the_handle_unchanged() {
-        let q = Name::parse(b"\x05alice\x06github\x07handles\x04link\x00")
+        let q = Name::decode(b"\x05alice\x06github\x07handles\x04link\x00")
             .unwrap()
             .query(&handles_link())
             .unwrap();
@@ -785,7 +787,7 @@ mod tests {
 
     #[test]
     fn gmail_joins_its_labels_and_appends_the_domain_the_platform_implies() {
-        let q = Name::parse(b"\x05alice\x01b\x06google\x07handles\x04link\x00")
+        let q = Name::decode(b"\x05alice\x01b\x06google\x07handles\x04link\x00")
             .unwrap()
             .query(&handles_link())
             .unwrap();
@@ -798,7 +800,7 @@ mod tests {
         // deliberate: a mapping for characters no account holds would be
         // untested code on a payment path.
         assert!(matches!(
-            Name::parse(b"\x06al-ice\x06google\x07handles\x04link\x00")
+            Name::decode(b"\x06al-ice\x06google\x07handles\x04link\x00")
                 .unwrap()
                 .query(&handles_link()),
             Err(EnsError::UnnormalizedLabel(_))
@@ -817,7 +819,7 @@ mod tests {
         let mut wire = vec![long.len() as u8];
         wire.extend_from_slice(long.as_bytes());
         wire.extend_from_slice(b"\x07handles\x04link\x00");
-        assert_eq!(Name::parse(&wire), Err(EnsError::MalformedName));
+        assert_eq!(Name::decode(&wire), Err(EnsError::MalformedName));
     }
 
     // ─── Google: the two address forms ──────────────────────────────
@@ -1003,7 +1005,7 @@ mod tests {
 
     #[test]
     fn the_forwarded_call_decodes_to_a_name_and_a_record() {
-        let node = Name::parse(ALICE_X).unwrap().node();
+        let node = Name::decode(ALICE_X).unwrap().node();
         let call = resolve_call(ALICE_X, &addr_call(node, 0x8000_2105));
         let ResolveCall { name, record } = ResolveCall::decode(&call).unwrap();
         assert_eq!(name, ALICE_X);
