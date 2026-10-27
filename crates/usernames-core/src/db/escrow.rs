@@ -440,9 +440,7 @@ impl Page<SlotCursor> {
             .push_bind(self.fetch());
         statement
     }
-}
 
-impl Page<SlotCursor> {
     /// What `sender` may take back: its contributions, in the order of the
     /// table's key.
     pub(crate) fn refundable_lookup(&self, prefix: &str, sender: Address) -> Statement {
