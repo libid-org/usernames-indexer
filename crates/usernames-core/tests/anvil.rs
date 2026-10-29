@@ -185,6 +185,17 @@ async fn indexes_a_real_chain_end_to_end() {
         escrow_as_registry.check_registry(provider).await,
         Err(chain::RegistryRefused::Unread { .. })
     ));
+    // The registry has no `REFUND_GRACE`, as an escrow from before 0.21 has
+    // none: an indexer pointed at it as the escrow refuses.
+    let registry_as_escrow = Contracts {
+        registry: contracts.registry,
+        escrow: Some(contracts.registry),
+    };
+    let refused = registry_as_escrow.check_escrow(provider).await;
+    assert!(
+        matches!(refused, Err(chain::EscrowRefused::NoRefundGrace { .. })),
+        "{refused:?}"
+    );
     let mut lease = store.acquire_writer().await.expect("writer lease");
     let writer = store.prepare(&mut lease, contracts).await.expect("prepare");
 
