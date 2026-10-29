@@ -1,5 +1,5 @@
 //! The indexer binary as a supervisor runs it: stopped by SIGTERM while it
-//! waits for its chain's lease, and while it indexes.
+//! waits for its chain's lease, and while it indexes; refused at start.
 
 use std::{
     process::{
@@ -21,9 +21,12 @@ use tokio::{
     },
     sync::watch,
 };
-use usernames_core::db::{
-    self,
-    ChainStore,
+use usernames_core::{
+    db::{
+        self,
+        ChainStore,
+    },
+    ens::ChainName,
 };
 use usernames_fixtures::{
     anvil_available,
@@ -80,9 +83,10 @@ impl Chain {
         })
     }
 
-    /// The indexer binary for this chain, polling.
-    fn indexer(&self) -> Running {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_usernames-indexer"))
+    /// The indexer binary for this chain, polling, not yet started.
+    fn command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_usernames-indexer"));
+        command
             .env("DATABASE_URL", &self.database)
             .env("RPC_URL", self.node.rpc().as_str())
             .env(
@@ -98,8 +102,15 @@ impl Chain {
             .env("POLL_INTERVAL", "100ms")
             .env("START_BLOCK", "0")
             .env("NO_COLOR", "1")
+            .kill_on_drop(true);
+        command
+    }
+
+    /// The indexer binary for this chain, running.
+    fn indexer(&self) -> Running {
+        let mut child = self
+            .command()
             .stdout(Stdio::piped())
-            .kill_on_drop(true)
             .spawn()
             .expect("the indexer starts");
         let mut lines = BufReader::new(child.stdout.take().expect("its log")).lines();
@@ -177,4 +188,49 @@ async fn an_indexing_indexer_stops_on_sigterm_and_frees_the_chain() {
         .expect("the chain's lease is free")
         .expect("the lease");
     next.release().await.expect("the lease goes back");
+}
+
+/// A start that cannot declare its chain's names refuses before it clears
+/// anything: a name another chain holds stops the process and leaves the
+/// chain's rows as they were, even where the start would replay the chain.
+#[tokio::test]
+async fn a_start_refused_for_a_taken_name_keeps_the_chain() {
+    let Some(chain) = Chain::start(43161).await else {
+        return;
+    };
+    let mut watch = ChainWatch::new(&chain.pool, &chain.store).await;
+    let indexer = chain.indexer();
+    watch.cursor_at(1).await;
+    assert!(indexer.terminate().await.success());
+
+    let other = ChainStore::new(chain.pool.clone(), 43162);
+    other.forget().await;
+    let mut lease = other
+        .acquire_writer()
+        .await
+        .expect("the other chain's lease");
+    let taken: ChainName = "taken".parse().expect("a label");
+    other
+        .set_chain_names(&mut lease, &[taken])
+        .await
+        .expect("the other chain holds the name");
+
+    // Without its escrow, the start would replay the chain.
+    let refused = chain
+        .command()
+        .env("CHAIN_NAMES", "taken")
+        .env_remove("HANDLE_ESCROW_ADDRESS")
+        .output()
+        .await
+        .expect("the indexer runs");
+    assert!(!refused.status.success());
+    let shown = String::from_utf8_lossy(&refused.stderr);
+    assert!(shown.contains("already belongs to chain 43162"), "{shown}");
+    assert!(
+        chain.store.cursor().await.expect("the cursor").is_some(),
+        "the chain's rows are kept"
+    );
+
+    lease.release().await.expect("the lease goes back");
+    other.forget().await;
 }

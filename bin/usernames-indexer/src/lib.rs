@@ -156,9 +156,11 @@ impl Config {
         // write the chain, no other instance may. prepare runs under it —
         // the lease is a parameter there, so a version-bump replay cannot race a
         // still-running older pod.
-        let lease = store.acquire_writer().await?;
-        let writer = store.prepare(&lease, contracts).await?;
-        store.set_chain_names(&lease, &self.chain_names).await?;
+        let mut lease = store.acquire_writer().await?;
+        // Names first: a name another chain holds refuses the start, and it
+        // has to before `prepare` may clear the chain for a replay.
+        store.set_chain_names(&mut lease, &self.chain_names).await?;
+        let writer = store.prepare(&mut lease, contracts).await?;
 
         // Startup's own connection: every session of the loop opens its own.
         drop(provider);

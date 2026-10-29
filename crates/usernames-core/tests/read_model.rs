@@ -1355,11 +1355,11 @@ async fn preparing_an_unchanged_chain_keeps_everything() {
     let Some(chains) = Chains::open(2).await else {
         return;
     };
-    let lease = chains.store.acquire_writer().await.expect("lease");
+    let mut lease = chains.store.acquire_writer().await.expect("lease");
     let writer = chains
         .store
         .prepare(
-            &lease,
+            &mut lease,
             Contracts {
                 registry: a_contract(),
                 escrow: None,
@@ -1373,7 +1373,7 @@ async fn preparing_an_unchanged_chain_keeps_everything() {
     chains
         .store
         .prepare(
-            &lease,
+            &mut lease,
             Contracts {
                 registry: a_contract(),
                 escrow: None,
@@ -1406,11 +1406,11 @@ async fn watching_another_contract_clears_the_chain() {
     let Some(chains) = Chains::open(2).await else {
         return;
     };
-    let lease = chains.store.acquire_writer().await.expect("lease");
+    let mut lease = chains.store.acquire_writer().await.expect("lease");
     let writer = chains
         .store
         .prepare(
-            &lease,
+            &mut lease,
             Contracts {
                 registry: a_contract(),
                 escrow: None,
@@ -1430,7 +1430,7 @@ async fn watching_another_contract_clears_the_chain() {
     chains
         .store
         .prepare(
-            &lease,
+            &mut lease,
             Contracts {
                 registry: OTHER_CONTRACT,
                 escrow: Some(OTHER_ESCROW),
@@ -1476,11 +1476,11 @@ async fn the_deployment_block_survives_a_replay_of_the_same_registry() {
     let Some(chains) = Chains::open(2).await else {
         return;
     };
-    let lease = chains.store.acquire_writer().await.expect("lease");
+    let mut lease = chains.store.acquire_writer().await.expect("lease");
     let writer = chains
         .store
         .prepare(
-            &lease,
+            &mut lease,
             Contracts {
                 registry: a_contract(),
                 escrow: None,
@@ -1495,7 +1495,7 @@ async fn the_deployment_block_survives_a_replay_of_the_same_registry() {
     chains
         .store
         .prepare(
-            &lease,
+            &mut lease,
             Contracts {
                 registry: a_contract(),
                 escrow: Some(escrow),
@@ -1515,7 +1515,7 @@ async fn the_deployment_block_survives_a_replay_of_the_same_registry() {
     chains
         .store
         .prepare(
-            &lease,
+            &mut lease,
             Contracts {
                 registry: OTHER_CONTRACT,
                 escrow: Some(escrow),
@@ -1706,7 +1706,7 @@ async fn a_replay_waits_for_the_window_in_flight_and_clears_it() {
         window.apply(event, &at).await.expect("apply");
     }
 
-    // The replay runs on sessions of its own name, so the wait below is its
+    // The replay runs on a lease of its own name, so the wait below is its
     // wait and no other session's.
     const REPLAY: &str = "replay under test";
     let replaying = ChainStore::new(
@@ -1719,11 +1719,11 @@ async fn a_replay_waits_for_the_window_in_flight_and_clears_it() {
         .expect("the replay's pool"),
         CHAIN,
     );
-    let lease = chains.store.acquire_writer().await.expect("lease");
+    let mut lease = replaying.acquire_writer().await.expect("lease");
     let replay = tokio::spawn(async move {
         replaying
             .prepare(
-                &lease,
+                &mut lease,
                 Contracts {
                     registry: OTHER_CONTRACT,
                     escrow: None,
@@ -1756,6 +1756,86 @@ async fn a_replay_waits_for_the_window_in_flight_and_clears_it() {
         "what the window committed is cleared"
     );
     lease.release().await.expect("the lease releases");
+    chains.done();
+}
+
+/// A prepare commits only while its lease holds the chain: a lease whose
+/// session ends while the prepare waits for a window in flight takes the
+/// prepare with it, and what the window committed stays.
+#[tokio::test]
+async fn a_prepare_whose_lease_ended_while_it_waited_clears_nothing() {
+    let Some(chains) = Chains::open(3).await else {
+        return;
+    };
+    let stale = chains.store.writer().await;
+    let mut window = stale.begin_window().await.expect("a window");
+    let events = NamesEvent::bind(
+        Address::repeat_byte(1),
+        KnownPlatform::X,
+        "1",
+        "alice",
+        1,
+        true,
+    );
+    for (log_index, event) in (0u64..).zip(&events) {
+        let at = LogPosition {
+            block_number: 1,
+            log_index,
+            tx_hash: B256::repeat_byte(1),
+            block_time: 1_700_000_001,
+        };
+        window.apply(event, &at).await.expect("apply");
+    }
+
+    // The replay runs on a lease of its own name, so the wait below is its
+    // wait and no other session's.
+    const REPLAY: &str = "ended replay under test";
+    let replaying = ChainStore::new(
+        PgPool::connect_with(
+            (*chains.pool.connect_options())
+                .clone()
+                .application_name(REPLAY),
+        )
+        .await
+        .expect("the replay's pool"),
+        CHAIN,
+    );
+    let mut lease = replaying.acquire_writer().await.expect("lease");
+    let replay = tokio::spawn(async move {
+        replaying
+            .prepare(
+                &mut lease,
+                Contracts {
+                    registry: OTHER_CONTRACT,
+                    escrow: None,
+                },
+            )
+            .await
+    });
+    chains.pool.waits_on_a_lock(REPLAY).await;
+    sqlx::query(include_str!("sql/end_writer_session.sql"))
+        .bind(CHAIN)
+        .execute(&chains.pool)
+        .await
+        .expect("the lease's session ends");
+    window
+        .commit(1)
+        .await
+        .expect("the window in flight commits");
+
+    let replayed = replay.await.expect("the replay task");
+    assert!(replayed.is_err(), "a prepare without its lease committed");
+    assert_eq!(chains.store.cursor().await.unwrap(), Some(1));
+    assert_eq!(
+        chains
+            .store
+            .ens_answer(KnownPlatform::X.handle_node("alice").unwrap())
+            .await
+            .unwrap()
+            .holder,
+        Some(Address::repeat_byte(1)),
+        "what the window committed stays"
+    );
     chains.done();
 }
 
@@ -1826,12 +1906,20 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
         return;
     };
     let name = |s: &str| s.parse::<ens::ChainName>().unwrap();
-    let lease = chains.store.acquire_writer().await.expect("lease");
-    // In the indexer's order: the chain is prepared, then named.
+    let mut lease = chains.store.acquire_writer().await.expect("lease");
+    // In the indexer's order: the chain is named, then prepared.
+    chains
+        .store
+        .set_chain_names(
+            &mut lease,
+            &[name("alpha"), name("alpha-testnet"), name("alpha")],
+        )
+        .await
+        .expect("declared");
     chains
         .store
         .prepare(
-            &lease,
+            &mut lease,
             Contracts {
                 registry: a_contract(),
                 escrow: None,
@@ -1839,14 +1927,6 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
         )
         .await
         .expect("prepared");
-    chains
-        .store
-        .set_chain_names(
-            &lease,
-            &[name("alpha"), name("alpha-testnet"), name("alpha")],
-        )
-        .await
-        .expect("declared");
     assert_eq!(
         chains.pool.names_of(CHAIN).await,
         ["alpha", "alpha-testnet"]
@@ -1861,16 +1941,16 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
     // Declaring again replaces the set.
     chains
         .store
-        .set_chain_names(&lease, &[name("alpha")])
+        .set_chain_names(&mut lease, &[name("alpha")])
         .await
         .expect("declared again");
     assert_eq!(chains.pool.names_of(CHAIN).await, ["alpha"]);
 
     // Another chain cannot take a name this one holds, and writes nothing.
     let other = ChainStore::new(chains.pool.clone(), OTHER_CHAIN);
-    let other_lease = other.acquire_writer().await.expect("other lease");
+    let mut other_lease = other.acquire_writer().await.expect("other lease");
     let refused = other
-        .set_chain_names(&other_lease, &[name("beta"), name("alpha")])
+        .set_chain_names(&mut other_lease, &[name("beta"), name("alpha")])
         .await;
     assert!(
         matches!(

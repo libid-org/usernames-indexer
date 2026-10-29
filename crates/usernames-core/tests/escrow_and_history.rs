@@ -1115,11 +1115,11 @@ async fn the_status_names_the_escrow_the_chain_was_indexed_from() {
         return;
     };
     let (registry, escrow) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
-    let lease = suite.store().acquire_writer().await.expect("lease");
+    let mut lease = suite.store().acquire_writer().await.expect("lease");
     suite
         .store()
         .prepare(
-            &lease,
+            &mut lease,
             Contracts {
                 registry,
                 escrow: Some(escrow),
@@ -1148,11 +1148,11 @@ async fn another_escrow_replays_the_chain_and_the_same_one_keeps_it() {
     };
     let registry = Address::repeat_byte(0x11);
     let (escrow, other_escrow) = (Address::repeat_byte(0x22), Address::repeat_byte(0x33));
-    let lease = suite.store().acquire_writer().await.expect("lease");
+    let mut lease = suite.store().acquire_writer().await.expect("lease");
     let writer = suite
         .store()
         .prepare(
-            &lease,
+            &mut lease,
             Contracts {
                 registry,
                 escrow: Some(escrow),
@@ -1168,7 +1168,7 @@ async fn another_escrow_replays_the_chain_and_the_same_one_keeps_it() {
     suite
         .store()
         .prepare(
-            &lease,
+            &mut lease,
             Contracts {
                 registry,
                 escrow: Some(escrow),
@@ -1184,7 +1184,7 @@ async fn another_escrow_replays_the_chain_and_the_same_one_keeps_it() {
     suite
         .store()
         .prepare(
-            &lease,
+            &mut lease,
             Contracts {
                 registry,
                 escrow: Some(other_escrow),

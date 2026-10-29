@@ -353,10 +353,11 @@ pub enum LeaseLost {
 /// process's lifetime, so a second instance — a rolling-deploy overlap, a
 /// stray operator shell — blocks instead of interleaving writes with ours.
 ///
-/// It is also a witness: [`ChainStore::prepare`] takes `&WriterLease`, so the
-/// check-clear-stamp sequence cannot be run without holding the lock that
-/// makes it safe. The lease remembers which chain it locks, and `prepare`
-/// verifies the match, so a lease from one store cannot vouch for another.
+/// It is also where [`ChainStore::prepare`] runs: the check-clear-stamp
+/// sequence is a transaction on this session, so it cannot commit without
+/// the lock that makes it safe. The lease remembers which chain it locks,
+/// and `prepare` verifies the match, so a lease from one store cannot vouch
+/// for another.
 pub struct WriterLease {
     /// The lease's own session, not a pooled one: the advisory lock belongs to
     /// the session, so a pooled connection would carry the lock back into the
@@ -467,7 +468,10 @@ impl ChainStore {
     ///
     /// The lease parameter is the safety argument in the signature: without
     /// the chain's writer lock, the check-clear-stamp sequence could race a
-    /// still-running older instance. The writer it returns carries a new
+    /// still-running older instance. It runs on the lease's own session, so
+    /// it commits only while the lock is held: a lease whose session ended
+    /// while the prepare waited on the chain's row takes the prepare's
+    /// transaction with it. The writer it returns carries a new
     /// generation, which the chain's row names from then on, so whatever an
     /// earlier writer still tries to write after its lease was lost lands
     /// nowhere.
@@ -479,7 +483,7 @@ impl ChainStore {
     /// not bad input.
     pub async fn prepare(
         &self,
-        lease: &WriterLease,
+        lease: &mut WriterLease,
         contracts: Contracts,
     ) -> Result<ChainWriter, sqlx::Error> {
         assert_eq!(
@@ -487,7 +491,7 @@ impl ChainStore {
             "writer lease locks chain {}, but this store prepares chain {}",
             lease.chain_id, self.chain_id
         );
-        let mut tx = self.pool.begin().await?;
+        let mut tx = lease.conn.begin().await?;
         sqlx::query(sql::LOCK_CHAIN)
             .bind(self.chain_id)
             .execute(&mut *tx)
@@ -553,13 +557,14 @@ impl ChainStore {
     }
 
     /// Declare the names this chain goes by in an ENS name, replacing whatever
-    /// it declared before. Under the writer lease like [`Self::prepare`], and
-    /// for the same reason: the check-clear-write must not race another
-    /// instance of this chain. A name another chain holds refuses the whole
-    /// set, so a misconfigured deployment writes nothing rather than half.
+    /// it declared before. On the writer lease's session like
+    /// [`Self::prepare`], and for the same reason: the check-clear-write must
+    /// not race another instance of this chain. A name another chain holds
+    /// refuses the whole set, so a misconfigured deployment writes nothing
+    /// rather than half.
     pub async fn set_chain_names(
         &self,
-        lease: &WriterLease,
+        lease: &mut WriterLease,
         names: &[ChainName],
     ) -> Result<(), ChainNamesError> {
         assert_eq!(
@@ -572,7 +577,7 @@ impl ChainStore {
         wanted.sort();
         wanted.dedup();
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = lease.conn.begin().await?;
         let taken: Vec<(String, i64)> = sqlx::query_as(sql::CHAIN_NAMES_TAKEN)
             .bind(&wanted)
             .bind(self.chain_id)

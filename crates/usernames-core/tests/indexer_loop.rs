@@ -120,9 +120,9 @@ impl Chain {
         node.provider.anvil_mine(Some(8), None).await.expect("mine");
         let relay = Relay::start(node.rpc()).await;
 
-        let lease = store.acquire_writer().await.expect("writer lease");
+        let mut lease = store.acquire_writer().await.expect("writer lease");
         let writer = store
-            .prepare(&lease, libid.contracts())
+            .prepare(&mut lease, libid.contracts())
             .await
             .expect("prepare");
         Some(Self {
