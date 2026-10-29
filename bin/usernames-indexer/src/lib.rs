@@ -203,7 +203,7 @@ impl Config {
     /// How long readers may trust a report: `STALE_AFTER`, or four poll
     /// intervals plus a minute. Refused unless it outlasts a poll interval,
     /// or every idle cycle would expire the report before the next one
-    /// renews it, and unless it stays within a year.
+    /// renews it, and unless it stays between a second and a year.
     fn report_validity(&self) -> anyhow::Result<Duration> {
         let validity = self.stale_after.unwrap_or(
             self.poll_interval
@@ -216,6 +216,12 @@ impl Config {
              expires the report before the next one renews it",
             humantime::format_duration(validity),
             humantime::format_duration(self.poll_interval)
+        );
+        anyhow::ensure!(
+            validity >= db::MIN_VALID_FOR,
+            "STALE_AFTER ({}) is under a second, the unit the store keeps report \
+             times in; a shorter report would expire as it is written",
+            humantime::format_duration(validity)
         );
         anyhow::ensure!(
             validity <= db::MAX_VALID_FOR,
@@ -392,6 +398,35 @@ mod help_tests {
                 "{rpc}"
             );
         }
+    }
+
+    /// The store keeps report times in whole seconds, so a sub-second
+    /// report would expire as it is written.
+    #[test]
+    fn a_sub_second_stale_after_is_refused() {
+        let config = |stale_after| {
+            Config::try_parse_from([
+                "usernames-indexer",
+                "--database-url",
+                "postgres://localhost/usernames",
+                "--rpc-url",
+                "http://127.0.0.1:8545",
+                "--identity-registry-address",
+                "0x0000000000000000000000000000000000000001",
+                "--chain-names",
+                "eden",
+                "--poll-interval",
+                "100ms",
+                "--stale-after",
+                stale_after,
+            ])
+            .expect("parses")
+        };
+        assert!(config("500ms").report_validity().is_err());
+        assert_eq!(
+            config("1s").report_validity().ok(),
+            Some(Duration::from_secs(1))
+        );
     }
 
     /// A zero interval would poll and retry back to back.

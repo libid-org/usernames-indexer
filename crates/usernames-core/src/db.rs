@@ -202,6 +202,10 @@ pub const CHAIN_CHANNEL: &str = "names_chains";
 /// setting at startup; the store adds it to the clock as a `bigint`.
 pub const MAX_VALID_FOR: Duration = Duration::from_secs(366 * 24 * 60 * 60);
 
+/// The shortest a report may be trusted: a second, the unit the store keeps
+/// report times in. The indexer refuses a shorter setting at startup.
+pub const MIN_VALID_FOR: Duration = Duration::from_secs(1);
+
 /// The whole store: every chain any indexer has written into one database.
 ///
 /// What the gateway serves is exactly what this holds — nothing to configure,
