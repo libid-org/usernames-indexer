@@ -50,6 +50,7 @@ use crate::{
     db::{
         self,
         ChainStatusRow,
+        HandleNodeRow,
         Search,
         Store,
     },
@@ -193,21 +194,21 @@ impl AppState {
 }
 
 impl HandleRef {
-    /// The handle a request named, completed from `known`: any row about the
-    /// node names its platform, and its text once disclosed.
-    fn asked(key: &HandleKey, known: Option<&HandleRef>) -> Self {
-        let (platform, platform_id) = match key {
-            HandleKey::Text { platform, .. } => (Some(*platform), Some(platform.id())),
-            HandleKey::Node(_) => (
-                known.and_then(|handle| handle.platform),
-                known.and_then(|handle| handle.platform_id),
-            ),
-        };
-        Self {
-            platform,
-            platform_id,
-            handle_node: key.node(),
-            handle: known.and_then(|handle| handle.handle.clone()),
+    /// The handle a request named, completed from what the store knows of
+    /// its node: the platform a row named, and its text once disclosed.
+    fn asked(key: &HandleKey, known: Option<HandleNodeRow>) -> Self {
+        let handle_node = key.node();
+        match (key, known) {
+            (HandleKey::Text { platform, .. }, known) => Self {
+                platform: Some(*platform),
+                platform_id: Some(platform.id()),
+                handle_node,
+                handle: known.and_then(|row| row.handle),
+            },
+            (HandleKey::Node(_), Some(row)) => {
+                Self::of(Some(row.platform_id), handle_node, row.handle)
+            }
+            (HandleKey::Node(_), None) => Self::of(None, handle_node, None),
         }
     }
 

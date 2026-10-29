@@ -1070,6 +1070,31 @@ async fn a_handle_nothing_was_sent_to_holds_nothing() {
     suite.done();
 }
 
+/// A handle's platform and text come from what the chain named and
+/// disclosed about its node, not from the page: asked by node, a disclosed
+/// handle nothing was sent to still shows them.
+#[tokio::test]
+async fn an_empty_page_still_names_the_handle_it_is_about() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    suite
+        .apply_tx(
+            1,
+            NamesEvent::bind(Address::repeat_byte(1), X, "1", "alice", 1_000, true),
+        )
+        .await;
+    let held: HandleAmounts = suite
+        .get(&format!("/v1/escrow/node/{}", node("alice")))
+        .await
+        .answer();
+    assert!(held.amounts.is_empty() && held.next.is_none());
+    assert_eq!(held.handle.platform, Some(X));
+    assert_eq!(held.handle.handle.as_deref(), Some("alice"));
+    suite.done();
+}
+
 /// The chain folds a deposit's text and checks nothing else, so text no
 /// circuit hashes still finds what was sent to it, but no account can bind
 /// it and its text is not stored.

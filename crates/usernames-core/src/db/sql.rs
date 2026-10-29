@@ -50,6 +50,10 @@ pub const IDENTITY_PROJECTION: &str = include_str!("../../sql/identity_projectio
 /// The projection every `names.handles` read shares: the row and its
 /// disclosed text. A caller appends its `WHERE`.
 pub const HANDLE_PROJECTION: &str = include_str!("../../sql/handle_projection.sql");
+/// A handle node's platform and disclosed text; the caller narrows the node
+/// and the chain.
+pub const HANDLE_NODE_PROJECTION: &str =
+    include_str!("../../sql/handle_node_projection.sql");
 /// Live, disclosed handles with their id node and display flag; the caller
 /// narrows, orders and pages.
 pub const SEARCH_PROJECTION: &str = include_str!("../../sql/search_projection.sql");

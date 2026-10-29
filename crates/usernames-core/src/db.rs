@@ -76,6 +76,7 @@ pub use self::{
     },
     reads::{
         EnsAnswer,
+        HandleNodeRow,
         HandleRow,
         IdentityRow,
         Search,

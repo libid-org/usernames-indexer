@@ -73,6 +73,16 @@ impl StorePlans for PgConnection {
                 Scope(Some(1)).handle_lookup("EXPLAIN ", node),
             ),
             (
+                "a handle node's text, any chain",
+                Some(&["handle_nodes_node_chain_idx"][..]),
+                Scope(None).handle_node_lookup("EXPLAIN ", node),
+            ),
+            (
+                "a handle node's text, one chain",
+                Some(&["handle_nodes_pkey|handle_nodes_node_chain_idx"][..]),
+                Scope(Some(1)).handle_node_lookup("EXPLAIN ", node),
+            ),
+            (
                 "id node, any chain",
                 Some(&["ids_node_chain_idx"][..]),
                 Scope(None).id_lookup("EXPLAIN ", node),

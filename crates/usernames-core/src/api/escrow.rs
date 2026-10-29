@@ -138,14 +138,14 @@ impl AppState {
         params: PageParams,
     ) -> Result<Json<HandleAmounts>, ApiError> {
         let page = params.page()?;
-        self.synced(page.chain).await?;
+        let chain = page.chain;
+        self.synced(chain).await?;
 
-        let (amounts, next) = self
-            .store
-            .escrowed_for(key.node(), page)
-            .await?
-            .served(EscrowAmount::of)?;
-        let known = amounts.first().map(|amount| &amount.handle);
+        let (slots, known) = tokio::try_join!(
+            self.store.escrowed_for(key.node(), page),
+            self.store.handle_node(key.node(), chain),
+        )?;
+        let (amounts, next) = slots.served(EscrowAmount::of)?;
         Ok(Json(HandleAmounts {
             handle: HandleRef::asked(&key, known),
             amounts,
