@@ -11,7 +11,10 @@
 //! [`Window::apply`], so replaying a window — after a crash, or after a
 //! version-bump re-index — converges instead of counting an event twice.
 
-use std::time::Duration;
+use std::{
+    sync::LazyLock,
+    time::Duration,
+};
 
 use alloy::primitives::{
     Address,
@@ -38,6 +41,7 @@ use crate::{
         LogPosition,
         NamesEvent,
     },
+    nodes::KnownPlatform,
 };
 
 mod escrow;
@@ -79,10 +83,18 @@ pub use self::{
     },
 };
 
-/// Bump on any change to what the indexer writes. A mismatch at startup
-/// clears the chain's rows and cursor, so the next loop replays the chain
-/// from the deployment block — the re-index IS the migration.
-pub const INDEXER_VERSION: &str = "1";
+/// Bump on any change to the shape of what the indexer writes.
+const SHAPE_VERSION: &str = "1";
+
+/// The version a chain's rows are stamped with: the written shape, and every
+/// platform whose disclosed text this build checks and keeps. A mismatch at
+/// startup clears the chain's rows and cursor, so the next loop replays the
+/// chain from the deployment block — the re-index IS the migration — and a
+/// build that learns a platform stores the text earlier windows dropped.
+pub static INDEXER_VERSION: LazyLock<String> = LazyLock::new(|| {
+    let platforms: Vec<&str> = KnownPlatform::ALL.iter().map(|p| p.key()).collect();
+    format!("{SHAPE_VERSION}+{}", platforms.join(","))
+});
 
 /// One chain's row: what its indexer watches and writes, how far it got,
 /// and its last report. Blocks and times are what the indexer wrote, so
@@ -501,7 +513,7 @@ impl ChainStore {
             .fetch_optional(&mut *tx)
             .await?
             .unwrap_or_default();
-        if known.indexer_version.as_deref() == Some(INDEXER_VERSION)
+        if known.indexer_version.as_deref() == Some(INDEXER_VERSION.as_str())
             && known.contract == Some(contracts.registry)
             && known.escrow == contracts.escrow
         {
@@ -518,7 +530,7 @@ impl ChainStore {
         tracing::warn!(
             chain_id = self.chain_id,
             version_from = known.indexer_version.as_deref().unwrap_or("<none>"),
-            version_to = INDEXER_VERSION,
+            version_to = INDEXER_VERSION.as_str(),
             contract_from = ?known.contract,
             contract_to = %contracts.registry,
             escrow_from = ?known.escrow,
@@ -538,7 +550,7 @@ impl ChainStore {
         let deploy_block = known.deploy_block_of(contracts.registry);
         let writer = sqlx::query_scalar(sql::RESET_CHAIN)
             .bind(self.chain_id)
-            .bind(INDEXER_VERSION)
+            .bind(INDEXER_VERSION.as_str())
             .bind(contracts.registry)
             .bind(contracts.escrow)
             .bind(deploy_block)
@@ -547,7 +559,7 @@ impl ChainStore {
         tx.commit().await?;
         tracing::info!(
             chain_id = self.chain_id,
-            version = INDEXER_VERSION,
+            version = INDEXER_VERSION.as_str(),
             "replay armed; starts next cycle"
         );
         Ok(ChainWriter {
@@ -977,3 +989,22 @@ impl Window {
 // put `EXPLAIN` in front of the exact statement the store runs.
 
 type Statement = QueryBuilder<'static, Postgres>;
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    /// A build that learns a platform stamps another version, so the chains
+    /// it opens replay and keep that platform's disclosed text.
+    #[test]
+    fn the_version_names_every_platform_the_build_knows() {
+        let (shape, platforms) = INDEXER_VERSION
+            .split_once('+')
+            .expect("the shape, then the platforms");
+        assert_eq!(shape, SHAPE_VERSION);
+        let named: Vec<&str> = platforms.split(',').collect();
+        for platform in KnownPlatform::ALL {
+            assert!(named.contains(&platform.key()), "{platform:?}");
+        }
+    }
+}

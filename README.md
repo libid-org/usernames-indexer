@@ -332,9 +332,11 @@ One process holds a per-chain Postgres advisory lock while it may write; a
 second instance (a rolling-deploy overlap) blocks on it instead of
 interleaving.
 
-Bump `INDEXER_VERSION` (in `db.rs`) when the written shape changes: the next
+Bump `SHAPE_VERSION` (in `db.rs`) when the written shape changes: the next
 start clears that chain's rows — co-tenant chains untouched — and replays it
-from the deployment block. The re-index is the migration. Changing
+from the deployment block. The re-index is the migration. The stored version
+also lists every `KnownPlatform`, so a build that learns a platform replays
+too, and keeps that platform's disclosed text. Changing
 `IDENTITY_REGISTRY_ADDRESS` or `HANDLE_ESCROW_ADDRESS` triggers the same
 per-chain replay, because the old contract's bindings are not the new
 contract's bindings.
