@@ -268,11 +268,10 @@ pub async fn connect_and_migrate(database_url: &str) -> Result<PgPool, ConnectEr
 
 /// Connect without touching the schema.
 ///
-/// For the read API, which owns nothing here. Migrating is a write, and the
-/// writer is the indexer: two processes racing `sqlx::migrate!` on a fresh
-/// database is a deadlock waiting to be reported as a startup flake. A reader
-/// that starts before the schema exists fails its first query and gets
-/// restarted, which is the right outcome and a visible one.
+/// For the read API, which owns nothing here: the indexer owns the schema and
+/// migrates it, so the API's role needs no right to change it. A reader that
+/// starts before the schema exists fails its first query and gets restarted,
+/// a visible outcome.
 pub async fn connect(database_url: &str) -> Result<PgPool, sqlx::Error> {
     PgPool::connect(database_url).await
 }

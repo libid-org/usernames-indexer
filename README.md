@@ -52,7 +52,7 @@ indexer's settings.
 
 | Variable | Used by | Default | Meaning |
 |---|---|---|---|
-| `DATABASE_URL` | both | — | Postgres connection string |
+| `DATABASE_URL` | both | — | Postgres 14 or later. A session-level connection: the indexer's writer lease is a session advisory lock, which a transaction- or statement-mode pooler (PgBouncer) does not hold |
 | `RPC_URL` | indexer | — | JSON-RPC endpoint of the chain to follow, `http` or `https`; any other scheme is a usage error. When its `eth_getLogs` leaves out `blockTimestamp` (a field outside the method's standard answer), the indexer reads each such block's header, one call per block with logs. Prefer a single node or a sticky endpoint: a load balancer that mixes lagged replicas can answer `eth_getLogs` for blocks a backend has not seen, and events dropped that way past the confirmation margin are gone until a re-index. |
 | `IDENTITY_REGISTRY_ADDRESS` | indexer | — | The IdentityRegistry **ERC1967 proxy** (the implementation changes on upgrade; the proxy is the one that emits). The indexer records it per chain, and `/v1/status` reports it from there |
 | `HANDLE_ESCROW_ADDRESS` | indexer | unset | The HandleEscrow **ERC1967 proxy**, when the chain has one. The indexer refuses to start unless it answers `REFUND_GRACE()` (libID-contracts 0.21) and its `registry()` is `IDENTITY_REGISTRY_ADDRESS`. Its events share the registry's windows and cursor; setting, changing or unsetting it replays the chain. `/v1/status` reports it as `escrow` |
@@ -86,7 +86,7 @@ often than `STALE_AFTER`, so on a live chain it never fires.
 |---|---|
 | `GET /v1/resolve/handle/{platform}/{handle}` | The wallet a handle resolves to (`resolveHandle`) on each chain it is bound on, each with the id node it pairs with. The handle is hashed here into its node |
 | `GET /v1/resolve/handle-node/{handleNode}` | The same, by node |
-| `GET /v1/resolve/id-node/{idNode}` | The wallet an id node resolves to (`resolveId`) on each chain it is bound on, each with the handle node that account holds now. The client hashes the id (`libid-identity`, or `idNode` in `@libid/contracts`); no plaintext id reaches the server |
+| `GET /v1/resolve/id-node/{idNode}` | The wallet an id node resolves to (`resolveId`) on each chain it is bound on, each with the handle node that account holds now. The client hashes the id (`libid-identity`, or `idNode` in `@libid/contracts`) and sends only its node |
 | `GET /v1/resolve/address/{address}` | Every identity a wallet proved on every chain, by id node, with `resolves`, and `published` on the one whose handle is the wallet's name (`primaryHandleOf`) |
 | `GET /v1/search?q=gre&platform=x&owner=0x…&limit=10&offset=0` | Live handles whose text the chain disclosed, matching a partial query of at least three characters (exact, then prefix, then substring, then trigram-fuzzy), linked to a wallet, or both; one of `q` and `owner` is required. `limit` (1..50, default 10) and `offset` (up to 10000) page the ranked list; a page shorter than `limit` is the last |
 | `GET /v1/history/address/{address}?before=&limit=` | Every event the address took part in, newest first, each with its `roles`: `holder`, `previousHandleHolder` and `previousIdHolder` (an event took that handle or account from it), `feeReceiver`, `sender` (of a deposit; a claim that took it names it too), `claimer`, `recipient` |
@@ -104,7 +104,9 @@ Every read spans every chain the store holds, and every result carries its
 or contracts is configured on the API: the indexers wrote it.
 
 A history is ordered by block time, then chain, block and log index, so one
-spanning chains interleaves them in time. Every history and escrow list pages
+spanning chains interleaves them in time. Each chain's entries are as of its
+own index: an entry a lagging chain commits later, older than a page already
+read, shows on a fresh read from the top. Every history and escrow list pages
 by cursor: a page holds `limit` entries (1..100, default 20) and, while more
 remain, a `next` to pass back as `before`. The unclaimed list ranks by
 amount, so a slot whose amount moves between two pages may show twice or not
@@ -116,7 +118,7 @@ Anybody can deposit a token they wrote, so show the tokens you recognize.
 
 A `deposit` names a handle by its node alone: the store knows no platform
 for it (`platformId` is absent) until a bind, a `HandleRevealed`, a
-publish or a retire names one. Asking by text works from the first deposit: the escrow and history
+publish or a retire names one, and a bind before `START_BLOCK` names none. Asking by text works from the first deposit: the escrow and history
 routes fold the text's A-Z and hash it, the way `depositToHandle` does, so
 `/v1/escrow/handle/x/Bo%22b` finds a deposit to `Bo"b`.
 
@@ -135,9 +137,10 @@ Search lists disclosed handles only. A binding nothing disclosed still
 resolves by text or by node, without text in the answer.
 
 `{platform}` is a short key (`x`, `github`, `google`) or a 0x-hex 32-byte
-platform id. A text route hashes its text with `libid-identity`, so it needs a
-platform this build knows: an unknown id is `invalid_platform`, and the node
-routes answer for any platform. A resolution route folds the handle and checks
+platform id. A text route takes non-empty UTF-8 text and hashes it with
+`libid-identity`, so it needs a platform this build knows: an unknown id is
+`invalid_platform`, and the node routes answer for any platform and any
+text. A resolution route folds the handle and checks
 it is a token a circuit hashes; the escrow and history routes only fold it, as
 the chain does.
 
@@ -248,7 +251,10 @@ That is what lets the eden testnet work: its chain id is 3735928814
 have got 1588445166 and refused every eden name. The one genuinely ambiguous
 store — holding 3735928814 AND 1588445166 together — is refused per request,
 unsigned, so a wallet walks on rather than being answered with a guess;
-`/ens/status` marks both rows `ambiguous`.
+`/ens/status` marks both rows `ambiguous`. A gateway sees only its own store,
+so one resolver's `urls` must not list gateways whose stores hold two chains
+of one coin type: each answers for the chain it holds, and the first to
+answer ends the walk.
 
 **Bare `addr(node)` asks for the registry's own chain.** It is coin type 60:
 the coin of the chain whose ENS registry was asked, so Ethereum mainnet
@@ -261,7 +267,9 @@ index that chain refuses the bare query.
 **A name resolves through its node.** The gateway inverts the label to a
 handle, hashes it with `libid-identity` into the SHA-256 handle node, and
 answers that node's holder; `sql/ens_answer.sql` says which bindings it
-answers for.
+answers for. A platform label this build does not know is a name nobody
+holds, answered with a signed null, so roll out a gateway that knows a
+platform before that platform's binds go live.
 
 **Where answers come from.** The indexed model, and nothing else: the gateway
 opens no RPC and takes no per-chain configuration. Answers are as of the

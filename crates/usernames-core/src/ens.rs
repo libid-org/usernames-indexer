@@ -807,12 +807,9 @@ mod tests {
         ));
     }
 
-    /// A label may hold 63 octets. The ceiling is the reason the design's
-    /// id-derived name — the storage key as 64 hex characters — was dropped
-    /// rather than implemented: it is one past what a name can carry, so no
-    /// client could ever send it. Standard encoders enforce this (ethers'
-    /// `dnsEncode` refuses above 63), which makes it unencodable rather than
-    /// merely long.
+    /// A label holds at most 63 octets, so a name spelling a storage key as
+    /// 64 hex characters does not decode: names resolve handles, as
+    /// `resolveHandle` does, never storage keys.
     #[test]
     fn a_label_past_sixty_three_octets_cannot_be_encoded() {
         let long = "1".repeat(64);
