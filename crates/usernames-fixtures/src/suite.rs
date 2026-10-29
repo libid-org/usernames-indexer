@@ -27,6 +27,7 @@ use std::{
 use tokio::sync::{
     Mutex,
     MutexGuard,
+    OnceCell,
 };
 use tower::ServiceExt;
 use usernames_core::{
@@ -332,6 +333,14 @@ impl Events for NamesEvent {
 /// How long a suite waits for the indexer to do something.
 pub const PATIENCE: Duration = Duration::from_secs(30);
 
+/// The channel every change to a chain's row is announced on, with the
+/// chain's id as the payload, once [`ChainWatch`] installed the announcement.
+const CHAIN_CHANNEL: &str = "names_chains";
+
+/// Set once this process installed the announcement: it outlives every
+/// suite, and replacing a trigger locks the table it is on.
+static ANNOUNCED: OnceCell<()> = OnceCell::const_new();
+
 /// One chain's row, followed through the notices of its changes.
 pub struct ChainWatch {
     listener: PgListener,
@@ -341,9 +350,17 @@ pub struct ChainWatch {
 impl ChainWatch {
     /// Follow `store`'s chain from now on.
     pub async fn new(pool: &PgPool, store: &ChainStore) -> Self {
+        ANNOUNCED
+            .get_or_init(|| async {
+                sqlx::raw_sql(include_str!("announce_chains.sql"))
+                    .execute(pool)
+                    .await
+                    .expect("chain changes are announced");
+            })
+            .await;
         let mut listener = PgListener::connect_with(pool).await.expect("a listener");
         listener
-            .listen(db::CHAIN_CHANNEL)
+            .listen(CHAIN_CHANNEL)
             .await
             .expect("the chain channel");
         Self {
