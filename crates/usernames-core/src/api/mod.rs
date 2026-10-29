@@ -352,6 +352,9 @@ struct SearchParams {
 
 /// The page size a search may ask for: at most this many hits per request.
 const SEARCH_MAX_LIMIT: i64 = 50;
+/// The shortest query a search takes: a trigram index cannot narrow a
+/// shorter substring, so its match would read every disclosed handle.
+const SEARCH_MIN_QUERY: usize = 3;
 /// A search page holds this many hits when the request names no `limit`.
 const SEARCH_DEFAULT_LIMIT: i64 = 10;
 /// How far into a ranked list a search may page. Deeper pages are a scan the
@@ -376,10 +379,10 @@ async fn search(
         Some(raw) => {
             raw.refuse_nul("q")?;
             let folded = nodes::fold_search_query(raw);
-            if folded.is_empty() {
+            if folded.chars().count() < SEARCH_MIN_QUERY {
                 return Err(ApiError::bad_request(
                     ErrorCode::InvalidArgument,
-                    "q must be nonempty",
+                    format!("q must be at least {SEARCH_MIN_QUERY} characters"),
                 ));
             }
             Some(folded)

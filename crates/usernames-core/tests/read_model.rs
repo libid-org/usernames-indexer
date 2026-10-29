@@ -919,9 +919,22 @@ async fn search_ranks_exact_prefix_substring() {
     assert!(!handles.is_empty(), "fuzzy neighbors should still match");
 
     // LIKE metacharacters match themselves, not everything.
-    let results: SearchResults =
-        chains.pool.get_on(CHAIN, "/v1/search?q=%25").await.answer();
+    let results: SearchResults = chains
+        .pool
+        .get_on(CHAIN, "/v1/search?q=%25%25%25")
+        .await
+        .answer();
     assert!(results.hits.is_empty());
+
+    // A query under three characters would read every disclosed handle.
+    assert_eq!(
+        chains
+            .pool
+            .get_on::<SearchResults>(CHAIN, "/v1/search?q=al")
+            .await
+            .refusal(),
+        (StatusCode::BAD_REQUEST, ErrorCode::InvalidArgument)
+    );
 
     chains.done();
 }
