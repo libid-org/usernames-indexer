@@ -7,6 +7,7 @@
 //! the replay converges.
 
 mod deadline;
+mod head;
 mod rpc;
 
 use std::time::Duration;
@@ -21,6 +22,7 @@ use alloy::{
 use anyhow::Context;
 use tokio_util::sync::CancellationToken;
 
+use self::head::Head;
 pub use self::rpc::{
     RpcUrl,
     RpcUrlError,
@@ -235,7 +237,11 @@ impl<'a> Session<'a> {
     async fn catch_up(&self, cancel: &CancellationToken) -> anyhow::Result<()> {
         let indexer = self.indexer;
         let config = &indexer.config;
-        let (head, mut from) = tokio::try_join!(self.head(), self.next_block())?;
+        let (head, mut from) =
+            tokio::try_join!(Head::latest(&self.provider), self.next_block())?;
+        // Before the report below is renewed: a node that answers with a
+        // head it stopped moving would keep the report fresh forever.
+        let head = head.recent(config.stale_after)?.number;
         let target = head.saturating_sub(config.confirmations);
         // Both, because they answer different questions: `head` is how far
         // the chain has grown, `target` is how far this loop intends to get.
@@ -273,14 +279,6 @@ impl<'a> Session<'a> {
             .commit(&logs, to)
             .await
             .with_context(|| format!("blocks {from}..{to}"))
-    }
-
-    /// The chain head, as the endpoint reports it.
-    async fn head(&self) -> anyhow::Result<u64> {
-        self.provider
-            .get_block_number()
-            .await
-            .context("eth_blockNumber")
     }
 
     /// One `eth_getLogs` window, inclusive on both ends, in chain order.

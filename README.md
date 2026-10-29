@@ -67,14 +67,18 @@ indexer's settings.
 
 ### Polling
 
-Every `POLL_INTERVAL` the indexer reads the head with `eth_blockNumber` and
-commits the blocks past the cursor that are `CONFIRMATIONS` deep, in
-`eth_getLogs` windows of up to `MAX_BLOCK_RANGE` blocks. A poll whose head
-has not passed the cursor's confirmation depth asks for no logs. Each poll
-costs one head read, plus one `eth_getLogs` call per `MAX_BLOCK_RANGE` newly
-confirmed blocks, so a longer interval batches more blocks into each call at
-the price of a later index. An RPC error, or a call left unanswered for half
-of `STALE_AFTER`, ends the session, and the next one resumes from the cursor.
+Every `POLL_INTERVAL` the indexer reads the head block with
+`eth_getBlockByNumber` and commits the blocks past the cursor that are
+`CONFIRMATIONS` deep, in `eth_getLogs` windows of up to `MAX_BLOCK_RANGE`
+blocks. A poll whose head has not passed the cursor's confirmation depth asks
+for no logs. Each poll costs one head read, plus one `eth_getLogs` call per
+`MAX_BLOCK_RANGE` newly confirmed blocks, so a longer interval batches more
+blocks into each call at the price of a later index. An RPC error, a call
+left unanswered for half of `STALE_AFTER`, or a head block whose timestamp is
+older than `STALE_AFTER` ends the session without renewing the report, and
+the next one resumes from the cursor. The last is a node that still answers
+but stopped following its chain; every chain served makes a block far more
+often than `STALE_AFTER`, so on a live chain it never fires.
 
 ## API
 
@@ -203,7 +207,8 @@ readiness probe may look at the STATUS CODE of `/v1/status`, which is 200
 whenever the database answers, but never at a chain's `stale`,
 `reportValidFor` or `lagBlocks`: one stopped indexer would take every chain
 out of rotation, when the gate already refuses that chain alone. And the
-report says only that the loop is alive and can see the head. Progress is
+report says only that the loop is alive and its endpoint's head is younger
+than `STALE_AFTER`. Progress is
 still what `ENS_MAX_LAG_BLOCKS` measures, and `lastWindowError` is the alert
 for a loop that is up but failing its windows.
 
