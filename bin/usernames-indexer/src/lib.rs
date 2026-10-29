@@ -126,27 +126,10 @@ impl Config {
         };
 
         let provider = config.provider(&self.rpc_url);
-        let reported = provider.get_chain_id().await.context("eth_chainId")?;
-        if let Some(expected) = self.chain_id {
-            anyhow::ensure!(
-                reported == expected,
-                "RPC reports chain id {reported}, config expects {expected}"
-            );
-        }
-        let chain_id = i64::try_from(reported).map_err(|_| {
-            anyhow::anyhow!("chain id {reported} does not fit in a BIGINT")
-        })?;
-        // Before `prepare` too: an older registry's events would be misread.
-        contracts
-            .check_registry(&provider)
+        let chain_id = self
+            .check_endpoint(&provider, contracts)
             .await
-            .context("IDENTITY_REGISTRY_ADDRESS")?;
-        // Before `prepare`, which clears the chain when the escrow changes: a
-        // misconfiguration refuses without touching the rows.
-        contracts
-            .check_escrow(&provider)
-            .await
-            .context("HANDLE_ESCROW_ADDRESS")?;
+            .map_err(|e| anyhow::anyhow!(self.rpc_url.redact(&e)))?;
 
         // The indexer migrates because the indexer writes. The read API connects
         // to whatever schema it finds.
@@ -172,6 +155,37 @@ impl Config {
             "indexing"
         );
         Ok((lease, indexer))
+    }
+
+    /// The chain `provider` follows, once it is the configured one and its
+    /// contracts are ones this build reads. Checked before `prepare`, which
+    /// clears the chain when a contract changes: a misconfiguration refuses
+    /// without touching the rows.
+    async fn check_endpoint(
+        &self,
+        provider: &impl Provider,
+        contracts: Contracts,
+    ) -> anyhow::Result<i64> {
+        let reported = provider.get_chain_id().await.context("eth_chainId")?;
+        if let Some(expected) = self.chain_id {
+            anyhow::ensure!(
+                reported == expected,
+                "RPC reports chain id {reported}, config expects {expected}"
+            );
+        }
+        let chain_id = i64::try_from(reported).map_err(|_| {
+            anyhow::anyhow!("chain id {reported} does not fit in a BIGINT")
+        })?;
+        // An older registry's events would be misread.
+        contracts
+            .check_registry(provider)
+            .await
+            .context("IDENTITY_REGISTRY_ADDRESS")?;
+        contracts
+            .check_escrow(provider)
+            .await
+            .context("HANDLE_ESCROW_ADDRESS")?;
+        Ok(chain_id)
     }
 
     /// How long the loop waits between polls and before a retry:
@@ -419,5 +433,37 @@ mod indexing_tests {
             .await
             .expect("the loop ended");
         assert!(ended.unwrap_err().is_cancelled());
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use clap::Parser;
+
+    use super::Config;
+
+    /// An endpoint's URL often holds its API key, and an HTTP client's error
+    /// names the URL it called: a startup that fails on its endpoint names
+    /// the endpoint by its setting.
+    #[tokio::test]
+    async fn a_failed_startup_names_the_endpoint_by_its_setting() {
+        let config = Config::try_parse_from([
+            "usernames-indexer",
+            "--database-url",
+            "postgres://localhost/usernames",
+            "--rpc-url",
+            "http://127.0.0.1:1/v2/api-key-marker",
+            "--identity-registry-address",
+            "0x0000000000000000000000000000000000000001",
+            "--chain-names",
+            "eden",
+        ])
+        .expect("parses");
+        let Err(refused) = config.start().await else {
+            panic!("nothing answers on port 1");
+        };
+        let shown = format!("{refused:#}");
+        assert!(!shown.contains("api-key-marker"), "{shown}");
+        assert!(shown.contains("<RPC_URL>"), "{shown}");
     }
 }

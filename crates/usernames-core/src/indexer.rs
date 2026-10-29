@@ -160,7 +160,7 @@ impl Indexer {
                 if let Some(WindowError::Superseded(superseded)) = e.downcast_ref() {
                     return Err(*superseded);
                 }
-                let error = self.rpc.redact(e.one_line());
+                let error = self.rpc.redact(&e);
                 tracing::warn!(%error, "indexing stopped; resuming from the cursor");
                 // Surfaced in /v1/status: a deterministic failure, an
                 // undecodable log say, stalls the cursor rather than skip
