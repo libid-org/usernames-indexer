@@ -93,8 +93,10 @@ pub struct Config {
     /// How long readers may trust this indexer's last report: `80s`, `2m`.
     /// The API refuses a chain whose report has expired, so this decides how
     /// soon a stopped indexer is noticed — and how long a slow chunk or a
-    /// missed cycle may take without a healthy loop reading as stopped. Unset
-    /// means four poll intervals plus a minute.
+    /// missed cycle may take without a healthy loop reading as stopped. It has
+    /// to exceed the chain's longest gap between blocks: a poll whose head is
+    /// older ends without renewing the report. Unset means four poll
+    /// intervals plus a minute.
     #[arg(long, env = "STALE_AFTER", value_parser = humantime::parse_duration)]
     pub stale_after: Option<Duration>,
 }
@@ -126,27 +128,10 @@ impl Config {
         };
 
         let provider = config.provider(&self.rpc_url);
-        let reported = provider.get_chain_id().await.context("eth_chainId")?;
-        if let Some(expected) = self.chain_id {
-            anyhow::ensure!(
-                reported == expected,
-                "RPC reports chain id {reported}, config expects {expected}"
-            );
-        }
-        let chain_id = i64::try_from(reported).map_err(|_| {
-            anyhow::anyhow!("chain id {reported} does not fit in a BIGINT")
-        })?;
-        // Before `prepare` too: an older registry's events would be misread.
-        contracts
-            .check_registry(&provider)
+        let chain_id = self
+            .check_endpoint(&provider, contracts)
             .await
-            .context("IDENTITY_REGISTRY_ADDRESS")?;
-        // Before `prepare`, which clears the chain when the escrow changes: a
-        // misconfiguration refuses without touching the rows.
-        contracts
-            .check_escrow(&provider)
-            .await
-            .context("HANDLE_ESCROW_ADDRESS")?;
+            .map_err(|e| anyhow::anyhow!(self.rpc_url.redact(&e)))?;
 
         // The indexer migrates because the indexer writes. The read API connects
         // to whatever schema it finds.
@@ -156,9 +141,11 @@ impl Config {
         // write the chain, no other instance may. prepare runs under it —
         // the lease is a parameter there, so a version-bump replay cannot race a
         // still-running older pod.
-        let lease = store.acquire_writer().await?;
-        let writer = store.prepare(&lease, contracts).await?;
-        store.set_chain_names(&lease, &self.chain_names).await?;
+        let mut lease = store.acquire_writer().await?;
+        // Names first: a name another chain holds refuses the start, and it
+        // has to before `prepare` may clear the chain for a replay.
+        store.set_chain_names(&mut lease, &self.chain_names).await?;
+        let writer = store.prepare(&mut lease, contracts).await?;
 
         // Startup's own connection: every session of the loop opens its own.
         drop(provider);
@@ -170,6 +157,37 @@ impl Config {
             "indexing"
         );
         Ok((lease, indexer))
+    }
+
+    /// The chain `provider` follows, once it is the configured one and its
+    /// contracts are ones this build reads. Checked before `prepare`, which
+    /// clears the chain when a contract changes: a misconfiguration refuses
+    /// without touching the rows.
+    async fn check_endpoint(
+        &self,
+        provider: &impl Provider,
+        contracts: Contracts,
+    ) -> anyhow::Result<i64> {
+        let reported = provider.get_chain_id().await.context("eth_chainId")?;
+        if let Some(expected) = self.chain_id {
+            anyhow::ensure!(
+                reported == expected,
+                "RPC reports chain id {reported}, config expects {expected}"
+            );
+        }
+        let chain_id = i64::try_from(reported).map_err(|_| {
+            anyhow::anyhow!("chain id {reported} does not fit in a BIGINT")
+        })?;
+        // An older registry's events would be misread.
+        contracts
+            .check_registry(provider)
+            .await
+            .context("IDENTITY_REGISTRY_ADDRESS")?;
+        contracts
+            .check_escrow(provider)
+            .await
+            .context("HANDLE_ESCROW_ADDRESS")?;
+        Ok(chain_id)
     }
 
     /// How long the loop waits between polls and before a retry:
@@ -187,7 +205,7 @@ impl Config {
     /// How long readers may trust a report: `STALE_AFTER`, or four poll
     /// intervals plus a minute. Refused unless it outlasts a poll interval,
     /// or every idle cycle would expire the report before the next one
-    /// renews it, and unless it stays within a year.
+    /// renews it, and unless it stays between a second and a year.
     fn report_validity(&self) -> anyhow::Result<Duration> {
         let validity = self.stale_after.unwrap_or(
             self.poll_interval
@@ -200,6 +218,12 @@ impl Config {
              expires the report before the next one renews it",
             humantime::format_duration(validity),
             humantime::format_duration(self.poll_interval)
+        );
+        anyhow::ensure!(
+            validity >= db::MIN_VALID_FOR,
+            "STALE_AFTER ({}) is under a second, the unit the store keeps report \
+             times in; a shorter report would expire as it is written",
+            humantime::format_duration(validity)
         );
         anyhow::ensure!(
             validity <= db::MAX_VALID_FOR,
@@ -378,6 +402,35 @@ mod help_tests {
         }
     }
 
+    /// The store keeps report times in whole seconds, so a sub-second
+    /// report would expire as it is written.
+    #[test]
+    fn a_sub_second_stale_after_is_refused() {
+        let config = |stale_after| {
+            Config::try_parse_from([
+                "usernames-indexer",
+                "--database-url",
+                "postgres://localhost/usernames",
+                "--rpc-url",
+                "http://127.0.0.1:8545",
+                "--identity-registry-address",
+                "0x0000000000000000000000000000000000000001",
+                "--chain-names",
+                "eden",
+                "--poll-interval",
+                "100ms",
+                "--stale-after",
+                stale_after,
+            ])
+            .expect("parses")
+        };
+        assert!(config("500ms").report_validity().is_err());
+        assert_eq!(
+            config("1s").report_validity().ok(),
+            Some(Duration::from_secs(1))
+        );
+    }
+
     /// A zero interval would poll and retry back to back.
     #[test]
     fn a_zero_poll_interval_is_refused() {
@@ -417,5 +470,37 @@ mod indexing_tests {
             .await
             .expect("the loop ended");
         assert!(ended.unwrap_err().is_cancelled());
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use clap::Parser;
+
+    use super::Config;
+
+    /// An endpoint's URL often holds its API key, and an HTTP client's error
+    /// names the URL it called: a startup that fails on its endpoint names
+    /// the endpoint by its setting.
+    #[tokio::test]
+    async fn a_failed_startup_names_the_endpoint_by_its_setting() {
+        let config = Config::try_parse_from([
+            "usernames-indexer",
+            "--database-url",
+            "postgres://localhost/usernames",
+            "--rpc-url",
+            "http://127.0.0.1:1/v2/api-key-marker",
+            "--identity-registry-address",
+            "0x0000000000000000000000000000000000000001",
+            "--chain-names",
+            "eden",
+        ])
+        .expect("parses");
+        let Err(refused) = config.start().await else {
+            panic!("nothing answers on port 1");
+        };
+        let shown = format!("{refused:#}");
+        assert!(!shown.contains("api-key-marker"), "{shown}");
+        assert!(shown.contains("<RPC_URL>"), "{shown}");
     }
 }

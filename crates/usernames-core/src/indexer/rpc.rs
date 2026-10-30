@@ -12,7 +12,10 @@ use alloy::{
 };
 use url::Url;
 
-use super::deadline::Deadline;
+use super::{
+    deadline::Deadline,
+    OneLine,
+};
 
 /// An `http` or `https` JSON-RPC endpoint. The loop polls over HTTP, so a
 /// WebSocket or IPC address is refused where it is parsed.
@@ -41,11 +44,12 @@ impl RpcUrl {
         )
     }
 
-    /// `error` with this endpoint named by its setting. An HTTP client's
-    /// error carries the URL it called, an endpoint's URL often holds its
-    /// API key, and `/v1/status` shows the stored error to anyone.
-    pub(crate) fn redact(&self, error: String) -> String {
-        error.replace(self.0.as_str(), "<RPC_URL>")
+    /// `error` and its causes as one line, with this endpoint named by its
+    /// setting. An HTTP client's error carries the URL it called, an
+    /// endpoint's URL often holds its API key, and both the process's exit
+    /// error and `/v1/status` show the line.
+    pub fn redact(&self, error: &anyhow::Error) -> String {
+        error.one_line().replace(self.0.as_str(), "<RPC_URL>")
     }
 }
 
@@ -108,9 +112,11 @@ mod tests {
         let rpc: RpcUrl = "https://eth-mainnet.g.alchemy.com/v2/secret"
             .parse()
             .expect("an https URL");
-        let error = "eth_blockNumber: error sending request for url \
-                     (https://eth-mainnet.g.alchemy.com/v2/secret)";
-        let stored = rpc.redact(error.to_string());
+        let error = anyhow::anyhow!(
+            "error sending request for url (https://eth-mainnet.g.alchemy.com/v2/secret)"
+        )
+        .context("eth_getBlockByNumber");
+        let stored = rpc.redact(&error);
         assert!(!stored.contains("secret"), "{stored}");
         assert!(stored.contains("<RPC_URL>"), "{stored}");
     }

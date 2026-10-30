@@ -96,9 +96,9 @@ impl Harness {
 
         let node = Node::spawn(chain);
         let libid = Libid::deploy(&node.provider, node.accounts()[0]).await;
-        let lease = store.acquire_writer().await.expect("writer lease");
+        let mut lease = store.acquire_writer().await.expect("writer lease");
         let writer = store
-            .prepare(&lease, libid.contracts())
+            .prepare(&mut lease, libid.contracts())
             .await
             .expect("prepare");
         let cancel = CancellationToken::new();

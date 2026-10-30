@@ -50,6 +50,7 @@ use crate::{
     db::{
         self,
         ChainStatusRow,
+        HandleNodeRow,
         Search,
         Store,
     },
@@ -193,21 +194,21 @@ impl AppState {
 }
 
 impl HandleRef {
-    /// The handle a request named, completed from `known`: any row about the
-    /// node names its platform, and its text once disclosed.
-    fn asked(key: &HandleKey, known: Option<&HandleRef>) -> Self {
-        let (platform, platform_id) = match key {
-            HandleKey::Text { platform, .. } => (Some(*platform), Some(platform.id())),
-            HandleKey::Node(_) => (
-                known.and_then(|handle| handle.platform),
-                known.and_then(|handle| handle.platform_id),
-            ),
-        };
-        Self {
-            platform,
-            platform_id,
-            handle_node: key.node(),
-            handle: known.and_then(|handle| handle.handle.clone()),
+    /// The handle a request named, completed from what the store knows of
+    /// its node: the platform a row named, and its text once disclosed.
+    fn asked(key: &HandleKey, known: Option<HandleNodeRow>) -> Self {
+        let handle_node = key.node();
+        match (key, known) {
+            (HandleKey::Text { platform, .. }, known) => Self {
+                platform: Some(*platform),
+                platform_id: Some(platform.id()),
+                handle_node,
+                handle: known.and_then(|row| row.handle),
+            },
+            (HandleKey::Node(_), Some(row)) => {
+                Self::of(Some(row.platform_id), handle_node, row.handle)
+            }
+            (HandleKey::Node(_), None) => Self::of(None, handle_node, None),
         }
     }
 
@@ -351,6 +352,10 @@ struct SearchParams {
 
 /// The page size a search may ask for: at most this many hits per request.
 const SEARCH_MAX_LIMIT: i64 = 50;
+/// The shortest query a search by text alone takes: a trigram index cannot
+/// narrow a shorter substring, so its match would read every disclosed
+/// handle. A search by owner reads that wallet's handles first.
+const SEARCH_MIN_QUERY: usize = 3;
 /// A search page holds this many hits when the request names no `limit`.
 const SEARCH_DEFAULT_LIMIT: i64 = 10;
 /// How far into a ranked list a search may page. Deeper pages are a scan the
@@ -371,25 +376,27 @@ async fn search(
         chain: params.chain,
     }
     .chain_id()?;
+    let owner = params
+        .owner
+        .as_deref()
+        .map(str::parse_address)
+        .transpose()?;
     let query = match params.q.as_deref() {
         Some(raw) => {
             raw.refuse_nul("q")?;
             let folded = nodes::fold_search_query(raw);
-            if folded.is_empty() {
+            if owner.is_none() && folded.chars().count() < SEARCH_MIN_QUERY {
                 return Err(ApiError::bad_request(
                     ErrorCode::InvalidArgument,
-                    "q must be nonempty",
+                    format!(
+                        "q must be at least {SEARCH_MIN_QUERY} characters, unless owner narrows the search"
+                    ),
                 ));
             }
             Some(folded)
         }
         None => None,
     };
-    let owner = params
-        .owner
-        .as_deref()
-        .map(str::parse_address)
-        .transpose()?;
     if query.is_none() && owner.is_none() {
         return Err(ApiError::bad_request(
             ErrorCode::InvalidArgument,

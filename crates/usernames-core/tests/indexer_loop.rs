@@ -26,6 +26,7 @@ use alloy::{
     rpc::types::Filter,
 };
 use axum::http::StatusCode;
+use chrono::TimeDelta;
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -120,9 +121,9 @@ impl Chain {
         node.provider.anvil_mine(Some(8), None).await.expect("mine");
         let relay = Relay::start(node.rpc()).await;
 
-        let lease = store.acquire_writer().await.expect("writer lease");
+        let mut lease = store.acquire_writer().await.expect("writer lease");
         let writer = store
-            .prepare(&lease, libid.contracts())
+            .prepare(&mut lease, libid.contracts())
             .await
             .expect("prepare");
         Some(Self {
@@ -251,18 +252,18 @@ async fn an_idle_chain_is_polled_once_an_interval_without_logs() {
     chain.wait_for_index(chain.head().await - 1).await;
 
     let (heads, logs) = (
-        chain.relay.count("eth_blockNumber"),
+        chain.relay.count("eth_getBlockByNumber"),
         chain.relay.count("eth_getLogs"),
     );
     let polls = 5;
     tokio::time::timeout(
         PATIENCE,
-        chain.relay.called("eth_blockNumber", heads + polls),
+        chain.relay.called("eth_getBlockByNumber", heads + polls),
     )
     .await
     .expect("the loop kept polling");
     spaced(
-        &chain.relay.times("eth_blockNumber")[heads..heads + polls],
+        &chain.relay.times("eth_getBlockByNumber")[heads..heads + polls],
         interval,
     );
     assert_eq!(
@@ -288,16 +289,16 @@ async fn a_refusing_endpoint_is_retried_once_an_interval() {
     chain.wait_for_index(chain.head().await - 1).await;
 
     chain.relay.refuse(true);
-    let heads = chain.relay.count("eth_blockNumber");
+    let heads = chain.relay.count("eth_getBlockByNumber");
     let tries = 5;
     tokio::time::timeout(
         PATIENCE,
-        chain.relay.called("eth_blockNumber", heads + tries),
+        chain.relay.called("eth_getBlockByNumber", heads + tries),
     )
     .await
     .expect("the loop kept retrying");
     spaced(
-        &chain.relay.times("eth_blockNumber")[heads..heads + tries],
+        &chain.relay.times("eth_getBlockByNumber")[heads..heads + tries],
         interval,
     );
     chain.relay.refuse(false);
@@ -313,8 +314,16 @@ async fn a_deaf_endpoint_is_left_and_the_next_session_catches_up() {
     let Some(mut chain) = Chain::start(43141).await else {
         return;
     };
+    // A block a second, as a live chain makes them, so the head stays
+    // younger than the report while the endpoint is deaf.
+    chain
+        .node
+        .provider
+        .anvil_set_interval_mining(1)
+        .await
+        .expect("interval mining");
     let running = chain.run(IndexerConfig {
-        stale_after: Duration::from_secs(2),
+        stale_after: Duration::from_secs(4),
         ..chain.config(2)
     });
     chain.wait_for_index(chain.head().await - 2).await;
@@ -322,15 +331,11 @@ async fn a_deaf_endpoint_is_left_and_the_next_session_catches_up() {
     let mut watch = ChainWatch::new(&chain.pool, chain.writer.store()).await;
     // The next poll asks for the head, and nothing answers.
     chain.relay.deafen(true);
-    let stored = tokio::time::timeout(PATIENCE, async {
-        loop {
-            if let Some(error) = watch.next().await.window_error {
-                return error;
-            }
-        }
-    })
-    .await
-    .expect("the unanswered call failed and its error was stored");
+    let stored = watch
+        .until(|state| state.window_error.is_some())
+        .await
+        .window_error
+        .expect("the unanswered call failed and its error was stored");
     assert_eq!(stored.matches("no answer within").count(), 1, "{stored}");
 
     chain.relay.deafen(false);
@@ -340,6 +345,70 @@ async fn a_deaf_endpoint_is_left_and_the_next_session_catches_up() {
     chain.wait_for_index(bound).await;
 
     assert_eq!(chain.resolve("deafened_1").await, Ok(holder));
+    chain.stop(running).await;
+}
+
+/// A node that still answers but stopped following its chain reports the
+/// same head on every poll. Once that head is older than the report may
+/// live, the loop stores why and renews the report no more, so the gateway
+/// refuses the chain; a head that moves again brings the report back.
+#[tokio::test]
+async fn a_head_older_than_the_report_lets_the_report_expire() {
+    let Some(chain) = Chain::start(43171).await else {
+        return;
+    };
+    chain.mine(1).await;
+    let running = chain.run(IndexerConfig {
+        stale_after: Duration::from_secs(2),
+        ..chain.config(1)
+    });
+    chain.wait_for_index(chain.head().await - 1).await;
+
+    let mut watch = ChainWatch::new(&chain.pool, chain.writer.store()).await;
+    let stalled = watch
+        .until(|state| {
+            state
+                .window_error
+                .as_deref()
+                .is_some_and(|error| error.contains("not following its chain"))
+        })
+        .await;
+    assert_eq!(
+        stalled
+            .window_error
+            .as_deref()
+            .map(|e| e.matches("STALE_AFTER").count()),
+        Some(1)
+    );
+
+    // Nothing renews the report now, so the clock alone runs it out; the
+    // polls in between see the same head and change nothing in the row.
+    let left = stalled
+        .position()
+        .valid_for
+        .and_then(|left| left.to_std().ok())
+        .unwrap_or_default();
+    tokio::time::sleep(left + Duration::from_secs(2)).await;
+    let expired = chain.writer.store().state().await.expect("the chain's row");
+    assert!(
+        expired
+            .position()
+            .valid_for
+            .is_some_and(|left| left < TimeDelta::zero()),
+        "{expired:?}"
+    );
+    assert_eq!(expired.window_error, stalled.window_error);
+
+    chain.mine(1).await;
+    watch
+        .until(|state| {
+            state.window_error.is_none()
+                && state
+                    .position()
+                    .valid_for
+                    .is_some_and(|left| left > TimeDelta::zero())
+        })
+        .await;
     chain.stop(running).await;
 }
 

@@ -111,6 +111,16 @@ impl IdentityRow {
     }
 }
 
+/// What the store knows of a handle node: the platform a bind, disclosure,
+/// publish or retire named, and the text a disclosure carried.
+#[derive(sqlx::FromRow)]
+pub struct HandleNodeRow {
+    /// The platform the node is a handle on.
+    pub platform_id: B256,
+    /// Its text, once the chain disclosed it.
+    pub handle: Option<String>,
+}
+
 /// One search hit: a live, disclosed handle, its owner, and the id node it
 /// pairs with.
 #[derive(sqlx::FromRow)]
@@ -197,6 +207,20 @@ impl Store {
             .await
     }
 
+    /// What the chains in scope know of `handle_node`: its platform, and its
+    /// text where any of them disclosed it.
+    pub async fn handle_node(
+        &self,
+        handle_node: B256,
+        chain: Option<i64>,
+    ) -> Result<Option<HandleNodeRow>, sqlx::Error> {
+        Scope(chain)
+            .handle_node_lookup("", handle_node)
+            .build_query_as()
+            .fetch_optional(&self.pool)
+            .await
+    }
+
     /// Live, disclosed handles a search lists, across the chains in scope:
     /// those a wallet holds, those matching a folded partial query — exact
     /// first, then prefix, then substring, then trigram-fuzzy — or both.
@@ -264,6 +288,19 @@ impl Scope {
         statement.push_bind(handle_node);
         statement.scoped("h.chain_id", self.0);
         statement.push(" ORDER BY h.chain_id");
+        statement
+    }
+
+    /// What the store knows of a handle node, behind `prefix`: the row with
+    /// text first, since a node's text is one string on every chain.
+    pub(crate) fn handle_node_lookup(self, prefix: &str, handle_node: B256) -> Statement {
+        let mut statement = QueryBuilder::new(format!(
+            "{prefix}{} WHERE v.handle_node = ",
+            sql::HANDLE_NODE_PROJECTION
+        ));
+        statement.push_bind(handle_node);
+        statement.scoped("v.chain_id", self.0);
+        statement.push(" ORDER BY (v.handle IS NULL), v.chain_id LIMIT 1");
         statement
     }
 

@@ -116,14 +116,14 @@ impl AppState {
         params: PageParams,
     ) -> Result<Json<HandleHistory>, ApiError> {
         let page = params.page()?;
-        self.synced(page.chain).await?;
+        let chain = page.chain;
+        self.synced(chain).await?;
 
-        let (entries, next) = self
-            .store
-            .handle_history(key.node(), page)
-            .await?
-            .served(HistoryEntry::of)?;
-        let known = entries.iter().find_map(|entry| entry.handle.as_ref());
+        let (rows, known) = tokio::try_join!(
+            self.store.handle_history(key.node(), page),
+            self.store.handle_node(key.node(), chain),
+        )?;
+        let (entries, next) = rows.served(HistoryEntry::of)?;
         Ok(Json(HandleHistory {
             handle: HandleRef::asked(&key, known),
             entries,

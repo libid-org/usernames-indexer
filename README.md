@@ -52,7 +52,7 @@ indexer's settings.
 
 | Variable | Used by | Default | Meaning |
 |---|---|---|---|
-| `DATABASE_URL` | both | — | Postgres connection string |
+| `DATABASE_URL` | both | — | Postgres 14 or later. A session-level connection: the indexer's writer lease is a session advisory lock, which a transaction- or statement-mode pooler (PgBouncer) does not hold |
 | `RPC_URL` | indexer | — | JSON-RPC endpoint of the chain to follow, `http` or `https`; any other scheme is a usage error. When its `eth_getLogs` leaves out `blockTimestamp` (a field outside the method's standard answer), the indexer reads each such block's header, one call per block with logs. Prefer a single node or a sticky endpoint: a load balancer that mixes lagged replicas can answer `eth_getLogs` for blocks a backend has not seen, and events dropped that way past the confirmation margin are gone until a re-index. |
 | `IDENTITY_REGISTRY_ADDRESS` | indexer | — | The IdentityRegistry **ERC1967 proxy** (the implementation changes on upgrade; the proxy is the one that emits). The indexer records it per chain, and `/v1/status` reports it from there |
 | `HANDLE_ESCROW_ADDRESS` | indexer | unset | The HandleEscrow **ERC1967 proxy**, when the chain has one. The indexer refuses to start unless its `registry()` is `IDENTITY_REGISTRY_ADDRESS`. Its events share the registry's windows and cursor; setting, changing or unsetting it replays the chain. `/v1/status` reports it as `escrow` |
@@ -60,21 +60,25 @@ indexer's settings.
 | `CHAIN_NAMES` | indexer | — | Required. The names this chain goes by in an ENS name, comma-separated: the `base` in `alice.x.base.handles.link`. Labels only, never a platform key. Written to the store at every start for the gateway to read; a name belongs to one chain across the store, and declaring one another chain holds refuses to start |
 | `CONFIRMATIONS` | indexer | `5` | Blocks behind the head to stay (shallow-reorg protection) |
 | `POLL_INTERVAL` | indexer | `5s` | The poll cycle, and the retry delay after a failure; above zero. See [Polling](#polling) |
-| `STALE_AFTER` | indexer | four poll intervals + 1m | How long readers may trust this indexer's last report; the ENS gateway refuses this chain once it expires. Must exceed `POLL_INTERVAL`, and at most a year. Half of it also bounds every RPC call |
+| `STALE_AFTER` | indexer | four poll intervals + 1m | How long readers may trust this indexer's last report; the ENS gateway refuses this chain once it expires. Must exceed `POLL_INTERVAL` and the chain's longest gap between blocks, from a second to a year. Half of it also bounds every RPC call, and a head block older than it ends the poll unreported |
 | `MAX_BLOCK_RANGE` | indexer | `10000` | Largest `eth_getLogs` window |
 | `START_BLOCK` | indexer | unset | Where a FRESH scan starts — consulted only when no cursor exists (new database, or right after a re-index). Unset means the deployment block is found by binary search over `eth_getCode`; only a successful detection is cached, and an RPC failure mid-search retries next cycle |
 | `LISTEN_ADDR` | api | `127.0.0.1:8080` | Read-API listen address |
 
 ### Polling
 
-Every `POLL_INTERVAL` the indexer reads the head with `eth_blockNumber` and
-commits the blocks past the cursor that are `CONFIRMATIONS` deep, in
-`eth_getLogs` windows of up to `MAX_BLOCK_RANGE` blocks. A poll whose head
-has not passed the cursor's confirmation depth asks for no logs. Each poll
-costs one head read, plus one `eth_getLogs` call per `MAX_BLOCK_RANGE` newly
-confirmed blocks, so a longer interval batches more blocks into each call at
-the price of a later index. An RPC error, or a call left unanswered for half
-of `STALE_AFTER`, ends the session, and the next one resumes from the cursor.
+Every `POLL_INTERVAL` the indexer reads the head block with
+`eth_getBlockByNumber` and commits the blocks past the cursor that are
+`CONFIRMATIONS` deep, in `eth_getLogs` windows of up to `MAX_BLOCK_RANGE`
+blocks. A poll whose head has not passed the cursor's confirmation depth asks
+for no logs. Each poll costs one head read, plus one `eth_getLogs` call per
+`MAX_BLOCK_RANGE` newly confirmed blocks, so a longer interval batches more
+blocks into each call at the price of a later index. An RPC error, a call
+left unanswered for half of `STALE_AFTER`, or a head block whose timestamp is
+older than `STALE_AFTER` ends the session without renewing the report, and
+the next one resumes from the cursor. The last is a node that still answers
+but stopped following its chain, or a chain that makes blocks only on demand:
+set `STALE_AFTER` past the chain's longest gap between blocks.
 
 ## API
 
@@ -82,9 +86,9 @@ of `STALE_AFTER`, ends the session, and the next one resumes from the cursor.
 |---|---|
 | `GET /v1/resolve/handle/{platform}/{handle}` | The wallet a handle resolves to (`resolveHandle`) on each chain it is bound on, each with the id node it pairs with. The handle is hashed here into its node |
 | `GET /v1/resolve/handle-node/{handleNode}` | The same, by node |
-| `GET /v1/resolve/id-node/{idNode}` | The wallet an id node resolves to (`resolveId`) on each chain it is bound on, each with the handle node that account holds now. The client hashes the id (`libid-identity`, or `idNode` in `@libid/contracts`); no plaintext id reaches the server |
+| `GET /v1/resolve/id-node/{idNode}` | The wallet an id node resolves to (`resolveId`) on each chain it is bound on, each with the handle node that account holds now. The client hashes the id (`libid-identity`, or `idNode` in `@libid/contracts`) and sends only its node |
 | `GET /v1/resolve/address/{address}` | Every identity a wallet proved on every chain, by id node, with `resolves`, and `published` on the one whose handle is the wallet's name (`primaryHandleOf`) |
-| `GET /v1/search?q=gre&platform=x&owner=0x…&limit=10&offset=0` | Live handles whose text the chain disclosed, matching a partial query (exact, then prefix, then substring, then trigram-fuzzy), linked to a wallet, or both; one of `q` and `owner` is required. `limit` (1..50, default 10) and `offset` (up to 10000) page the ranked list; a page shorter than `limit` is the last |
+| `GET /v1/search?q=gre&platform=x&owner=0x…&limit=10&offset=0` | Live handles whose text the chain disclosed, matching a partial query (exact, then prefix, then substring, then trigram-fuzzy), linked to a wallet, or both; one of `q` and `owner` is required, and a `q` without `owner` has at least three characters. `limit` (1..50, default 10) and `offset` (up to 10000) page the ranked list; a page shorter than `limit` is the last |
 | `GET /v1/history/address/{address}?before=&limit=` | Every event the address took part in, newest first, each with its `roles`: `holder`, `previousHandleHolder` and `previousIdHolder` (an event took that handle or account from it), `feeReceiver`, `sender` (of a deposit; a claim that took it names it too), `claimer`, `recipient` |
 | `GET /v1/history/handle/{platform}/{handle}?before=&limit=` | Every event on the handle: deposits while nobody held it, the binds that gave it a holder, and every claim, refund and payment after |
 | `GET /v1/history/node/{node}?before=&limit=` | The same, by handle node: for a handle nobody has bound, whose text no event carried |
@@ -100,7 +104,9 @@ Every read spans every chain the store holds, and every result carries its
 or contracts is configured on the API: the indexers wrote it.
 
 A history is ordered by block time, then chain, block and log index, so one
-spanning chains interleaves them in time. Every history and escrow list pages
+spanning chains interleaves them in time. Each chain's entries are as of its
+own index: an entry a lagging chain commits later, older than a page already
+read, shows on a fresh read from the top. Every history and escrow list pages
 by cursor: a page holds `limit` entries (1..100, default 20) and, while more
 remain, a `next` to pass back as `before`. The unclaimed list ranks by
 amount, so a slot whose amount moves between two pages may show twice or not
@@ -112,7 +118,7 @@ Anybody can deposit a token they wrote, so show the tokens you recognize.
 
 A `deposit` names a handle by its node alone: the store knows no platform
 for it (`platformId` is absent) until a bind, a `HandleRevealed`, a
-publish or a retire names one. Asking by text works from the first deposit: the escrow and history
+publish or a retire names one, and a bind before `START_BLOCK` names none. Asking by text works from the first deposit: the escrow and history
 routes fold the text's A-Z and hash it, the way `depositToHandle` does, so
 `/v1/escrow/handle/x/Bo%22b` finds a deposit to `Bo"b`.
 
@@ -131,9 +137,10 @@ Search lists disclosed handles only. A binding nothing disclosed still
 resolves by text or by node, without text in the answer.
 
 `{platform}` is a short key (`x`, `github`, `google`) or a 0x-hex 32-byte
-platform id. A text route hashes its text with `libid-identity`, so it needs a
-platform this build knows: an unknown id is `invalid_platform`, and the node
-routes answer for any platform. A resolution route folds the handle and checks
+platform id. A text route takes non-empty UTF-8 text and hashes it with
+`libid-identity`, so it needs a platform this build knows: an unknown id is
+`invalid_platform`, and the node routes answer for any platform and any
+text. A resolution route folds the handle and checks
 it is a token a circuit hashes; the escrow and history routes only fold it, as
 the chain does.
 
@@ -203,7 +210,8 @@ readiness probe may look at the STATUS CODE of `/v1/status`, which is 200
 whenever the database answers, but never at a chain's `stale`,
 `reportValidFor` or `lagBlocks`: one stopped indexer would take every chain
 out of rotation, when the gate already refuses that chain alone. And the
-report says only that the loop is alive and can see the head. Progress is
+report says only that the loop is alive and its endpoint's head is younger
+than `STALE_AFTER`. Progress is
 still what `ENS_MAX_LAG_BLOCKS` measures, and `lastWindowError` is the alert
 for a loop that is up but failing its windows.
 
@@ -243,7 +251,10 @@ That is what lets the eden testnet work: its chain id is 3735928814
 have got 1588445166 and refused every eden name. The one genuinely ambiguous
 store — holding 3735928814 AND 1588445166 together — is refused per request,
 unsigned, so a wallet walks on rather than being answered with a guess;
-`/ens/status` marks both rows `ambiguous`.
+`/ens/status` marks both rows `ambiguous`. A gateway sees only its own store,
+so one resolver's `urls` must not list gateways whose stores hold two chains
+of one coin type: each answers for the chain it holds, and the first to
+answer ends the walk.
 
 **Bare `addr(node)` asks for the registry's own chain.** It is coin type 60:
 the coin of the chain whose ENS registry was asked, so Ethereum mainnet
@@ -256,7 +267,9 @@ index that chain refuses the bare query.
 **A name resolves through its node.** The gateway inverts the label to a
 handle, hashes it with `libid-identity` into the SHA-256 handle node, and
 answers that node's holder; `sql/ens_answer.sql` says which bindings it
-answers for.
+answers for. A platform label this build does not know is a name nobody
+holds, answered with a signed null, so roll out a gateway that knows a
+platform before that platform's binds go live.
 
 **Where answers come from.** The indexed model, and nothing else: the gateway
 opens no RPC and takes no per-chain configuration. Answers are as of the
@@ -327,9 +340,11 @@ One process holds a per-chain Postgres advisory lock while it may write; a
 second instance (a rolling-deploy overlap) blocks on it instead of
 interleaving.
 
-Bump `INDEXER_VERSION` (in `db.rs`) when the written shape changes: the next
+Bump `SHAPE_VERSION` (in `db.rs`) when the written shape changes: the next
 start clears that chain's rows — co-tenant chains untouched — and replays it
-from the deployment block. The re-index is the migration. Changing
+from the deployment block. The re-index is the migration. The stored version
+also lists every `KnownPlatform`, so a build that learns a platform replays
+too, and keeps that platform's disclosed text. Changing
 `IDENTITY_REGISTRY_ADDRESS` or `HANDLE_ESCROW_ADDRESS` triggers the same
 per-chain replay, because the old contract's bindings are not the new
 contract's bindings.

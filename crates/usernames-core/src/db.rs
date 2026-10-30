@@ -11,7 +11,10 @@
 //! [`Window::apply`], so replaying a window — after a crash, or after a
 //! version-bump re-index — converges instead of counting an event twice.
 
-use std::time::Duration;
+use std::{
+    sync::LazyLock,
+    time::Duration,
+};
 
 use alloy::primitives::{
     Address,
@@ -38,6 +41,7 @@ use crate::{
         LogPosition,
         NamesEvent,
     },
+    nodes::KnownPlatform,
 };
 
 mod escrow;
@@ -72,6 +76,7 @@ pub use self::{
     },
     reads::{
         EnsAnswer,
+        HandleNodeRow,
         HandleRow,
         IdentityRow,
         Search,
@@ -79,10 +84,18 @@ pub use self::{
     },
 };
 
-/// Bump on any change to what the indexer writes. A mismatch at startup
-/// clears the chain's rows and cursor, so the next loop replays the chain
-/// from the deployment block — the re-index IS the migration.
-pub const INDEXER_VERSION: &str = "1";
+/// Bump on any change to the shape of what the indexer writes.
+const SHAPE_VERSION: &str = "1";
+
+/// The version a chain's rows are stamped with: the written shape, and every
+/// platform whose disclosed text this build checks and keeps. A mismatch at
+/// startup clears the chain's rows and cursor, so the next loop replays the
+/// chain from the deployment block — the re-index IS the migration — and a
+/// build that learns a platform stores the text earlier windows dropped.
+pub static INDEXER_VERSION: LazyLock<String> = LazyLock::new(|| {
+    let platforms: Vec<&str> = KnownPlatform::ALL.iter().map(|p| p.key()).collect();
+    format!("{SHAPE_VERSION}+{}", platforms.join(","))
+});
 
 /// One chain's row: what its indexer watches and writes, how far it got,
 /// and its last report. Blocks and times are what the indexer wrote, so
@@ -190,6 +203,10 @@ pub const CHAIN_CHANNEL: &str = "names_chains";
 /// setting at startup; the store adds it to the clock as a `bigint`.
 pub const MAX_VALID_FOR: Duration = Duration::from_secs(366 * 24 * 60 * 60);
 
+/// The shortest a report may be trusted: a second, the unit the store keeps
+/// report times in. The indexer refuses a shorter setting at startup.
+pub const MIN_VALID_FOR: Duration = Duration::from_secs(1);
+
 /// The whole store: every chain any indexer has written into one database.
 ///
 /// What the gateway serves is exactly what this holds — nothing to configure,
@@ -256,11 +273,9 @@ pub async fn connect_and_migrate(database_url: &str) -> Result<PgPool, ConnectEr
 
 /// Connect without touching the schema.
 ///
-/// For the read API, which owns nothing here. Migrating is a write, and the
-/// writer is the indexer: two processes racing `sqlx::migrate!` on a fresh
-/// database is a deadlock waiting to be reported as a startup flake. A reader
-/// that starts before the schema exists fails its first query and gets
-/// restarted, which is the right outcome and a visible one.
+/// For the read API: the indexer owns the schema and migrates it, so the API's
+/// role needs no right to change it. A reader that starts before the schema
+/// exists fails its first query and gets restarted.
 pub async fn connect(database_url: &str) -> Result<PgPool, sqlx::Error> {
     PgPool::connect(database_url).await
 }
@@ -353,10 +368,11 @@ pub enum LeaseLost {
 /// process's lifetime, so a second instance — a rolling-deploy overlap, a
 /// stray operator shell — blocks instead of interleaving writes with ours.
 ///
-/// It is also a witness: [`ChainStore::prepare`] takes `&WriterLease`, so the
-/// check-clear-stamp sequence cannot be run without holding the lock that
-/// makes it safe. The lease remembers which chain it locks, and `prepare`
-/// verifies the match, so a lease from one store cannot vouch for another.
+/// It is also where [`ChainStore::prepare`] runs: the check-clear-stamp
+/// sequence is a transaction on this session, so it cannot commit without
+/// the lock that makes it safe. The lease remembers which chain it locks,
+/// and `prepare` verifies the match, so a lease from one store cannot vouch
+/// for another.
 pub struct WriterLease {
     /// The lease's own session, not a pooled one: the advisory lock belongs to
     /// the session, so a pooled connection would carry the lock back into the
@@ -467,7 +483,10 @@ impl ChainStore {
     ///
     /// The lease parameter is the safety argument in the signature: without
     /// the chain's writer lock, the check-clear-stamp sequence could race a
-    /// still-running older instance. The writer it returns carries a new
+    /// still-running older instance. It runs on the lease's own session, so
+    /// it commits only while the lock is held: a lease whose session ended
+    /// while the prepare waited on the chain's row takes the prepare's
+    /// transaction with it. The writer it returns carries a new
     /// generation, which the chain's row names from then on, so whatever an
     /// earlier writer still tries to write after its lease was lost lands
     /// nowhere.
@@ -479,7 +498,7 @@ impl ChainStore {
     /// not bad input.
     pub async fn prepare(
         &self,
-        lease: &WriterLease,
+        lease: &mut WriterLease,
         contracts: Contracts,
     ) -> Result<ChainWriter, sqlx::Error> {
         assert_eq!(
@@ -487,7 +506,7 @@ impl ChainStore {
             "writer lease locks chain {}, but this store prepares chain {}",
             lease.chain_id, self.chain_id
         );
-        let mut tx = self.pool.begin().await?;
+        let mut tx = lease.conn.begin().await?;
         sqlx::query(sql::LOCK_CHAIN)
             .bind(self.chain_id)
             .execute(&mut *tx)
@@ -497,7 +516,7 @@ impl ChainStore {
             .fetch_optional(&mut *tx)
             .await?
             .unwrap_or_default();
-        if known.indexer_version.as_deref() == Some(INDEXER_VERSION)
+        if known.indexer_version.as_deref() == Some(INDEXER_VERSION.as_str())
             && known.contract == Some(contracts.registry)
             && known.escrow == contracts.escrow
         {
@@ -514,7 +533,7 @@ impl ChainStore {
         tracing::warn!(
             chain_id = self.chain_id,
             version_from = known.indexer_version.as_deref().unwrap_or("<none>"),
-            version_to = INDEXER_VERSION,
+            version_to = INDEXER_VERSION.as_str(),
             contract_from = ?known.contract,
             contract_to = %contracts.registry,
             escrow_from = ?known.escrow,
@@ -534,7 +553,7 @@ impl ChainStore {
         let deploy_block = known.deploy_block_of(contracts.registry);
         let writer = sqlx::query_scalar(sql::RESET_CHAIN)
             .bind(self.chain_id)
-            .bind(INDEXER_VERSION)
+            .bind(INDEXER_VERSION.as_str())
             .bind(contracts.registry)
             .bind(contracts.escrow)
             .bind(deploy_block)
@@ -543,7 +562,7 @@ impl ChainStore {
         tx.commit().await?;
         tracing::info!(
             chain_id = self.chain_id,
-            version = INDEXER_VERSION,
+            version = INDEXER_VERSION.as_str(),
             "replay armed; starts next cycle"
         );
         Ok(ChainWriter {
@@ -553,13 +572,14 @@ impl ChainStore {
     }
 
     /// Declare the names this chain goes by in an ENS name, replacing whatever
-    /// it declared before. Under the writer lease like [`Self::prepare`], and
-    /// for the same reason: the check-clear-write must not race another
-    /// instance of this chain. A name another chain holds refuses the whole
-    /// set, so a misconfigured deployment writes nothing rather than half.
+    /// it declared before. On the writer lease's session like
+    /// [`Self::prepare`], and for the same reason: the check-clear-write must
+    /// not race another instance of this chain. A name another chain holds
+    /// refuses the whole set, so a misconfigured deployment writes nothing
+    /// rather than half.
     pub async fn set_chain_names(
         &self,
-        lease: &WriterLease,
+        lease: &mut WriterLease,
         names: &[ChainName],
     ) -> Result<(), ChainNamesError> {
         assert_eq!(
@@ -572,7 +592,7 @@ impl ChainStore {
         wanted.sort();
         wanted.dedup();
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = lease.conn.begin().await?;
         let taken: Vec<(String, i64)> = sqlx::query_as(sql::CHAIN_NAMES_TAKEN)
             .bind(&wanted)
             .bind(self.chain_id)
@@ -972,3 +992,22 @@ impl Window {
 // put `EXPLAIN` in front of the exact statement the store runs.
 
 type Statement = QueryBuilder<'static, Postgres>;
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    /// A build that learns a platform stamps another version, so the chains
+    /// it opens replay and keep that platform's disclosed text.
+    #[test]
+    fn the_version_names_every_platform_the_build_knows() {
+        let (shape, platforms) = INDEXER_VERSION
+            .split_once('+')
+            .expect("the shape, then the platforms");
+        assert_eq!(shape, SHAPE_VERSION);
+        let named: Vec<&str> = platforms.split(',').collect();
+        for platform in KnownPlatform::ALL {
+            assert!(named.contains(&platform.key()), "{platform:?}");
+        }
+    }
+}

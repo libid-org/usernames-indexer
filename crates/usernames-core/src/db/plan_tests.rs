@@ -73,6 +73,16 @@ impl StorePlans for PgConnection {
                 Scope(Some(1)).handle_lookup("EXPLAIN ", node),
             ),
             (
+                "a handle node's text, any chain",
+                Some(&["handle_nodes_node_chain_idx"][..]),
+                Scope(None).handle_node_lookup("EXPLAIN ", node),
+            ),
+            (
+                "a handle node's text, one chain",
+                Some(&["handle_nodes_pkey|handle_nodes_node_chain_idx"][..]),
+                Scope(Some(1)).handle_node_lookup("EXPLAIN ", node),
+            ),
+            (
                 "id node, any chain",
                 Some(&["ids_node_chain_idx"][..]),
                 Scope(None).id_lookup("EXPLAIN ", node),
@@ -113,6 +123,19 @@ impl StorePlans for PgConnection {
                     platform_id: Some(platform),
                     owner: Some(owner),
                     folded_query: None,
+                    limit: 10,
+                    offset: 0,
+                }
+                .lookup("EXPLAIN "),
+            ),
+            (
+                "search by wallet and a short text, any chain",
+                Some(&["handles_owner_chain_node_idx"][..]),
+                Search {
+                    chain: None,
+                    platform_id: None,
+                    owner: Some(owner),
+                    folded_query: Some("a"),
                     limit: 10,
                     offset: 0,
                 }
