@@ -320,16 +320,15 @@ impl<'a> Session<'a> {
     }
 
     /// Where a fresh scan starts: the override, the cached detection, or a
-    /// new binary search. `None` means the RPC failed mid-detection — the
-    /// session ends and the next one retries instead of committing to a
-    /// guess. Only a genuine detection is cached: a cached fallback would
-    /// outlive the failure that produced it and pin this deployment to
-    /// genesis scans forever.
-    async fn resolve_start_block(&self) -> Option<u64> {
+    /// new binary search. An RPC failure mid-detection ends the session, and
+    /// the next one retries instead of committing to a guess. Only a genuine
+    /// detection is cached: a cached fallback would outlive the failure that
+    /// produced it and pin this deployment to genesis scans forever.
+    async fn resolve_start_block(&self) -> anyhow::Result<u64> {
         let indexer = self.indexer;
         let contracts = indexer.config.contracts;
         if let Some(block) = indexer.config.start_block {
-            return Some(block);
+            return Ok(block);
         }
         match indexer
             .writer
@@ -337,31 +336,29 @@ impl<'a> Session<'a> {
             .deploy_block(contracts.registry)
             .await
         {
-            Ok(Some(block)) => return Some(block),
+            Ok(Some(block)) => return Ok(block),
             Ok(None) => {}
             Err(error) => {
                 tracing::warn!(%error, "failed to read the cached deployment block")
             }
         }
-        let latest = match self.provider.get_block_number().await {
-            Ok(n) => n,
-            Err(error) => {
-                tracing::warn!(%error, "no latest block for deployment detection");
-                return None;
-            }
-        };
+        let latest = self
+            .provider
+            .get_block_number()
+            .await
+            .context("eth_blockNumber")?;
         match contracts
             .registry_deployment_block(&self.provider, latest)
-            .await
+            .await?
         {
-            Ok(Some(block)) => {
+            Some(block) => {
                 tracing::info!(block, "detected contract deployment block");
                 if let Err(error) = indexer.writer.set_deploy_block(block).await {
                     tracing::warn!(%error, "failed to cache the deployment block");
                 }
-                Some(block)
+                Ok(block)
             }
-            Ok(None) => {
+            None => {
                 // Absence is an answer, but not one worth caching: the
                 // contract may simply not be deployed yet. Scanning from
                 // genesis is slow but never wrong, and the next fresh cycle
@@ -369,11 +366,7 @@ impl<'a> Session<'a> {
                 tracing::warn!(
                     "the contract has no code at the chain head; scanning from genesis"
                 );
-                Some(0)
-            }
-            Err(error) => {
-                tracing::warn!(%error, "deployment detection failed on RPC");
-                None
+                Ok(0)
             }
         }
     }
