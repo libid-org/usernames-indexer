@@ -1072,7 +1072,8 @@ async fn a_handle_nothing_was_sent_to_holds_nothing() {
 
 /// A handle's platform and text come from what the chain named and
 /// disclosed about its node, not from the page: asked by node, a disclosed
-/// handle nothing was sent to still shows them.
+/// handle shows them on an escrow page nothing was sent to and on a history
+/// page past its events.
 #[tokio::test]
 async fn an_empty_page_still_names_the_handle_it_is_about() {
     let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
@@ -1092,6 +1093,17 @@ async fn an_empty_page_still_names_the_handle_it_is_about() {
     assert!(held.amounts.is_empty() && held.next.is_none());
     assert_eq!(held.handle.platform, Some(X));
     assert_eq!(held.handle.handle.as_deref(), Some("alice"));
+
+    // A page from before the first event.
+    let history: HandleHistory = suite
+        .get(&format!(
+            "/v1/history/node/{}?before=0-0-0-0",
+            node("alice")
+        ))
+        .await
+        .answer();
+    assert!(history.entries.is_empty() && history.next.is_none());
+    assert_eq!(history.handle, held.handle);
     suite.done();
 }
 
