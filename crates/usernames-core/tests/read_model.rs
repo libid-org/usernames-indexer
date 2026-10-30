@@ -935,6 +935,16 @@ async fn search_ranks_exact_prefix_substring() {
             .refusal(),
         (StatusCode::BAD_REQUEST, ErrorCode::InvalidArgument)
     );
+    // An owner narrows the read to its wallet's handles first.
+    let results: SearchResults = chains
+        .pool
+        .get_on(
+            CHAIN,
+            &format!("/v1/search?q=al&owner={}", Address::repeat_byte(1)),
+        )
+        .await
+        .answer();
+    assert_eq!(results.handles(), ["ali"]);
 
     chains.done();
 }

@@ -352,8 +352,9 @@ struct SearchParams {
 
 /// The page size a search may ask for: at most this many hits per request.
 const SEARCH_MAX_LIMIT: i64 = 50;
-/// The shortest query a search takes: a trigram index cannot narrow a
-/// shorter substring, so its match would read every disclosed handle.
+/// The shortest query a search by text alone takes: a trigram index cannot
+/// narrow a shorter substring, so its match would read every disclosed
+/// handle. A search by owner reads that wallet's handles first.
 const SEARCH_MIN_QUERY: usize = 3;
 /// A search page holds this many hits when the request names no `limit`.
 const SEARCH_DEFAULT_LIMIT: i64 = 10;
@@ -375,25 +376,27 @@ async fn search(
         chain: params.chain,
     }
     .chain_id()?;
+    let owner = params
+        .owner
+        .as_deref()
+        .map(str::parse_address)
+        .transpose()?;
     let query = match params.q.as_deref() {
         Some(raw) => {
             raw.refuse_nul("q")?;
             let folded = nodes::fold_search_query(raw);
-            if folded.chars().count() < SEARCH_MIN_QUERY {
+            if owner.is_none() && folded.chars().count() < SEARCH_MIN_QUERY {
                 return Err(ApiError::bad_request(
                     ErrorCode::InvalidArgument,
-                    format!("q must be at least {SEARCH_MIN_QUERY} characters"),
+                    format!(
+                        "q must be at least {SEARCH_MIN_QUERY} characters, unless owner narrows the search"
+                    ),
                 ));
             }
             Some(folded)
         }
         None => None,
     };
-    let owner = params
-        .owner
-        .as_deref()
-        .map(str::parse_address)
-        .transpose()?;
     if query.is_none() && owner.is_none() {
         return Err(ApiError::bad_request(
             ErrorCode::InvalidArgument,

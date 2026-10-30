@@ -129,6 +129,19 @@ impl StorePlans for PgConnection {
                 .lookup("EXPLAIN "),
             ),
             (
+                "search by wallet and a short text, any chain",
+                Some(&["handles_owner_chain_node_idx"][..]),
+                Search {
+                    chain: None,
+                    platform_id: None,
+                    owner: Some(owner),
+                    folded_query: Some("a"),
+                    limit: 10,
+                    offset: 0,
+                }
+                .lookup("EXPLAIN "),
+            ),
+            (
                 "search by text, any chain",
                 Some(&["handle_nodes_handle_trgm_idx"][..]),
                 Search {
