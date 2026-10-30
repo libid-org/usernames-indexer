@@ -93,8 +93,10 @@ pub struct Config {
     /// How long readers may trust this indexer's last report: `80s`, `2m`.
     /// The API refuses a chain whose report has expired, so this decides how
     /// soon a stopped indexer is noticed — and how long a slow chunk or a
-    /// missed cycle may take without a healthy loop reading as stopped. Unset
-    /// means four poll intervals plus a minute.
+    /// missed cycle may take without a healthy loop reading as stopped. It has
+    /// to exceed the chain's longest gap between blocks: a poll whose head is
+    /// older ends without renewing the report. Unset means four poll
+    /// intervals plus a minute.
     #[arg(long, env = "STALE_AFTER", value_parser = humantime::parse_duration)]
     pub stale_after: Option<Duration>,
 }

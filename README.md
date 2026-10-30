@@ -60,7 +60,7 @@ indexer's settings.
 | `CHAIN_NAMES` | indexer | — | Required. The names this chain goes by in an ENS name, comma-separated: the `base` in `alice.x.base.handles.link`. Labels only, never a platform key. Written to the store at every start for the gateway to read; a name belongs to one chain across the store, and declaring one another chain holds refuses to start |
 | `CONFIRMATIONS` | indexer | `5` | Blocks behind the head to stay (shallow-reorg protection) |
 | `POLL_INTERVAL` | indexer | `5s` | The poll cycle, and the retry delay after a failure; above zero. See [Polling](#polling) |
-| `STALE_AFTER` | indexer | four poll intervals + 1m | How long readers may trust this indexer's last report; the ENS gateway refuses this chain once it expires. Must exceed `POLL_INTERVAL`, from a second to a year. Half of it also bounds every RPC call, and a head block older than it ends the poll unreported |
+| `STALE_AFTER` | indexer | four poll intervals + 1m | How long readers may trust this indexer's last report; the ENS gateway refuses this chain once it expires. Must exceed `POLL_INTERVAL` and the chain's longest gap between blocks, from a second to a year. Half of it also bounds every RPC call, and a head block older than it ends the poll unreported |
 | `MAX_BLOCK_RANGE` | indexer | `10000` | Largest `eth_getLogs` window |
 | `START_BLOCK` | indexer | unset | Where a FRESH scan starts — consulted only when no cursor exists (new database, or right after a re-index). Unset means the deployment block is found by binary search over `eth_getCode`; only a successful detection is cached, and an RPC failure mid-search retries next cycle |
 | `LISTEN_ADDR` | api | `127.0.0.1:8080` | Read-API listen address |
@@ -77,8 +77,8 @@ blocks into each call at the price of a later index. An RPC error, a call
 left unanswered for half of `STALE_AFTER`, or a head block whose timestamp is
 older than `STALE_AFTER` ends the session without renewing the report, and
 the next one resumes from the cursor. The last is a node that still answers
-but stopped following its chain; every chain served makes a block far more
-often than `STALE_AFTER`, so on a live chain it never fires.
+but stopped following its chain, or a chain that makes blocks only on demand:
+set `STALE_AFTER` past the chain's longest gap between blocks.
 
 ## API
 
