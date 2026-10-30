@@ -34,8 +34,8 @@ services:
       postgres:
         condition: service_healthy
     restart: unless-stopped
-    # Past compose's 10s default: a stopped indexer finishes its window and
-    # releases its lease within about 12s.
+    # Past compose's 10s default: a stopped indexer takes up to 10s to finish
+    # its window and release its lease.
     stop_grace_period: 20s
 
   api:
