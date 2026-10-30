@@ -55,7 +55,7 @@ indexer's settings.
 | `DATABASE_URL` | both | — | Postgres 14 or later. A session-level connection: the indexer's writer lease is a session advisory lock, which a transaction- or statement-mode pooler (PgBouncer) does not hold |
 | `RPC_URL` | indexer | — | JSON-RPC endpoint of the chain to follow, `http` or `https`; any other scheme is a usage error. When its `eth_getLogs` leaves out `blockTimestamp` (a field outside the method's standard answer), the indexer reads each such block's header, one call per block with logs. Prefer a single node or a sticky endpoint: a load balancer that mixes lagged replicas can answer `eth_getLogs` for blocks a backend has not seen, and events dropped that way past the confirmation margin are gone until a re-index. |
 | `IDENTITY_REGISTRY_ADDRESS` | indexer | — | The IdentityRegistry **ERC1967 proxy** (the implementation changes on upgrade; the proxy is the one that emits). The indexer records it per chain, and `/v1/status` reports it from there |
-| `HANDLE_ESCROW_ADDRESS` | indexer | unset | The HandleEscrow **ERC1967 proxy**, when the chain has one. The indexer refuses to start unless it answers `REFUND_GRACE()` (libID-contracts 0.21) and its `registry()` is `IDENTITY_REGISTRY_ADDRESS`. Its events share the registry's windows and cursor; setting, changing or unsetting it replays the chain. `/v1/status` reports it as `escrow` |
+| `HANDLE_ESCROW_ADDRESS` | indexer | unset | The HandleEscrow **ERC1967 proxy**, when the chain has one. The indexer refuses to start unless its `registry()` is `IDENTITY_REGISTRY_ADDRESS`. Its events share the registry's windows and cursor; setting, changing or unsetting it replays the chain. `/v1/status` reports it as `escrow` |
 | `CHAIN_ID` | indexer | unset | Refuse to start unless the RPC reports this chain id. The API takes none: it serves every chain the store holds, and a request narrows with `?chain=` |
 | `CHAIN_NAMES` | indexer | — | Required. The names this chain goes by in an ENS name, comma-separated: the `base` in `alice.x.base.handles.link`. Labels only, never a platform key. Written to the store at every start for the gateway to read; a name belongs to one chain across the store, and declaring one another chain holds refuses to start |
 | `CONFIRMATIONS` | indexer | `5` | Blocks behind the head to stay (shallow-reorg protection) |
@@ -363,8 +363,8 @@ without pushing so packaging cannot rot:
 **Database.** The indexer indexes the node-keyed `IdentityRegistry` and
 `HandleEscrow` of the libid-contracts release `Cargo.toml` pins, from the
 registry's deployment block or from `START_BLOCK`. It refuses a registry
-whose `nodeKeyed()` does not answer true, an escrow without `REFUND_GRACE()`,
-and a database whose applied migrations differ from its own. To reuse such a database, stop every process
+whose `nodeKeyed()` does not answer true, and a database whose applied
+migrations differ from its own. To reuse such a database, stop every process
 on it and run `DROP SCHEMA names CASCADE; DROP TABLE _sqlx_migrations;`
 first; that keeps `pg_trgm`, which a least-privilege role cannot create.
 

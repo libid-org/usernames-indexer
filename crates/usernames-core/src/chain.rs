@@ -197,11 +197,10 @@ impl Contracts {
         }
     }
 
-    /// Refuse an escrow whose events this build would skip, one older than
-    /// the per-sender refund grace, and one that does not resolve holders
-    /// through the registry; without an escrow there is nothing to refuse.
-    /// An escrow keeps its registry for life, so an indexer checks once, at
-    /// startup, before it touches a row.
+    /// Refuse an escrow that does not resolve holders through the registry;
+    /// without an escrow there is nothing to refuse. An escrow keeps its
+    /// registry for life, so an indexer checks once, at startup, before it
+    /// touches a row.
     pub async fn check_escrow(
         &self,
         provider: &impl Provider,
@@ -209,13 +208,7 @@ impl Contracts {
         let Some(escrow) = self.escrow else {
             return Ok(());
         };
-        let contract = HandleEscrow::new(escrow, provider);
-        contract
-            .REFUND_GRACE()
-            .call()
-            .await
-            .map_err(|source| EscrowRefused::NoRefundGrace { escrow, source })?;
-        let resolves = contract
+        let resolves = HandleEscrow::new(escrow, provider)
             .registry()
             .call()
             .await
@@ -257,18 +250,6 @@ pub enum RegistryRefused {
 /// Why an escrow is refused beside the registry an indexer follows.
 #[derive(Debug, thiserror::Error)]
 pub enum EscrowRefused {
-    /// `REFUND_GRACE()` could not be read: an escrow from before the
-    /// per-sender refund grace, whose deposits this build cannot read.
-    #[error(
-        "escrow {escrow}: REFUND_GRACE() could not be read; point it at a libID-contracts 0.21 HandleEscrow"
-    )]
-    NoRefundGrace {
-        /// The escrow asked.
-        escrow: Address,
-        /// The call's failure.
-        #[source]
-        source: contract::Error,
-    },
     /// The escrow's `registry()` could not be read.
     #[error("escrow {escrow}: registry() could not be read")]
     Unread {
