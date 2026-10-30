@@ -25,17 +25,17 @@ pub(crate) struct Head {
 
 /// A head older than a report may live: the endpoint answers, but its node
 /// stopped following the chain, and a report on it would vouch for an index
-/// that cannot move.
+/// that cannot move. The message names the head alone, so it stays the same
+/// on every poll that sees that head and is stored once.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "the head, block {number}, is {}s old, past STALE_AFTER: the endpoint is not following its chain",
-    age.as_secs()
+    "the head, block {number} stamped at unix time {time}, is older than STALE_AFTER: the endpoint is not following its chain"
 )]
 pub(crate) struct StaleHead {
     /// The head's number.
     number: u64,
-    /// How old its timestamp is by this host's clock.
-    age: Duration,
+    /// The head's timestamp, in unix seconds.
+    time: u64,
 }
 
 impl Head {
@@ -57,11 +57,10 @@ impl Head {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
-        let age = now.saturating_sub(Duration::from_secs(self.time));
-        if age > limit {
+        if now.saturating_sub(Duration::from_secs(self.time)) > limit {
             Err(StaleHead {
                 number: self.number,
-                age,
+                time: self.time,
             })
         } else {
             Ok(self)
@@ -94,10 +93,8 @@ mod tests {
 
     #[test]
     fn a_head_past_the_limit_is_stale() {
-        let stale = made(Duration::from_secs(300))
-            .recent(Duration::from_secs(80))
-            .unwrap_err();
-        assert_eq!(stale.number, 7);
-        assert!(stale.age >= Duration::from_secs(300), "{stale}");
+        let head = made(Duration::from_secs(300));
+        let stale = head.recent(Duration::from_secs(80)).unwrap_err();
+        assert_eq!((stale.number, stale.time), (7, head.time));
     }
 }

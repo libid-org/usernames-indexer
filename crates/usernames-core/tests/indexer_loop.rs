@@ -375,10 +375,6 @@ async fn a_head_older_than_the_report_lets_the_report_expire() {
                 .window_error
                 .as_deref()
                 .is_some_and(|error| error.contains("not following its chain"))
-                && state
-                    .position()
-                    .valid_for
-                    .is_some_and(|left| left < TimeDelta::zero())
         })
         .await;
     assert_eq!(
@@ -388,6 +384,25 @@ async fn a_head_older_than_the_report_lets_the_report_expire() {
             .map(|e| e.matches("STALE_AFTER").count()),
         Some(1)
     );
+
+    // Nothing renews the report now, so the clock alone runs it out; the
+    // polls in between see the same head and store the same error.
+    let left = stalled
+        .position()
+        .valid_for
+        .and_then(|left| left.to_std().ok())
+        .unwrap_or_default();
+    tokio::time::sleep(left + Duration::from_secs(2)).await;
+    let expired = chain.writer.store().state().await.expect("the chain's row");
+    assert!(
+        expired
+            .position()
+            .valid_for
+            .is_some_and(|left| left < TimeDelta::zero()),
+        "{:?}",
+        expired.position()
+    );
+    assert_eq!(expired.window_error, stalled.window_error);
 
     chain.mine(1).await;
     watch
