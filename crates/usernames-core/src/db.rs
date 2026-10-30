@@ -194,6 +194,11 @@ impl IndexPosition {
     }
 }
 
+/// The channel every change to a chain's row is announced on, with the
+/// chain's id as the payload, once the change commits.
+#[cfg(feature = "test-helpers")]
+pub const CHAIN_CHANNEL: &str = "names_chains";
+
 /// The longest a report may be trusted: a year. The indexer refuses a longer
 /// setting at startup; the store adds it to the clock as a `bigint`.
 pub const MAX_VALID_FOR: Duration = Duration::from_secs(366 * 24 * 60 * 60);

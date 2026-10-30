@@ -221,7 +221,7 @@ async fn indexes_a_real_chain_end_to_end() {
         .run(cancel.clone()),
     );
 
-    store.cursor_at(latest).await;
+    ChainWatch::new(&pool, &store).await.cursor_at(latest).await;
     cancel.cancel();
     let _ = task.await;
     lease.release().await.expect("the lease releases");

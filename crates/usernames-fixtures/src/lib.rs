@@ -27,8 +27,8 @@
 //!   through the indexer's own window ([`Writes`]) and read through the real
 //!   router ([`Reads`]), its answers typed ([`Reply`]).
 //! - [`Events`]: the events the contracts emit, as the suites write them.
-//! - [`ChainWatch`]: a chain's row, read until it reaches what a suite
-//!   waits for.
+//! - [`ChainWatch`]: a chain's row, followed through the notices of its
+//!   changes.
 //! - [`libid`]: the libid contracts deployed on anvil, and the calls a
 //!   holder or a payer makes to them.
 

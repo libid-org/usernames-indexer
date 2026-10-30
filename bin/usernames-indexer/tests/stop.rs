@@ -178,8 +178,9 @@ async fn an_indexing_indexer_stops_on_sigterm_and_frees_the_chain() {
     let Some(chain) = Chain::start(43130).await else {
         return;
     };
+    let mut watch = ChainWatch::new(&chain.pool, &chain.store).await;
     let indexer = chain.indexer();
-    chain.store.cursor_at(1).await;
+    watch.cursor_at(1).await;
 
     assert!(indexer.terminate().await.success());
     let next = tokio::time::timeout(Duration::from_secs(1), chain.store.acquire_writer())
@@ -197,8 +198,9 @@ async fn a_start_refused_for_a_taken_name_keeps_the_chain() {
     let Some(chain) = Chain::start(43161).await else {
         return;
     };
+    let mut watch = ChainWatch::new(&chain.pool, &chain.store).await;
     let indexer = chain.indexer();
-    chain.store.cursor_at(1).await;
+    watch.cursor_at(1).await;
     assert!(indexer.terminate().await.success());
 
     let other = ChainStore::new(chain.pool.clone(), 43162);

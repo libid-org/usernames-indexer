@@ -187,8 +187,8 @@ impl Chain {
     /// committed through it, and the target reported beside it.
     async fn wait_for_index(&self, block: u64) {
         let reached = |at: Option<u64>| at.is_some_and(|at| at >= block);
-        self.writer
-            .store()
+        ChainWatch::new(&self.pool, self.writer.store())
+            .await
             .until(|state| {
                 let position = state.position();
                 reached(position.cursor) && reached(position.target)
@@ -328,11 +328,10 @@ async fn a_deaf_endpoint_is_left_and_the_next_session_catches_up() {
     });
     chain.wait_for_index(chain.head().await - 2).await;
 
+    let mut watch = ChainWatch::new(&chain.pool, chain.writer.store()).await;
     // The next poll asks for the head, and nothing answers.
     chain.relay.deafen(true);
-    let stored = chain
-        .writer
-        .store()
+    let stored = watch
         .until(|state| state.window_error.is_some())
         .await
         .window_error
@@ -365,8 +364,8 @@ async fn a_head_older_than_the_report_lets_the_report_expire() {
     });
     chain.wait_for_index(chain.head().await - 1).await;
 
-    let store = chain.writer.store();
-    let stalled = store
+    let mut watch = ChainWatch::new(&chain.pool, chain.writer.store()).await;
+    let stalled = watch
         .until(|state| {
             state
                 .window_error
@@ -383,19 +382,25 @@ async fn a_head_older_than_the_report_lets_the_report_expire() {
     );
 
     // Nothing renews the report now, so the clock alone runs it out; the
-    // polls in between see the same head and store the same error.
-    let expired = store
-        .until(|state| {
-            state
-                .position()
-                .valid_for
-                .is_some_and(|left| left < TimeDelta::zero())
-        })
-        .await;
+    // polls in between see the same head and change nothing in the row.
+    let left = stalled
+        .position()
+        .valid_for
+        .and_then(|left| left.to_std().ok())
+        .unwrap_or_default();
+    tokio::time::sleep(left + Duration::from_secs(2)).await;
+    let expired = chain.writer.store().state().await.expect("the chain's row");
+    assert!(
+        expired
+            .position()
+            .valid_for
+            .is_some_and(|left| left < TimeDelta::zero()),
+        "{expired:?}"
+    );
     assert_eq!(expired.window_error, stalled.window_error);
 
     chain.mine(1).await;
-    store
+    watch
         .until(|state| {
             state.window_error.is_none()
                 && state

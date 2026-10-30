@@ -146,7 +146,10 @@ impl Harness {
     /// Wait for the indexer to commit every block mined so far.
     async fn settle(&self) {
         let latest = self.node.provider.get_block_number().await.expect("latest");
-        self.store.cursor_at(latest).await;
+        ChainWatch::new(&self.pool, &self.store)
+            .await
+            .cursor_at(latest)
+            .await;
     }
 
     /// The anvil accounts that act in the scenario, after the deployer.
