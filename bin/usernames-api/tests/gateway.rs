@@ -338,9 +338,9 @@ async fn a_bound_handle_resolves_and_the_signature_verifies() {
     gateway.done();
 }
 
-/// A private binding resolves too, as `resolveHandle` does on chain.
+/// An unlisted binding resolves too, as `resolveHandle` does on chain.
 #[tokio::test]
-async fn a_private_binding_resolves() {
+async fn an_unlisted_binding_resolves() {
     let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
         return;
     };

@@ -1,4 +1,4 @@
-//! Hashed identities end to end: the libid contracts on anvil take private
+//! Hashed identities end to end: the libid contracts on anvil take unlisted
 //! and disclosing binds, an unpublish and deposits; the indexer's own loop
 //! indexes them; the read API answers; and no plaintext the chain did not
 //! disclose is left anywhere in the store.
@@ -202,7 +202,7 @@ fn x_proof(id: &'static str, handle: &'static str, observed_at: u64) -> Proof {
 }
 
 #[tokio::test]
-async fn private_binds_stay_private_and_disclosures_stay_shown() {
+async fn unlisted_binds_show_no_text_and_disclosures_stay_shown() {
     let Some(mut h) = Harness::open(CHAIN).await else {
         return;
     };
@@ -214,11 +214,11 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
     let alice_node = x.handle_node("Alice_1").expect("a handle");
     let alice_id = x.id_node(ALICE_ID);
 
-    // 1. A private bind of @Alice_1: nodes only, resolved by hashing here,
+    // 1. An unlisted bind of @Alice_1: nodes only, resolved by hashing here,
     //    with no text to show.
-    let private = x_proof(ALICE_ID, "alice_1", 1000);
+    let unlisted = x_proof(ALICE_ID, "alice_1", 1000);
     h.libid
-        .bind(alice, private, Disclose::Nothing, U256::ZERO)
+        .bind(alice, unlisted, Disclose::Nothing, U256::ZERO)
         .await;
     h.settle().await;
     let resolved: HandleResolution = h.get("/v1/resolve/handle/x/Alice_1").await;
@@ -279,9 +279,9 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
         "{history:?}"
     );
 
-    // 4. A public deposit to @Bob_2, then Bob binds it privately: the
-    //    escrow's reveal maps the handle to his id node. A private deposit names only
-    //    a node, and no platform.
+    // 4. A public deposit to @Bob_2, then Bob binds it unlisted: the
+    //    payer's text maps the handle to his id node. A deposit by node names
+    //    only a node, and no platform.
     let bob_node = x.handle_node("bob_2").expect("a handle");
     let bob_id = x.id_node(BOB_ID);
     let carol_node = x.handle_node("carol_3").expect("a handle");
@@ -293,7 +293,7 @@ async fn private_binds_stay_private_and_disclosures_stay_shown() {
     h.libid
         .bind(bob, bobs_proof, Disclose::Nothing, U256::ZERO)
         .await;
-    // Dave binds privately and is never disclosed.
+    // Dave binds unlisted, and nobody names his handle.
     let daves_proof = x_proof(DAVE_ID, "dave_4", 4000);
     h.libid
         .bind(dave, daves_proof, Disclose::Nothing, U256::ZERO)
