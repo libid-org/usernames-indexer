@@ -279,7 +279,7 @@ async fn unlisted_binds_show_no_text_and_disclosures_stay_shown() {
         "{history:?}"
     );
 
-    // 4. A public deposit to @Bob_2, then Bob binds it unlisted: the
+    // 4. A deposit by text to @Bob_2, then Bob binds it unlisted: the
     //    payer's text maps the handle to his id node. A deposit by node names
     //    only a node, and no platform.
     let bob_node = x.handle_node("bob_2").expect("a handle");
