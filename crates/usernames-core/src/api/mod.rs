@@ -292,7 +292,7 @@ async fn resolve_handle_node(
 
 /// `GET /v1/resolve/id-node/{idNode}?chain=` — the wallet an id node resolves
 /// to, the way `resolveId` would answer it, on every chain it is bound on or
-/// the one named. The client hashes the id; no plaintext id reaches here.
+/// the one named. The client hashes the id and sends its node.
 async fn resolve_id_node(
     State(state): State<AppState>,
     ApiPath(id_node): ApiPath<String>,
