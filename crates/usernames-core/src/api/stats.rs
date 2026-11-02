@@ -48,7 +48,7 @@ use crate::{
 /// a burst of requests must not run them again on a small database.
 const STATS_TTL: Duration = Duration::from_secs(5 * 60);
 
-/// `GET /v1/stats` — totals and a weekly series per chain, from one
+/// `GET /v1/stats` — totals and a daily series per chain, from one
 /// snapshot of the store.
 pub(crate) async fn stats(
     State(state): State<AppState>,

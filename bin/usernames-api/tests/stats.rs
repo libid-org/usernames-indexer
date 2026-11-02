@@ -213,7 +213,7 @@ impl StatsRoute for Router {
 /// claimed by the holder who bound it after, is an onboarding claim; a
 /// claim of deposits made before the index's first block is not.
 #[tokio::test]
-async fn the_journal_adds_up_per_chain_and_week() {
+async fn the_journal_adds_up_per_chain_and_day() {
     let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
