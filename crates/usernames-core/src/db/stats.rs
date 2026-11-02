@@ -209,6 +209,7 @@ impl Store {
             listed.iter().map(|listed| listed.token.to_vec()).collect();
         let native = NATIVE_COIN.to_vec();
         let mut tx = self.pool.begin_with(sql::STATS_SNAPSHOT).await?;
+        sqlx::query(sql::STATS_DEADLINE).execute(&mut *tx).await?;
         let snapshot = StatsSnapshot {
             taken_at: sqlx::query_scalar(sql::STATS_TAKEN_AT)
                 .fetch_one(&mut *tx)

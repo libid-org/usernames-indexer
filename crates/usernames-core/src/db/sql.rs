@@ -88,6 +88,8 @@ pub const REFUNDABLE_PROJECTION: &str =
     include_str!("../../sql/refundable_projection.sql");
 /// Opens the one read-only snapshot every `/v1/stats` number is read from.
 pub const STATS_SNAPSHOT: &str = include_str!("../../sql/stats_snapshot.sql");
+/// Bounds each statement of that snapshot.
+pub const STATS_DEADLINE: &str = include_str!("../../sql/stats_deadline.sql");
 pub const STATS_TAKEN_AT: &str = include_str!("../../sql/stats_taken_at.sql");
 pub const STATS_HANDLES: &str = include_str!("../../sql/stats_handles.sql");
 pub const STATS_LINKS: &str = include_str!("../../sql/stats_links.sql");

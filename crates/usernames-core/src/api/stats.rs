@@ -59,9 +59,13 @@ const STATS_TTL: Duration = Duration::from_secs(5 * 60);
 /// `GET /v1/stats` — totals and a daily series per chain, from one
 /// snapshot of the store.
 pub(crate) async fn stats(State(state): State<AppState>) -> Result<Response, ApiError> {
-    let body = state
-        .stats
-        .get(|| async { Stats::of(state.store.stats(&state.listed).await?) })
+    let AppState {
+        store,
+        listed,
+        stats,
+    } = state;
+    let body = stats
+        .get(|| async move { Stats::of(store.stats(&listed).await?) })
         .await?;
     Ok(([(CONTENT_TYPE, "application/json")], body).into_response())
 }
@@ -98,28 +102,37 @@ impl StatsCache {
     /// The answer, from `compute` when none younger than [`STATS_TTL`] is
     /// held. The lock is held through the computation, so requests arriving
     /// meanwhile wait for its answer instead of computing again; after a
-    /// failure the next of them computes.
+    /// failure the next of them computes. The computation runs in a task of
+    /// its own: a request whose client goes away leaves it running.
     pub(crate) async fn get<F>(
         &self,
         compute: impl FnOnce() -> F,
     ) -> Result<Bytes, ApiError>
     where
-        F: Future<Output = Result<Stats, ApiError>>,
+        F: Future<Output = Result<Stats, ApiError>> + Send + 'static,
     {
-        let mut latest = self.latest.lock().await;
+        let mut latest = Arc::clone(&self.latest).lock_owned().await;
         let held = latest
             .as_ref()
             .filter(|computed| computed.fresh(Instant::now()))
             .map(|computed| computed.body.clone());
-        let answer = match held {
-            Some(body) => Ok(body),
-            None => compute()
+        if let Some(body) = held {
+            drop(latest);
+            return Ok(body);
+        }
+        let computation = compute();
+        tokio::spawn(async move {
+            let answer = computation
                 .await
                 .and_then(|stats| Computed::of(&stats))
-                .map(|computed| latest.insert(computed).body.clone()),
-        };
-        drop(latest);
-        answer
+                .map(|computed| latest.insert(computed).body.clone());
+            drop(latest);
+            answer
+        })
+        .await
+        .map_err(|stopped| {
+            ApiError::internal(format_args!("the stats computation stopped: {stopped}"))
+        })?
     }
 }
 
@@ -341,6 +354,7 @@ mod tests {
     };
 
     use futures_util::future::join_all;
+    use tokio::sync::oneshot;
 
     use super::*;
 
@@ -368,18 +382,43 @@ mod tests {
     #[tokio::test]
     async fn requests_arriving_together_share_one_computation() {
         let cache = StatsCache::default();
-        let computations = AtomicI64::new(0);
-        let compute = || async {
-            let computation = computations.fetch_add(1, Ordering::SeqCst);
-            // The other requests are polled while this one computes.
-            tokio::task::yield_now().await;
-            Ok(answer(computation))
-        };
-        let answers = join_all((0..10).map(|_| cache.get(compute))).await;
+        let computations = Arc::new(AtomicI64::new(0));
+        let answers = join_all((0..10).map(|_| {
+            let computations = Arc::clone(&computations);
+            cache.get(|| async move {
+                let computation = computations.fetch_add(1, Ordering::SeqCst);
+                // The other requests are polled while this one computes.
+                tokio::task::yield_now().await;
+                Ok(answer(computation))
+            })
+        }))
+        .await;
         assert_eq!(computations.load(Ordering::SeqCst), 1);
         for body in answers {
             assert_eq!(body.served(), answer(0));
         }
+    }
+
+    /// A request whose client goes away mid-computation leaves the
+    /// computation running, and the request behind it gets its answer.
+    #[tokio::test]
+    async fn a_dropped_request_leaves_its_computation_running() {
+        let cache = StatsCache::default();
+        let (started, has_started) = oneshot::channel();
+        let (finish, finishes) = oneshot::channel();
+        let first = cache.get(|| async move {
+            started.send(()).expect("the test waits for the start");
+            finishes.await.expect("the test lets it finish");
+            Ok(answer(0))
+        });
+        // axum drops a request's future when its client disconnects.
+        tokio::select! {
+            _ = first => panic!("the computation finished before it was let go"),
+            started = has_started => started.expect("the computation started"),
+        }
+        let second = cache.get(|| async { Ok(answer(1)) });
+        finish.send(()).expect("the computation still runs");
+        assert_eq!(second.await.served(), answer(0));
     }
 
     /// A failed computation is not served: the next request computes.
