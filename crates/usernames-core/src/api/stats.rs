@@ -11,9 +11,15 @@ use std::{
     },
 };
 
+use alloy::primitives::Address;
 use axum::{
+    body::Bytes,
     extract::State,
-    Json,
+    http::header::CONTENT_TYPE,
+    response::{
+        IntoResponse,
+        Response,
+    },
 };
 use tokio::sync::Mutex;
 
@@ -25,10 +31,12 @@ use super::{
         DayActivity,
         EscrowActivity,
         FeesPaid,
+        OtherTokens,
         PlatformHandles,
         PlatformLinks,
         Stats,
         TokenFlow,
+        TokenFlows,
     },
     AppState,
 };
@@ -50,29 +58,36 @@ const STATS_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// `GET /v1/stats` — totals and a daily series per chain, from one
 /// snapshot of the store.
-pub(crate) async fn stats(
-    State(state): State<AppState>,
-) -> Result<Json<Stats>, ApiError> {
-    let stats = state
+pub(crate) async fn stats(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let body = state
         .stats
-        .get(|| async { Stats::of(state.store.stats().await?) })
+        .get(|| async { Stats::of(state.store.stats(&state.listed).await?) })
         .await?;
-    Ok(Json(stats))
+    Ok(([(CONTENT_TYPE, "application/json")], body).into_response())
 }
 
-/// The latest answer, shared by every request.
+/// The latest answer, serialized once and shared by every request.
 #[derive(Clone, Default)]
 pub(crate) struct StatsCache {
     latest: Arc<Mutex<Option<Computed>>>,
 }
 
-/// One computation's answer, and when it finished.
+/// One computation's answer as served, and when it finished.
 struct Computed {
     at: Instant,
-    stats: Stats,
+    body: Bytes,
 }
 
 impl Computed {
+    /// `stats` as served from now on.
+    fn of(stats: &Stats) -> Result<Self, ApiError> {
+        let body = serde_json::to_vec(stats).map_err(ApiError::internal)?;
+        Ok(Self {
+            at: Instant::now(),
+            body: body.into(),
+        })
+    }
+
     /// Whether the answer may still be served at `now`.
     fn fresh(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.at) < STATS_TTL
@@ -87,7 +102,7 @@ impl StatsCache {
     pub(crate) async fn get<F>(
         &self,
         compute: impl FnOnce() -> F,
-    ) -> Result<Stats, ApiError>
+    ) -> Result<Bytes, ApiError>
     where
         F: Future<Output = Result<Stats, ApiError>>,
     {
@@ -95,15 +110,13 @@ impl StatsCache {
         let held = latest
             .as_ref()
             .filter(|computed| computed.fresh(Instant::now()))
-            .map(|computed| computed.stats.clone());
+            .map(|computed| computed.body.clone());
         let answer = match held {
-            Some(stats) => Ok(stats),
-            None => compute().await.inspect(|stats| {
-                *latest = Some(Computed {
-                    at: Instant::now(),
-                    stats: stats.clone(),
-                });
-            }),
+            Some(body) => Ok(body),
+            None => compute()
+                .await
+                .and_then(|stats| Computed::of(&stats))
+                .map(|computed| latest.insert(computed).body.clone()),
         };
         drop(latest);
         answer
@@ -152,21 +165,19 @@ impl Stats {
         }
         for row in snapshot.escrow {
             let kind: EventKind = row.kind.parse().map_err(ApiError::internal)?;
-            let flow = TokenFlow::of(&row.flow)?;
             chains
                 .chain(row.flow.chain_id)
                 .span(row.flow.day)
                 .escrow
                 .flows(kind)?
-                .push(flow);
+                .add(&row.flow)?;
         }
         for row in snapshot.onboarding_claims {
-            let flow = TokenFlow::of(&row)?;
             chains
                 .chain(row.chain_id)
                 .span(row.day)
                 .onboarding_claims
-                .push(flow);
+                .add(&row)?;
         }
         Ok(Self {
             computed_at: snapshot.taken_at,
@@ -237,8 +248,8 @@ impl From<Tally> for ChainStats {
 }
 
 impl EscrowActivity {
-    /// The list an escrow event of `kind` counts in.
-    fn flows(&mut self, kind: EventKind) -> Result<&mut Vec<TokenFlow>, ApiError> {
+    /// The flows an escrow event of `kind` counts in.
+    fn flows(&mut self, kind: EventKind) -> Result<&mut TokenFlows, ApiError> {
         match kind {
             EventKind::Deposited => Ok(&mut self.deposits),
             EventKind::Forwarded => Ok(&mut self.forwards),
@@ -289,16 +300,32 @@ impl FeesPaid {
     }
 }
 
+impl TokenFlows {
+    /// Count `row`: under its token, or under `other` when it names none.
+    fn add(&mut self, row: &TokenFlowRow) -> Result<(), ApiError> {
+        match row.token {
+            Some(token) => self.tokens.push(TokenFlow::of(token, row)?),
+            None => {
+                self.other = Some(OtherTokens {
+                    count: row.count,
+                    wallets: row.wallets,
+                })
+            }
+        }
+        Ok(())
+    }
+}
+
 impl TokenFlow {
-    fn of(row: &TokenFlowRow) -> Result<Self, ApiError> {
+    fn of(token: Address, row: &TokenFlowRow) -> Result<Self, ApiError> {
         let amount = row.amount().ok_or_else(|| {
             ApiError::internal(format_args!(
-                "{} flows on chain {}: amount {:?}",
-                row.token, row.chain_id, row.amount
+                "{token} flows on chain {}: amount {:?}",
+                row.chain_id, row.amount
             ))
         })?;
         Ok(Self {
-            token: row.token,
+            token,
             count: row.count,
             amount,
             wallets: row.wallets,
@@ -324,6 +351,18 @@ mod tests {
         }
     }
 
+    /// The answer a cached body serves.
+    trait Served {
+        fn served(self) -> Stats;
+    }
+
+    impl Served for Result<Bytes, ApiError> {
+        fn served(self) -> Stats {
+            let body = self.ok().expect("an answer");
+            serde_json::from_slice(&body).expect("a stats answer")
+        }
+    }
+
     /// Ten requests that arrive together run one computation, and each gets
     /// its answer.
     #[tokio::test]
@@ -338,8 +377,8 @@ mod tests {
         };
         let answers = join_all((0..10).map(|_| cache.get(compute))).await;
         assert_eq!(computations.load(Ordering::SeqCst), 1);
-        for served in answers {
-            assert_eq!(served.ok(), Some(answer(0)));
+        for body in answers {
+            assert_eq!(body.served(), answer(0));
         }
     }
 
@@ -351,8 +390,8 @@ mod tests {
             .get(|| async { Err(ApiError::internal("the database is down")) })
             .await;
         assert!(failed.is_err());
-        let served = cache.get(|| async { Ok(answer(1)) }).await;
-        assert_eq!(served.ok(), Some(answer(1)));
+        let body = cache.get(|| async { Ok(answer(1)) }).await;
+        assert_eq!(body.served(), answer(1));
     }
 
     /// An answer is served for five minutes after its computation.
@@ -361,7 +400,7 @@ mod tests {
         let at = Instant::now();
         let computed = Computed {
             at,
-            stats: answer(0),
+            body: Bytes::new(),
         };
         assert!(computed.fresh(at));
         assert!(computed.fresh(at + STATS_TTL - Duration::from_secs(1)));

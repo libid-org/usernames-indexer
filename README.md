@@ -67,6 +67,7 @@ indexer's settings.
 | `MAX_BLOCK_RANGE` | indexer | `10000` | Largest `eth_getLogs` window |
 | `START_BLOCK` | indexer | unset | Where a FRESH scan starts — consulted only when no cursor exists (new database, or right after a re-index). Unset means the deployment block is found by binary search over `eth_getCode`; only a successful detection is cached, and an RPC failure mid-search retries next cycle |
 | `LISTEN_ADDR` | api | `127.0.0.1:8080` | Read-API listen address |
+| `STATS_TOKENS` | api | unset | The tokens `/v1/stats` names beside each chain's own coin, comma-separated `<chain id>:<address>` pairs (`8453:0x8335…`). Every other token's movements count together under `other`, without an amount: anybody can write a token |
 
 ### Polling
 
@@ -95,7 +96,7 @@ of `STALE_AFTER`, ends the session, and the next one resumes from the cursor.
 | `GET /v1/escrow/refundable/{address}?before=&limit=` | What the address sent that nobody has claimed yet, each contribution with its `refundableAt`: when `refund` opens for it |
 | `GET /v1/escrow/handle/{platform}/{handle}?before=&limit=` | What a handle holds, token by token, and its holder; `/v1/escrow/node/{node}` by node |
 | `GET /v1/escrow/unclaimed?token=0x…&before=&limit=` | Every slot still holding something, bound or not: token by token, descending, the largest amount first within each |
-| `GET /v1/stats` | Per chain, in total and per UTC day: users (wallets that linked, sent through the escrow or claimed) and new users, links and live handles per platform, registration fees per receiver, escrow deposits, forwards, claims and refunds per token, and onboarding claims (deposits to a handle nobody held, claimed after its holder linked). Amounts are token units as decimal strings. One computation is served for five minutes; `computedAt` says when it was taken |
+| `GET /v1/stats` | Per chain, in total and per UTC day: users (wallets that linked, sent through the escrow or claimed) and new users, links and live handles per platform, registration fees per receiver, escrow deposits, forwards, claims and refunds, and onboarding claims (deposits to a handle nobody held, claimed after its holder linked). Token movements are listed per token for the chain's own coin and the `STATS_TOKENS`, and together under `other` for every other token, with a count and wallets but no amount. Amounts are token units as decimal strings. One computation is served for five minutes; `computedAt` says when it was taken |
 | `GET /v1/status` | Every chain the store holds: chain id, contract, escrow, last indexed block, chain head, lag, when the indexer last reported and how long that report is still good, last window error, the Proof Verifier the contract is wired to; and the read-model version |
 | `GET /health` | Liveness |
 

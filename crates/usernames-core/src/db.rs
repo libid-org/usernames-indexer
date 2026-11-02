@@ -83,6 +83,8 @@ pub use self::{
         FeesRow,
         HandlesRow,
         LinksRow,
+        ListedToken,
+        ListedTokenError,
         StatsSnapshot,
         TokenFlowRow,
         UsersRow,

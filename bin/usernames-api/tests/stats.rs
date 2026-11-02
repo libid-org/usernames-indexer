@@ -1,10 +1,13 @@
 //! `GET /v1/stats` over a journal written through the indexer's apply path:
 //! users, links, fees and escrow movements counted per chain, in total and
-//! per UTC day, and one answer served until it expires.
+//! per UTC day, tokens nobody listed counted together, and one answer served
+//! until it expires.
 //!
 //! Skips without `DATABASE_URL`, unless `CI` is set: there its absence
 //! fails. The suite's chain is its own; the answer lists every chain the
 //! database holds, so it reads only its own.
+
+use std::ops::Range;
 
 use alloy::primitives::{
     address,
@@ -35,14 +38,19 @@ use usernames_core::{
             DayActivity,
             EscrowActivity,
             FeesPaid,
+            OtherTokens,
             PlatformHandles,
             PlatformLinks,
             Stats,
             TokenFlow,
+            TokenFlows,
         },
         AppState,
     },
-    db::Store,
+    db::{
+        ListedToken,
+        Store,
+    },
     events::{
         EscrowEvent,
         NamesEvent,
@@ -178,6 +186,20 @@ impl ByPlatform for Vec<PlatformHandles> {
     }
 }
 
+/// Flows of named tokens only, none under `other`.
+trait Named {
+    fn named(self) -> TokenFlows;
+}
+
+impl Named for Vec<TokenFlow> {
+    fn named(self) -> TokenFlows {
+        TokenFlows {
+            tokens: self,
+            other: None,
+        }
+    }
+}
+
 /// One chain's entry in an answer.
 trait ChainEntry {
     fn chain(self, chain_id: i64) -> ChainStats;
@@ -209,9 +231,10 @@ impl StatsRoute for Router {
 }
 
 /// Users, links, live handles, fees and every escrow movement add up per
-/// chain, over the whole journal and per UTC day. A deposit to a handle nobody held,
-/// claimed by the holder who bound it after, is an onboarding claim; a
-/// claim of deposits made before the index's first block is not.
+/// chain, over the whole journal and per UTC day, each listed token by
+/// name. A deposit to a handle nobody held, claimed by the holder who bound
+/// it after, is an onboarding claim; a claim of deposits made before the
+/// index's first block is not.
 #[tokio::test]
 async fn the_journal_adds_up_per_chain_and_day() {
     let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
@@ -274,7 +297,15 @@ async fn the_journal_adds_up_per_chain_and_day() {
         .apply(IN_B + 6, NamesEvent::claimed("eve", NATIVE, EVE, 7))
         .await;
 
-    let stats: Stats = suite.get("/v1/stats").await.answer();
+    let listed = vec![ListedToken {
+        chain_id: CHAIN,
+        token: USDC,
+    }];
+    let stats = AppState::new(Store::new(suite.pool.clone()))
+        .listing(listed)
+        .router()
+        .stats()
+        .await;
     let ether = u128::from(ETHER);
     let handles = vec![
         PlatformHandles {
@@ -298,12 +329,13 @@ async fn the_journal_adds_up_per_chain_and_day() {
             links: vec![links(X, 4, 4), links(GITHUB, 1, 1)].by_platform(),
             registration_fees: fees(2),
             escrow: EscrowActivity {
-                deposits: vec![flow(USDC, 1, 1_000, 1), flow(NATIVE, 2, 3 * ether, 2)],
-                forwards: vec![flow(NATIVE, 1, 5, 1)],
-                claims: vec![flow(NATIVE, 2, 3 * ether + 7, 2)],
-                refunds: vec![flow(USDC, 1, 1_000, 1)],
+                deposits: vec![flow(USDC, 1, 1_000, 1), flow(NATIVE, 2, 3 * ether, 2)]
+                    .named(),
+                forwards: vec![flow(NATIVE, 1, 5, 1)].named(),
+                claims: vec![flow(NATIVE, 2, 3 * ether + 7, 2)].named(),
+                refunds: vec![flow(USDC, 1, 1_000, 1)].named(),
             },
-            onboarding_claims: vec![flow(NATIVE, 1, 3 * ether, 1)],
+            onboarding_claims: vec![flow(NATIVE, 1, 3 * ether, 1)].named(),
         },
         days: vec![
             DayActivity {
@@ -317,10 +349,11 @@ async fn the_journal_adds_up_per_chain_and_day() {
                         deposits: vec![
                             flow(USDC, 1, 1_000, 1),
                             flow(NATIVE, 2, 3 * ether, 2),
-                        ],
+                        ]
+                        .named(),
                         ..EscrowActivity::default()
                     },
-                    onboarding_claims: Vec::new(),
+                    onboarding_claims: TokenFlows::default(),
                 },
             },
             DayActivity {
@@ -331,17 +364,74 @@ async fn the_journal_adds_up_per_chain_and_day() {
                     links: vec![links(X, 2, 2), links(GITHUB, 1, 1)].by_platform(),
                     registration_fees: fees(1),
                     escrow: EscrowActivity {
-                        deposits: Vec::new(),
-                        forwards: vec![flow(NATIVE, 1, 5, 1)],
-                        claims: vec![flow(NATIVE, 2, 3 * ether + 7, 2)],
-                        refunds: vec![flow(USDC, 1, 1_000, 1)],
+                        deposits: TokenFlows::default(),
+                        forwards: vec![flow(NATIVE, 1, 5, 1)].named(),
+                        claims: vec![flow(NATIVE, 2, 3 * ether + 7, 2)].named(),
+                        refunds: vec![flow(USDC, 1, 1_000, 1)].named(),
                     },
-                    onboarding_claims: vec![flow(NATIVE, 1, 3 * ether, 1)],
+                    onboarding_claims: vec![flow(NATIVE, 1, 3 * ether, 1)].named(),
                 },
             },
         ],
     };
     assert_eq!(stats.chain(CHAIN), expected);
+    suite.done();
+}
+
+/// Anybody can deposit a token they wrote. A thousand of them, and a token
+/// the deployment did not list, count together under one `other` per kind
+/// and day, without an amount, so the answer does not grow with them.
+#[tokio::test]
+async fn unlisted_tokens_count_together() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let junk = |tokens: Range<u64>| -> Vec<NamesEvent> {
+        tokens
+            .map(|i| Address::from_word(U256::from(i + 1).into()))
+            .map(|token| NamesEvent::deposited("dave", token, SENDER, 1))
+            .collect()
+    };
+    let mut day_a = junk(0..500);
+    day_a.push(NamesEvent::deposited("dave", USDC, PAYER, 1_000));
+    day_a.push(NamesEvent::deposited("dave", NATIVE, PAYER, ETHER));
+    suite.apply_tx(IN_A, day_a).await;
+    suite.apply_tx(IN_B, junk(500..1_000)).await;
+
+    let stats: Stats = suite.get("/v1/stats").await.answer();
+    let chain = stats.chain(CHAIN);
+    let deposits_on = |day: i64| {
+        chain
+            .days
+            .iter()
+            .find(|entry| entry.day == day)
+            .map(|entry| entry.activity.escrow.deposits.clone())
+            .unwrap_or_else(|| panic!("day {day} listed"))
+    };
+    let coin = || vec![flow(NATIVE, 1, u128::from(ETHER), 1)];
+    let other = |count, wallets| Some(OtherTokens { count, wallets });
+    assert_eq!(
+        chain.total.escrow.deposits,
+        TokenFlows {
+            tokens: coin(),
+            other: other(1_001, 2),
+        }
+    );
+    assert_eq!(
+        deposits_on(DAY_A),
+        TokenFlows {
+            tokens: coin(),
+            other: other(501, 2),
+        }
+    );
+    assert_eq!(
+        deposits_on(DAY_B),
+        TokenFlows {
+            tokens: Vec::new(),
+            other: other(500, 1),
+        }
+    );
     suite.done();
 }
 

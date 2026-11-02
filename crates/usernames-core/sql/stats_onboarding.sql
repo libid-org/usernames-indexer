@@ -2,13 +2,23 @@
 -- the token while nobody held the node, and the node was bound after that
 -- deposit and before the claim. A claim whose deposits came before the
 -- index's first block is not one. Per chain and token: once over the whole
--- journal (day NULL), and once per UTC day.
+-- journal (day NULL), and once per UTC day. Tokens are named or folded as
+-- in stats_escrow.sql: the chain's coin ($1) and the listed (chain, token)
+-- pairs ($2, $3) by name, every other one in a row with no token and no
+-- amount.
+WITH listed (chain_id, token) AS (
+    SELECT * FROM unnest($2::bigint[], $3::bytea[])
+)
 SELECT chain_id, day, token,
        count(*) AS count,
-       sum(released)::text AS amount,
+       CASE WHEN token IS NOT NULL THEN sum(released)::text END AS amount,
        count(DISTINCT claimer) AS wallets
 FROM (
-    SELECT c.chain_id, c.token, c.released, c.claimer,
+    SELECT c.chain_id,
+           CASE WHEN c.token = $1
+                  OR (c.chain_id, c.token) IN (SELECT chain_id, token FROM listed)
+                THEN c.token END AS token,
+           c.released, c.claimer,
            c.block_time - c.block_time % 86400 AS day
     FROM names.events c
     WHERE c.kind = 'claimed'
@@ -29,4 +39,4 @@ FROM (
       )
 ) e
 GROUP BY GROUPING SETS ((chain_id, token), (chain_id, day, token))
-ORDER BY chain_id, day NULLS FIRST, token
+ORDER BY chain_id, day NULLS FIRST, token NULLS LAST

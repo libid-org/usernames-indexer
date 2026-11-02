@@ -12,6 +12,8 @@ pub mod model;
 mod params;
 mod stats;
 
+use std::sync::Arc;
+
 use alloy::primitives::B256;
 use axum::{
     extract::State,
@@ -53,6 +55,7 @@ use crate::{
     db::{
         self,
         ChainStatusRow,
+        ListedToken,
         Search,
         Store,
     },
@@ -61,19 +64,31 @@ use crate::{
 
 /// What every handler needs: the store. Which chains it holds, and which
 /// contract each was indexed from, is read from what the indexers wrote.
-/// Beside it, the latest `/v1/stats` answer, shared by every clone.
+/// Beside it, the tokens `/v1/stats` names and its latest answer, shared by
+/// every clone.
 #[derive(Clone)]
 pub struct AppState {
     store: Store,
+    listed: Arc<[ListedToken]>,
     stats: StatsCache,
 }
 
 impl AppState {
-    /// State over one database, however many chains it holds.
+    /// State over one database, however many chains it holds. `/v1/stats`
+    /// names each chain's own coin and no other token.
     pub fn new(store: Store) -> Self {
         Self {
             store,
+            listed: Arc::new([]),
             stats: StatsCache::default(),
+        }
+    }
+
+    /// The same state, with `/v1/stats` also naming the `listed` tokens.
+    pub fn listing(self, listed: Vec<ListedToken>) -> Self {
+        Self {
+            listed: listed.into(),
+            ..self
         }
     }
 

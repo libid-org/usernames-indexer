@@ -681,9 +681,10 @@ pub struct Unclaimed {
 
 /// `GET /v1/stats`: what the chains this store holds recorded, chain by
 /// chain: totals and a series per UTC day. Every address counts. Amounts
-/// are token units, never converted: the chain's own coin is EIP-7528
-/// `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`, and anybody can deposit a
-/// token they wrote, so show the tokens you recognize.
+/// are token units, never converted. Tokens are named only when they are
+/// the chain's own coin, EIP-7528 `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`,
+/// or a token the deployment lists (`STATS_TOKENS`); anybody can write a
+/// token, so every other one is counted under `other`, without an amount.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Stats {
@@ -740,8 +741,8 @@ pub struct Activity {
     pub escrow: EscrowActivity,
     /// Claims of deposits made to a handle nobody held, claimed by the
     /// holder who bound it after the deposit: payments that brought their
-    /// recipient in. Per token, by address; the wallets are their claimers.
-    pub onboarding_claims: Vec<TokenFlow>,
+    /// recipient in. The wallets are their claimers.
+    pub onboarding_claims: TokenFlows,
 }
 
 /// One UTC day of a chain's activity.
@@ -785,20 +786,31 @@ pub struct FeesPaid {
     pub amount: U512,
 }
 
-/// What moved through `HandleEscrow`, per token, each list by token address.
+/// What moved through `HandleEscrow`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EscrowActivity {
     /// Held for a handle nobody held (`Deposited`); the wallets are their
     /// senders.
-    pub deposits: Vec<TokenFlow>,
+    pub deposits: TokenFlows,
     /// Paid straight to a handle's holder (`Forwarded`); the wallets are
     /// their senders.
-    pub forwards: Vec<TokenFlow>,
+    pub forwards: TokenFlows,
     /// Taken by a holder (`Claimed`); the wallets are their claimers.
-    pub claims: Vec<TokenFlow>,
+    pub claims: TokenFlows,
     /// Taken back by a sender (`Refunded`); the wallets are their senders.
-    pub refunds: Vec<TokenFlow>,
+    pub refunds: TokenFlows,
+}
+
+/// Movements of one kind: per named token, and every other token together.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenFlows {
+    /// The chain's own coin and the listed tokens, by token address.
+    pub tokens: Vec<TokenFlow>,
+    /// Every other token's movements, together; absent when there were
+    /// none.
+    pub other: Option<OtherTokens>,
 }
 
 /// One token's movements of one kind.
@@ -816,5 +828,17 @@ pub struct TokenFlow {
     pub amount: U512,
     /// Distinct wallets that made them, as the list that holds this one
     /// names them.
+    pub wallets: i64,
+}
+
+/// The movements of every token `/v1/stats` does not name, together: a
+/// count and wallets, but no amount, since a sum across tokens means
+/// nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OtherTokens {
+    /// Movements.
+    pub count: i64,
+    /// Distinct wallets that made them.
     pub wallets: i64,
 }
