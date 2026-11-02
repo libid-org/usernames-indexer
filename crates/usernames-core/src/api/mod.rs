@@ -1,14 +1,16 @@
 //! The read API. Resolution answers exactly what the contract's resolvers
-//! answer, from the projections; search, the histories and the escrow's
-//! waiting amounts are what the chain cannot list. The answers' shapes live
-//! in [`model`]; the handlers here and in the history and escrow modules only
-//! translate HTTP to store calls and rows to those shapes.
+//! answer, from the projections; search, the histories, the escrow's
+//! waiting amounts and the statistics are what the chain cannot list. The
+//! answers' shapes live in [`model`]; the handlers here and in the history,
+//! escrow and stats modules only translate HTTP to store calls and rows to
+//! those shapes.
 
 mod error;
 mod escrow;
 mod history;
 pub mod model;
 mod params;
+mod stats;
 
 use alloy::primitives::B256;
 use axum::{
@@ -45,6 +47,7 @@ use self::{
         PageParams,
         Param,
     },
+    stats::StatsCache,
 };
 use crate::{
     db::{
@@ -58,15 +61,20 @@ use crate::{
 
 /// What every handler needs: the store. Which chains it holds, and which
 /// contract each was indexed from, is read from what the indexers wrote.
+/// Beside it, the latest `/v1/stats` answer, shared by every clone.
 #[derive(Clone)]
 pub struct AppState {
     store: Store,
+    stats: StatsCache,
 }
 
 impl AppState {
     /// State over one database, however many chains it holds.
     pub fn new(store: Store) -> Self {
-        Self { store }
+        Self {
+            store,
+            stats: StatsCache::default(),
+        }
     }
 
     /// The chains a request reads from — the one `?chain=` names, or all —
@@ -114,6 +122,7 @@ impl AppState {
             .route("/v1/escrow/handle/{platform}/{handle}", get(escrow::handle))
             .route("/v1/escrow/node/{node}", get(escrow::node))
             .route("/v1/escrow/unclaimed", get(escrow::unclaimed))
+            .route("/v1/stats", get(stats::stats))
             .with_state(self)
     }
 
