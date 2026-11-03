@@ -5687,6 +5687,7 @@ dependencies = [
  "libid-contracts",
  "libid-identity",
  "libid-profiles",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_with",

@@ -7,6 +7,7 @@
 //! the replay converges.
 
 mod deadline;
+mod retry;
 mod rpc;
 
 use std::time::Duration;
