@@ -80,12 +80,16 @@ impl fmt::Display for RpcUrl {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        atomic::{
-            AtomicUsize,
-            Ordering,
+    use std::{
+        io,
+        sync::{
+            atomic::{
+                AtomicUsize,
+                Ordering,
+            },
+            Arc,
+            Mutex,
         },
-        Arc,
     };
 
     use alloy::{
@@ -244,6 +248,51 @@ mod tests {
         }
     }
 
+    /// Every line a subscriber writes, kept to read back.
+    #[derive(Clone, Default)]
+    struct Log(Arc<Mutex<Vec<u8>>>);
+
+    impl Log {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("the log").clone())
+                .expect("UTF-8 lines")
+        }
+    }
+
+    impl io::Write for Log {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("the log").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A refused connection's error names the URL it called, key and all, and
+    /// the retry logs each failed try.
+    #[tokio::test]
+    async fn the_retry_log_names_no_endpoint() {
+        let log = Log::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let rpc: RpcUrl = "http://127.0.0.1:1/v2/secret".parse().expect("an http URL");
+        let logging = tracing::subscriber::set_default(subscriber);
+        rpc.provider(PATIENCE)
+            .get_block_number()
+            .await
+            .expect_err("nothing listens on port 1");
+        drop(logging);
+        let log = log.text();
+        assert!(log.contains("trying again"), "{log}");
+        assert!(log.contains("<RPC_URL>"), "{log}");
+        assert!(!log.contains("secret"), "{log}");
+    }
+
     /// Eden's RPC answering one `eth_getLogs` in some 600-900 with a 503.
     #[tokio::test]
     async fn a_read_answered_after_one_503_succeeds() {
@@ -281,10 +330,10 @@ mod tests {
         assert_eq!(requests, 1);
     }
 
-    /// Each unanswered try costs the whole deadline, so a dead endpoint gets
-    /// one more try, not five.
+    /// An unanswered try costs the whole patience, and two would outlast the
+    /// report; the next poll sends the read again.
     #[tokio::test]
-    async fn an_unanswered_read_is_sent_again_once() {
+    async fn an_unanswered_read_is_sent_once() {
         let patience = Duration::from_millis(200);
         let (block, requests) = Endpoint::call(vec![Answer::Silence], patience).await;
         let error = block.expect_err("an endpoint that never answers");
@@ -292,7 +341,7 @@ mod tests {
             panic!("expected the deadline's error, got {error:?}");
         };
         assert_eq!(source.downcast_ref(), Some(&Unanswered(patience)));
-        assert_eq!(requests, 2);
+        assert_eq!(requests, 1);
     }
 
     #[test]

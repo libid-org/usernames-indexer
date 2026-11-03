@@ -5697,6 +5697,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "url",
  "usernames-core",
  "usernames-fixtures",
