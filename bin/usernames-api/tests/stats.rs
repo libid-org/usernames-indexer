@@ -5,7 +5,9 @@
 //!
 //! Skips without `DATABASE_URL`, unless `CI` is set: there its absence
 //! fails. The suite's chain is its own; the answer lists every chain the
-//! database holds, so it reads only its own.
+//! database holds, so it reads only its own. Each test forgets its chain
+//! when it ends: the index-plan test plans over what the database holds,
+//! and escrow rows left here can tip its plans.
 
 use std::ops::Range;
 
@@ -405,6 +407,7 @@ async fn the_journal_adds_up_per_chain_and_day() {
         ],
     };
     assert_eq!(stats.chain(CHAIN), expected);
+    suite.store().forget().await;
     suite.done();
 }
 
@@ -462,6 +465,7 @@ async fn a_freed_handle_onboards_its_next_holder() {
     };
     assert_eq!(onboarding_on(DAY_A), TokenFlows::default());
     assert_eq!(onboarding_on(DAY_B), grace());
+    suite.store().forget().await;
     suite.done();
 }
 
@@ -519,6 +523,7 @@ async fn unlisted_tokens_count_together() {
             other: other(500, 1),
         }
     );
+    suite.store().forget().await;
     suite.done();
 }
 
@@ -581,6 +586,7 @@ async fn a_wallet_on_two_chains_counts_once_across_them() {
     ChainStore::new(suite.pool.clone(), OTHER_CHAIN)
         .forget()
         .await;
+    suite.store().forget().await;
     suite.done();
 }
 
@@ -613,5 +619,6 @@ async fn an_answer_is_served_again_until_it_expires() {
 
     let restarted: Stats = suite.get("/v1/stats").await.answer();
     assert_eq!(restarted.chain(CHAIN).total.links, [links(X, 2, 2)]);
+    suite.store().forget().await;
     suite.done();
 }
