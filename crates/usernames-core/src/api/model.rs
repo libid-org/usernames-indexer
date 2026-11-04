@@ -28,6 +28,7 @@ use crate::{
         NamesEvent,
     },
     nodes::KnownPlatform,
+    referral::Code,
 };
 
 /// One error shape for the whole API, beside the HTTP status: a stable code
@@ -51,6 +52,8 @@ pub enum ErrorCode {
     HandleRetired,
     /// No chain in scope binds the account.
     IdNotBound,
+    /// No chain has bound a handle node the referral code names.
+    CodeNotIssued,
     /// Text the platform could never hold as a handle.
     HandleImpossible,
     /// No indexer has committed a first window for the chains in scope.
@@ -61,6 +64,8 @@ pub enum ErrorCode {
     InvalidAddress,
     /// Not a 0x-hex 32-byte handle node.
     InvalidNode,
+    /// Not a referral code: the base58 of 8 to 32 bytes.
+    InvalidCode,
     /// Not a chain id.
     InvalidChain,
     /// Not a cursor the list handed out.
@@ -296,6 +301,27 @@ pub struct HandleRef {
     pub handle_node: B256,
     /// The handle's text, once the chain disclosed it.
     pub handle: Option<String>,
+}
+
+/// `GET /v1/referral/code/{code}` and `GET /v1/referral/node/{node}/code`:
+/// the handle a referral code names, and how a landing page shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Referrer {
+    /// The code asked for, or the shortest code that names the node.
+    pub code: Code,
+    /// The platform's short key, when this build knows the id.
+    pub platform: Option<KnownPlatform>,
+    /// The platform the handle lives on.
+    pub platform_id: B256,
+    /// The node the code names.
+    pub handle_node: B256,
+    /// The handle's text, where a holder published it as its name; `None`
+    /// keeps the handle hidden.
+    pub primary_handle: Option<String>,
+    /// The chains the handle is bound on now; empty once retired everywhere,
+    /// when the code still names it.
+    pub chains: Vec<i64>,
 }
 
 /// One event, typed by its `kind`: the journal kinds, with each event's

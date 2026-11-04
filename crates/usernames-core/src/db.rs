@@ -51,6 +51,7 @@ mod page;
 #[cfg(test)]
 mod plan_tests;
 mod reads;
+mod referral;
 mod sql;
 mod stats;
 
@@ -83,6 +84,7 @@ pub use self::{
         Search,
         SearchRow,
     },
+    referral::ReferrerRow,
     stats::{
         EscrowFlowRow,
         FeesRow,
