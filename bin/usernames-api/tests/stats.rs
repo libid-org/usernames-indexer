@@ -83,6 +83,8 @@ const ALICE: Address = Address::repeat_byte(0xA1);
 const BOB: Address = Address::repeat_byte(0xB0);
 const DAVE: Address = Address::repeat_byte(0xDA);
 const EVE: Address = Address::repeat_byte(0xE0);
+const FRANK: Address = Address::repeat_byte(0xF1);
+const GRACE: Address = Address::repeat_byte(0x6A);
 const SENDER: Address = Address::repeat_byte(0x51);
 const PAYER: Address = Address::repeat_byte(0x52);
 const SAFE: Address = Address::repeat_byte(0xFE);
@@ -403,6 +405,63 @@ async fn the_journal_adds_up_per_chain_and_day() {
         ],
     };
     assert_eq!(stats.chain(CHAIN), expected);
+    suite.done();
+}
+
+/// A handle bound once, freed and then sent several deposits is an
+/// onboarding when its next holder claims them: the bind before the first
+/// deposit counts for nothing, the one after it brought the holder in.
+#[tokio::test]
+async fn a_freed_handle_onboards_its_next_holder() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    // Day A: frank links "frank", then moves his account to another handle,
+    // which frees it; two deposits follow.
+    suite
+        .apply_tx(IN_A, NamesEvent::bind(FRANK, X, "7", "frank", 1, false))
+        .await;
+    let mut moved = NamesEvent::bind(FRANK, X, "7", "frankie", 1, false);
+    moved.push(NamesEvent::retire(X, "frank", FRANK));
+    suite.apply_tx(IN_A + 1, moved).await;
+    suite
+        .apply(
+            IN_A + 2,
+            NamesEvent::deposited("frank", NATIVE, SENDER, ETHER),
+        )
+        .await;
+    suite
+        .apply(
+            IN_A + 3,
+            NamesEvent::deposited("frank", NATIVE, PAYER, 2 * ETHER),
+        )
+        .await;
+    // Day B: grace's account takes the handle and claims both.
+    suite
+        .apply_tx(IN_B, NamesEvent::bind(GRACE, X, "8", "frank", 1, false))
+        .await;
+    suite
+        .apply(
+            IN_B + 1,
+            NamesEvent::claimed("frank", NATIVE, GRACE, 3 * ETHER),
+        )
+        .await;
+
+    let stats: Stats = suite.get("/v1/stats").await.answer();
+    let chain = stats.chain(CHAIN);
+    let grace = || vec![flow(NATIVE, 1, 3 * u128::from(ETHER), 1)].named();
+    assert_eq!(chain.total.onboarding_claims, grace());
+    let onboarding_on = |day: i64| {
+        chain
+            .days
+            .iter()
+            .find(|entry| entry.day == day)
+            .map(|entry| entry.activity.onboarding_claims.clone())
+            .unwrap_or_else(|| panic!("day {day} listed"))
+    };
+    assert_eq!(onboarding_on(DAY_A), TokenFlows::default());
+    assert_eq!(onboarding_on(DAY_B), grace());
     suite.done();
 }
 
