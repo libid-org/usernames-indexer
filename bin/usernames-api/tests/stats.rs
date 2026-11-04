@@ -1,7 +1,7 @@
 //! `GET /v1/stats` over a journal written through the indexer's apply path:
 //! users, links, fees and escrow movements counted per chain, in total and
-//! per UTC day, tokens nobody listed counted together, and one answer served
-//! until it expires.
+//! per UTC day, users counted once across chains, tokens nobody listed
+//! counted together, and one answer served until it expires.
 //!
 //! Skips without `DATABASE_URL`, unless `CI` is set: there its absence
 //! fails. The suite's chain is its own; the answer lists every chain the
@@ -34,6 +34,7 @@ use usernames_core::{
     api::{
         model::{
             Activity,
+            AllChainsDay,
             ChainStats,
             DayActivity,
             EscrowActivity,
@@ -48,6 +49,7 @@ use usernames_core::{
         AppState,
     },
     db::{
+        ChainStore,
         ListedToken,
         Store,
     },
@@ -59,10 +61,14 @@ use usernames_core::{
 };
 use usernames_fixtures::{
     Events,
+    Seed,
     Suite,
+    Writes,
 };
 
 const CHAIN: i64 = 31351;
+/// The second chain of the case across chains.
+const OTHER_CHAIN: i64 = 31352;
 
 static SUITE: Mutex<()> = Mutex::const_new(());
 
@@ -80,6 +86,8 @@ const EVE: Address = Address::repeat_byte(0xE0);
 const SENDER: Address = Address::repeat_byte(0x51);
 const PAYER: Address = Address::repeat_byte(0x52);
 const SAFE: Address = Address::repeat_byte(0xFE);
+/// A wallet on both of the suite's chains, and on no other suite's.
+const ROAMER: Address = Address::repeat_byte(0x7C);
 
 const ETHER: u64 = 1_000_000_000_000_000_000;
 const FEE: u64 = 3_700_000_000_000_000;
@@ -211,6 +219,26 @@ impl ChainEntry for Stats {
             .into_iter()
             .find(|chain| chain.chain_id == chain_id)
             .unwrap_or_else(|| panic!("chain {chain_id} listed"))
+    }
+}
+
+/// One day of an answer across every chain; nothing counted when the day
+/// is absent.
+trait AllChainsEntry {
+    fn on(&self, day: i64) -> AllChainsDay;
+}
+
+impl AllChainsEntry for Stats {
+    fn on(&self, day: i64) -> AllChainsDay {
+        self.days
+            .iter()
+            .find(|entry| entry.day == day)
+            .cloned()
+            .unwrap_or(AllChainsDay {
+                day,
+                users: 0,
+                new_users: 0,
+            })
     }
 }
 
@@ -432,6 +460,68 @@ async fn unlisted_tokens_count_together() {
             other: other(500, 1),
         }
     );
+    suite.done();
+}
+
+/// A wallet that used two chains counts once across them: in the total, and
+/// as new only on the first day it used either. Each chain still counts it
+/// as new on its own first day there. The numbers across chains span every
+/// chain the database holds, so the test counts what its writes add.
+#[tokio::test]
+async fn a_wallet_on_two_chains_counts_once_across_them() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let other = ChainStore::new(suite.pool.clone(), OTHER_CHAIN);
+    other.forget().await;
+    let other = other.writer().await;
+    let before: Stats = suite.get("/v1/stats").await.answer();
+
+    other
+        .apply_tx(IN_A, NamesEvent::bind(ROAMER, X, "6", "roamer", 1, false))
+        .await;
+    suite
+        .apply_tx(IN_B, NamesEvent::bind(ROAMER, X, "6", "roamer", 1, false))
+        .await;
+    let after: Stats = suite.get("/v1/stats").await.answer();
+
+    assert_eq!(after.total.users - before.total.users, 1);
+    let added = |day: i64| {
+        let (now, then) = (after.on(day), before.on(day));
+        AllChainsDay {
+            day,
+            users: now.users - then.users,
+            new_users: now.new_users - then.new_users,
+        }
+    };
+    assert_eq!(
+        added(DAY_A),
+        AllChainsDay {
+            day: DAY_A,
+            users: 1,
+            new_users: 1,
+        }
+    );
+    assert_eq!(
+        added(DAY_B),
+        AllChainsDay {
+            day: DAY_B,
+            users: 1,
+            new_users: 0,
+        }
+    );
+    let chain = after.chain(CHAIN);
+    assert_eq!(chain.total.users, 1);
+    let day_b = chain
+        .days
+        .iter()
+        .find(|entry| entry.day == DAY_B)
+        .expect("day B listed");
+    assert_eq!(day_b.new_users, 1);
+    ChainStore::new(suite.pool.clone(), OTHER_CHAIN)
+        .forget()
+        .await;
     suite.done();
 }
 

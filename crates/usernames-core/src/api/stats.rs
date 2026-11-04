@@ -27,6 +27,8 @@ use super::{
     error::ApiError,
     model::{
         Activity,
+        AllChains,
+        AllChainsDay,
         ChainStats,
         DayActivity,
         EscrowActivity,
@@ -157,15 +159,25 @@ impl Stats {
                 .handles
                 .push(PlatformHandles::of(row));
         }
+        let mut total = AllChains::default();
+        let mut days = BTreeMap::new();
         for row in snapshot.users {
-            let chain = chains.chain(row.chain_id);
-            match row.day {
-                Some(day) => {
-                    let day = chain.day(day);
+            match (row.chain_id, row.day) {
+                (Some(chain_id), Some(day)) => {
+                    let day = chains.chain(chain_id).day(day);
                     day.new_users = row.new_users;
                     day.activity.users = row.users;
                 }
-                None => chain.total.users = row.users,
+                (Some(chain_id), None) => chains.chain(chain_id).total.users = row.users,
+                (None, Some(day)) => {
+                    let all = AllChainsDay {
+                        day,
+                        users: row.users,
+                        new_users: row.new_users,
+                    };
+                    days.insert(day, all);
+                }
+                (None, None) => total.users = row.users,
             }
         }
         for row in snapshot.links {
@@ -198,6 +210,8 @@ impl Stats {
         }
         Ok(Self {
             computed_at: snapshot.taken_at,
+            total,
+            days: days.into_values().collect(),
             chains: chains.0.into_values().map(ChainStats::from).collect(),
         })
     }
@@ -371,6 +385,8 @@ mod tests {
     fn answer(computed_at: i64) -> Stats {
         Stats {
             computed_at,
+            total: AllChains::default(),
+            days: Vec::new(),
             chains: Vec::new(),
         }
     }

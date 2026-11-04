@@ -61,17 +61,18 @@ pub struct HandlesRow {
     pub holders: i64,
 }
 
-/// The wallets that used the names on one chain: linked, sent through the
-/// escrow, or claimed from it.
+/// The wallets that used the names on one chain, or across every chain:
+/// linked, sent through the escrow, or claimed from it.
 #[derive(sqlx::FromRow)]
 pub struct UsersRow {
-    /// The chain.
-    pub chain_id: i64,
-    /// The day's start in unix seconds; `None` on the chain's total.
+    /// The chain; `None` on the rows across every chain.
+    pub chain_id: Option<i64>,
+    /// The day's start in unix seconds; `None` on the total.
     pub day: Option<i64>,
     /// Distinct wallets.
     pub users: i64,
-    /// Those seen that day for the first time; all of them on the total.
+    /// Those seen that day for the first time, on the row's chain or, across
+    /// every chain, on any of them; all of them on the total.
     pub new_users: i64,
 }
 

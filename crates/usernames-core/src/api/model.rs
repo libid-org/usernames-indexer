@@ -680,7 +680,8 @@ pub struct Unclaimed {
 }
 
 /// `GET /v1/stats`: what the chains this store holds recorded, chain by
-/// chain: totals and a series per UTC day. Every address counts. Amounts
+/// chain, and the users across them: totals and a series per UTC day.
+/// Every address counts. Amounts
 /// are token units, never converted. Tokens are named only when they are
 /// the chain's own coin, EIP-7528 `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`,
 /// or a token the deployment lists (`STATS_TOKENS`); anybody can write a
@@ -691,9 +692,36 @@ pub struct Stats {
     /// Unix seconds, by the database's clock, of the snapshot every number
     /// comes from. The same answer is served for five minutes after it.
     pub computed_at: i64,
+    /// The wallets across every chain the store holds: one that used
+    /// several chains counts once.
+    pub total: AllChains,
+    /// The same, day by day, oldest first; a day with nothing recorded is
+    /// absent.
+    pub days: Vec<AllChainsDay>,
     /// Every chain the store holds, by id; a chain with nothing recorded
     /// yet included.
     pub chains: Vec<ChainStats>,
+}
+
+/// The wallets across every chain the store holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AllChains {
+    /// Distinct wallets that linked, sent through the escrow, or claimed
+    /// from it, on any chain.
+    pub users: i64,
+}
+
+/// One UTC day across every chain the store holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AllChainsDay {
+    /// Unix seconds of the day's start, 00:00 UTC.
+    pub day: i64,
+    /// Distinct wallets that day, on any chain.
+    pub users: i64,
+    /// Of them, those no chain had seen before.
+    pub new_users: i64,
 }
 
 /// One chain's numbers.
