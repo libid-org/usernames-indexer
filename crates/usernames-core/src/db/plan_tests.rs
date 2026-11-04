@@ -1,7 +1,13 @@
 //! The plan test: every read over the big tables, planned over
 //! production-shaped volume.
 
-use sqlx::PgConnection;
+use std::str::FromStr;
+
+use sqlx::{
+    postgres::PgConnectOptions,
+    PgConnection,
+};
+use usernames_fixtures::database_url;
 
 use super::{
     escrow::plans::EscrowPlans,
@@ -10,6 +16,7 @@ use super::{
         Scope,
         Search,
     },
+    stats::plans::StatsPlans,
     *,
 };
 
@@ -42,6 +49,74 @@ impl Plan {
             .unwrap_or_else(|e| panic!("{name}: {e}"))
             .join("\n");
         Self { name, seeks, text }
+    }
+
+    /// Panics unless the plan seeks every index it names and scans none of
+    /// the big tables.
+    fn check(&self) {
+        let Self { name, seeks, text } = self;
+        for index in seeks.unwrap_or_default() {
+            assert!(
+                index.split('|').any(|index| text.contains(index)),
+                "{name} does not seek {index}:\n{text}"
+            );
+        }
+        for table in [
+            "handles",
+            "ids",
+            "published",
+            "events",
+            "escrow_held",
+            "escrow_refundable",
+            "address_events",
+            "handle_nodes",
+        ] {
+            assert!(
+                !text.contains(&format!("Seq Scan on {table}")),
+                "{name} scans {table}:\n{text}"
+            );
+        }
+    }
+}
+
+/// A database of a test's own on `DATABASE_URL`'s server: rows committed
+/// there reach no other suite.
+struct OwnDatabase {
+    server: PgPool,
+    name: String,
+    pool: PgPool,
+}
+
+impl OwnDatabase {
+    /// A fresh database named after `DATABASE_URL`'s with `suffix`; one an
+    /// interrupted run left behind is dropped first.
+    async fn create(url: &str, suffix: &str) -> Self {
+        let options = PgConnectOptions::from_str(url).expect("DATABASE_URL");
+        let name = format!("{}_{suffix}", options.get_database().unwrap_or("postgres"));
+        let server = PgPool::connect_with(options.clone())
+            .await
+            .expect("connect");
+        sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+            .execute(&server)
+            .await
+            .expect("the leftover database dropped");
+        sqlx::raw_sql(&format!("CREATE DATABASE \"{name}\""))
+            .execute(&server)
+            .await
+            .expect("the database created");
+        let pool = PgPool::connect_with(options.database(&name))
+            .await
+            .expect("connect to the database");
+        Self { server, name, pool }
+    }
+
+    /// Drops the database.
+    async fn remove(self) {
+        self.pool.close().await;
+        sqlx::raw_sql(&format!("DROP DATABASE \"{}\" WITH (FORCE)", self.name))
+            .execute(&self.server)
+            .await
+            .expect("the database dropped");
     }
 }
 
@@ -262,28 +337,42 @@ async fn every_read_over_the_big_tables_seeks_its_index() {
     all.extend(conn.history_plans().await);
     all.extend(conn.escrow_plans().await);
     for plan in all {
-        let Plan { name, seeks, text } = plan;
-        for index in seeks.unwrap_or_default() {
-            assert!(
-                index.split('|').any(|index| text.contains(index)),
-                "{name} does not seek {index}:\n{text}"
-            );
-        }
-        for table in [
-            "handles",
-            "ids",
-            "published",
-            "events",
-            "escrow_held",
-            "escrow_refundable",
-            "address_events",
-            "handle_nodes",
-        ] {
-            assert!(
-                !text.contains(&format!("Seq Scan on {table}")),
-                "{name} scans {table}:\n{text}"
-            );
-        }
+        plan.check();
     }
     conn.rollback().await.expect("rollback")
+}
+
+/// The `/v1/stats` aggregates read their covering indexes whole, without
+/// the heap: a vacuumed journal allows that, and rows loaded in a
+/// transaction that rolls back never do. So they are planned in a database
+/// of the test's own, over [`VOLUME`] committed and vacuumed.
+#[tokio::test]
+async fn the_stats_aggregates_read_their_covering_indexes() {
+    let Some(url) = database_url() else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let own = OwnDatabase::create(&url, "stats_plans").await;
+    MIGRATOR.run(&own.pool).await.expect("migrations");
+    let mut tx = own.pool.begin().await.expect("transaction");
+    sqlx::raw_sql(VOLUME)
+        .execute(&mut *tx)
+        .await
+        .expect("the volume loads");
+    tx.commit().await.expect("the volume committed");
+    sqlx::raw_sql(VACUUM)
+        .execute(&own.pool)
+        .await
+        .expect("the tables vacuumed");
+    let mut conn = own.pool.acquire().await.expect("connection");
+    sqlx::query("SET enable_seqscan = off")
+        .execute(&mut *conn)
+        .await
+        .expect("session setting");
+    let plans = conn.stats_plans().await;
+    drop(conn);
+    own.remove().await;
+    for plan in plans {
+        plan.check();
+    }
 }

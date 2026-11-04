@@ -10,6 +10,7 @@ use alloy::primitives::{
     Bytes,
     B256,
     U256,
+    U512,
 };
 use serde::{
     Deserialize,
@@ -676,4 +677,196 @@ pub struct Unclaimed {
     pub amounts: Vec<EscrowAmount>,
     /// Pass as `before` for the next page; absent on the last one.
     pub next: Option<String>,
+}
+
+/// `GET /v1/stats`: what the chains this store holds recorded, chain by
+/// chain, and the users across them: totals and a series per UTC day.
+/// Every address counts. Amounts
+/// are token units, never converted. Tokens are named only when they are
+/// the chain's own coin, EIP-7528 `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`,
+/// or a token the deployment lists (`STATS_TOKENS`); anybody can write a
+/// token, so every other one is counted under `other`, without an amount.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Stats {
+    /// Unix seconds, by the database's clock, of the snapshot every number
+    /// comes from. The same answer is served for five minutes after it.
+    pub computed_at: i64,
+    /// The wallets across every chain the store holds: one that used
+    /// several chains counts once.
+    pub total: AllChains,
+    /// The same, day by day, oldest first; a day with nothing recorded is
+    /// absent.
+    pub days: Vec<AllChainsDay>,
+    /// Every chain the store holds, by id; a chain with nothing recorded
+    /// yet included.
+    pub chains: Vec<ChainStats>,
+}
+
+/// The wallets across every chain the store holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AllChains {
+    /// Distinct wallets that linked, sent through the escrow, or claimed
+    /// from it, on any chain.
+    pub users: i64,
+}
+
+/// One UTC day across every chain the store holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AllChainsDay {
+    /// Unix seconds of the day's start, 00:00 UTC.
+    pub day: i64,
+    /// Distinct wallets that day, on any chain.
+    pub users: i64,
+    /// Of them, those no chain had seen before.
+    pub new_users: i64,
+}
+
+/// One chain's numbers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainStats {
+    /// The chain.
+    pub chain_id: i64,
+    /// The handles that resolve now, per platform, by platform id.
+    pub handles: Vec<PlatformHandles>,
+    /// Everything the chain recorded since the index's first block.
+    pub total: Activity,
+    /// The same, day by day, oldest first; a day with nothing recorded is
+    /// absent.
+    pub days: Vec<DayActivity>,
+}
+
+/// The handles one platform has that resolve now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlatformHandles {
+    /// The platform's short key, when this build knows the id.
+    pub platform: Option<KnownPlatform>,
+    /// The platform id the chain keys by.
+    pub platform_id: B256,
+    /// Handles with a holder: bound and never retired since.
+    pub live: i64,
+    /// Distinct wallets holding them.
+    pub holders: i64,
+}
+
+/// What a chain recorded over a span: since the index's first block, or on
+/// one day.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Activity {
+    /// Distinct wallets that linked, sent through the escrow, or claimed
+    /// from it.
+    pub users: i64,
+    /// Bindings (`IdentityBound`) per platform, by platform id.
+    pub links: Vec<PlatformLinks>,
+    /// Registration fees paid (`BindFeePaid`) per receiver, by address.
+    pub registration_fees: Vec<FeesPaid>,
+    /// What moved through `HandleEscrow`.
+    pub escrow: EscrowActivity,
+    /// Claims of deposits made to a handle nobody held, claimed by the
+    /// holder who bound it after the deposit: payments that brought their
+    /// recipient in. The wallets are their claimers.
+    pub onboarding_claims: TokenFlows,
+}
+
+/// One UTC day of a chain's activity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DayActivity {
+    /// Unix seconds of the day's start, 00:00 UTC.
+    pub day: i64,
+    /// Of the day's users, those the chain had not seen before.
+    pub new_users: i64,
+    /// What the chain recorded that day.
+    #[serde(flatten)]
+    pub activity: Activity,
+}
+
+/// The bindings made on one platform.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlatformLinks {
+    /// The platform's short key, when this build knows the id.
+    pub platform: Option<KnownPlatform>,
+    /// The platform id the chain keys by.
+    pub platform_id: B256,
+    /// Bindings made, a rebinding of an account to another wallet included.
+    pub count: i64,
+    /// Distinct wallets they bound to.
+    pub holders: i64,
+}
+
+/// The registration fees one address was paid.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeesPaid {
+    /// The fee receiver a binding named.
+    pub receiver: Address,
+    /// Fees paid.
+    pub count: i64,
+    /// Their sum in the chain's own coin, base units, as a decimal string.
+    #[serde_as(as = "DisplayFromStr")]
+    pub amount: U512,
+}
+
+/// What moved through `HandleEscrow`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EscrowActivity {
+    /// Held for a handle nobody held (`Deposited`); the wallets are their
+    /// senders.
+    pub deposits: TokenFlows,
+    /// Paid straight to a handle's holder (`Forwarded`); the wallets are
+    /// their senders.
+    pub forwards: TokenFlows,
+    /// Taken by a holder (`Claimed`); the wallets are their claimers.
+    pub claims: TokenFlows,
+    /// Taken back by a sender (`Refunded`); the wallets are their senders.
+    pub refunds: TokenFlows,
+}
+
+/// Movements of one kind: per named token, and every other token together.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenFlows {
+    /// The chain's own coin and the listed tokens, by token address.
+    pub tokens: Vec<TokenFlow>,
+    /// Every other token's movements, together; absent when there were
+    /// none.
+    pub other: Option<OtherTokens>,
+}
+
+/// One token's movements of one kind.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenFlow {
+    /// The token; EIP-7528 `0xEeee…EEeE` is the chain's own coin.
+    pub token: Address,
+    /// Movements.
+    pub count: i64,
+    /// Their sum in token units, as a decimal string: what was sent, or
+    /// what a claim or refund released. A sum, so it may pass a `uint256`.
+    #[serde_as(as = "DisplayFromStr")]
+    pub amount: U512,
+    /// Distinct wallets that made them, as the list that holds this one
+    /// names them.
+    pub wallets: i64,
+}
+
+/// The movements of every token `/v1/stats` does not name, together: a
+/// count and wallets, but no amount, since a sum across tokens means
+/// nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OtherTokens {
+    /// Movements.
+    pub count: i64,
+    /// Distinct wallets that made them.
+    pub wallets: i64,
 }

@@ -45,6 +45,7 @@ use usernames_core::{
     api,
     db::{
         self,
+        ListedToken,
         Store,
     },
     ens::{
@@ -116,6 +117,13 @@ pub struct Config {
     /// index has not earned the right to say that.
     #[arg(long, env = "ENS_MAX_LAG_BLOCKS", default_value_t = 32)]
     pub ens_max_lag_blocks: u64,
+
+    /// The tokens `/v1/stats` names by address beside each chain's own coin,
+    /// comma-separated `<chain id>:<address>` pairs: `8453:0x8335…`. Every
+    /// other token counts under `other`, without an amount: anybody can
+    /// write a token, and naming each would let them grow every answer.
+    #[arg(long, env = "STATS_TOKENS", value_delimiter = ',')]
+    pub stats_tokens: Vec<ListedToken>,
 }
 
 /// The API serving as a task, and the token that stops it.
@@ -227,7 +235,7 @@ impl Config {
             }
         }
         let app = Service {
-            api: api::AppState::new(store),
+            api: api::AppState::new(store).listing(self.stats_tokens),
             gateway,
         }
         .router();

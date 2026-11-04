@@ -52,6 +52,7 @@ mod page;
 mod plan_tests;
 mod reads;
 mod sql;
+mod stats;
 
 pub use self::{
     escrow::{
@@ -81,6 +82,17 @@ pub use self::{
         IdentityRow,
         Search,
         SearchRow,
+    },
+    stats::{
+        EscrowFlowRow,
+        FeesRow,
+        HandlesRow,
+        LinksRow,
+        ListedToken,
+        ListedTokenError,
+        StatsSnapshot,
+        TokenFlowRow,
+        UsersRow,
     },
 };
 
