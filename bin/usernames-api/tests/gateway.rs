@@ -184,8 +184,8 @@ impl DeclareNames for ChainStore {
             .iter()
             .map(|name| name.parse::<ens::ChainName>().expect("a chain name"))
             .collect();
-        let writer = self.acquire_writer().await.expect("lease");
-        self.set_chain_names(&writer, &names)
+        let mut writer = self.acquire_writer().await.expect("lease");
+        self.set_chain_names(&mut writer, &names)
             .await
             .expect("names declared");
         writer.release().await.expect("release");
