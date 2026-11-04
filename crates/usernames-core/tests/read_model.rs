@@ -918,23 +918,31 @@ async fn search_ranks_exact_prefix_substring() {
     assert!(!handles.contains(&"alice_1"), "{handles:?}");
     assert!(!handles.is_empty(), "fuzzy neighbors should still match");
 
-    // LIKE metacharacters match themselves, not everything.
+    // LIKE metacharacters match themselves, not everything: the owner's
+    // `ali` is no match for `%%%`.
     let results: SearchResults = chains
         .pool
-        .get_on(CHAIN, "/v1/search?q=%25%25%25")
+        .get_on(
+            CHAIN,
+            &format!("/v1/search?q=%25%25%25&owner={}", Address::repeat_byte(1)),
+        )
         .await
         .answer();
     assert!(results.hits.is_empty());
 
-    // A query under three characters would read every disclosed handle.
-    assert_eq!(
-        chains
-            .pool
-            .get_on::<SearchResults>(CHAIN, "/v1/search?q=al")
-            .await
-            .refusal(),
-        (StatusCode::BAD_REQUEST, ErrorCode::InvalidArgument)
-    );
+    // A query under three letters or digits would read every disclosed
+    // handle: a trigram index takes nothing else.
+    for q in ["al", "---", "a-b-"] {
+        assert_eq!(
+            chains
+                .pool
+                .get_on::<SearchResults>(CHAIN, &format!("/v1/search?q={q}"))
+                .await
+                .refusal(),
+            (StatusCode::BAD_REQUEST, ErrorCode::InvalidArgument),
+            "{q}"
+        );
+    }
     // An owner narrows the read to its wallet's handles first.
     let results: SearchResults = chains
         .pool

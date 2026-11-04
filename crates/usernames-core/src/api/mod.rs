@@ -352,9 +352,10 @@ struct SearchParams {
 
 /// The page size a search may ask for: at most this many hits per request.
 const SEARCH_MAX_LIMIT: i64 = 50;
-/// The shortest query a search by text alone takes: a trigram index cannot
-/// narrow a shorter substring, so its match would read every disclosed
-/// handle. A search by owner reads that wallet's handles first.
+/// The fewest letters and digits a search by text alone takes: a trigram
+/// index is built from those alone and cannot narrow fewer, so the match
+/// would read every disclosed handle. A search by owner reads that wallet's
+/// handles first.
 const SEARCH_MIN_QUERY: usize = 3;
 /// A search page holds this many hits when the request names no `limit`.
 const SEARCH_DEFAULT_LIMIT: i64 = 10;
@@ -385,11 +386,12 @@ async fn search(
         Some(raw) => {
             raw.refuse_nul("q")?;
             let folded = nodes::fold_search_query(raw);
-            if owner.is_none() && folded.chars().count() < SEARCH_MIN_QUERY {
+            let indexed = folded.chars().filter(char::is_ascii_alphanumeric).count();
+            if owner.is_none() && indexed < SEARCH_MIN_QUERY {
                 return Err(ApiError::bad_request(
                     ErrorCode::InvalidArgument,
                     format!(
-                        "q must be at least {SEARCH_MIN_QUERY} characters, unless owner narrows the search"
+                        "q must have at least {SEARCH_MIN_QUERY} letters or digits, unless owner narrows the search"
                     ),
                 ));
             }
