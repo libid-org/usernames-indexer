@@ -267,8 +267,10 @@ impl Deadline {
         Self(Instant::now() + budget)
     }
 
-    /// `conn`, its next statement bounded by the time left. A millisecond at
-    /// least: Postgres reads a timeout of zero as none.
+    /// `conn`, its next statement bounded by the time left, in whole
+    /// milliseconds rounded up, so the database never stops it before the
+    /// deadline. A millisecond at least: Postgres reads a timeout of zero as
+    /// none.
     async fn bound<'c>(
         &self,
         conn: &'c mut PgConnection,
@@ -278,7 +280,7 @@ impl Deadline {
             .saturating_duration_since(Instant::now())
             .max(Duration::from_millis(1));
         sqlx::query(sql::STATS_DEADLINE)
-            .bind(left.as_millis().to_string())
+            .bind(left.as_micros().div_ceil(1_000).to_string())
             .execute(&mut *conn)
             .await?;
         Ok(conn)
