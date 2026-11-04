@@ -575,8 +575,8 @@ pub(crate) mod plans {
     impl EscrowPlans for PgConnection {
         async fn escrow_plans(&mut self) -> Vec<Plan> {
             let (address, node) = (Address::repeat_byte(2), B256::repeat_byte(1));
-            // A cursor high in the node and token ranges, where a list read
-            // backwards has most of its rows still ahead of it.
+            // A cursor high in the node, token and amount ranges, where a list
+            // read backwards has most of its rows still ahead of it.
             let (high, token) = (B256::repeat_byte(0xEE), Address::repeat_byte(0xEE));
             let slot = Some(SlotCursor {
                 chain_id: 1,
@@ -585,7 +585,7 @@ pub(crate) mod plans {
             });
             let unclaimed = Some(UnclaimedCursor {
                 token,
-                held: U256::from(10u64),
+                held: U256::from(4000u64),
                 chain_id: 1,
                 handle_node: high,
             });
