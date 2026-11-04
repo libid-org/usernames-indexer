@@ -47,12 +47,14 @@ use usernames_core::{
     api::{
         model::{
             OtherTokens,
+            Stats,
             TokenFlow,
             TokenFlows,
             Usd,
         },
         AppState,
         PriceSource,
+        KEPT_PER_CHAIN,
     },
     db::{
         Store,
@@ -529,9 +531,10 @@ async fn a_price_older_than_a_day_is_not_used() {
     suite.done();
 }
 
-/// Each chain asks prices for at most [`CANDIDATES_PER_CHAIN`] tokens
-/// beyond its coin, the most moved first. A token priced once stays asked:
-/// tokens anybody writes and moves more cannot push it out.
+/// Each chain asks prices for its coin, the tokens it kept, and at most
+/// [`CANDIDATES_PER_CHAIN`] others, the most moved first. A token priced
+/// once stays asked: tokens anybody writes and moves more cannot push it
+/// out.
 #[tokio::test]
 async fn a_token_priced_before_keeps_its_place() {
     let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
@@ -589,7 +592,7 @@ async fn a_token_priced_before_keeps_its_place() {
 }
 
 /// A token's value past the arithmetic, or decimals past it, leaves the
-/// token unpriced and the answer served: anybody chooses an amount, and the
+/// token unpriced under `other` and the answer served: anybody chooses an amount, and the
 /// source chooses a price and decimals.
 #[tokio::test]
 async fn a_value_past_the_arithmetic_leaves_its_token_unpriced() {
@@ -614,11 +617,11 @@ async fn a_value_past_the_arithmetic_leaves_its_token_unpriced() {
     assert_eq!(
         stats.chain(CHAIN).total.escrow.deposits,
         TokenFlows {
-            tokens: vec![TokenFlow::unpriced(USDC, U256::MAX.to())],
+            tokens: Vec::new(),
             usd: Usd::default(),
             other: Some(OtherTokens {
-                count: 1,
-                wallets: 1,
+                count: 2,
+                wallets: 2,
             }),
         }
     );
@@ -651,6 +654,134 @@ async fn a_long_symbol_is_not_served() {
     let flows = stats.chain(CHAIN).total.escrow.deposits;
     assert_eq!(flows.tokens[0].symbol, None);
     assert_eq!(flows.tokens[0].usd, Some(usd("2.50")));
+    suite.store().forget().await;
+    suite.done();
+}
+
+/// Junk tokens moved more each round, n per round.
+fn junk(from: u64, count: u64) -> Vec<NamesEvent> {
+    (from..from + count)
+        .map(|i| Address::from_word(U256::from(i).into()))
+        .flat_map(|token| {
+            [
+                NamesEvent::deposited(token, SENDER, U256::from(1u64)),
+                NamesEvent::deposited(token, SENDER, U256::from(1u64)),
+            ]
+        })
+        .collect()
+}
+
+/// Dust of tokens the source prices joins the kept tokens 40 per
+/// computation, but each chain keeps only the [`KEPT_PER_CHAIN`] that moved
+/// the most USD: a token with real volume stays named, and the coins asked
+/// stop growing at the kept and the new.
+#[tokio::test]
+async fn priced_dust_cannot_grow_the_tokens_asked() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let mock = MockSource::start().await;
+    mock.price(USDC, Coin::priced(1.0, 6, "USDC"));
+    let dust = 2_000..2_000 + 3 * CANDIDATES_PER_CHAIN as u64 + 30;
+    for i in dust.clone() {
+        let token = Address::from_word(U256::from(i).into());
+        mock.price(token, Coin::priced(1.0, 6, "DUST"));
+    }
+    let source = mock.source();
+    let api = || {
+        AppState::new(Store::new(suite.pool.clone()))
+            .pricing(Arc::clone(&source))
+            .router()
+    };
+    let paid = NamesEvent::deposited(USDC, PAYER, U256::from(1_000_000_000u64));
+    suite.apply(10, paid).await;
+    api().stats().await;
+    mock.asked();
+    suite
+        .apply_tx(11, junk(dust.start, dust.end - dust.start))
+        .await;
+
+    let mut asked = Vec::new();
+    let mut named = Vec::new();
+    for _ in 0..5 {
+        let stats = api().stats().await;
+        asked.push(mock.asked().len());
+        named = stats
+            .chain(CHAIN)
+            .total
+            .escrow
+            .deposits
+            .tokens
+            .iter()
+            .map(|flow| flow.token)
+            .collect();
+    }
+    let new = CANDIDATES_PER_CHAIN as usize;
+    assert_eq!(
+        asked,
+        [
+            1 + new,
+            1 + 2 * new,
+            1 + 3 * new,
+            KEPT_PER_CHAIN + new,
+            KEPT_PER_CHAIN + new
+        ]
+    );
+    assert_eq!(named.len(), KEPT_PER_CHAIN);
+    assert!(named.contains(&USDC), "{named:?}");
+    suite.store().forget().await;
+    suite.done();
+}
+
+/// A kept token answered once without confidence is not valued that
+/// round, stays asked, and is valued again once the source is confident.
+#[tokio::test]
+async fn a_confidence_dip_keeps_a_token_asked() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let mock = MockSource::start().await;
+    mock.price(USDC, Coin::priced(1.0, 6, "USDC"));
+    let source = mock.source();
+    let api = || {
+        AppState::new(Store::new(suite.pool.clone()))
+            .pricing(Arc::clone(&source))
+            .router()
+    };
+    let usdc_named = |stats: Stats| {
+        stats
+            .chain(CHAIN)
+            .total
+            .escrow
+            .deposits
+            .tokens
+            .iter()
+            .any(|flow| flow.token == USDC)
+    };
+    suite
+        .apply(10, NamesEvent::deposited(USDC, PAYER, U256::from(1_000u64)))
+        .await;
+    assert!(usdc_named(api().stats().await));
+    suite
+        .apply_tx(11, junk(3_000, CANDIDATES_PER_CHAIN as u64 + 1))
+        .await;
+    mock.asked();
+
+    mock.price(
+        USDC,
+        Coin {
+            confidence: 0.5,
+            ..Coin::priced(1.0, 6, "USDC")
+        },
+    );
+    assert!(!usdc_named(api().stats().await));
+    assert!(mock.asked().contains(&coin_id(USDC)));
+
+    mock.price(USDC, Coin::priced(1.0, 6, "USDC"));
+    assert!(usdc_named(api().stats().await));
+    assert!(mock.asked().contains(&coin_id(USDC)));
     suite.store().forget().await;
     suite.done();
 }

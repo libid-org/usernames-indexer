@@ -160,6 +160,24 @@ impl ChainToken {
     }
 }
 
+/// A token worth a price, and what its deposits and forwards moved.
+#[derive(Debug, sqlx::FromRow)]
+pub struct Candidate {
+    /// The token.
+    #[sqlx(flatten)]
+    pub coin: ChainToken,
+    /// The sum of its deposits and forwards, as Postgres prints a
+    /// `numeric`.
+    pub moved: String,
+}
+
+impl Candidate {
+    /// The sum as a number, under [`FeesRow::amount`]'s rule.
+    pub fn moved(&self) -> Option<U512> {
+        self.moved.parse().ok()
+    }
+}
+
 /// The tokens a computation names, once it has their prices.
 pub trait NamedTokens {
     /// The tokens named beside each chain's coin.
@@ -177,7 +195,7 @@ pub struct EscrowFlowRow {
 }
 
 /// The tokens per chain asked a price for beyond its coin and those priced
-/// before. DefiLlama answers 100 coins a request; five chains take two.
+/// before, the most moved first.
 pub const CANDIDATES_PER_CHAIN: i64 = 40;
 
 impl Store {
@@ -194,7 +212,7 @@ impl Store {
         &self,
         kept: &[ChainToken],
         budget: Duration,
-        price: impl FnOnce(Vec<ChainToken>) -> F,
+        price: impl FnOnce(Vec<Candidate>) -> F,
     ) -> Result<(StatsSnapshot, P), sqlx::Error>
     where
         F: Future<Output = P>,

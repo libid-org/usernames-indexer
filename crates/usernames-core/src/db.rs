@@ -84,6 +84,7 @@ pub use self::{
         SearchRow,
     },
     stats::{
+        Candidate,
         ChainToken,
         EscrowFlowRow,
         FeesRow,

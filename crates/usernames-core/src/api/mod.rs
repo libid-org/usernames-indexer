@@ -27,6 +27,7 @@ use serde::Deserialize;
 pub use self::prices::{
     PriceSource,
     DEFILLAMA,
+    KEPT_PER_CHAIN,
 };
 use self::{
     error::{

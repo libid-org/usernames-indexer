@@ -6,6 +6,7 @@
 use std::{
     collections::HashMap,
     future::Future,
+    ops::RangeInclusive,
     str::FromStr,
     sync::{
         Mutex,
@@ -31,6 +32,7 @@ use super::model::Usd;
 use crate::{
     chain::NATIVE_COIN,
     db::{
+        Candidate,
         ChainToken,
         NamedTokens,
     },
@@ -72,8 +74,23 @@ const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// must fit the arithmetic.
 const MAX_DECIMALS: u32 = 77;
 
+/// The priced tokens a chain names and keeps asking for, those that moved
+/// the most USD at their prices: a deposit of dust cannot buy a place. With
+/// [`CANDIDATES_PER_CHAIN`](crate::db::CANDIDATES_PER_CHAIN) new ones, a computation asks at most 141 coins
+/// per chain.
+pub const KEPT_PER_CHAIN: usize = 100;
+
 /// The longest symbol served; a token's creator writes it.
 const MAX_SYMBOL: usize = 32;
+
+/// Format characters that reorder text or take no width, which a symbol
+/// could use to pass for another: zero-width spaces and joiners, the bidi
+/// marks, embeddings, overrides and isolates.
+const HIDDEN: [RangeInclusive<char>; 3] = [
+    '\u{200B}'..='\u{200F}',
+    '\u{202A}'..='\u{202E}',
+    '\u{2066}'..='\u{2069}',
+];
 
 /// A price in units of 10^-18 USD.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,6 +174,15 @@ impl Quote {
             .checked_mul(self.price.0)
             .map(|product| Usd::from_cents(product / divisor))
     }
+
+    /// `amount` token units in units of 10^-18 USD, a rank finer than
+    /// cents; `None` when the arithmetic overflows.
+    fn worth(&self, amount: U512) -> Option<U512> {
+        let divisor = ten_to(u32::from(self.decimals))?;
+        amount
+            .checked_mul(self.price.0)
+            .map(|product| product / divisor)
+    }
 }
 
 /// One coin of a source's answer.
@@ -177,13 +203,15 @@ struct Answer {
 
 impl Priced {
     /// The symbol as served: at most [`MAX_SYMBOL`] characters, none of
-    /// them a control character.
+    /// them a control character or one that reorders or hides text.
     fn symbol(&self) -> Option<String> {
         self.symbol
             .as_deref()
             .filter(|symbol| {
                 symbol.chars().count() <= MAX_SYMBOL
-                    && !symbol.chars().any(char::is_control)
+                    && !symbol.chars().any(|c| {
+                        c.is_control() || HIDDEN.iter().any(|hidden| hidden.contains(&c))
+                    })
             })
             .map(str::to_string)
     }
@@ -221,15 +249,92 @@ impl Quotes {
     }
 }
 
-/// A price source and the last good quote of every coin it priced. The one
-/// stats computation running at a time asks it, so it has one writer.
+/// A coin priced with confidence at least once: its last confident quote,
+/// and whether the source's latest answer for it was confident too.
+#[derive(Clone, Debug)]
+struct Known {
+    quote: Quote,
+    current: bool,
+}
+
+/// The coins a source priced with confidence, by coin: the tokens each
+/// computation asks again, and the quotes it may value them at.
+#[derive(Debug, Default)]
+struct Book(HashMap<ChainToken, Known>);
+
+impl Book {
+    /// What the source answered for `coin`: a confident quote replaces the
+    /// last one, and any other answer leaves it unable to value the coin
+    /// while keeping the coin known.
+    fn learn(&mut self, coin: ChainToken, priced: &Priced) {
+        match priced.quote() {
+            Some(quote) => {
+                self.0.insert(
+                    coin,
+                    Known {
+                        quote,
+                        current: true,
+                    },
+                );
+            }
+            None => {
+                if let Some(known) = self.0.get_mut(&coin) {
+                    known.current = false;
+                }
+            }
+        }
+    }
+
+    /// Keep, per chain, the [`KEPT_PER_CHAIN`] known `candidates` that moved
+    /// the most USD at their last confident quote, ties by token; forget the
+    /// rest.
+    fn keep(&mut self, candidates: &[Candidate]) {
+        let mut chains: HashMap<i64, Vec<(U512, ChainToken)>> = HashMap::new();
+        for candidate in candidates {
+            let worth = self
+                .0
+                .get(&candidate.coin)
+                .zip(candidate.moved())
+                .and_then(|(known, moved)| known.quote.worth(moved));
+            if let Some(worth) = worth {
+                let chain = chains.entry(candidate.coin.chain_id).or_default();
+                chain.push((worth, candidate.coin));
+            }
+        }
+        let mut kept = HashMap::new();
+        for mut ranked in chains.into_values() {
+            ranked.sort_by(|(a, x), (b, y)| b.cmp(a).then(x.token.cmp(&y.token)));
+            for (_, coin) in ranked.into_iter().take(KEPT_PER_CHAIN) {
+                if let Some(known) = self.0.remove(&coin) {
+                    kept.insert(coin, known);
+                }
+            }
+        }
+        self.0 = kept;
+    }
+
+    /// The quotes that value their coins now: the source's latest answer
+    /// was confident, and the price is under a day old.
+    fn quotes(&self) -> Quotes {
+        let oldest = unix_now().saturating_sub(MAX_AGE.as_secs() as i64);
+        Quotes(
+            self.0
+                .iter()
+                .filter(|(_, known)| known.current && known.quote.at >= oldest)
+                .map(|(coin, known)| (*coin, known.quote.clone()))
+                .collect(),
+        )
+    }
+}
+
+/// A price source and the coins it priced with confidence. The one stats
+/// computation running at a time asks it, so it has one writer.
 pub struct PriceSource {
     base: Url,
     chains: HashMap<i64, String>,
     client: reqwest::Client,
-    held: Mutex<HashMap<ChainToken, Quote>>,
+    book: Mutex<Book>,
 }
-
 impl PriceSource {
     /// The source at `base`, DefiLlama's [`DEFILLAMA`] or one that answers
     /// the same way.
@@ -241,7 +346,7 @@ impl PriceSource {
                 .map(|(chain_id, name)| (*chain_id, name.to_string()))
                 .collect(),
             client: reqwest::Client::new(),
-            held: Mutex::default(),
+            book: Mutex::default(),
         }
     }
 
@@ -265,20 +370,28 @@ impl PriceSource {
         Some(format!("{chain}:{token:#x}"))
     }
 
-    /// The coins priced before, which stay among those asked: a token
-    /// anybody wrote cannot push them out.
+    /// The coins priced with confidence before and kept, which stay among
+    /// those asked whatever their latest answer: a token anybody wrote
+    /// cannot push them out.
     pub(crate) fn priced_before(&self) -> Vec<ChainToken> {
-        self.held().keys().copied().collect()
+        let book = self.book();
+        let coins = book.0.keys().copied().collect();
+        drop(book);
+        coins
     }
 
-    /// Prices for `coins`, asked now. A coin the source prices with
-    /// confidence takes the new quote, and one it answers otherwise loses
-    /// its price; a request that fails keeps the quotes held for its coins.
-    /// A quote older than a day is not used.
-    pub(crate) async fn quotes(&self, coins: &[ChainToken]) -> Quotes {
-        let ids: HashMap<String, ChainToken> = coins
+    /// Prices for `candidates`, asked now. A coin the source prices with
+    /// confidence takes the new quote, and one it answers otherwise is not
+    /// valued until it is again; a request that fails keeps the quotes of its
+    /// coins. A quote older than a day values nothing. Each chain keeps the
+    /// [`KEPT_PER_CHAIN`] priced coins that moved the most USD; the rest are
+    /// forgotten and not valued.
+    pub(crate) async fn quotes(&self, candidates: &[Candidate]) -> Quotes {
+        let ids: HashMap<String, ChainToken> = candidates
             .iter()
-            .filter_map(|coin| Some((self.coin_id(coin)?, *coin)))
+            .filter_map(|candidate| {
+                Some((self.coin_id(&candidate.coin)?, candidate.coin))
+            })
             .collect();
         let mut asked: Vec<&String> = ids.keys().collect();
         asked.sort();
@@ -300,22 +413,16 @@ impl PriceSource {
                 }
             }
         }
-        let mut held = self.held();
-        for (id, priced) in fresh {
-            let Some(coin) = ids.get(&id) else { continue };
-            match priced.quote() {
-                Some(quote) => held.insert(*coin, quote),
-                None => held.remove(coin),
-            };
+        let mut book = self.book();
+        for (id, priced) in &fresh {
+            if let Some(coin) = ids.get(id) {
+                book.learn(*coin, priced);
+            }
         }
-        let oldest = unix_now().saturating_sub(MAX_AGE.as_secs() as i64);
-        held.retain(|_, quote| quote.at >= oldest);
-        let quotes = coins
-            .iter()
-            .filter_map(|coin| Some((*coin, held.get(coin)?.clone())))
-            .collect();
-        drop(held);
-        Quotes(quotes)
+        book.keep(candidates);
+        let quotes = book.quotes();
+        drop(book);
+        quotes
     }
 
     /// The request for one batch of coin ids.
@@ -329,8 +436,8 @@ impl PriceSource {
         Ok(url)
     }
 
-    fn held(&self) -> MutexGuard<'_, HashMap<ChainToken, Quote>> {
-        self.held
+    fn book(&self) -> MutexGuard<'_, Book> {
+        self.book
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -450,5 +557,8 @@ mod tests {
         assert_eq!(symbol(&"A".repeat(33)), None);
         assert_eq!(symbol("US\u{7}DC"), None);
         assert_eq!(symbol("US\nDC"), None);
+        assert_eq!(symbol("US\u{202E}DC"), None);
+        assert_eq!(symbol("US\u{200B}DC"), None);
+        assert_eq!(symbol("US\u{2066}DC"), None);
     }
 }
