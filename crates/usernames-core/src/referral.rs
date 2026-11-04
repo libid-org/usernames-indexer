@@ -29,6 +29,9 @@ impl Code {
     /// The bytes of its node a code carries. At 8 bytes, about 11
     /// characters, two of a million nodes share one with odds of about 3e-8.
     const LENGTHS: RangeInclusive<usize> = 8..=32;
+    /// The longest code: 32 bytes of 0xff in base58. Text past it is refused
+    /// before decoding, whose cost grows with the square of the length.
+    const MAX_CHARS: usize = 44;
 
     /// Every code `node` may go by, shortest first, the whole node last.
     pub fn prefixes(node: B256) -> impl Iterator<Item = Self> {
@@ -59,6 +62,9 @@ impl FromStr for Code {
     type Err = InvalidCode;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.len() > Self::MAX_CHARS {
+            return Err(InvalidCode);
+        }
         let bytes = bs58::decode(s).into_vec().map_err(|_| InvalidCode)?;
         if !Self::LENGTHS.contains(&bytes.len()) {
             return Err(InvalidCode);
@@ -75,6 +81,11 @@ impl fmt::Display for Code {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{
+        Duration,
+        Instant,
+    };
+
     use super::*;
 
     #[test]
@@ -98,6 +109,19 @@ mod tests {
         for text in ["0OIl0OIl0OIl", "not base58!", ""] {
             assert!(text.parse::<Code>().is_err(), "{text:?}");
         }
+    }
+
+    #[test]
+    fn the_longest_code_reads_and_longer_text_is_refused_before_decoding() {
+        let longest = Code(vec![0xff; 32]).to_string();
+        assert_eq!(longest.len(), Code::MAX_CHARS);
+        assert!(longest.parse::<Code>().is_ok());
+
+        let long = "z".repeat(16_000);
+        let started = Instant::now();
+        assert!(long.parse::<Code>().is_err());
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(50), "{took:?}");
     }
 
     #[test]
