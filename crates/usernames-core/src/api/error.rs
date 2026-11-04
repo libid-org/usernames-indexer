@@ -31,7 +31,10 @@ use super::model::{
     ErrorCode,
     ErrorDetail,
 };
-use crate::db::InvalidCursor;
+use crate::{
+    db::InvalidCursor,
+    referral::InvalidCode,
+};
 /// A refusal: its status, and the code and prose of the [`ErrorBody`] it
 /// renders as.
 pub(crate) struct ApiError {
@@ -72,6 +75,14 @@ impl ApiError {
             message: "internal error".into(),
             source: None,
         }
+    }
+
+    /// A referral code no bound handle node starts.
+    pub(crate) fn code_not_issued() -> Self {
+        Self::not_found(
+            ErrorCode::CodeNotIssued,
+            "no chain has bound a handle this code names",
+        )
     }
 
     pub(crate) fn not_synced(chain: Option<i64>) -> Self {
@@ -124,6 +135,12 @@ impl From<QueryRejection> for ApiError {
 impl From<InvalidCursor> for ApiError {
     fn from(e: InvalidCursor) -> Self {
         Self::bad_request(ErrorCode::InvalidCursor, e.to_string())
+    }
+}
+
+impl From<InvalidCode> for ApiError {
+    fn from(e: InvalidCode) -> Self {
+        Self::bad_request(ErrorCode::InvalidCode, e.to_string())
     }
 }
 
