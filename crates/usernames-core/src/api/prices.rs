@@ -74,8 +74,10 @@ const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// must fit the arithmetic.
 const MAX_DECIMALS: u32 = 77;
 
-/// The priced tokens a chain names and keeps asking for, those that moved
-/// the most USD at their prices: a deposit of dust cannot buy a place. With
+/// The priced tokens a chain names and keeps asking for beside its coin:
+/// those valued now first, then those that moved the most USD at their last
+/// confident prices. A deposit of dust cannot buy a place, and a token that
+/// lost its price cannot hold one against a token that has one. With
 /// [`CANDIDATES_PER_CHAIN`](crate::db::CANDIDATES_PER_CHAIN) new ones, a computation asks at most 141 coins
 /// per chain.
 pub const KEPT_PER_CHAIN: usize = 100;
@@ -257,6 +259,14 @@ struct Known {
     current: bool,
 }
 
+impl Known {
+    /// Whether the quote values its coin: the source's latest answer was
+    /// confident, and the price is from `oldest` on.
+    fn values(&self, oldest: i64) -> bool {
+        self.current && self.quote.at >= oldest
+    }
+}
+
 /// The coins a source priced with confidence, by coin: the tokens each
 /// computation asks again, and the quotes it may value them at.
 #[derive(Debug, Default)]
@@ -285,42 +295,54 @@ impl Book {
         }
     }
 
-    /// Keep, per chain, the [`KEPT_PER_CHAIN`] known `candidates` that moved
-    /// the most USD at their last confident quote, ties by token; forget the
-    /// rest.
+    /// Keep each chain's own coin and, per chain, the [`KEPT_PER_CHAIN`]
+    /// known `candidates` ranked by whether they value now, then by the USD
+    /// they moved at their last confident quote, ties by token; forget the
+    /// rest. A coin that lost its price never outranks one that has one.
     fn keep(&mut self, candidates: &[Candidate]) {
-        let mut chains: HashMap<i64, Vec<(U512, ChainToken)>> = HashMap::new();
+        let oldest = Self::oldest();
+        let mut chains: HashMap<i64, Vec<(bool, U512, ChainToken)>> = HashMap::new();
+        let mut kept = HashMap::new();
         for candidate in candidates {
-            let worth = self
-                .0
-                .get(&candidate.coin)
-                .zip(candidate.moved())
-                .and_then(|(known, moved)| known.quote.worth(moved));
+            let Some(known) = self.0.get(&candidate.coin) else {
+                continue;
+            };
+            if candidate.coin.token == NATIVE_COIN {
+                kept.insert(candidate.coin, known.clone());
+                continue;
+            }
+            let worth = candidate.moved().and_then(|moved| known.quote.worth(moved));
             if let Some(worth) = worth {
                 let chain = chains.entry(candidate.coin.chain_id).or_default();
-                chain.push((worth, candidate.coin));
+                chain.push((known.values(oldest), worth, candidate.coin));
             }
         }
-        let mut kept = HashMap::new();
         for mut ranked in chains.into_values() {
-            ranked.sort_by(|(a, x), (b, y)| b.cmp(a).then(x.token.cmp(&y.token)));
-            for (_, coin) in ranked.into_iter().take(KEPT_PER_CHAIN) {
-                if let Some(known) = self.0.remove(&coin) {
-                    kept.insert(coin, known);
+            ranked.sort_by(|(now_a, a, x), (now_b, b, y)| {
+                now_b.cmp(now_a).then(b.cmp(a)).then(x.token.cmp(&y.token))
+            });
+            for (_, _, coin) in ranked.into_iter().take(KEPT_PER_CHAIN) {
+                if let Some(known) = self.0.get(&coin) {
+                    kept.insert(coin, known.clone());
                 }
             }
         }
         self.0 = kept;
     }
 
+    /// The oldest unix second a quote may be from and still value its coin.
+    fn oldest() -> i64 {
+        unix_now().saturating_sub(MAX_AGE.as_secs() as i64)
+    }
+
     /// The quotes that value their coins now: the source's latest answer
     /// was confident, and the price is under a day old.
     fn quotes(&self) -> Quotes {
-        let oldest = unix_now().saturating_sub(MAX_AGE.as_secs() as i64);
+        let oldest = Self::oldest();
         Quotes(
             self.0
                 .iter()
-                .filter(|(_, known)| known.current && known.quote.at >= oldest)
+                .filter(|(_, known)| known.values(oldest))
                 .map(|(coin, known)| (*coin, known.quote.clone()))
                 .collect(),
         )
@@ -494,6 +516,8 @@ fn unix_now() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::U256;
+
     use super::*;
 
     fn price(text: &str) -> U512 {
@@ -560,5 +584,58 @@ mod tests {
         assert_eq!(symbol("US\u{202E}DC"), None);
         assert_eq!(symbol("US\u{200B}DC"), None);
         assert_eq!(symbol("US\u{2066}DC"), None);
+    }
+
+    /// A known coin of chain 1 with 18 decimals, priced at `dollars` at
+    /// unix second `at`, `current` or not.
+    fn known(
+        token: Address,
+        dollars: u64,
+        at: i64,
+        current: bool,
+    ) -> (ChainToken, Known) {
+        let coin = ChainToken { chain_id: 1, token };
+        let quote = Quote {
+            symbol: None,
+            decimals: 18,
+            price: Price(U512::from(dollars) * U512::from(10u8).pow(U512::from(18u8))),
+            at,
+        };
+        (coin, Known { quote, current })
+    }
+
+    #[test]
+    fn coins_without_a_price_cannot_push_out_those_with_one() {
+        let now = unix_now();
+        let real = Address::repeat_byte(0x05);
+        let mut book = Book::default();
+        let mut candidates = Vec::new();
+        let mut add = |(coin, known): (ChainToken, Known), moved: &str| {
+            book.0.insert(coin, known);
+            candidates.push(Candidate {
+                coin,
+                moved: moved.to_string(),
+            });
+        };
+        add(known(NATIVE_COIN, 3_000, now, true), "10");
+        add(known(real, 1, now, true), "10");
+        for i in 0..KEPT_PER_CHAIN as u64 {
+            let lapsed = Address::from_word(U256::from(1_000 + i).into());
+            add(
+                known(lapsed, 1, now - 2 * 24 * 60 * 60, false),
+                "1000000000000000000000000",
+            );
+        }
+        book.keep(&candidates);
+        let quotes = book.quotes();
+        assert!(
+            quotes.0.contains_key(&candidates[0].coin),
+            "the chain's coin"
+        );
+        assert!(
+            quotes.0.contains_key(&candidates[1].coin),
+            "the valued token"
+        );
+        assert_eq!(book.0.len(), 1 + KEPT_PER_CHAIN);
     }
 }
