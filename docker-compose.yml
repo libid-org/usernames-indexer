@@ -34,6 +34,9 @@ services:
       postgres:
         condition: service_healthy
     restart: unless-stopped
+    # Past compose's 10s default: a stopped indexer takes up to 10s to finish
+    # its window and release its lease.
+    stop_grace_period: 20s
 
   api:
     build:
@@ -64,6 +67,8 @@ services:
       indexer:
         condition: service_started
     restart: unless-stopped
+    # Past the API's 10s drain of requests in flight, compose's default.
+    stop_grace_period: 20s
 
   postgres:
     image: postgres:16

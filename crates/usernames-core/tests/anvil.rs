@@ -185,8 +185,8 @@ async fn indexes_a_real_chain_end_to_end() {
         escrow_as_registry.check_registry(provider).await,
         Err(chain::RegistryRefused::Unread { .. })
     ));
-    let lease = store.acquire_writer().await.expect("writer lease");
-    let writer = store.prepare(&lease, contracts).await.expect("prepare");
+    let mut lease = store.acquire_writer().await.expect("writer lease");
+    let writer = store.prepare(&mut lease, contracts).await.expect("prepare");
 
     // Run the real loop: no start override (detection must find the deploy
     // block), a tiny window so catch-up spans several chunks, and one

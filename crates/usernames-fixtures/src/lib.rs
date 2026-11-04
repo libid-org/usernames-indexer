@@ -224,10 +224,10 @@ pub trait Seed {
 
 impl Seed for ChainStore {
     async fn writer(&self) -> ChainWriter {
-        let lease = self.acquire_writer().await.expect("the writer lease");
+        let mut lease = self.acquire_writer().await.expect("the writer lease");
         let writer = self
             .prepare(
-                &lease,
+                &mut lease,
                 Contracts {
                     registry: REGISTRY,
                     escrow: None,

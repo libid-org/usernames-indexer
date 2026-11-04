@@ -97,7 +97,7 @@ where
                 };
                 match waits.next() {
                     Some(wait) if Retry::sends_again(&error) => {
-                        let error = rpc.redact(error.to_string());
+                        let error = rpc.redact(&anyhow::Error::new(error));
                         tracing::warn!(%error, ?wait, "RPC call failed; trying again");
                         tokio::time::sleep(*wait).await;
                     }
