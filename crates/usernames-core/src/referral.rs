@@ -117,11 +117,16 @@ mod tests {
         assert_eq!(longest.len(), Code::MAX_CHARS);
         assert!(longest.parse::<Code>().is_ok());
 
-        let long = "z".repeat(16_000);
-        let started = Instant::now();
-        assert!(long.parse::<Code>().is_err());
-        let took = started.elapsed();
-        assert!(took < Duration::from_millis(50), "{took:?}");
+        for len in [Code::MAX_CHARS + 1, 16_000, 64 * 1024] {
+            let long = "z".repeat(len);
+            let started = Instant::now();
+            assert!(long.parse::<Code>().is_err(), "{len} characters");
+            let took = started.elapsed();
+            assert!(
+                took < Duration::from_millis(50),
+                "{len} characters: {took:?}"
+            );
+        }
     }
 
     #[test]

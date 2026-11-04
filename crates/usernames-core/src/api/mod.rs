@@ -618,6 +618,10 @@ mod tests {
                 bad(ErrorCode::InvalidCode),
             ),
             (
+                format!("/v1/referral/code/{}", "z".repeat(45)),
+                bad(ErrorCode::InvalidCode),
+            ),
+            (
                 "/v1/referral/node/0x1234/code".to_string(),
                 bad(ErrorCode::InvalidNode),
             ),
