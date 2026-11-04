@@ -12,6 +12,11 @@ use alloy::primitives::{
     U256,
     U512,
 };
+use std::{
+    fmt,
+    str::FromStr,
+};
+
 use serde::{
     Deserialize,
     Serialize,
@@ -681,10 +686,11 @@ pub struct Unclaimed {
 
 /// `GET /v1/stats`: what the chains this store holds recorded, chain by
 /// chain, and the users across them: totals and a series per UTC day.
-/// Every address counts. Amounts
-/// are token units, never converted. Tokens are named only when they are
-/// the chain's own coin, EIP-7528 `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`,
-/// or a token the deployment lists (`STATS_TOKENS`); anybody can write a
+/// Every address counts. Amounts are token units; a priced token also
+/// carries them after its decimals and in USD, every day valued at the
+/// prices of [`Stats::priced_at`]. Tokens are named only when they are the
+/// chain's own coin, EIP-7528 `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`,
+/// or a token the price source prices with confidence; anybody can write a
 /// token, so every other one is counted under `other`, without an amount.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -692,6 +698,9 @@ pub struct Stats {
     /// Unix seconds, by the database's clock, of the snapshot every number
     /// comes from. The same answer is served for five minutes after it.
     pub computed_at: i64,
+    /// Unix seconds of the oldest price the answer uses; absent when it
+    /// uses none.
+    pub priced_at: Option<i64>,
     /// The wallets across every chain the store holds: one that used
     /// several chains counts once.
     pub total: AllChains,
@@ -710,6 +719,68 @@ pub struct AllChains {
     /// Distinct wallets that linked, sent through the escrow, or claimed
     /// from it, on any chain.
     pub users: i64,
+    /// What senders paid through the escrow, deposits and forwards, on
+    /// every chain.
+    pub payments: Payments,
+}
+
+/// Payments across every chain, in USD where their token is priced.
+#[serde_as]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Payments {
+    /// The priced tokens' payments, in USD.
+    #[serde_as(as = "DisplayFromStr")]
+    pub usd: Usd,
+    /// Payments in tokens without a price, not in `usd`.
+    pub unpriced: i64,
+}
+
+/// A USD amount in cents, served with two places: `1234.05`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Usd(U512);
+
+/// Why a USD amount does not parse.
+#[derive(Debug, thiserror::Error)]
+#[error("not a USD amount with two places: {0}")]
+pub struct UsdError(String);
+
+impl Usd {
+    /// `cents` cents.
+    pub(crate) fn from_cents(cents: U512) -> Self {
+        Self(cents)
+    }
+
+    /// The sum, unless it overflows.
+    pub(crate) fn checked_add(self, other: Self) -> Option<Self> {
+        self.0.checked_add(other.0).map(Self)
+    }
+}
+
+impl fmt::Display for Usd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let hundred = U512::from(100u8);
+        write!(f, "{}.{:0>2}", self.0 / hundred, self.0 % hundred)
+    }
+}
+
+impl FromStr for Usd {
+    type Err = UsdError;
+
+    fn from_str(text: &str) -> Result<Self, UsdError> {
+        let refused = || UsdError(text.to_string());
+        let (dollars, cents) = text.split_once('.').ok_or_else(refused)?;
+        if cents.len() != 2 {
+            return Err(refused());
+        }
+        let dollars = U512::from_str_radix(dollars, 10).map_err(|_| refused())?;
+        let cents = U512::from_str_radix(cents, 10).map_err(|_| refused())?;
+        dollars
+            .checked_mul(U512::from(100u8))
+            .and_then(|total| total.checked_add(cents))
+            .map(Self)
+            .ok_or_else(refused)
+    }
 }
 
 /// One UTC day across every chain the store holds.
@@ -831,11 +902,16 @@ pub struct EscrowActivity {
 }
 
 /// Movements of one kind: per named token, and every other token together.
+#[serde_as]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenFlows {
-    /// The chain's own coin and the listed tokens, by token address.
+    /// The chain's own coin and the priced tokens, by token address.
     pub tokens: Vec<TokenFlow>,
+    /// The priced tokens' movements in USD, each truncated to the cent
+    /// before the sum.
+    #[serde_as(as = "DisplayFromStr")]
+    pub usd: Usd,
     /// Every other token's movements, together; absent when there were
     /// none.
     pub other: Option<OtherTokens>,
@@ -857,6 +933,17 @@ pub struct TokenFlow {
     /// Distinct wallets that made them, as the list that holds this one
     /// names them.
     pub wallets: i64,
+    /// The token's symbol, as its creator wrote it: text to show, never
+    /// markup. Absent when unpriced or not plain.
+    pub symbol: Option<String>,
+    /// The token's decimals; absent when unpriced.
+    pub decimals: Option<u8>,
+    /// `amount` after the decimals, as a decimal string; absent when
+    /// unpriced.
+    pub value: Option<String>,
+    /// `amount` in USD, truncated to the cent; absent when unpriced.
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub usd: Option<Usd>,
 }
 
 /// The movements of every token `/v1/stats` does not name, together: a

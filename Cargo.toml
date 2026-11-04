@@ -28,7 +28,7 @@ libid-identity = { version = "0.21", features = ["node"] }
 libid-profiles = "0.21"
 libid-signer = "0.7"
 # Tells apart the failures in alloy's HTTP transport errors, which carry
-# the reqwest error underneath.
+# the reqwest error underneath, and asks the price source for /v1/stats.
 reqwest = { version = "0.13", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
