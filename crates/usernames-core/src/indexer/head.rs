@@ -24,12 +24,13 @@ pub(crate) struct Head {
 }
 
 /// A head older than a report may live: the endpoint answers, but its node
-/// stopped following the chain, and a report on it would vouch for an index
-/// that cannot move. The message names the head alone, so it stays the same
-/// on every poll that sees that head and is stored once.
+/// stopped following the chain or the chain stopped making blocks, and a
+/// report on it would vouch for an index that cannot move. The message names
+/// the head alone, so it stays the same on every poll that sees that head and
+/// is stored once.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "the head, block {number} stamped at unix time {time}, is older than STALE_AFTER: the endpoint is not following its chain"
+    "the head, block {number} stamped at unix time {time}, is older than STALE_AFTER: the endpoint is not following its chain, or the chain makes no blocks"
 )]
 pub(crate) struct StaleHead {
     /// The head's number.

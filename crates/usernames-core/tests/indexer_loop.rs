@@ -367,10 +367,9 @@ async fn a_head_older_than_the_report_lets_the_report_expire() {
     let mut watch = ChainWatch::new(&chain.pool, chain.writer.store()).await;
     let stalled = watch
         .until(|state| {
-            state
-                .window_error
-                .as_deref()
-                .is_some_and(|error| error.contains("not following its chain"))
+            state.window_error.as_deref().is_some_and(|error| {
+                error.contains("not following its chain, or the chain makes no blocks")
+            })
         })
         .await;
     assert_eq!(
