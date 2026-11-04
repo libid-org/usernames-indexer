@@ -136,7 +136,7 @@ async fn indexes_a_real_chain_end_to_end() {
     // A payer escrows for @bob_x, whom nobody holds yet, pays Alice's held
     // @alice_2 straight through, and escrows for @carol_x. A second payer
     // escrows for @carol_x, takes it back once its refund date has come, and
-    // escrows again. Bob then binds @bob_x privately and claims what waited;
+    // escrows again. Bob then binds @bob_x unlisted and claims what waited;
     // nobody binds @carol_x.
     let (bob_x, carol_x) = (Handle(x, "bob_x"), Handle(x, "carol_x"));
     libid.deposit(payer, bob_x, 100).await;

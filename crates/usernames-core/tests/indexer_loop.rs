@@ -176,7 +176,7 @@ impl Chain {
             .expect("mine");
     }
 
-    /// `holder` binds `handle` on X privately; the block the bind landed in.
+    /// `holder` binds `handle` on X, unlisted; the block the bind landed in.
     async fn bind(&mut self, handle: &'static str, holder: Address) -> u64 {
         self.libid
             .bind(holder, x_proof(handle), Disclose::Nothing, U256::ZERO)

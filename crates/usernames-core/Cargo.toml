@@ -1,6 +1,6 @@
 [package]
 name = "usernames-core"
-version = "0.7.0"
+version = "0.7.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -22,6 +22,7 @@ chrono.workspace = true
 futures-util.workspace = true
 libid-contracts.workspace = true
 libid-identity.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_with.workspace = true
 sqlx.workspace = true
@@ -39,3 +40,4 @@ libid-profiles.workspace = true
 http-body-util.workspace = true
 serde_json.workspace = true
 tower = { workspace = true, features = ["util"] }
+tracing-subscriber.workspace = true

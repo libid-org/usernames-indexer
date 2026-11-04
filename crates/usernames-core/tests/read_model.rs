@@ -398,7 +398,7 @@ async fn a_takeover_keeps_the_disclosed_text() {
             .collect()
     };
 
-    // (a) Tom discloses @lee1; Uma's account takes it privately.
+    // (a) Tom discloses @lee1; Uma's account takes it, unlisted.
     writer
         .apply_tx(1, NamesEvent::bind(tom, x, "555", "lee1", 1_000, true))
         .await;
@@ -467,7 +467,7 @@ async fn a_takeover_keeps_the_disclosed_text() {
 }
 
 /// `publish` over a name overwrites it and logs no `HandleUnpublished`; the
-/// old name's text still shows, after its handle passes, privately, to
+/// old name's text still shows, after its handle passes, unlisted, to
 /// someone else too.
 #[tokio::test]
 async fn publishing_another_name_keeps_the_one_it_replaces_disclosed() {
@@ -493,7 +493,7 @@ async fn publishing_another_name_keeps_the_one_it_replaces_disclosed() {
         Some("kim")
     );
 
-    // Bob's account takes kim privately: Alice's name is lee, so the bind
+    // Bob's account takes kim, unlisted: Alice's name is lee, so the bind
     // withdraws nothing on chain.
     writer
         .apply_tx(4, NamesEvent::bind(bob, x, "71", "kim", 3_000, false))
@@ -539,7 +539,7 @@ async fn a_withdrawn_name_is_no_longer_published_but_still_shows() {
         .apply_tx(1, NamesEvent::bind(alice, x, "111", "alice_1", 1000, true))
         .await;
     // A rename retires the old handle and withdraws the name it published,
-    // before the new, private bind.
+    // before the new, unlisted bind.
     let mut rename = vec![
         NamesEvent::retire(x, "alice_1", alice),
         NamesEvent::unpublish(alice),
@@ -551,7 +551,7 @@ async fn a_withdrawn_name_is_no_longer_published_but_still_shows() {
     let resolved: AddressResolution = chains.pool.get_on(CHAIN, &address).await.answer();
     let identity = resolved.identities.only();
     assert!(!identity.published);
-    assert_eq!(identity.handle, None, "a private bind shows no text");
+    assert_eq!(identity.handle, None, "an unlisted bind shows no text");
 
     // A later `publish` discloses it.
     writer
@@ -789,7 +789,7 @@ async fn search_ranks_exact_prefix_substring() {
             NamesEvent::bind(Address::repeat_byte(5), github, "5", "alicorn", 1000, true),
         )
         .await;
-    // A private bind is never a hit, whatever it would match.
+    // An unlisted bind nobody named is no hit, whatever it would match.
     writer
         .apply_tx(
             6,

@@ -413,7 +413,7 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
         .answer();
     assert!(daves.amounts.is_empty());
 
-    // Bob binds @bob_1 privately: what is held is his to claim, under the
+    // Bob binds @bob_1 unlisted: what is held is his to claim, under the
     // text the deposit disclosed.
     suite
         .apply_tx(5, NamesEvent::bind(bob, X, "222", "bob_1", 5_000, false))
@@ -850,7 +850,7 @@ async fn a_retired_handle_is_in_the_history_of_the_address_that_held_it() {
     ];
     rename.extend(NamesEvent::bind(alice, X, "777", "kim2", 2_000, true));
     suite.apply_tx(2, rename).await;
-    // The account moves to Bob's address and renames to @kim3, privately:
+    // The account moves to Bob's address and renames to @kim3, unlisted:
     // @kim2 retires from Alice, and her name for it goes.
     let mut to_bob = vec![
         NamesEvent::retire(X, "kim2", alice),

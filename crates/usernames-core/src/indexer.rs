@@ -8,6 +8,7 @@
 
 mod deadline;
 mod head;
+mod retry;
 mod rpc;
 
 use std::time::Duration;

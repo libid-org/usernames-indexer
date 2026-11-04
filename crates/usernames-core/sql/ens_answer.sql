@@ -1,6 +1,6 @@
 -- What the ENS gateway answers from, read in one statement and so from one
 -- snapshot: the chain's row, which says how far its index got, and who holds
--- the handle node there. The gateway answers every binding, a private one
+-- the handle node there. The gateway answers every binding, an unlisted one
 -- too, as `resolveHandle` does.
 SELECT c.chain_id, c.indexer_version, c.contract, c.escrow, c.deploy_block,
        c.cursor, c.head, c.target, c.reported_at,

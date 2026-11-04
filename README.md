@@ -17,10 +17,13 @@ Neither binary contains logic: both stand on the `usernames-core` library,
 where the read model, the event decoding and the loop itself live.
 
 The chain keys every binding by node: `SHA256(tag || id)` and
-`SHA256(tag || folded handle)`, the nodes the circuits output. No plaintext
-id ever reaches the chain, and handle text reaches it only where somebody
-disclosed it: a disclosing bind, `publish` or `reveal` on the registry, or a
-`depositToHandle` on the escrow. Each logs the text in the one
+`SHA256(tag || folded handle)`, the nodes the circuits output. Anyone who has
+an id or a handle hashes it to the same node, so a binding without handle
+text is unlisted: it resolves for whoever has the id or the handle
+([libID spec §12](https://github.com/libid-org/libID/blob/main/specs/ceremony-common.md#12-security-considerations)).
+Handle text reaches the chain wherever an account names it: a disclosing
+bind, `publish` or `reveal` by its holder on the registry, or a
+`depositToHandle` on the escrow by any payer. Each logs the text in the one
 `HandleRevealed` event both contracts share. The read model holds exactly
 that much. It keys bindings by node, keeps one map from node to revealed
 text, and checks that each text hashes to its node before it stores it.
@@ -86,7 +89,7 @@ set `STALE_AFTER` past the chain's longest gap between blocks.
 |---|---|
 | `GET /v1/resolve/handle/{platform}/{handle}` | The wallet a handle resolves to (`resolveHandle`) on each chain it is bound on, each with the id node it pairs with. The handle is hashed here into its node |
 | `GET /v1/resolve/handle-node/{handleNode}` | The same, by node |
-| `GET /v1/resolve/id-node/{idNode}` | The wallet an id node resolves to (`resolveId`) on each chain it is bound on, each with the handle node that account holds now. The client hashes the id (`libid-identity`, or `idNode` in `@libid/contracts`) and sends only its node |
+| `GET /v1/resolve/id-node/{idNode}` | The wallet an id node resolves to (`resolveId`) on each chain it is bound on, each with the handle node that account holds now. The client hashes the id (`libid-identity`, or `idNode` in `@libid/contracts`) and sends its node |
 | `GET /v1/resolve/address/{address}` | Every identity a wallet proved on every chain, by id node, with `resolves`, and `published` on the one whose handle is the wallet's name (`primaryHandleOf`) |
 | `GET /v1/search?q=gre&platform=x&owner=0x…&limit=10&offset=0` | Live handles whose text the chain disclosed, matching a partial query (exact, then prefix, then substring, then trigram-fuzzy), linked to a wallet, or both; one of `q` and `owner` is required, and a `q` without `owner` has at least three characters. `limit` (1..50, default 10) and `offset` (up to 10000) page the ranked list; a page shorter than `limit` is the last |
 | `GET /v1/history/address/{address}?before=&limit=` | Every event the address took part in, newest first, each with its `roles`: `holder`, `previousHandleHolder` and `previousIdHolder` (an event took that handle or account from it), `feeReceiver`, `sender` (of a deposit; a claim that took it names it too), `claimer`, `recipient` |
@@ -125,9 +128,11 @@ routes fold the text's A-Z and hash it, the way `depositToHandle` does, so
 **Handle text shows once the chain disclosed it.** Every response that
 carries handle text (`handle` in resolutions, search hits, histories and
 escrow amounts) takes it from `names.handle_nodes`, the map every
-`HandleRevealed` fills, whichever contract logged it. The API explores the chain's
-history, so a name its holder later withdrew or replaced, or a handle that
-passed privately to another account, still shows the text once disclosed;
+`HandleRevealed` fills, whichever contract logged it and whoever sent it: a
+payer's `depositToHandle` shows a held handle beside its holder, as the
+holder's own `publish` does. The API explores the chain's history, so a name
+its holder later withdrew or replaced, or a handle that passed to another
+account in an unlisted bind, still shows the text once disclosed;
 `published` says whether it is the holder's name now: one per holder, on
 whichever platform. Text is stored
 only when it is a token a circuit hashes (printable ASCII without `"` or `\`,

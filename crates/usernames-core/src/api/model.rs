@@ -192,7 +192,7 @@ pub struct IdBinding {
 }
 
 /// `GET /v1/resolve/id-node/{idNode}`: the wallet an id node resolves to on
-/// each chain it is bound on. The user id never reaches the server.
+/// each chain it is bound on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IdResolution {
