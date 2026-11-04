@@ -34,16 +34,23 @@ use super::{
         EscrowActivity,
         FeesPaid,
         OtherTokens,
+        Payments,
         PlatformHandles,
         PlatformLinks,
         Stats,
         TokenFlow,
         TokenFlows,
     },
+    prices::{
+        PriceSource,
+        Quote,
+        Quotes,
+    },
     AppState,
 };
 use crate::{
     db::{
+        ChainToken,
         FeesRow,
         HandlesRow,
         LinksRow,
@@ -67,11 +74,25 @@ const STATS_DEADLINE: Duration = Duration::from_secs(30);
 pub(crate) async fn stats(State(state): State<AppState>) -> Result<Response, ApiError> {
     let AppState {
         store,
-        listed,
+        prices,
         stats,
     } = state;
     let body = stats
-        .get(|| async move { Stats::of(store.stats(&listed, STATS_DEADLINE).await?) })
+        .get(|| async move {
+            let kept = prices
+                .as_deref()
+                .map(PriceSource::priced_before)
+                .unwrap_or_default();
+            let (snapshot, quotes) = store
+                .stats(&kept, STATS_DEADLINE, |candidates| async move {
+                    match prices.as_deref() {
+                        Some(source) => source.quotes(&candidates).await,
+                        None => Quotes::default(),
+                    }
+                })
+                .await?;
+            Stats::of(snapshot, &quotes)
+        })
         .await?;
     Ok(([(CONTENT_TYPE, "application/json")], body).into_response())
 }
@@ -143,9 +164,10 @@ impl StatsCache {
 }
 
 impl Stats {
-    /// The answer from the store's aggregates: every chain the store holds,
-    /// each with its totals and its days.
-    fn of(snapshot: StatsSnapshot) -> Result<Self, ApiError> {
+    /// The answer from the store's aggregates, its tokens valued at
+    /// `quotes`: every chain the store holds, each with its totals and its
+    /// days.
+    fn of(snapshot: StatsSnapshot, quotes: &Quotes) -> Result<Self, ApiError> {
         let mut chains = Tallies(
             snapshot
                 .chains
@@ -199,17 +221,22 @@ impl Stats {
                 .span(row.flow.day)
                 .escrow
                 .flows(kind)?
-                .add(&row.flow)?;
+                .add(&row.flow, quotes)?;
         }
         for row in snapshot.onboarding_claims {
             chains
                 .chain(row.chain_id)
                 .span(row.day)
                 .onboarding_claims
-                .add(&row)?;
+                .add(&row, quotes)?;
+        }
+        for tally in chains.0.values() {
+            total.payments.add(&tally.total.escrow.deposits);
+            total.payments.add(&tally.total.escrow.forwards);
         }
         Ok(Self {
             computed_at: snapshot.taken_at,
+            priced_at: quotes.taken_at(),
             total,
             days: days.into_values().collect(),
             chains: chains.0.into_values().map(ChainStats::from).collect(),
@@ -331,11 +358,37 @@ impl FeesPaid {
     }
 }
 
+impl Payments {
+    /// Count the payments of `flows`.
+    fn add(&mut self, flows: &TokenFlows) {
+        for flow in &flows.tokens {
+            match flow.usd.and_then(|usd| self.usd.checked_add(usd)) {
+                Some(usd) => self.usd = usd,
+                None => self.unpriced += flow.count,
+            }
+        }
+        self.unpriced += flows.other.as_ref().map_or(0, |other| other.count);
+    }
+}
+
 impl TokenFlows {
-    /// Count `row`: under its token, or under `other` when it names none.
-    fn add(&mut self, row: &TokenFlowRow) -> Result<(), ApiError> {
+    /// Count `row`, valued at `quotes`: under its token, or under `other`
+    /// when it names none.
+    fn add(&mut self, row: &TokenFlowRow, quotes: &Quotes) -> Result<(), ApiError> {
         match row.token {
-            Some(token) => self.tokens.push(TokenFlow::of(token, row)?),
+            Some(token) => {
+                let coin = ChainToken {
+                    chain_id: row.chain_id,
+                    token,
+                };
+                let mut flow = TokenFlow::of(token, row, quotes.0.get(&coin))?;
+                match flow.usd.map(|usd| self.usd.checked_add(usd)) {
+                    Some(Some(usd)) => self.usd = usd,
+                    Some(None) => flow.unprice(),
+                    None => {}
+                }
+                self.tokens.push(flow);
+            }
             None => {
                 self.other = Some(OtherTokens {
                     count: row.count,
@@ -348,19 +401,39 @@ impl TokenFlows {
 }
 
 impl TokenFlow {
-    fn of(token: Address, row: &TokenFlowRow) -> Result<Self, ApiError> {
+    /// `row`'s movements of `token`, valued at `quote` when the arithmetic
+    /// holds.
+    fn of(
+        token: Address,
+        row: &TokenFlowRow,
+        quote: Option<&Quote>,
+    ) -> Result<Self, ApiError> {
         let amount = row.amount().ok_or_else(|| {
             ApiError::internal(format_args!(
                 "{token} flows on chain {}: amount {:?}",
                 row.chain_id, row.amount
             ))
         })?;
+        let usd = quote.and_then(|quote| quote.usd(amount));
+        let quote = quote.filter(|_| usd.is_some());
         Ok(Self {
             token,
             count: row.count,
             amount,
             wallets: row.wallets,
+            symbol: quote.and_then(|quote| quote.symbol.clone()),
+            decimals: quote.map(|quote| quote.decimals),
+            value: quote.map(|quote| quote.value(amount)),
+            usd,
         })
+    }
+
+    /// The flow without a price, as when its sum would overflow.
+    fn unprice(&mut self) {
+        self.symbol = None;
+        self.decimals = None;
+        self.value = None;
+        self.usd = None;
     }
 }
 
@@ -385,9 +458,24 @@ mod tests {
     fn answer(computed_at: i64) -> Stats {
         Stats {
             computed_at,
+            priced_at: None,
             total: AllChains::default(),
             days: Vec::new(),
             chains: Vec::new(),
+        }
+    }
+
+    /// The store's answer with nothing priced.
+    trait Unpriced {
+        async fn unpriced(&self, budget: Duration) -> Result<Stats, ApiError>;
+    }
+
+    impl Unpriced for Store {
+        async fn unpriced(&self, budget: Duration) -> Result<Stats, ApiError> {
+            let (snapshot, quotes) = self
+                .stats(&[], budget, |_| async { Quotes::default() })
+                .await?;
+            Stats::of(snapshot, &quotes)
         }
     }
 
@@ -482,7 +570,7 @@ mod tests {
         let waiting = store.clone();
         let started = Instant::now();
         let failed = cache
-            .get(|| async move { Stats::of(waiting.stats(&[], budget).await?) })
+            .get(|| async move { waiting.unpriced(budget).await })
             .await;
         let waited = started.elapsed();
         assert!(failed.is_err(), "the computation outlasted its deadline");
@@ -492,7 +580,7 @@ mod tests {
         );
         holder.rollback().await.expect("the journal free");
         let served = cache
-            .get(|| async move { Stats::of(store.stats(&[], budget).await?) })
+            .get(|| async move { store.unpriced(budget).await })
             .await;
         assert!(served.is_ok(), "the next request computes again");
     }

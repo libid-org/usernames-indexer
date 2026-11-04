@@ -41,11 +41,15 @@ use tower_http::cors::{
     Any,
     CorsLayer,
 };
+use url::Url;
 use usernames_core::{
-    api,
+    api::{
+        self,
+        PriceSource,
+        DEFILLAMA,
+    },
     db::{
         self,
-        ListedToken,
         Store,
     },
     ens::{
@@ -118,12 +122,11 @@ pub struct Config {
     #[arg(long, env = "ENS_MAX_LAG_BLOCKS", default_value_t = 32)]
     pub ens_max_lag_blocks: u64,
 
-    /// The tokens `/v1/stats` names by address beside each chain's own coin,
-    /// comma-separated `<chain id>:<address>` pairs: `8453:0x8335…`. Every
-    /// other token counts under `other`, without an amount: anybody can
-    /// write a token, and naming each would let them grow every answer.
-    #[arg(long, env = "STATS_TOKENS", value_delimiter = ',')]
-    pub stats_tokens: Vec<ListedToken>,
+    /// The source `/v1/stats` prices tokens from, answering DefiLlama's
+    /// `prices/current/<coins>`. A token it prices with confidence is named
+    /// and valued in USD; every other one counts under `other`.
+    #[arg(long, env = "PRICE_SOURCE", default_value = DEFILLAMA)]
+    pub price_source: Url,
 }
 
 /// The API serving as a task, and the token that stops it.
@@ -235,7 +238,8 @@ impl Config {
             }
         }
         let app = Service {
-            api: api::AppState::new(store).listing(self.stats_tokens),
+            api: api::AppState::new(store)
+                .pricing(Arc::new(PriceSource::new(self.price_source))),
             gateway,
         }
         .router();

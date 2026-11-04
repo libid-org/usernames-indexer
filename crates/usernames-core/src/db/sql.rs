@@ -99,6 +99,7 @@ pub const STATS_TAKEN_AT: &str = include_str!("../../sql/stats_taken_at.sql");
 pub const STATS_HANDLES: &str = include_str!("../../sql/stats_handles.sql");
 pub const STATS_LINKS: &str = include_str!("../../sql/stats_links.sql");
 pub const STATS_FEES: &str = include_str!("../../sql/stats_fees.sql");
+pub const STATS_CANDIDATES: &str = include_str!("../../sql/stats_candidates.sql");
 pub const STATS_ESCROW: &str = include_str!("../../sql/stats_escrow.sql");
 pub const STATS_ONBOARDING: &str = include_str!("../../sql/stats_onboarding.sql");
 pub const STATS_USERS: &str = include_str!("../../sql/stats_users.sql");

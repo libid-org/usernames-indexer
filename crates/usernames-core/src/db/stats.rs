@@ -3,9 +3,7 @@
 //! movements, over the whole journal and day by day.
 
 use std::{
-    fmt,
-    num::ParseIntError,
-    str::FromStr,
+    future::Future,
     time::{
         Duration,
         Instant,
@@ -13,7 +11,6 @@ use std::{
 };
 
 use alloy::primitives::{
-    hex::FromHexError,
     Address,
     B256,
     U512,
@@ -115,7 +112,7 @@ impl FeesRow {
     }
 }
 
-/// One token's movements of one kind on one chain, or every unlisted
+/// One token's movements of one kind on one chain, or every unnamed
 /// token's together.
 #[derive(sqlx::FromRow)]
 pub struct TokenFlowRow {
@@ -123,12 +120,12 @@ pub struct TokenFlowRow {
     pub chain_id: i64,
     /// The day's start in unix seconds; `None` on the chain's total.
     pub day: Option<i64>,
-    /// The token: the chain's coin or a listed one; `None` for every other
+    /// The token: the chain's coin or a named one; `None` for every other
     /// token together.
     pub token: Option<Address>,
     /// Movements.
     pub count: i64,
-    /// Their sum, as Postgres prints a `numeric`; `None` for the unlisted
+    /// Their sum, as Postgres prints a `numeric`; `None` for the unnamed
     /// tokens, whose units do not add up.
     pub amount: Option<String>,
     /// Distinct wallets that made them.
@@ -143,52 +140,48 @@ impl TokenFlowRow {
     }
 }
 
-/// A token `/v1/stats` names on one chain, beside the chain's own coin,
-/// written `<chain id>:<address>`. Every other token counts under `other`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ListedToken {
+/// A token on one chain: a coin `/v1/stats` asks a price for, and names
+/// once priced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::FromRow)]
+pub struct ChainToken {
     /// The chain.
     pub chain_id: i64,
     /// The token's address there.
     pub token: Address,
 }
 
-/// Why a listed token does not parse.
-#[derive(Debug, thiserror::Error)]
-pub enum ListedTokenError {
-    /// No `:` between the chain id and the address.
-    #[error("{0:?} is not <chain id>:<address>")]
-    Shape(String),
-    /// The chain id is not a number.
-    #[error("chain id {0:?}: {1}")]
-    Chain(String, ParseIntError),
-    /// The address is not one.
-    #[error("token {0:?}: {1}")]
-    Token(String, FromHexError),
-}
-
-impl FromStr for ListedToken {
-    type Err = ListedTokenError;
-
-    fn from_str(listed: &str) -> Result<Self, ListedTokenError> {
-        let (chain, token) = listed
-            .split_once(':')
-            .ok_or_else(|| ListedTokenError::Shape(listed.to_string()))?;
-        Ok(Self {
-            chain_id: chain
-                .parse()
-                .map_err(|e| ListedTokenError::Chain(chain.to_string(), e))?,
-            token: token
-                .parse()
-                .map_err(|e| ListedTokenError::Token(token.to_string(), e))?,
-        })
+impl ChainToken {
+    /// `tokens` as the two arrays a statement unnests into pairs.
+    fn columns(tokens: &[Self]) -> (Vec<i64>, Vec<Vec<u8>>) {
+        tokens
+            .iter()
+            .map(|token| (token.chain_id, token.token.to_vec()))
+            .unzip()
     }
 }
 
-impl fmt::Display for ListedToken {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.chain_id, self.token)
+/// A token worth a price, and what its deposits and forwards moved.
+#[derive(Debug, sqlx::FromRow)]
+pub struct Candidate {
+    /// The token.
+    #[sqlx(flatten)]
+    pub coin: ChainToken,
+    /// The sum of its deposits and forwards, as Postgres prints a
+    /// `numeric`.
+    pub moved: String,
+}
+
+impl Candidate {
+    /// The sum as a number, under [`FeesRow::amount`]'s rule.
+    pub fn moved(&self) -> Option<U512> {
+        self.moved.parse().ok()
     }
+}
+
+/// The tokens a computation names, once it has their prices.
+pub trait NamedTokens {
+    /// The tokens named beside each chain's coin.
+    fn named(&self) -> Vec<ChainToken>;
 }
 
 /// One token's escrow movements of one kind.
@@ -201,43 +194,52 @@ pub struct EscrowFlowRow {
     pub flow: TokenFlowRow,
 }
 
+/// The tokens per chain asked a price for beyond its coin and those priced
+/// before, the most moved first.
+pub const CANDIDATES_PER_CHAIN: i64 = 40;
+
 impl Store {
     /// Every number `/v1/stats` serves, read in one snapshot so they agree
-    /// with each other. Token flows name each chain's coin and the `listed`
-    /// tokens, and fold every other token into one row. The aggregates read
-    /// whole tables, so a caller runs them once per period, not per request.
-    /// The statements share `budget`: the database stops the one running
-    /// when it is spent.
-    pub async fn stats(
+    /// with each other. The snapshot first reads the tokens worth a price:
+    /// each chain's coin, the `kept` tokens and the most moved others, up
+    /// to [`CANDIDATES_PER_CHAIN`]. `price` values them while the snapshot
+    /// reads the aggregates; the token flows then name each chain's coin and
+    /// the tokens it named, and fold every other token into one row. The
+    /// aggregates read whole tables, so a caller runs them once per period,
+    /// not per request. The statements share `budget`: the database stops
+    /// the one running when it is spent.
+    pub async fn stats<F, P>(
         &self,
-        listed: &[ListedToken],
+        kept: &[ChainToken],
         budget: Duration,
-    ) -> Result<StatsSnapshot, sqlx::Error> {
+        price: impl FnOnce(Vec<Candidate>) -> F,
+    ) -> Result<(StatsSnapshot, P), sqlx::Error>
+    where
+        F: Future<Output = P>,
+        P: NamedTokens,
+    {
         let deadline = Deadline::after(budget);
-        let chains: Vec<i64> = listed.iter().map(|listed| listed.chain_id).collect();
-        let tokens: Vec<Vec<u8>> =
-            listed.iter().map(|listed| listed.token.to_vec()).collect();
         let native = NATIVE_COIN.to_vec();
+        let (kept_chains, kept_tokens) = ChainToken::columns(kept);
         let mut tx = self.pool.begin_with(sql::STATS_SNAPSHOT).await?;
+        let candidates = sqlx::query_as(sql::STATS_CANDIDATES)
+            .bind(&native)
+            .bind(&kept_chains)
+            .bind(&kept_tokens)
+            .bind(CANDIDATES_PER_CHAIN)
+            .fetch_all(deadline.bound(&mut tx).await?)
+            .await?;
+        let (prices, aggregates) =
+            tokio::join!(price(candidates), Aggregates::read(&mut tx, &deadline));
+        let aggregates = aggregates?;
+        let (chains, tokens) = ChainToken::columns(&prices.named());
         let snapshot = StatsSnapshot {
-            taken_at: sqlx::query_scalar(sql::STATS_TAKEN_AT)
-                .fetch_one(deadline.bound(&mut tx).await?)
-                .await?,
-            chains: sqlx::query_scalar(sql::CHAINS)
-                .fetch_all(deadline.bound(&mut tx).await?)
-                .await?,
-            handles: sqlx::query_as(sql::STATS_HANDLES)
-                .fetch_all(deadline.bound(&mut tx).await?)
-                .await?,
-            users: sqlx::query_as(sql::STATS_USERS)
-                .fetch_all(deadline.bound(&mut tx).await?)
-                .await?,
-            links: sqlx::query_as(sql::STATS_LINKS)
-                .fetch_all(deadline.bound(&mut tx).await?)
-                .await?,
-            fees: sqlx::query_as(sql::STATS_FEES)
-                .fetch_all(deadline.bound(&mut tx).await?)
-                .await?,
+            taken_at: aggregates.taken_at,
+            chains: aggregates.chains,
+            handles: aggregates.handles,
+            users: aggregates.users,
+            links: aggregates.links,
+            fees: aggregates.fees,
             escrow: sqlx::query_as(sql::STATS_ESCROW)
                 .bind(&native)
                 .bind(&chains)
@@ -252,7 +254,46 @@ impl Store {
                 .await?,
         };
         tx.commit().await?;
-        Ok(snapshot)
+        Ok((snapshot, prices))
+    }
+}
+
+/// The numbers of a snapshot that need no prices.
+struct Aggregates {
+    taken_at: i64,
+    chains: Vec<i64>,
+    handles: Vec<HandlesRow>,
+    users: Vec<UsersRow>,
+    links: Vec<LinksRow>,
+    fees: Vec<FeesRow>,
+}
+
+impl Aggregates {
+    /// The aggregates, read on `conn` within `deadline`.
+    async fn read(
+        conn: &mut PgConnection,
+        deadline: &Deadline,
+    ) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            taken_at: sqlx::query_scalar(sql::STATS_TAKEN_AT)
+                .fetch_one(deadline.bound(conn).await?)
+                .await?,
+            chains: sqlx::query_scalar(sql::CHAINS)
+                .fetch_all(deadline.bound(conn).await?)
+                .await?,
+            handles: sqlx::query_as(sql::STATS_HANDLES)
+                .fetch_all(deadline.bound(conn).await?)
+                .await?,
+            users: sqlx::query_as(sql::STATS_USERS)
+                .fetch_all(deadline.bound(conn).await?)
+                .await?,
+            links: sqlx::query_as(sql::STATS_LINKS)
+                .fetch_all(deadline.bound(conn).await?)
+                .await?,
+            fees: sqlx::query_as(sql::STATS_FEES)
+                .fetch_all(deadline.bound(conn).await?)
+                .await?,
+        })
     }
 }
 
@@ -409,22 +450,5 @@ mod tests {
         let code = stopped.as_database_error().and_then(|error| error.code());
         // query_canceled: the statement timeout stopped it on the server.
         assert_eq!(code.as_deref(), Some("57014"), "{stopped}");
-    }
-
-    /// A listed token reads from its `<chain id>:<address>` text and prints
-    /// back to it; anything else is refused.
-    #[test]
-    fn a_listed_token_parses_from_its_text() {
-        let text = "8453:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
-        let listed: ListedToken = text.parse().expect("a listed token");
-        assert_eq!(listed.chain_id, 8453);
-        assert_eq!(listed.to_string(), text);
-        for refused in [
-            "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-            "base:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-            "8453:0x8335",
-        ] {
-            assert!(refused.parse::<ListedToken>().is_err(), "{refused}");
-        }
     }
 }
