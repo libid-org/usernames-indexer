@@ -6,6 +6,10 @@ use std::{
     fmt,
     num::ParseIntError,
     str::FromStr,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 use alloy::primitives::{
@@ -14,6 +18,7 @@ use alloy::primitives::{
     B256,
     U512,
 };
+use sqlx::PgConnection;
 
 use super::{
     sql,
@@ -200,38 +205,49 @@ impl Store {
     /// with each other. Token flows name each chain's coin and the `listed`
     /// tokens, and fold every other token into one row. The aggregates read
     /// whole tables, so a caller runs them once per period, not per request.
+    /// The statements share `budget`: the database stops the one running
+    /// when it is spent.
     pub async fn stats(
         &self,
         listed: &[ListedToken],
+        budget: Duration,
     ) -> Result<StatsSnapshot, sqlx::Error> {
+        let deadline = Deadline::after(budget);
         let chains: Vec<i64> = listed.iter().map(|listed| listed.chain_id).collect();
         let tokens: Vec<Vec<u8>> =
             listed.iter().map(|listed| listed.token.to_vec()).collect();
         let native = NATIVE_COIN.to_vec();
         let mut tx = self.pool.begin_with(sql::STATS_SNAPSHOT).await?;
-        sqlx::query(sql::STATS_DEADLINE).execute(&mut *tx).await?;
         let snapshot = StatsSnapshot {
             taken_at: sqlx::query_scalar(sql::STATS_TAKEN_AT)
-                .fetch_one(&mut *tx)
+                .fetch_one(deadline.bound(&mut tx).await?)
                 .await?,
-            chains: sqlx::query_scalar(sql::CHAINS).fetch_all(&mut *tx).await?,
+            chains: sqlx::query_scalar(sql::CHAINS)
+                .fetch_all(deadline.bound(&mut tx).await?)
+                .await?,
             handles: sqlx::query_as(sql::STATS_HANDLES)
-                .fetch_all(&mut *tx)
+                .fetch_all(deadline.bound(&mut tx).await?)
                 .await?,
-            users: sqlx::query_as(sql::STATS_USERS).fetch_all(&mut *tx).await?,
-            links: sqlx::query_as(sql::STATS_LINKS).fetch_all(&mut *tx).await?,
-            fees: sqlx::query_as(sql::STATS_FEES).fetch_all(&mut *tx).await?,
+            users: sqlx::query_as(sql::STATS_USERS)
+                .fetch_all(deadline.bound(&mut tx).await?)
+                .await?,
+            links: sqlx::query_as(sql::STATS_LINKS)
+                .fetch_all(deadline.bound(&mut tx).await?)
+                .await?,
+            fees: sqlx::query_as(sql::STATS_FEES)
+                .fetch_all(deadline.bound(&mut tx).await?)
+                .await?,
             escrow: sqlx::query_as(sql::STATS_ESCROW)
                 .bind(&native)
                 .bind(&chains)
                 .bind(&tokens)
-                .fetch_all(&mut *tx)
+                .fetch_all(deadline.bound(&mut tx).await?)
                 .await?,
             onboarding_claims: sqlx::query_as(sql::STATS_ONBOARDING)
                 .bind(&native)
                 .bind(&chains)
                 .bind(&tokens)
-                .fetch_all(&mut *tx)
+                .fetch_all(deadline.bound(&mut tx).await?)
                 .await?,
         };
         tx.commit().await?;
@@ -239,9 +255,65 @@ impl Store {
     }
 }
 
+/// When a computation's time runs out. Its statements share the time: each
+/// may run only for what the ones before it left, and the database stops
+/// it there, so the work ends on the server too.
+struct Deadline(Instant);
+
+impl Deadline {
+    /// The deadline `budget` from now.
+    fn after(budget: Duration) -> Self {
+        Self(Instant::now() + budget)
+    }
+
+    /// `conn`, its next statement bounded by the time left. A millisecond at
+    /// least: Postgres reads a timeout of zero as none.
+    async fn bound<'c>(
+        &self,
+        conn: &'c mut PgConnection,
+    ) -> Result<&'c mut PgConnection, sqlx::Error> {
+        let left = self
+            .0
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
+        sqlx::query(sql::STATS_DEADLINE)
+            .bind(left.as_millis().to_string())
+            .execute(&mut *conn)
+            .await?;
+        Ok(conn)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use sqlx::PgPool;
+    use usernames_fixtures::database_url;
+
     use super::*;
+
+    /// A computation's statements share its deadline: the second gets only
+    /// what the first left, and the database stops it there.
+    #[tokio::test]
+    async fn the_statements_share_one_deadline() {
+        let Some(url) = database_url() else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = PgPool::connect(&url).await.expect("connect");
+        let mut tx = pool.begin().await.expect("transaction");
+        let deadline = Deadline::after(Duration::from_secs(1));
+        sqlx::query("SELECT pg_sleep(0.6)")
+            .execute(deadline.bound(&mut tx).await.expect("bounded"))
+            .await
+            .expect("the first statement ends in time");
+        let stopped = sqlx::query("SELECT pg_sleep(0.6)")
+            .execute(deadline.bound(&mut tx).await.expect("bounded"))
+            .await
+            .expect_err("the second statement outlasts the deadline");
+        let code = stopped.as_database_error().and_then(|error| error.code());
+        // query_canceled: the statement timeout stopped it on the server.
+        assert_eq!(code.as_deref(), Some("57014"), "{stopped}");
+    }
 
     /// A listed token reads from its `<chain id>:<address>` text and prints
     /// back to it; anything else is refused.

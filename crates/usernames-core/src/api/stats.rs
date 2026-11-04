@@ -56,6 +56,10 @@ use crate::{
 /// a burst of requests must not run them again on a small database.
 const STATS_TTL: Duration = Duration::from_secs(5 * 60);
 
+/// How long one computation may take, its statements together. The lock is
+/// held through it, and every request behind it waits that long.
+const STATS_DEADLINE: Duration = Duration::from_secs(30);
+
 /// `GET /v1/stats` — totals and a daily series per chain, from one
 /// snapshot of the store.
 pub(crate) async fn stats(State(state): State<AppState>) -> Result<Response, ApiError> {
@@ -65,7 +69,7 @@ pub(crate) async fn stats(State(state): State<AppState>) -> Result<Response, Api
         stats,
     } = state;
     let body = stats
-        .get(|| async move { Stats::of(store.stats(&listed).await?) })
+        .get(|| async move { Stats::of(store.stats(&listed, STATS_DEADLINE).await?) })
         .await?;
     Ok(([(CONTENT_TYPE, "application/json")], body).into_response())
 }
@@ -354,9 +358,15 @@ mod tests {
     };
 
     use futures_util::future::join_all;
+    use sqlx::PgPool;
     use tokio::sync::oneshot;
+    use usernames_fixtures::database_url;
 
     use super::*;
+    use crate::db::{
+        Store,
+        MIGRATOR,
+    };
 
     fn answer(computed_at: i64) -> Stats {
         Stats {
@@ -431,6 +441,44 @@ mod tests {
         assert!(failed.is_err());
         let body = cache.get(|| async { Ok(answer(1)) }).await;
         assert_eq!(body.served(), answer(1));
+    }
+
+    /// A computation past its deadline fails on the database and is not
+    /// served: once the journal is free, the next request computes again.
+    #[tokio::test]
+    async fn a_computation_past_its_deadline_is_not_served() {
+        let Some(url) = database_url() else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return;
+        };
+        let pool = PgPool::connect(&url).await.expect("connect");
+        MIGRATOR.run(&pool).await.expect("migrations");
+        let store = Store::new(pool.clone());
+        let budget = Duration::from_secs(1);
+        // Another session holds the journal every aggregate reads, so the
+        // computation waits on it until its deadline.
+        let mut holder = pool.begin().await.expect("transaction");
+        sqlx::query("LOCK TABLE names.events IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *holder)
+            .await
+            .expect("the journal locked");
+        let cache = StatsCache::default();
+        let waiting = store.clone();
+        let started = Instant::now();
+        let failed = cache
+            .get(|| async move { Stats::of(waiting.stats(&[], budget).await?) })
+            .await;
+        let waited = started.elapsed();
+        assert!(failed.is_err(), "the computation outlasted its deadline");
+        assert!(
+            waited >= budget && waited < 2 * budget,
+            "stopped after {waited:?}"
+        );
+        holder.rollback().await.expect("the journal free");
+        let served = cache
+            .get(|| async move { Stats::of(store.stats(&[], budget).await?) })
+            .await;
+        assert!(served.is_ok(), "the next request computes again");
     }
 
     /// An answer is served for five minutes after its computation.
