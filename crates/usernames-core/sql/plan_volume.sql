@@ -1,12 +1,12 @@
 -- Rows in the shape production holds them, for the index-plan test in
 -- db.rs, on the chain every probe names: 5000 per table over 1000 addresses
 -- and three platforms, the probes' platform among them and the probes'
--- address, node and handle nowhere. The journal holds a bind and a fee per
--- handle beside the 5000 deposits, and 1000 claims. A probe's chain and
--- platform then select little and its address or node select almost
--- nothing, the way they do in production. The index-plan test loads it in a
--- transaction that rolls back; the stats plan test commits and vacuums it in
--- a database of its own.
+-- address, node and handle nowhere; the escrow's slots also on four more
+-- chains. The journal holds a bind and a fee per handle beside the 5000
+-- deposits, and 1000 claims. A probe's chain and platform then select little
+-- and its address or node select almost nothing, the way they do in
+-- production. The index-plan test loads it in a transaction that rolls back;
+-- the stats plan test commits and vacuums it in a database of its own.
 --
 -- Held for that transaction: autovacuum, which every rolled-back load gives
 -- work, cannot rewrite these tables' statistics under the plans. Other
@@ -74,11 +74,15 @@ FROM generate_series(1, 5000) i;
 INSERT INTO names.handle_nodes (chain_id, handle_node, platform_id, handle)
 SELECT 1, handle_node, platform_id, md5(handle_node::text)
 FROM names.handles WHERE chain_id = 1;
+-- Escrow slots on five chains, as on mainnet, one of the tokens the probes'
+-- 0xee..ee: a list on one chain and in one token then has the other chains'
+-- slots of that token to pass if it seeks across them.
 INSERT INTO names.escrow_held (chain_id, handle_node, token, held, round)
-SELECT 1, sha256(('node' || i)::bytea),
-       substring(sha256(('token' || i % 5)::bytea) FROM 1 FOR 20),
+SELECT chain, sha256(('node' || i)::bytea),
+       CASE i % 5 WHEN 0 THEN decode(repeat('ee', 20), 'hex')
+                  ELSE substring(sha256(('token' || i % 5)::bytea) FROM 1 FOR 20) END,
        i, 0
-FROM generate_series(1, 5000) i;
+FROM generate_series(1, 5000) i, generate_series(1, 5) chain;
 INSERT INTO names.escrow_refundable
     (sender, chain_id, handle_node, token, amount, refundable_at)
 SELECT substring(sha256(('address' || i % 1000)::bytea) FROM 1 FOR 20), 1,
