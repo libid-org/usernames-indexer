@@ -3,11 +3,7 @@
 SELECT chain_id, day, receiver,
        count(*) AS count,
        sum(amount)::text AS amount
-FROM (
-    SELECT chain_id, receiver, amount,
-           block_time - block_time % 86400 AS day
-    FROM names.events
-    WHERE kind = 'bind_fee_paid'
-) e
+FROM names.events
+WHERE kind = 'bind_fee_paid'
 GROUP BY GROUPING SETS ((chain_id, receiver), (chain_id, day, receiver))
 ORDER BY chain_id, day NULLS FIRST, receiver

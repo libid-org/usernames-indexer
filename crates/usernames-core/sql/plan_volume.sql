@@ -1,9 +1,12 @@
 -- Rows in the shape production holds them, for the index-plan test in
 -- db.rs, on the chain every probe names: 5000 per table over 1000 addresses
 -- and three platforms, the probes' platform among them and the probes'
--- address, node and handle nowhere. A probe's chain and platform then select
--- little and its address or node select almost nothing, the way they do in
--- production. The test loads it in a transaction that rolls back.
+-- address, node and handle nowhere. The journal holds a bind and a fee per
+-- handle beside the 5000 deposits, and 1000 claims. A probe's chain and
+-- platform then select little and its address or node select almost
+-- nothing, the way they do in production. The index-plan test loads it in a
+-- transaction that rolls back; the stats plan test commits and vacuums it in
+-- a database of its own.
 --
 -- Held for that transaction: autovacuum, which every rolled-back load gives
 -- work, cannot rewrite these tables' statistics under the plans. Other
@@ -37,6 +40,32 @@ SELECT 1, i, 0, sha256(('tx' || i)::bytea), i, 'deposited',
        substring(sha256(('token' || i % 5)::bytea) FROM 1 FOR 20),
        substring(sha256(('address' || i % 1000)::bytea) FROM 1 FOR 20), 0, i, i
 FROM generate_series(1, 5000) i;
+INSERT INTO names.events
+    (chain_id, block_number, log_index, tx_hash, block_time, kind, handle_node,
+     platform_id, holder, id_node)
+SELECT 1, i, 1, sha256(('bind' || i)::bytea), i, 'identity_bound',
+       sha256(('node' || i)::bytea),
+       CASE i % 3 WHEN 0 THEN decode(repeat('01', 32), 'hex')
+                  ELSE sha256(('platform' || i % 3)::bytea) END,
+       substring(sha256(('address' || i % 1000)::bytea) FROM 1 FOR 20),
+       sha256(('id' || i)::bytea)
+FROM generate_series(1, 5000) i;
+INSERT INTO names.events
+    (chain_id, block_number, log_index, tx_hash, block_time, kind, handle_node,
+     receiver, amount)
+SELECT 1, i, 2, sha256(('fee' || i)::bytea), i, 'bind_fee_paid',
+       sha256(('node' || i)::bytea),
+       substring(sha256(('receiver' || i % 2)::bytea) FROM 1 FOR 20), i
+FROM generate_series(1, 5000) i;
+INSERT INTO names.events
+    (chain_id, block_number, log_index, tx_hash, block_time, kind, handle_node,
+     token, claimer, recipient, round, released)
+SELECT 1, 5000 + i, 0, sha256(('claim' || i)::bytea), 5000 + i, 'claimed',
+       sha256(('node' || i)::bytea),
+       substring(sha256(('token' || i % 5)::bytea) FROM 1 FOR 20),
+       substring(sha256(('address' || i % 1000)::bytea) FROM 1 FOR 20),
+       substring(sha256(('address' || i % 1000)::bytea) FROM 1 FOR 20), 0, i
+FROM generate_series(1, 1000) i;
 INSERT INTO names.address_events
     (chain_id, address, block_number, log_index, block_time, roles)
 SELECT 1, substring(sha256(('address' || i % 1000)::bytea) FROM 1 FOR 20),

@@ -288,6 +288,99 @@ impl Deadline {
 }
 
 #[cfg(test)]
+pub(crate) mod plans {
+    use sqlx::PgConnection;
+
+    use super::*;
+    use crate::db::plan_tests::{
+        explain,
+        Plan,
+    };
+
+    /// The `/v1/stats` aggregates, planned.
+    pub(crate) trait StatsPlans {
+        /// Each aggregate, with the covering indexes it reads whole and
+        /// without the heap.
+        async fn stats_plans(&mut self) -> Vec<Plan>;
+    }
+
+    impl StatsPlans for PgConnection {
+        async fn stats_plans(&mut self) -> Vec<Plan> {
+            let (native, chains, tokens) =
+                (NATIVE_COIN.to_vec(), [1i64], [vec![0xEE; 20]]);
+            let reads = [
+                (
+                    "the live handles",
+                    &["Index Only Scan using handles_live_idx"][..],
+                    sqlx::query_scalar::<_, String>(&explain(sql::STATS_HANDLES))
+                        .fetch_all(&mut *self)
+                        .await,
+                ),
+                (
+                    "the users",
+                    &[
+                        "Index Only Scan using events_users_wallet_idx",
+                        "Index Only Scan using events_users_day_idx",
+                        "Index Only Scan using events_users_all_chains_day_idx",
+                    ][..],
+                    sqlx::query_scalar(&explain(sql::STATS_USERS))
+                        .fetch_all(&mut *self)
+                        .await,
+                ),
+                (
+                    "the links",
+                    &["Index Only Scan using events_links_idx"][..],
+                    sqlx::query_scalar(&explain(sql::STATS_LINKS))
+                        .fetch_all(&mut *self)
+                        .await,
+                ),
+                (
+                    "the registration fees",
+                    &["Index Only Scan using events_fees_idx"][..],
+                    sqlx::query_scalar(&explain(sql::STATS_FEES))
+                        .fetch_all(&mut *self)
+                        .await,
+                ),
+                (
+                    "the escrow flows",
+                    &["Index Only Scan using events_escrow_idx"][..],
+                    sqlx::query_scalar(&explain(sql::STATS_ESCROW))
+                        .bind(&native)
+                        .bind(&chains[..])
+                        .bind(&tokens[..])
+                        .fetch_all(&mut *self)
+                        .await,
+                ),
+                (
+                    "the onboarding claims",
+                    &[
+                        "Index Only Scan using events_claims_idx",
+                        "Index Only Scan using events_first_deposit_idx",
+                        "Index Only Scan using events_binds_idx",
+                    ][..],
+                    sqlx::query_scalar(&explain(sql::STATS_ONBOARDING))
+                        .bind(&native)
+                        .bind(&chains[..])
+                        .bind(&tokens[..])
+                        .fetch_all(&mut *self)
+                        .await,
+                ),
+            ];
+            let mut plans = Vec::new();
+            for (name, seeks, text) in reads {
+                let text: Vec<String> = text.unwrap_or_else(|e| panic!("{name}: {e}"));
+                plans.push(Plan {
+                    name,
+                    seeks: Some(seeks),
+                    text: text.join("\n"),
+                });
+            }
+            plans
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use sqlx::PgPool;
     use usernames_fixtures::database_url;

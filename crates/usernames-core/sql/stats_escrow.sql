@@ -20,8 +20,7 @@ FROM (
                 THEN token END AS token,
            CASE WHEN kind IN ('claimed', 'refunded') THEN released
                 ELSE amount END AS amount,
-           CASE kind WHEN 'claimed' THEN claimer ELSE sender END AS wallet,
-           block_time - block_time % 86400 AS day
+           wallet, day
     FROM names.events
     WHERE kind IN ('deposited', 'forwarded', 'claimed', 'refunded')
 ) e

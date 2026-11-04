@@ -20,8 +20,7 @@ FROM (
            CASE WHEN c.token = $1
                   OR (c.chain_id, c.token) IN (SELECT chain_id, token FROM listed)
                 THEN c.token END AS token,
-           c.released, c.claimer,
-           c.block_time - c.block_time % 86400 AS day
+           c.released, c.wallet AS claimer, c.day
     FROM names.events c
     WHERE c.kind = 'claimed'
       AND EXISTS (

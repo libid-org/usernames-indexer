@@ -3,27 +3,36 @@
 -- once over the whole journal (day NULL) and once per UTC day with the
 -- wallets seen that day for the first time: on that chain, or across every
 -- chain on any of them. On the whole journal those are all of them.
-WITH acts AS (
-    SELECT chain_id,
-           block_time - block_time % 86400 AS day,
-           CASE kind WHEN 'identity_bound' THEN holder
-                     WHEN 'claimed' THEN claimer
-                     ELSE sender END AS wallet
+-- Each part is its own aggregate, so each reads one covering index in
+-- its order.
+WITH cdw AS MATERIALIZED (
+    SELECT DISTINCT chain_id, day, wallet
     FROM names.events
     WHERE kind IN ('identity_bound', 'deposited', 'forwarded', 'claimed')
-), firsts AS (
-    SELECT chain_id, wallet, min(day) AS first_day,
-           min(min(day)) OVER (PARTITION BY wallet) AS first_day_anywhere
-    FROM acts
+      AND wallet IS NOT NULL
+), firsts AS MATERIALIZED (
+    SELECT chain_id, wallet, min(day) AS first_day
+    FROM names.events
+    WHERE kind IN ('identity_bound', 'deposited', 'forwarded', 'claimed')
+      AND wallet IS NOT NULL
     GROUP BY chain_id, wallet
+), anywhere AS MATERIALIZED (
+    SELECT wallet, min(first_day) AS first_day FROM firsts GROUP BY wallet
+), dw AS (
+    SELECT DISTINCT day, wallet
+    FROM names.events
+    WHERE kind IN ('identity_bound', 'deposited', 'forwarded', 'claimed')
+      AND wallet IS NOT NULL
 )
-SELECT a.chain_id, a.day,
-       count(DISTINCT a.wallet) AS users,
-       CASE WHEN GROUPING(a.chain_id) = 0
-            THEN count(DISTINCT a.wallet) FILTER (WHERE a.day = f.first_day)
-            ELSE count(DISTINCT a.wallet) FILTER (WHERE a.day = f.first_day_anywhere)
-       END AS new_users
-FROM acts a
-JOIN firsts f USING (chain_id, wallet)
-GROUP BY GROUPING SETS ((a.chain_id), (a.chain_id, a.day), (), (a.day))
-ORDER BY a.chain_id NULLS FIRST, a.day NULLS FIRST
+SELECT c.chain_id, c.day, c.users, coalesce(n.new_users, 0) AS new_users
+FROM (SELECT chain_id, day, count(*) AS users FROM cdw GROUP BY 1, 2) c
+LEFT JOIN (SELECT chain_id, first_day AS day, count(*) AS new_users FROM firsts GROUP BY 1, 2) n
+  USING (chain_id, day)
+UNION ALL
+SELECT chain_id, NULL, count(*), count(*) FROM firsts GROUP BY chain_id
+UNION ALL
+SELECT NULL, d.day, d.users, coalesce(n.new_users, 0)
+FROM (SELECT day, count(*) AS users FROM dw GROUP BY day) d
+LEFT JOIN (SELECT first_day AS day, count(*) AS new_users FROM anywhere GROUP BY 1) n USING (day)
+UNION ALL
+SELECT NULL, NULL, count(*), count(*) FROM anywhere
