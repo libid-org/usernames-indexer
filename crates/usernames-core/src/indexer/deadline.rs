@@ -30,6 +30,11 @@ use tower::{
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Deadline(pub(crate) Duration);
 
+/// The error of a call the endpoint left unanswered past the limit.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("no answer within {0:?}")]
+pub(crate) struct Unanswered(pub(crate) Duration);
+
 /// A transport whose calls fail once they go unanswered past `limit`.
 #[derive(Clone, Debug)]
 pub(crate) struct Bounded<S> {
@@ -65,9 +70,9 @@ where
         let limit = self.limit;
         let answer = self.inner.call(request);
         Box::pin(async move {
-            tokio::time::timeout(limit, answer).await.map_err(|_| {
-                TransportErrorKind::custom_str(&format!("no answer within {limit:?}"))
-            })?
+            tokio::time::timeout(limit, answer)
+                .await
+                .map_err(|_| TransportErrorKind::custom(Unanswered(limit)))?
         })
     }
 }
