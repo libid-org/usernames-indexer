@@ -1,9 +1,10 @@
 //! The read API. Resolution answers exactly what the contract's resolvers
 //! answer, from the projections; search, the histories, the escrow's
-//! waiting amounts, the statistics and referral codes are what the chain
-//! cannot list. The answers' shapes live in [`model`]; the handlers here
-//! and in the history, escrow, stats and referral modules only translate
-//! HTTP to store calls and rows to those shapes.
+//! waiting amounts, the statistics, referral codes and the referrals they
+//! earned are what the chain cannot list. The answers' shapes live in
+//! [`model`]; the handlers here and in the history, escrow, stats, referral
+//! and referrals modules only translate HTTP to store calls and rows to
+//! those shapes.
 
 mod error;
 mod escrow;
@@ -11,6 +12,7 @@ mod history;
 pub mod model;
 mod params;
 mod referral;
+mod referrals;
 mod stats;
 
 use std::sync::Arc;
@@ -135,6 +137,7 @@ impl AppState {
             )
             .route("/v1/history/node/{node}", get(history::node))
             .route("/v1/escrow/claimable/{address}", get(escrow::claimable))
+            .route("/v1/escrow/awaiting/{address}", get(escrow::awaiting))
             .route("/v1/escrow/refundable/{address}", get(escrow::refundable))
             .route("/v1/escrow/handle/{platform}/{handle}", get(escrow::handle))
             .route("/v1/escrow/node/{node}", get(escrow::node))
@@ -142,6 +145,7 @@ impl AppState {
             .route("/v1/stats", get(stats::stats))
             .route("/v1/referral/code/{code}", get(referral::code))
             .route("/v1/referral/node/{node}/code", get(referral::node_code))
+            .route("/v1/referrals/address/{address}", get(referrals::address))
             .with_state(self)
     }
 
@@ -264,6 +268,7 @@ impl ChainStatus {
             names,
             contract: state.contract,
             escrow: state.escrow,
+            referrals: state.referrals,
             last_indexed_block: position.cursor,
             chain_head_block: state.head(),
             lag_blocks: position.lag_blocks(),
@@ -548,6 +553,22 @@ mod tests {
             (
                 "/v1/escrow/claimable/0xnope".to_string(),
                 bad(ErrorCode::InvalidAddress),
+            ),
+            (
+                "/v1/escrow/awaiting/0xnope".to_string(),
+                bad(ErrorCode::InvalidAddress),
+            ),
+            (
+                "/v1/referrals/address/alice".to_string(),
+                bad(ErrorCode::InvalidAddress),
+            ),
+            (
+                format!("/v1/escrow/awaiting/{address}?before=nope"),
+                bad(ErrorCode::InvalidCursor),
+            ),
+            (
+                format!("/v1/referrals/address/{address}?limit=ten"),
+                bad(ErrorCode::InvalidArgument),
             ),
             (
                 "/v1/escrow/unclaimed?token=usdc".to_string(),

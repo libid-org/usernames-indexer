@@ -164,9 +164,8 @@ impl Window {
             // the node's bind.
             NamesEvent::HandleRevealed { platform_id, .. }
             | NamesEvent::HandlePublished { platform_id, .. }
-            | NamesEvent::HandleRetired { platform_id, .. } => {
-                involvement.named(*platform_id)
-            }
+            | NamesEvent::HandleRetired { platform_id, .. }
+            | NamesEvent::Referred { platform_id, .. } => involvement.named(*platform_id),
 
             // A deposit names no platform; the `HandleRevealed` of a
             // `depositToHandle`, a bind, a publish or a retire does.
@@ -340,7 +339,7 @@ impl Page<HistoryCursor> {
     /// address, time) or the node's history index serves the page as one
     /// backward range; across chains the history index does, with the chain
     /// in the comparison.
-    fn bound(&self, statement: &mut Statement, table: &str) {
+    pub(crate) fn bound(&self, statement: &mut Statement, table: &str) {
         let order = match self.chain {
             Some(chain) => {
                 statement

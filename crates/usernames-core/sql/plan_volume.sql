@@ -13,7 +13,7 @@
 -- sessions still read and write them.
 LOCK TABLE names.handles, names.ids, names.published, names.events,
            names.address_events, names.handle_nodes,
-           names.escrow_held, names.escrow_refundable
+           names.escrow_held, names.escrow_refundable, names.referrals
     IN SHARE UPDATE EXCLUSIVE MODE;
 INSERT INTO names.handles
     (chain_id, handle_node, platform_id, owner,
@@ -89,8 +89,22 @@ SELECT substring(sha256(('address' || i % 1000)::bytea) FROM 1 FOR 20), 1,
        sha256(('node' || i)::bytea),
        substring(sha256(('token' || i % 5)::bytea) FROM 1 FOR 20), i, i
 FROM generate_series(1, 5000) i;
+-- 5000 referrals over the 1000 nodes the first 1000 handles hold, paid,
+-- forwarded or held, and unpaid.
+INSERT INTO names.referrals
+    (chain_id, block_number, log_index, block_time, referrer_node,
+     referrer_platform, binder, platform_id, handle_node, fee, share, outcome,
+     delivery)
+SELECT 1, i, 3, i, sha256(('node' || i % 1000)::bytea),
+       sha256(('platform' || i % 3)::bytea),
+       substring(sha256(('address' || (i + 7) % 1000)::bytea) FROM 1 FOR 20),
+       sha256(('platform' || i % 3)::bytea), sha256(('node' || i)::bytea),
+       10000, 3000,
+       CASE WHEN i % 4 = 0 THEN 'refused' ELSE 'paid' END,
+       CASE i % 4 WHEN 0 THEN NULL WHEN 1 THEN 'held' ELSE 'forwarded' END
+FROM generate_series(1, 5000) i;
 -- Vacuum moves a GIN index's pending entries into it; the rows above wait there.
 SELECT gin_clean_pending_list('names.handle_nodes_handle_trgm_idx');
 ANALYZE names.handles, names.ids, names.published, names.events,
         names.address_events, names.handle_nodes,
-        names.escrow_held, names.escrow_refundable;
+        names.escrow_held, names.escrow_refundable, names.referrals;

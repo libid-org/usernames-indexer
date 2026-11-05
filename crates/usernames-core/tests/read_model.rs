@@ -1394,6 +1394,7 @@ async fn preparing_an_unchanged_chain_keeps_everything() {
             Contracts {
                 registry: a_contract(),
                 escrow: None,
+                referrals: None,
             },
         )
         .await
@@ -1408,6 +1409,7 @@ async fn preparing_an_unchanged_chain_keeps_everything() {
             Contracts {
                 registry: a_contract(),
                 escrow: None,
+                referrals: None,
             },
         )
         .await
@@ -1445,6 +1447,7 @@ async fn watching_another_contract_clears_the_chain() {
             Contracts {
                 registry: a_contract(),
                 escrow: None,
+                referrals: None,
             },
         )
         .await
@@ -1465,6 +1468,7 @@ async fn watching_another_contract_clears_the_chain() {
             Contracts {
                 registry: OTHER_CONTRACT,
                 escrow: Some(OTHER_ESCROW),
+                referrals: None,
             },
         )
         .await
@@ -1482,6 +1486,7 @@ async fn watching_another_contract_clears_the_chain() {
             indexer_version: Some(db::INDEXER_VERSION.to_string()),
             contract: Some(OTHER_CONTRACT),
             escrow: Some(OTHER_ESCROW),
+            referrals: None,
             ..ChainState::default()
         }
     );
@@ -1515,6 +1520,7 @@ async fn the_deployment_block_survives_a_replay_of_the_same_registry() {
             Contracts {
                 registry: a_contract(),
                 escrow: None,
+                referrals: None,
             },
         )
         .await
@@ -1530,6 +1536,7 @@ async fn the_deployment_block_survives_a_replay_of_the_same_registry() {
             Contracts {
                 registry: a_contract(),
                 escrow: Some(escrow),
+                referrals: None,
             },
         )
         .await
@@ -1550,6 +1557,7 @@ async fn the_deployment_block_survives_a_replay_of_the_same_registry() {
             Contracts {
                 registry: OTHER_CONTRACT,
                 escrow: Some(escrow),
+                referrals: None,
             },
         )
         .await
@@ -1758,6 +1766,7 @@ async fn a_replay_waits_for_the_window_in_flight_and_clears_it() {
                 Contracts {
                     registry: OTHER_CONTRACT,
                     escrow: None,
+                    referrals: None,
                 },
             )
             .await
@@ -1839,6 +1848,7 @@ async fn a_prepare_whose_lease_ended_while_it_waited_clears_nothing() {
                 Contracts {
                     registry: OTHER_CONTRACT,
                     escrow: None,
+                    referrals: None,
                 },
             )
             .await
@@ -1954,6 +1964,7 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
             Contracts {
                 registry: a_contract(),
                 escrow: None,
+                referrals: None,
             },
         )
         .await

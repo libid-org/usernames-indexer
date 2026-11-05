@@ -3,4 +3,4 @@
 -- included.
 VACUUM names.handles, names.ids, names.published, names.events,
        names.address_events, names.handle_nodes,
-       names.escrow_held, names.escrow_refundable
+       names.escrow_held, names.escrow_refundable, names.referrals

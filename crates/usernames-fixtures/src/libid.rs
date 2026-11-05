@@ -1,7 +1,8 @@
 //! The libid contracts on anvil, wired as a deployment wires them: the
 //! crate's `IdentityRegistry`, `CeremonyProofVerifier` and `HandleEscrow`
-//! behind their proxies, with the crate's `StubPlatformVerifier` (feature
-//! `testing`) standing in for each platform's proof check.
+//! behind their proxies and the `ReferralSplitter` beside them, with the
+//! crate's `StubPlatformVerifier` (feature `testing`) standing in for each
+//! platform's proof check.
 
 use std::future::Future;
 
@@ -26,7 +27,10 @@ use alloy::{
         TransactionReceipt,
         TransactionRequest,
     },
-    sol_types::SolValue,
+    sol_types::{
+        SolConstructor,
+        SolValue,
+    },
 };
 use libid_contracts::{
     bindings::{
@@ -39,8 +43,15 @@ use libid_contracts::{
             self,
             IdentityRegistryInstance,
         },
+        referral::ReferralSplitter::{
+            self,
+            ReferralSplitterInstance,
+        },
     },
-    deploy::deploy_behind_proxy,
+    deploy::{
+        deploy_behind_proxy,
+        deploy_with_ctor,
+    },
     testing::{
         deploy_stub_platform_verifier,
         stub_payload,
@@ -66,6 +77,20 @@ pub const CEREMONY_VERSION: u16 = 1;
 
 /// Where a bind's service fee goes.
 pub const FEE_RECEIVER: Address = Address::repeat_byte(0xFE);
+
+/// Where the splitter sends every part of a fee that is not a delivered
+/// share.
+pub const TREASURY: Address = Address::repeat_byte(0x7E);
+
+/// The referrer's part of a referred fee, in basis points.
+pub const SHARE_BPS: u16 = 3_000;
+
+/// The smallest fee that pays a referrer: below it the treasury takes all.
+pub const MIN_REFERRAL_FEE: u64 = 1_000;
+
+/// Runtime code that reverts every call: a holder wallet that refuses
+/// payment (`PUSH0 PUSH0 REVERT`).
+const REFUSES: [u8; 3] = [0x5f, 0x5f, 0xfd];
 
 /// The crate's compiled contracts, the ones a deployment ships.
 const ARTIFACTS: Artifacts = Artifacts::embedded();
@@ -137,6 +162,8 @@ pub struct Libid {
     pub registry: IdentityRegistryInstance<DynProvider>,
     /// The `HandleEscrow`, behind its proxy.
     pub escrow: HandleEscrowInstance<DynProvider>,
+    /// The `ReferralSplitter`, paying through the escrow.
+    pub splitter: ReferralSplitterInstance<DynProvider>,
     /// The `CeremonyProofVerifier` the registry checks proofs with.
     pub proof_verifier: Address,
     /// The escrow's address for the chain's own coin.
@@ -149,11 +176,13 @@ pub struct Libid {
 }
 
 impl Libid {
-    /// The deployed registry and escrow, as an indexer follows them.
+    /// The deployed registry, escrow and splitter, as an indexer follows
+    /// them.
     pub fn contracts(&self) -> Contracts {
         Contracts {
             registry: *self.registry.address(),
             escrow: Some(*self.escrow.address()),
+            referrals: Some(*self.splitter.address()),
         }
     }
 
@@ -205,9 +234,16 @@ impl Libid {
             provider.clone(),
         );
         let native = escrow.NATIVE().call().await.expect("the native token");
+        let splitter = ReferralSplitter::new(
+            provider
+                .deploy_splitter(owner, *registry.address(), *escrow.address())
+                .await,
+            provider.clone(),
+        );
         Self {
             registry,
             escrow,
+            splitter,
             proof_verifier: *proof_verifier.address(),
             native,
             deployed_at,
@@ -302,6 +338,66 @@ impl Libid {
         let payload = self.prove(holder, proof).await;
         let request = self.binding(holder, proof.handle, payload, disclose, fee);
         self.send(request).await
+    }
+
+    /// `holder` binds what `proof` reports, disclosing nothing and paying
+    /// `fee` to the splitter with `referrer` as its referral; the block the
+    /// bind landed in.
+    pub async fn bind_referred(
+        &mut self,
+        holder: Address,
+        proof: Proof,
+        referrer: Handle,
+        fee: U256,
+    ) -> u64 {
+        let request = self.referred(holder, proof, referrer, fee).await;
+        self.send(request).await
+    }
+
+    /// The same bind, unsent, so several can go in one block.
+    pub async fn referred(
+        &mut self,
+        holder: Address,
+        proof: Proof,
+        referrer: Handle,
+        fee: U256,
+    ) -> TransactionRequest {
+        let payload = self.prove(holder, proof).await;
+        let Handle(platform, handle) = proof.handle;
+        let fee_data = (referrer.0.id(), self.node(referrer).await).abi_encode_params();
+        self.registry
+            .bindWithFeeCall(
+                platform.id(),
+                VERIFIER_VERSION,
+                payload,
+                handle.into(),
+                false,
+                fee,
+                *self.splitter.address(),
+                fee_data.into(),
+            )
+            .into_transaction_request()
+            .from(holder)
+            .value(fee)
+    }
+
+    /// `holder` becomes a wallet that refuses every payment, as a contract
+    /// wallet that reverts on receipt does.
+    pub async fn refuse_payments(&self, holder: Address) {
+        self.registry
+            .provider()
+            .anvil_set_code(holder, REFUSES.into())
+            .await
+            .expect("the code is set");
+    }
+
+    /// The chain's coin `address` holds.
+    pub async fn balance(&self, address: Address) -> U256 {
+        self.registry
+            .provider()
+            .get_balance(address)
+            .await
+            .expect("a balance")
     }
 
     /// `holder` withdraws its name.
@@ -428,6 +524,15 @@ pub trait Transacts {
         owner: Address,
         registry: Address,
     ) -> impl Future<Output = Address> + Send;
+
+    /// A splitter owned by `owner`, taking `registry`'s referred fees and
+    /// paying shares through `escrow`.
+    fn deploy_splitter(
+        &self,
+        owner: Address,
+        registry: Address,
+        escrow: Address,
+    ) -> impl Future<Output = Address> + Send;
 }
 
 impl Transacts for DynProvider {
@@ -456,6 +561,29 @@ impl Transacts for DynProvider {
         )
         .await
         .expect("deploy the escrow")
+    }
+
+    async fn deploy_splitter(
+        &self,
+        owner: Address,
+        registry: Address,
+        escrow: Address,
+    ) -> Address {
+        let arguments = ReferralSplitter::constructorCall {
+            registry,
+            escrow,
+            owner_: owner,
+            treasury_: TREASURY,
+            shareBps_: SHARE_BPS,
+            minReferralFee_: U256::from(MIN_REFERRAL_FEE),
+        }
+        .abi_encode();
+        let bytecode = ARTIFACTS
+            .bytecode("ReferralSplitter")
+            .expect("the splitter's bytecode");
+        deploy_with_ctor(self, &bytecode, &arguments, "ReferralSplitter", None)
+            .await
+            .expect("deploy the splitter")
     }
 
     async fn mined(&self, request: TransactionRequest) -> TransactionReceipt {

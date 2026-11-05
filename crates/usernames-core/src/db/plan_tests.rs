@@ -10,6 +10,7 @@ use sqlx::{
 use usernames_fixtures::database_url;
 
 use super::{
+    awaiting::plans::AwaitingPlans,
     escrow::plans::EscrowPlans,
     history::plans::HistoryPlans,
     reads::{
@@ -17,6 +18,7 @@ use super::{
         Search,
     },
     referral::plans::ReferralPlans,
+    referrals::plans::ReferralHistoryPlans,
     stats::plans::StatsPlans,
     *,
 };
@@ -71,6 +73,7 @@ impl Plan {
             "escrow_refundable",
             "address_events",
             "handle_nodes",
+            "referrals",
         ] {
             assert!(
                 !text.contains(&format!("Seq Scan on {table}")),
@@ -338,6 +341,8 @@ async fn every_read_over_the_big_tables_seeks_its_index() {
     all.extend(conn.history_plans().await);
     all.extend(conn.escrow_plans().await);
     all.extend(conn.referral_plans().await);
+    all.extend(conn.referral_history_plans().await);
+    all.extend(conn.awaiting_plans().await);
     for plan in all {
         plan.check();
     }

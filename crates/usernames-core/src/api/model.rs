@@ -21,7 +21,11 @@ use serde_with::{
     DisplayFromStr,
 };
 
-pub use crate::events::Role;
+pub use crate::events::{
+    Delivery,
+    Outcome,
+    Role,
+};
 use crate::{
     events::{
         EscrowEvent,
@@ -103,6 +107,9 @@ pub struct ChainStatus {
     /// The HandleEscrow the escrow rows were indexed from, when the indexer
     /// watches one.
     pub escrow: Option<Address>,
+    /// The ReferralSplitter the referrals were indexed from, when the
+    /// indexer watches one.
+    pub referrals: Option<Address>,
     /// The cursor: the last block whose window committed.
     pub last_indexed_block: Option<u64>,
     /// The chain head as the indexer last saw it.
@@ -420,6 +427,19 @@ pub enum HistoryEvent {
         #[serde_as(as = "DisplayFromStr")]
         received: U256,
     },
+    Referred {
+        referrer_node: B256,
+        binder: Address,
+        session_id: B256,
+        referrer_platform_id: B256,
+        platform_id: B256,
+        handle_node: B256,
+        #[serde_as(as = "DisplayFromStr")]
+        fee: U256,
+        #[serde_as(as = "DisplayFromStr")]
+        share: U256,
+        outcome: Outcome,
+    },
 }
 
 /// The wire's copy of a journaled event: the same fields, so a client reads
@@ -560,6 +580,27 @@ impl From<NamesEvent> for HistoryEvent {
                 released,
                 received,
             },
+            NamesEvent::Referred {
+                referrer_node,
+                binder,
+                session_id,
+                referrer_platform_id,
+                platform_id,
+                handle_node,
+                fee,
+                share,
+                outcome,
+            } => Self::Referred {
+                referrer_node,
+                binder,
+                session_id,
+                referrer_platform_id,
+                platform_id,
+                handle_node,
+                fee,
+                share,
+                outcome,
+            },
         }
     }
 }
@@ -639,13 +680,16 @@ pub struct EscrowAmount {
 }
 
 /// `GET /v1/escrow/claimable/{address}`: held for the handles the address
-/// holds now, which `claim` pays it.
+/// holds now, which `claim` pays it. `GET /v1/escrow/awaiting/{address}`:
+/// held for those handles' nodes on chains where nobody holds them, which
+/// binding the handle there makes claimable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddressAmounts {
     /// The address asked about.
     pub address: Address,
-    /// By chain, node and token, descending.
+    /// Claimable by chain, node and token; awaiting by node, chain and
+    /// token; descending.
     pub amounts: Vec<EscrowAmount>,
     /// Pass as `before` for the next page; absent on the last one.
     pub next: Option<String>,
@@ -701,6 +745,52 @@ pub struct Unclaimed {
     pub limit: i64,
     /// Token by token, descending, the largest amount first within each.
     pub amounts: Vec<EscrowAmount>,
+    /// Pass as `before` for the next page; absent on the last one.
+    pub next: Option<String>,
+}
+
+/// One bind that named a handle as its referrer, and what became of the
+/// referrer's share of the fee.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Referral {
+    /// The chain the bind happened on.
+    pub chain_id: i64,
+    /// Its block.
+    pub block_number: i64,
+    /// Its log's index in the block.
+    pub log_index: i64,
+    /// Its block's time, in unix seconds.
+    pub block_time: i64,
+    /// The address's handle the bind named as its referrer.
+    pub referrer: HandleRef,
+    /// The wallet that bound.
+    pub binder: Address,
+    /// The handle the binder publishes on that chain now, if any.
+    pub binder_handle: Option<String>,
+    /// The bind's fee, in the chain's coin units, as a decimal string.
+    #[serde_as(as = "DisplayFromStr")]
+    pub fee: U256,
+    /// The referrer's share of it, likewise.
+    #[serde_as(as = "DisplayFromStr")]
+    pub share: U256,
+    /// What became of the share.
+    pub outcome: Outcome,
+    /// For a paid share, where the escrow put it: forwarded to the handle's
+    /// holder on that chain, or held for its claim.
+    pub delivery: Option<Delivery>,
+}
+
+/// `GET /v1/referrals/address/{address}`: the binds that named a handle the
+/// address holds as their referrer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddressReferrals {
+    /// The address asked about.
+    pub address: Address,
+    /// Newest first: by block time, then chain, block and log index.
+    pub referrals: Vec<Referral>,
     /// Pass as `before` for the next page; absent on the last one.
     pub next: Option<String>,
 }

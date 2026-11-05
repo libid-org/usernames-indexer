@@ -232,6 +232,7 @@ impl Shape for AddressHistory {
                     HistoryEvent::Forwarded { .. } => EventKind::Forwarded,
                     HistoryEvent::Claimed { .. } => EventKind::Claimed,
                     HistoryEvent::Refunded { .. } => EventKind::Refunded,
+                    HistoryEvent::Referred { .. } => EventKind::Referred,
                 };
                 (
                     kind,
@@ -1160,6 +1161,7 @@ async fn the_status_names_the_escrow_the_chain_was_indexed_from() {
             Contracts {
                 registry,
                 escrow: Some(escrow),
+                referrals: None,
             },
         )
         .await
@@ -1193,6 +1195,7 @@ async fn another_escrow_replays_the_chain_and_the_same_one_keeps_it() {
             Contracts {
                 registry,
                 escrow: Some(escrow),
+                referrals: None,
             },
         )
         .await
@@ -1209,6 +1212,7 @@ async fn another_escrow_replays_the_chain_and_the_same_one_keeps_it() {
             Contracts {
                 registry,
                 escrow: Some(escrow),
+                referrals: None,
             },
         )
         .await
@@ -1225,6 +1229,7 @@ async fn another_escrow_replays_the_chain_and_the_same_one_keeps_it() {
             Contracts {
                 registry,
                 escrow: Some(other_escrow),
+                referrals: None,
             },
         )
         .await

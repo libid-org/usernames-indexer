@@ -161,6 +161,13 @@ pub use suite::{
 /// The registry a chain these fixtures write is prepared for.
 const REGISTRY: Address = Address::repeat_byte(0x1D);
 
+/// The escrow a chain these fixtures write is prepared for.
+pub const ESCROW: Address = Address::repeat_byte(0xE5);
+
+/// The referral splitter a chain these fixtures write is prepared for: the
+/// escrow deposits it sends pair with its referrals.
+pub const SPLITTER: Address = Address::repeat_byte(0x5B);
+
 /// A user id's node on a platform.
 pub trait IdNode {
     /// The node `id` is bound under, as libid-identity derives it.
@@ -230,7 +237,8 @@ impl Seed for ChainStore {
                 &mut lease,
                 Contracts {
                     registry: REGISTRY,
-                    escrow: None,
+                    escrow: Some(ESCROW),
+                    referrals: Some(SPLITTER),
                 },
             )
             .await

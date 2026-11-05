@@ -85,6 +85,30 @@ pub(crate) async fn claimable(
     }))
 }
 
+/// `GET /v1/escrow/awaiting/{address}?chain=&before=&limit=` — what is held
+/// for the handles the address holds, on the chains where nobody holds them:
+/// binding the handle there makes it claimable.
+pub(crate) async fn awaiting(
+    State(state): State<AppState>,
+    ApiPath(address): ApiPath<String>,
+    ApiQuery(params): ApiQuery<PageParams>,
+) -> Result<Json<AddressAmounts>, ApiError> {
+    let address = address.parse_address()?;
+    let page = params.page()?;
+    state.synced(page.chain).await?;
+
+    let (amounts, next) = state
+        .store
+        .awaiting(address, page)
+        .await?
+        .served(EscrowAmount::of)?;
+    Ok(Json(AddressAmounts {
+        address,
+        amounts,
+        next,
+    }))
+}
+
 /// `GET /v1/escrow/refundable/{address}?chain=&before=&limit=` — what the
 /// address sent that nobody has claimed yet, which `refund` pays back from
 /// each contribution's `refundableAt`.
