@@ -44,6 +44,7 @@ use crate::{
     nodes::KnownPlatform,
 };
 
+mod awaiting;
 mod escrow;
 mod history;
 mod journal;
@@ -52,6 +53,7 @@ mod page;
 mod plan_tests;
 mod reads;
 mod referral;
+mod referrals;
 mod sql;
 mod stats;
 
@@ -85,6 +87,7 @@ pub use self::{
         SearchRow,
     },
     referral::ReferrerRow,
+    referrals::ReferralRow,
     stats::{
         EscrowFlowRow,
         FeesRow,
@@ -99,7 +102,7 @@ pub use self::{
 };
 
 /// Bump on any change to the shape of what the indexer writes.
-const SHAPE_VERSION: &str = "1";
+const SHAPE_VERSION: &str = "2";
 
 /// The version a chain's rows are stamped with: the written shape, and every
 /// platform whose disclosed text this build checks and keeps. A mismatch at
@@ -124,6 +127,8 @@ pub struct ChainState {
     pub contract: Option<Address>,
     /// The escrow its escrow rows come from, when it watches one.
     pub escrow: Option<Address>,
+    /// The referral splitter its referrals come from, when it watches one.
+    pub referral_splitter: Option<Address>,
     /// The registry's deployment block, once detected.
     pub deploy_block: Option<i64>,
     /// The last block a window committed through.
@@ -323,6 +328,15 @@ pub enum ApplyError {
         what: &'static str,
         /// The value itself.
         value: u64,
+    },
+    /// A paid referral without the splitter's deposit before it in its
+    /// transaction, which the splitter never logs.
+    #[error("a paid referral at block {block}, log {log_index}, without its deposit")]
+    UnpairedReferral {
+        /// The referral's block.
+        block: i64,
+        /// The referral's log index.
+        log_index: i64,
     },
 }
 
@@ -533,6 +547,7 @@ impl ChainStore {
         if known.indexer_version.as_deref() == Some(INDEXER_VERSION.as_str())
             && known.contract == Some(contracts.registry)
             && known.escrow == contracts.escrow
+            && known.referral_splitter == contracts.referral_splitter
         {
             let writer = sqlx::query_scalar(sql::CLAIM_CHAIN)
                 .bind(self.chain_id)
@@ -542,6 +557,7 @@ impl ChainStore {
             return Ok(ChainWriter {
                 store: self.clone(),
                 writer,
+                splitter: contracts.referral_splitter,
             });
         }
         tracing::warn!(
@@ -552,6 +568,8 @@ impl ChainStore {
             contract_to = %contracts.registry,
             escrow_from = ?known.escrow,
             escrow_to = ?contracts.escrow,
+            referral_splitter_from = ?known.referral_splitter,
+            referral_splitter_to = ?contracts.referral_splitter,
             "read-model shape or a watched contract changed; clearing this chain for a full replay"
         );
         sqlx::query(sql::CLEAR_CHAIN)
@@ -571,6 +589,7 @@ impl ChainStore {
             .bind(contracts.registry)
             .bind(contracts.escrow)
             .bind(deploy_block)
+            .bind(contracts.referral_splitter)
             .fetch_one(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -582,6 +601,7 @@ impl ChainStore {
         Ok(ChainWriter {
             store: self.clone(),
             writer,
+            splitter: contracts.referral_splitter,
         })
     }
 
@@ -694,6 +714,9 @@ pub struct ChainWriter {
     store: ChainStore,
     /// The generation `prepare` wrote into the chain's row.
     writer: i64,
+    /// The referral splitter the chain's row names, whose escrow deposits
+    /// pair with its referrals.
+    splitter: Option<Address>,
 }
 
 impl ChainWriter {
@@ -821,6 +844,8 @@ impl ChainWriter {
             tx,
             chain_id,
             bind: None,
+            splitter: self.splitter,
+            deposit: None,
         })
     }
 }
@@ -859,6 +884,11 @@ pub struct Window {
     /// `CeremonyBound` and `BindFeePaid` follow its `IdentityBound` in the
     /// same transaction, and a window holds whole blocks.
     bind: Option<history::Bind>,
+    /// The referral splitter, whose escrow deposits pair with its referrals.
+    splitter: Option<Address>,
+    /// The splitter's last deposit this window took up, for the paid
+    /// `Referred` after it in the same transaction.
+    deposit: Option<referrals::Deposit>,
 }
 
 impl Window {
@@ -892,6 +922,7 @@ impl Window {
         // rows it is about to overwrite, and the journal row files the event
         // under the handle it concerns.
         let involvement = self.involvement(event, &at).await?;
+        let delivery = self.delivery(event, &at)?;
 
         let row = EventColumns::of(event, involvement.handle_node)?;
         if !row.journal(&mut self.tx, chain_id, &at).await? {
@@ -990,6 +1021,10 @@ impl Window {
             NamesEvent::Escrow(escrow) => {
                 self.book_escrow(escrow, &at).await?;
             }
+
+            NamesEvent::Referred { .. } => {
+                self.book_referral(event, delivery, &at).await?;
+            }
         }
 
         self.record(involvement, &at).await?;
@@ -1006,6 +1041,20 @@ impl Window {
 // put `EXPLAIN` in front of the exact statement the store runs.
 
 type Statement = QueryBuilder<'static, Postgres>;
+
+/// A read over `holder`'s handles, opened with `h`: each node it holds once,
+/// from the first chain it holds it on, up to `upto` when given. Picking the
+/// node once here keeps the read linear in the holder's handles; a join over
+/// them pairs each with every other.
+fn holder_nodes(prefix: &str, holder: Address, upto: Option<B256>) -> Statement {
+    let mut statement = QueryBuilder::new(format!("{prefix}{}", sql::HOLDER_NODES));
+    statement.push_bind(holder);
+    if let Some(node) = upto {
+        statement.push(" AND handle_node <= ").push_bind(node);
+    }
+    statement.push(" ORDER BY handle_node, chain_id)\n");
+    statement
+}
 
 #[cfg(test)]
 mod version_tests {

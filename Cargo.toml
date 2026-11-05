@@ -24,9 +24,9 @@ futures-util = "0.3"
 hex = "0.4"
 http-body-util = "0.1"
 humantime = "2"
-libid-contracts = "0.21"
-libid-identity = { version = "0.21", features = ["node"] }
-libid-profiles = "0.21"
+libid-contracts = "0.22"
+libid-identity = { version = "0.22", features = ["node"] }
+libid-profiles = "0.22"
 libid-signer = "0.7"
 # Tells apart the failures in alloy's HTTP transport errors, which carry
 # the reqwest error underneath.

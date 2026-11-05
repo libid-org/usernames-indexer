@@ -62,6 +62,7 @@ async fn the_retry_log_names_no_endpoint() {
         contracts: Contracts {
             registry: Address::ZERO,
             escrow: None,
+            referral_splitter: None,
         },
         confirmations: 0,
         poll_interval: Duration::from_secs(1),

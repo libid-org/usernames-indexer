@@ -59,6 +59,7 @@ indexer's settings.
 | `RPC_URL` | indexer | — | JSON-RPC endpoint of the chain to follow, `http` or `https`; any other scheme is a usage error. When its `eth_getLogs` leaves out `blockTimestamp` (a field outside the method's standard answer), the indexer reads each such block's header, one call per block with logs. Prefer a single node or a sticky endpoint: a load balancer that mixes lagged replicas can answer `eth_getLogs` for blocks a backend has not seen, and events dropped that way past the confirmation margin are gone until a re-index. |
 | `IDENTITY_REGISTRY_ADDRESS` | indexer | — | The IdentityRegistry **ERC1967 proxy** (the implementation changes on upgrade; the proxy is the one that emits). The indexer records it per chain, and `/v1/status` reports it from there |
 | `HANDLE_ESCROW_ADDRESS` | indexer | unset | The HandleEscrow **ERC1967 proxy**, when the chain has one. The indexer refuses to start unless its `registry()` is `IDENTITY_REGISTRY_ADDRESS`. Its events share the registry's windows and cursor; setting, changing or unsetting it replays the chain. `/v1/status` reports it as `escrow` |
+| `REFERRAL_SPLITTER_ADDRESS` | indexer | unset | The ReferralSplitter that binds pay their fee to when they name a referrer. Requires `HANDLE_ESCROW_ADDRESS`; the indexer refuses to start unless its `REGISTRY()` and `ESCROW()` are the two addresses above. Its `Referred` events feed `/v1/referrals`; setting, changing or unsetting it replays the chain. `/v1/status` reports it as `referralSplitter` |
 | `CHAIN_ID` | indexer | unset | Refuse to start unless the RPC reports this chain id. The API takes none: it serves every chain the store holds, and a request narrows with `?chain=` |
 | `CHAIN_NAMES` | indexer | — | Required. The names this chain goes by in an ENS name, comma-separated: the `base` in `alice.x.base.handles.link`. Labels only, never a platform key. Written to the store at every start for the gateway to read; a name belongs to one chain across the store, and declaring one another chain holds refuses to start |
 | `CONFIRMATIONS` | indexer | `5` | Blocks behind the head to stay (shallow-reorg protection) |
@@ -97,13 +98,15 @@ set `STALE_AFTER` past the chain's longest gap between blocks.
 | `GET /v1/history/handle/{platform}/{handle}?before=&limit=` | Every event on the handle: deposits while nobody held it, the binds that gave it a holder, and every claim, refund and payment after |
 | `GET /v1/history/node/{node}?before=&limit=` | The same, by handle node: for a handle nobody has bound, whose text no event carried |
 | `GET /v1/escrow/claimable/{address}?before=&limit=` | What `claim` would pay the address: everything held for the handles it holds now |
+| `GET /v1/escrow/awaiting/{address}?before=&limit=` | What is held for the handles the address holds, on each chain where nobody holds that handle: binding it there makes the amount claimable. By node, chain and token, descending |
 | `GET /v1/escrow/refundable/{address}?before=&limit=` | What the address sent that nobody has claimed yet, each contribution with its `refundableAt`: when `refund` opens for it |
 | `GET /v1/escrow/handle/{platform}/{handle}?before=&limit=` | What a handle holds, token by token, and its holder; `/v1/escrow/node/{node}` by node |
 | `GET /v1/escrow/unclaimed?token=0x…&before=&limit=` | Every slot still holding something, bound or not: token by token, descending, the largest amount first within each |
 | `GET /v1/stats` | Users (wallets that linked, sent through the escrow or claimed) and new users across every chain, a wallet counted once, in total and per UTC day. Per chain, in total and per UTC day: users and new users, links and live handles per platform, registration fees per receiver, escrow deposits, forwards, claims and refunds, and onboarding claims (deposits to a handle nobody held, claimed after its holder linked). Token movements are listed per token for the chain's own coin and the `STATS_TOKENS`, and together under `other` for every other token, with a count and wallets but no amount. Amounts are token units as decimal strings. One computation is served for five minutes; `computedAt` says when it was taken |
 | `GET /v1/referral/code/{code}` | The handle a referral code names: `platform`, `handleNode`, `primaryHandle` (its text, only where a holder published it as its name) and the `chains` it is bound on now. A code is the base58 of a bound node's first 8 to 32 bytes; of the nodes bound on any chain that those bytes start, it names the one bound first, retired or not |
 | `GET /v1/referral/node/{node}/code` | The same for a bound node, with the shortest `code` that names it: 8 bytes, or more where a node bound earlier shares them |
-| `GET /v1/status` | Every chain the store holds: chain id, contract, escrow, last indexed block, chain head, lag, when the indexer last reported and how long that report is still good, last window error, the Proof Verifier the contract is wired to; and the read-model version |
+| `GET /v1/referrals/address/{address}?before=&limit=` | Every bind on any chain that named a handle the address holds as its referrer, newest first: the `referrer` handle, the `binder` and its published `binderHandle` on that chain, the `fee` and the referrer's `share` (decimal strings), the `outcome` (`paid`, `self_referral`, `refused`), and for a paid share its `delivery` (`forwarded` to the holder, or `held` in the escrow for the handle's claim) |
+| `GET /v1/status` | Every chain the store holds: chain id, contract, escrow, referral splitter, last indexed block, chain head, lag, when the indexer last reported and how long that report is still good, last window error, the Proof Verifier the contract is wired to; and the read-model version |
 | `GET /health` | Liveness |
 
 Every read spans every chain the store holds, and every result carries its
@@ -145,7 +148,7 @@ transfer to text no account can bind keeps its deposit but not its text.
 Search lists disclosed handles only. A binding nothing disclosed still
 resolves by text or by node, without text in the answer.
 
-`{platform}` is a short key (`x`, `github`, `google`) or a 0x-hex 32-byte
+`{platform}` is a short key (`x`, `github`, `google`, `telegram`) or a 0x-hex 32-byte
 platform id. A text route takes non-empty UTF-8 text and hashes it with
 `libid-identity`, so it needs a platform this build knows: an unknown id is
 `invalid_platform`, and the node routes answer for any platform and any
@@ -354,7 +357,8 @@ start clears that chain's rows — co-tenant chains untouched — and replays it
 from the deployment block. The re-index is the migration. The stored version
 also lists every `KnownPlatform`, so a build that learns a platform replays
 too, and keeps that platform's disclosed text. Changing
-`IDENTITY_REGISTRY_ADDRESS` or `HANDLE_ESCROW_ADDRESS` triggers the same
+`IDENTITY_REGISTRY_ADDRESS`, `HANDLE_ESCROW_ADDRESS` or
+`REFERRAL_SPLITTER_ADDRESS` triggers the same
 per-chain replay, because the old contract's bindings are not the new
 contract's bindings.
 

@@ -26,6 +26,7 @@ use crate::events::{
     EventKind,
     NamesEvent,
     UnknownKind,
+    UnknownOutcome,
 };
 
 /// A journal row that does not read back as the event its kind names.
@@ -34,6 +35,9 @@ pub enum JournalError {
     /// A kind this build does not write.
     #[error(transparent)]
     Kind(#[from] UnknownKind),
+    /// A referral outcome this build does not write.
+    #[error(transparent)]
+    Outcome(#[from] UnknownOutcome),
     /// A column the kind carries is NULL.
     #[error("{kind} row without {field}")]
     Missing {
@@ -83,6 +87,10 @@ pub struct EventColumns {
     pub released: Option<String>,
     pub received: Option<String>,
     pub refundable_at: Option<i64>,
+    pub referrer_node: Option<B256>,
+    pub referrer_platform: Option<B256>,
+    pub share: Option<String>,
+    pub outcome: Option<String>,
 }
 
 impl EventColumns {
@@ -177,6 +185,28 @@ impl EventColumns {
                 refundable_at: Some(as_i64(*refundable_at, "refundableAt")?),
                 ..base
             },
+            // In the columns a bind's fee uses, beside the referrer's own.
+            NamesEvent::Referred {
+                referrer_node,
+                binder,
+                session_id,
+                referrer_platform_id,
+                platform_id,
+                fee,
+                share,
+                outcome,
+                ..
+            } => Self {
+                referrer_node: Some(*referrer_node),
+                holder: Some(*binder),
+                authorization_digest: Some(*session_id),
+                referrer_platform: Some(*referrer_platform_id),
+                platform_id: Some(*platform_id),
+                amount: text(fee),
+                share: text(share),
+                outcome: Some(outcome.to_string()),
+                ..base
+            },
             NamesEvent::Escrow(EscrowEvent::Forwarded {
                 token,
                 sender,
@@ -263,6 +293,10 @@ impl EventColumns {
             .bind(&self.released)
             .bind(&self.received)
             .bind(self.refundable_at)
+            .bind(self.referrer_node)
+            .bind(self.referrer_platform)
+            .bind(&self.share)
+            .bind(&self.outcome)
             .execute(&mut **tx)
             .await?;
         Ok(written.rows_affected() == 1)
@@ -390,6 +424,18 @@ impl TryFrom<&EventColumns> for NamesEvent {
                 released: row.number(&row.released, "released")?,
                 received: row.number(&row.received, "received")?,
             }),
+            EventKind::Referred => Self::Referred {
+                referrer_node: row.need(row.referrer_node, "referrer_node")?,
+                binder: holder()?,
+                session_id: row.need(row.authorization_digest, "authorization_digest")?,
+                referrer_platform_id: row
+                    .need(row.referrer_platform, "referrer_platform")?,
+                platform_id: platform_id()?,
+                handle_node: handle_node()?,
+                fee: row.number(&row.amount, "amount")?,
+                share: row.number(&row.share, "share")?,
+                outcome: row.need(row.outcome.as_deref(), "outcome")?.parse()?,
+            },
         })
     }
 }
@@ -397,9 +443,12 @@ impl TryFrom<&EventColumns> for NamesEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nodes::{
-        DisclosedHandle,
-        KnownPlatform,
+    use crate::{
+        events::Outcome,
+        nodes::{
+            DisclosedHandle,
+            KnownPlatform,
+        },
     };
 
     /// Every kind, the largest `uint256` and counts included, reads back from
@@ -514,6 +563,20 @@ mod tests {
                     received: U256::from(4u64),
                 }),
                 Some(n),
+            ),
+            (
+                NamesEvent::Referred {
+                    referrer_node: n,
+                    binder: a,
+                    session_id: p,
+                    referrer_platform_id: x.id(),
+                    platform_id: KnownPlatform::Google.id(),
+                    handle_node: alice,
+                    fee: big,
+                    share: U256::MAX,
+                    outcome: Outcome::SelfReferral,
+                },
+                Some(alice),
             ),
         ];
         for (event, handle_node) in events {

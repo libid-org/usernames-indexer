@@ -3,6 +3,7 @@
 
 use std::str::FromStr;
 
+use alloy::hex;
 use sqlx::{
     postgres::PgConnectOptions,
     PgConnection,
@@ -10,6 +11,7 @@ use sqlx::{
 use usernames_fixtures::database_url;
 
 use super::{
+    awaiting::plans::AwaitingPlans,
     escrow::plans::EscrowPlans,
     history::plans::HistoryPlans,
     reads::{
@@ -17,6 +19,7 @@ use super::{
         Search,
     },
     referral::plans::ReferralPlans,
+    referrals::plans::ReferralHistoryPlans,
     stats::plans::StatsPlans,
     *,
 };
@@ -52,6 +55,22 @@ impl Plan {
         Self { name, seeks, text }
     }
 
+    /// Panics unless the plan seeks `holder`'s handles once: a second read
+    /// of them joins each with every other, quadratic in their count.
+    pub(crate) fn reading_once(self, holder: Address) -> Self {
+        let Self { name, text, .. } = &self;
+        let owner = format!("owner = '\\x{}'", hex::encode(holder));
+        let reads = text
+            .lines()
+            .filter(|line| line.contains("Index Cond") && line.contains(&owner))
+            .count();
+        assert_eq!(
+            reads, 1,
+            "{name} reads the holder's handles {reads} times:\n{text}"
+        );
+        self
+    }
+
     /// Panics unless the plan seeks every index it names and scans none of
     /// the big tables.
     fn check(&self) {
@@ -71,6 +90,7 @@ impl Plan {
             "escrow_refundable",
             "address_events",
             "handle_nodes",
+            "referrals",
         ] {
             assert!(
                 !text.contains(&format!("Seq Scan on {table}")),
@@ -338,6 +358,8 @@ async fn every_read_over_the_big_tables_seeks_its_index() {
     all.extend(conn.history_plans().await);
     all.extend(conn.escrow_plans().await);
     all.extend(conn.referral_plans().await);
+    all.extend(conn.referral_history_plans().await);
+    all.extend(conn.awaiting_plans().await);
     for plan in all {
         plan.check();
     }

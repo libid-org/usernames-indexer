@@ -20,6 +20,7 @@ use libid_identity::{
         self,
         PLATFORM_GITHUB,
         PLATFORM_GOOGLE,
+        PLATFORM_TELEGRAM,
         PLATFORM_X,
     },
     HandleError,
@@ -53,12 +54,15 @@ pub enum KnownPlatform {
     GitHub,
     /// Google, whose handles are addresses rather than bare names.
     Google,
+    /// Telegram.
+    Telegram,
 }
 
 impl KnownPlatform {
     /// Every variant, in the order a listing shows them. A slice rather than
     /// an array so adding one is a single line and not also an arity.
-    pub const ALL: &'static [Self] = &[Self::X, Self::GitHub, Self::Google];
+    pub const ALL: &'static [Self] =
+        &[Self::X, Self::GitHub, Self::Google, Self::Telegram];
 
     /// The platform as libid-identity's table states it: key, tags, rules.
     const fn spec(self) -> &'static platforms::Platform {
@@ -66,6 +70,7 @@ impl KnownPlatform {
             Self::X => &PLATFORM_X,
             Self::GitHub => &PLATFORM_GITHUB,
             Self::Google => &PLATFORM_GOOGLE,
+            Self::Telegram => &PLATFORM_TELEGRAM,
         }
     }
 

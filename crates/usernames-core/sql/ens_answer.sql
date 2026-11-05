@@ -2,7 +2,7 @@
 -- snapshot: the chain's row, which says how far its index got, and who holds
 -- the handle node there. The gateway answers every binding, an unlisted one
 -- too, as `resolveHandle` does.
-SELECT c.chain_id, c.indexer_version, c.contract, c.escrow, c.deploy_block,
+SELECT c.chain_id, c.indexer_version, c.contract, c.escrow, c.referral_splitter, c.deploy_block,
        c.cursor, c.head, c.target, c.reported_at,
        c.valid_until - EXTRACT(EPOCH FROM now())::bigint AS valid_for,
        c.window_error, c.proof_verifier,
