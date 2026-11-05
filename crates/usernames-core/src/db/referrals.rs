@@ -1,14 +1,8 @@
 //! Referrals: each `Referred` the splitter logs, with where the escrow put a
 //! paid share, and the history of the referrals a holder's handles earned.
 
-use alloy::primitives::{
-    Address,
-    B256,
-    U256,
-};
-use sqlx::QueryBuilder;
-
 use super::{
+    holder_nodes,
     sql,
     ApplyError,
     Cursor,
@@ -24,6 +18,11 @@ use crate::events::{
     Delivery,
     NamesEvent,
     Outcome,
+};
+use alloy::primitives::{
+    Address,
+    B256,
+    U256,
 };
 
 /// The splitter's last deposit in a window: the paid share whose `Referred`
@@ -187,13 +186,12 @@ impl Page<HistoryCursor> {
     /// `holder`'s referrals: a page's worth per node of the handles it
     /// holds, then the page across them, newest first.
     pub(crate) fn referrals_lookup(&self, prefix: &str, holder: Address) -> Statement {
-        let mut statement =
-            QueryBuilder::new(format!("{prefix}{}", sql::REFERRALS_BY_NODE));
+        let mut statement = holder_nodes(prefix, holder, None);
+        statement.push(sql::REFERRALS_BY_NODE);
         self.bound(&mut statement, "r");
         statement
             .push(") r\n")
             .push(sql::REFERRALS_HOLDER)
-            .push_bind(holder)
             .push(
                 " ORDER BY r.block_time DESC, r.chain_id DESC, r.block_number DESC, \
                  r.log_index DESC LIMIT ",
@@ -235,7 +233,9 @@ pub(crate) mod plans {
 
     impl ReferralHistoryPlans for PgConnection {
         async fn referral_history_plans(&mut self) -> Vec<Plan> {
-            let holder = Address::repeat_byte(2);
+            // An address the volume holds nothing for, and one holding many
+            // handles on two chains.
+            let (holder, many) = (Address::repeat_byte(2), Address::repeat_byte(0x4E));
             // A cursor late in the volume's times, where a history read
             // backwards has most of its rows still ahead of it.
             let before = Some(HistoryCursor {
@@ -249,10 +249,28 @@ pub(crate) mod plans {
             let seeks: &[&str] =
                 &["handles_owner_chain_node_idx", "referrals_referrer_idx"];
             let mut plans = Vec::new();
-            for (name, chain, before) in [
-                ("referrals", None, None),
-                ("referrals, past a cursor", None, before),
-                ("referrals, one chain, past a cursor", Some(1), before),
+            for (name, holder, chain, before) in [
+                ("referrals", holder, None, None),
+                ("referrals, past a cursor", holder, None, before),
+                (
+                    "referrals, one chain, past a cursor",
+                    holder,
+                    Some(1),
+                    before,
+                ),
+                ("referrals of many handles", many, None, None),
+                (
+                    "referrals of many handles, past a cursor",
+                    many,
+                    None,
+                    before,
+                ),
+                (
+                    "referrals of many handles, one chain, past a cursor",
+                    many,
+                    Some(1),
+                    before,
+                ),
             ] {
                 let page = Page {
                     chain,
@@ -260,7 +278,8 @@ pub(crate) mod plans {
                     limit: 20,
                 };
                 let statement = page.referrals_lookup("EXPLAIN ", holder);
-                plans.push(Plan::of(self, name, Some(seeks), statement).await);
+                let plan = Plan::of(self, name, Some(seeks), statement).await;
+                plans.push(plan.reading_once(holder));
             }
             plans
         }

@@ -103,6 +103,18 @@ SELECT 1, i, 3, i, sha256(('node' || i % 1000)::bytea),
        CASE WHEN i % 4 = 0 THEN 'refused' ELSE 'paid' END,
        CASE i % 4 WHEN 0 THEN NULL WHEN 1 THEN 'held' ELSE 'forwarded' END
 FROM generate_series(1, 5000) i;
+-- A holder of many handles, 0x4e..4e: the first 1000 nodes, on chains 2 and
+-- 3, where nobody else holds them. Their referrals and their slots on chains
+-- 4 and 5 are its; a read over its handles that pairs them up grows with the
+-- square of their count.
+INSERT INTO names.handles
+    (chain_id, handle_node, platform_id, owner,
+     observed_at, ceremony_version, id_node)
+SELECT chain, sha256(('node' || i)::bytea),
+       CASE i % 3 WHEN 0 THEN decode(repeat('01', 32), 'hex')
+                  ELSE sha256(('platform' || i % 3)::bytea) END,
+       decode(repeat('4e', 20), 'hex'), 1, 1, sha256(('id' || i)::bytea)
+FROM generate_series(1, 1000) i, generate_series(2, 3) chain;
 -- Vacuum moves a GIN index's pending entries into it; the rows above wait there.
 SELECT gin_clean_pending_list('names.handle_nodes_handle_trgm_idx');
 ANALYZE names.handles, names.ids, names.published, names.events,

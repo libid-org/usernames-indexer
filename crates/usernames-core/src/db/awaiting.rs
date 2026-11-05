@@ -1,10 +1,8 @@
 //! What waits for a holder on the chains where nobody holds its handles:
 //! escrowed for a node it holds elsewhere, claimable once it binds there.
 
-use alloy::primitives::Address;
-use sqlx::QueryBuilder;
-
 use super::{
+    holder_nodes,
     sql,
     EscrowSlotRow,
     Page,
@@ -13,13 +11,16 @@ use super::{
     Statement,
     Store,
 };
+use alloy::primitives::Address;
 
 impl Page<SlotCursor> {
     /// What waits for `holder`: node by node of the handles it holds, each
     /// node's slots by chain and token, descending.
     pub(crate) fn awaiting_lookup(&self, prefix: &str, holder: Address) -> Statement {
-        let mut statement =
-            QueryBuilder::new(format!("{prefix}{}", sql::ESCROW_AWAITING_SLOTS));
+        // Nodes past the cursor's node have nothing left for the page.
+        let upto = self.before.map(|before| before.handle_node);
+        let mut statement = holder_nodes(prefix, holder, upto);
+        statement.push(sql::ESCROW_AWAITING_SLOTS);
         if let Some(chain) = self.chain {
             statement.push(" AND e.chain_id = ").push_bind(chain);
         }
@@ -40,13 +41,6 @@ impl Page<SlotCursor> {
             .push_bind(self.fetch())
             .push(") e\n")
             .push(sql::ESCROW_AWAITING_HOLDER)
-            .push_bind(holder);
-        if let Some(before) = self.before {
-            statement
-                .push(" AND h.handle_node <= ")
-                .push_bind(before.handle_node);
-        }
-        statement
             .push(" ORDER BY e.handle_node DESC, e.chain_id DESC, e.token DESC LIMIT ")
             .push_bind(self.fetch());
         statement
@@ -87,7 +81,9 @@ pub(crate) mod plans {
 
     impl AwaitingPlans for PgConnection {
         async fn awaiting_plans(&mut self) -> Vec<Plan> {
-            let holder = Address::repeat_byte(2);
+            // An address the volume holds nothing for, and one holding many
+            // handles on two chains.
+            let (holder, many) = (Address::repeat_byte(2), Address::repeat_byte(0x4E));
             // A cursor high in the node and token ranges, where a list read
             // backwards has most of its rows still ahead of it.
             let before = Some(SlotCursor {
@@ -104,10 +100,23 @@ pub(crate) mod plans {
                 "handles_pkey|handles_node_chain_idx",
             ];
             let mut plans = Vec::new();
-            for (name, chain, before) in [
-                ("awaiting", None, None),
-                ("awaiting, past a cursor", None, before),
-                ("awaiting, one chain, past a cursor", Some(1), before),
+            for (name, holder, chain, before) in [
+                ("awaiting", holder, None, None),
+                ("awaiting, past a cursor", holder, None, before),
+                (
+                    "awaiting, one chain, past a cursor",
+                    holder,
+                    Some(1),
+                    before,
+                ),
+                ("awaiting many handles", many, None, None),
+                ("awaiting many handles, past a cursor", many, None, before),
+                (
+                    "awaiting many handles, one chain, past a cursor",
+                    many,
+                    Some(1),
+                    before,
+                ),
             ] {
                 let page = Page {
                     chain,
@@ -115,7 +124,8 @@ pub(crate) mod plans {
                     limit: 20,
                 };
                 let statement = page.awaiting_lookup("EXPLAIN ", holder);
-                plans.push(Plan::of(self, name, Some(seeks), statement).await);
+                let plan = Plan::of(self, name, Some(seeks), statement).await;
+                plans.push(plan.reading_once(holder));
             }
             plans
         }

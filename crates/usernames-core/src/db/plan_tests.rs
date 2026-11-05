@@ -3,6 +3,7 @@
 
 use std::str::FromStr;
 
+use alloy::hex;
 use sqlx::{
     postgres::PgConnectOptions,
     PgConnection,
@@ -52,6 +53,22 @@ impl Plan {
             .unwrap_or_else(|e| panic!("{name}: {e}"))
             .join("\n");
         Self { name, seeks, text }
+    }
+
+    /// Panics unless the plan seeks `holder`'s handles once: a second read
+    /// of them joins each with every other, quadratic in their count.
+    pub(crate) fn reading_once(self, holder: Address) -> Self {
+        let Self { name, text, .. } = &self;
+        let owner = format!("owner = '\\x{}'", hex::encode(holder));
+        let reads = text
+            .lines()
+            .filter(|line| line.contains("Index Cond") && line.contains(&owner))
+            .count();
+        assert_eq!(
+            reads, 1,
+            "{name} reads the holder's handles {reads} times:\n{text}"
+        );
+        self
     }
 
     /// Panics unless the plan seeks every index it names and scans none of

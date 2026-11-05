@@ -1042,6 +1042,20 @@ impl Window {
 
 type Statement = QueryBuilder<'static, Postgres>;
 
+/// A read over `holder`'s handles, opened with `h`: each node it holds once,
+/// from the first chain it holds it on, up to `upto` when given. Picking the
+/// node once here keeps the read linear in the holder's handles; a join over
+/// them pairs each with every other.
+fn holder_nodes(prefix: &str, holder: Address, upto: Option<B256>) -> Statement {
+    let mut statement = QueryBuilder::new(format!("{prefix}{}", sql::HOLDER_NODES));
+    statement.push_bind(holder);
+    if let Some(node) = upto {
+        statement.push(" AND handle_node <= ").push_bind(node);
+    }
+    statement.push(" ORDER BY handle_node, chain_id)\n");
+    statement
+}
+
 #[cfg(test)]
 mod version_tests {
     use super::*;
