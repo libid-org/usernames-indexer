@@ -268,7 +268,7 @@ impl ChainStatus {
             names,
             contract: state.contract,
             escrow: state.escrow,
-            referrals: state.referrals,
+            referral_splitter: state.referral_splitter,
             last_indexed_block: position.cursor,
             chain_head_block: state.head(),
             lag_blocks: position.lag_blocks(),

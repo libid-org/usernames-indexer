@@ -63,7 +63,7 @@ pub struct Contracts {
     pub escrow: Option<Address>,
     /// The ReferralSplitter, when the indexer watches one. It deposits
     /// through the escrow, so it is watched only beside one.
-    pub referrals: Option<Address>,
+    pub referral_splitter: Option<Address>,
 }
 
 impl Contracts {
@@ -71,7 +71,7 @@ impl Contracts {
     pub fn watched(&self) -> Vec<Address> {
         std::iter::once(self.registry)
             .chain(self.escrow)
-            .chain(self.referrals)
+            .chain(self.referral_splitter)
             .collect()
     }
 
@@ -87,7 +87,7 @@ impl Contracts {
             NamesEvent::from_registry(log)
         } else if Some(emitter) == self.escrow {
             NamesEvent::from_escrow(log)
-        } else if Some(emitter) == self.referrals {
+        } else if Some(emitter) == self.referral_splitter {
             NamesEvent::from_splitter(log)
         } else {
             tracing::warn!(
@@ -248,7 +248,7 @@ impl Contracts {
         &self,
         provider: &impl Provider,
     ) -> Result<(), ReferralsRefused> {
-        let Some(splitter) = self.referrals else {
+        let Some(splitter) = self.referral_splitter else {
             return Ok(());
         };
         let Some(escrow) = self.escrow else {
@@ -401,7 +401,7 @@ mod tests {
         let contracts = Contracts {
             registry: Address::repeat_byte(0x11),
             escrow: Some(Address::repeat_byte(0xE5)),
-            referrals: Some(SPLITTER),
+            referral_splitter: Some(SPLITTER),
         };
         let decoded = contracts.decode(&referred_by(SPLITTER)).unwrap();
         assert!(matches!(decoded, Some((NamesEvent::Referred { .. }, _))));
@@ -413,7 +413,7 @@ mod tests {
             assert!(contracts.decode(&referred_by(other)).unwrap().is_none());
         }
         let unwatched = Contracts {
-            referrals: None,
+            referral_splitter: None,
             ..contracts
         };
         assert!(unwatched.decode(&referred_by(SPLITTER)).unwrap().is_none());

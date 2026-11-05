@@ -238,7 +238,7 @@ impl Seed for ChainStore {
                 Contracts {
                     registry: REGISTRY,
                     escrow: Some(ESCROW),
-                    referrals: Some(SPLITTER),
+                    referral_splitter: Some(SPLITTER),
                 },
             )
             .await

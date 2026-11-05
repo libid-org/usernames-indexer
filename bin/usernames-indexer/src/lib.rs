@@ -115,7 +115,7 @@ impl Config {
         Contracts {
             registry: self.identity_registry_address,
             escrow: self.handle_escrow_address,
-            referrals: self.referral_splitter_address,
+            referral_splitter: self.referral_splitter_address,
         }
     }
 
@@ -163,7 +163,7 @@ impl Config {
             chain_id,
             contract = %contracts.registry,
             escrow = ?contracts.escrow,
-            referrals = ?contracts.referrals,
+            referral_splitter = ?contracts.referral_splitter,
             "indexing"
         );
         Ok((lease, indexer))

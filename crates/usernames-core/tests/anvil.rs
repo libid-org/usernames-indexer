@@ -167,7 +167,7 @@ async fn indexes_a_real_chain_end_to_end() {
     let contracts = Contracts {
         registry,
         escrow: Some(escrow),
-        referrals: None,
+        referral_splitter: None,
     };
     contracts
         .check_escrow(provider)
@@ -181,7 +181,7 @@ async fn indexes_a_real_chain_end_to_end() {
     let escrow_as_registry = Contracts {
         registry: escrow,
         escrow: None,
-        referrals: None,
+        referral_splitter: None,
     };
     assert!(matches!(
         escrow_as_registry.check_registry(provider).await,
@@ -489,7 +489,7 @@ async fn an_escrow_of_another_registry_is_refused() {
     let refused = Contracts {
         registry: indexed,
         escrow: Some(escrow),
-        referrals: None,
+        referral_splitter: None,
     }
     .check_escrow(provider)
     .await;

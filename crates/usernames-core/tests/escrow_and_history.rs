@@ -1161,7 +1161,7 @@ async fn the_status_names_the_escrow_the_chain_was_indexed_from() {
             Contracts {
                 registry,
                 escrow: Some(escrow),
-                referrals: None,
+                referral_splitter: None,
             },
         )
         .await
@@ -1195,7 +1195,7 @@ async fn another_escrow_replays_the_chain_and_the_same_one_keeps_it() {
             Contracts {
                 registry,
                 escrow: Some(escrow),
-                referrals: None,
+                referral_splitter: None,
             },
         )
         .await
@@ -1212,7 +1212,7 @@ async fn another_escrow_replays_the_chain_and_the_same_one_keeps_it() {
             Contracts {
                 registry,
                 escrow: Some(escrow),
-                referrals: None,
+                referral_splitter: None,
             },
         )
         .await
@@ -1229,7 +1229,7 @@ async fn another_escrow_replays_the_chain_and_the_same_one_keeps_it() {
             Contracts {
                 registry,
                 escrow: Some(other_escrow),
-                referrals: None,
+                referral_splitter: None,
             },
         )
         .await

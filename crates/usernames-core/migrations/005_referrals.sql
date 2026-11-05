@@ -8,7 +8,7 @@
 SET LOCAL lock_timeout = '5s';
 
 -- The ReferralSplitter the chain's indexer watches, beside its escrow.
-ALTER TABLE names.chains ADD COLUMN IF NOT EXISTS referrals BYTEA;
+ALTER TABLE names.chains ADD COLUMN IF NOT EXISTS referral_splitter BYTEA;
 
 -- A `referred` row keeps the bind in the columns a bind's fee uses: the
 -- bound handle in `handle_node` and `platform_id`, the binder in `holder`,

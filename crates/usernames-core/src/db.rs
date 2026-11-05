@@ -128,7 +128,7 @@ pub struct ChainState {
     /// The escrow its escrow rows come from, when it watches one.
     pub escrow: Option<Address>,
     /// The referral splitter its referrals come from, when it watches one.
-    pub referrals: Option<Address>,
+    pub referral_splitter: Option<Address>,
     /// The registry's deployment block, once detected.
     pub deploy_block: Option<i64>,
     /// The last block a window committed through.
@@ -547,7 +547,7 @@ impl ChainStore {
         if known.indexer_version.as_deref() == Some(INDEXER_VERSION.as_str())
             && known.contract == Some(contracts.registry)
             && known.escrow == contracts.escrow
-            && known.referrals == contracts.referrals
+            && known.referral_splitter == contracts.referral_splitter
         {
             let writer = sqlx::query_scalar(sql::CLAIM_CHAIN)
                 .bind(self.chain_id)
@@ -557,7 +557,7 @@ impl ChainStore {
             return Ok(ChainWriter {
                 store: self.clone(),
                 writer,
-                splitter: contracts.referrals,
+                splitter: contracts.referral_splitter,
             });
         }
         tracing::warn!(
@@ -568,8 +568,8 @@ impl ChainStore {
             contract_to = %contracts.registry,
             escrow_from = ?known.escrow,
             escrow_to = ?contracts.escrow,
-            referrals_from = ?known.referrals,
-            referrals_to = ?contracts.referrals,
+            referral_splitter_from = ?known.referral_splitter,
+            referral_splitter_to = ?contracts.referral_splitter,
             "read-model shape or a watched contract changed; clearing this chain for a full replay"
         );
         sqlx::query(sql::CLEAR_CHAIN)
@@ -589,7 +589,7 @@ impl ChainStore {
             .bind(contracts.registry)
             .bind(contracts.escrow)
             .bind(deploy_block)
-            .bind(contracts.referrals)
+            .bind(contracts.referral_splitter)
             .fetch_one(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -601,7 +601,7 @@ impl ChainStore {
         Ok(ChainWriter {
             store: self.clone(),
             writer,
-            splitter: contracts.referrals,
+            splitter: contracts.referral_splitter,
         })
     }
 

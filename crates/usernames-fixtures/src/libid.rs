@@ -182,7 +182,7 @@ impl Libid {
         Contracts {
             registry: *self.registry.address(),
             escrow: Some(*self.escrow.address()),
-            referrals: Some(*self.splitter.address()),
+            referral_splitter: Some(*self.splitter.address()),
         }
     }
 

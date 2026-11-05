@@ -356,7 +356,7 @@ async fn a_paid_share_is_listed_as_forwarded_or_held_where_it_went() {
         .chains
         .iter()
         .filter(|c| [CHAIN, OTHER_CHAIN].contains(&c.chain_id))
-        .all(|c| c.referrals == Some(SPLITTER)));
+        .all(|c| c.referral_splitter == Some(SPLITTER)));
     suite.done();
 }
 

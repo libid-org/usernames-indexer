@@ -109,7 +109,7 @@ pub struct ChainStatus {
     pub escrow: Option<Address>,
     /// The ReferralSplitter the referrals were indexed from, when the
     /// indexer watches one.
-    pub referrals: Option<Address>,
+    pub referral_splitter: Option<Address>,
     /// The cursor: the last block whose window committed.
     pub last_indexed_block: Option<u64>,
     /// The chain head as the indexer last saw it.
