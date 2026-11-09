@@ -103,8 +103,8 @@ set `STALE_AFTER` past the chain's longest gap between blocks.
 | `GET /v1/escrow/handle/{platform}/{handle}?before=&limit=` | What a handle holds, token by token, and its holder; `/v1/escrow/node/{node}` by node |
 | `GET /v1/escrow/unclaimed?token=0x…&before=&limit=` | Every slot still holding something, bound or not: token by token, descending, the largest amount first within each |
 | `GET /v1/stats` | Users (wallets that linked, sent through the escrow or claimed) and new users across every chain, a wallet counted once, in total and per UTC day. Per chain, in total and per UTC day: users and new users, links and live handles per platform, registration fees per receiver, escrow deposits, forwards, claims and refunds, and onboarding claims (deposits to a handle nobody held, claimed after its holder linked). Token movements are listed per token for the chain's own coin and the `STATS_TOKENS`, and together under `other` for every other token, with a count and wallets but no amount. Amounts are token units as decimal strings. One computation is served for five minutes; `computedAt` says when it was taken |
-| `GET /v1/referral/code/{code}` | The handle a referral code names: `platform`, `handleNode`, `primaryHandle` (its text, only where a holder published it as its name) and the `chains` it is bound on now. A code is the base58 of a bound node's first 8 to 32 bytes; of the nodes bound on any chain that those bytes start, it names the one bound first, retired or not |
-| `GET /v1/referral/node/{node}/code` | The same for a bound node, with the shortest `code` that names it: 8 bytes, or more where a node bound earlier shares them |
+| `GET /v1/referral/code/{code}` | The handle a referral code names: `platform`, `handleNode`, `primaryHandle` (its text, only where a holder published it as its name) and the `chains` it is bound on now. A code is the base58 of a bound node's first 8 to 32 bytes; it names the one node bound on any chain that those bytes start, retired or not. While two are, it names neither: 409 `code_ambiguous` |
+| `GET /v1/referral/node/{node}/code` | The same for a bound node, with the shortest `code` that names it: 8 bytes, or more where another bound node shares them |
 | `GET /v1/referrals/address/{address}?before=&limit=` | Every bind on any chain that named a handle the address holds as its referrer, newest first: the `referrer` handle, the `binder` and its published `binderHandle` on that chain, the `fee` and the referrer's `share` (decimal strings), the `outcome` (`paid`, `self_referral`, `refused`), and for a paid share its `delivery` (`forwarded` to the holder, or `held` in the escrow for the handle's claim) |
 | `GET /v1/status` | Every chain the store holds: chain id, contract, escrow, referral splitter, last indexed block, chain head, lag, when the indexer last reported and how long that report is still good, last window error, the Proof Verifier the contract is wired to; and the read-model version |
 | `GET /health` | Liveness |
@@ -160,7 +160,8 @@ Errors share one envelope — `{ "error": { "code", "message" } }`. The `code`
 is stable and machine-readable; the prose is for humans and may be reworded.
 Resolution 404s distinguish `handle_not_bound` (on a known platform, whether
 or not anything was ever bound on it), `handle_retired`, `id_not_bound` and
-`handle_impossible` (text no circuit hashes); `not_synced` is the 503 before the first window;
+`handle_impossible` (text no circuit hashes); a referral code is `code_not_issued` (404) or
+`code_ambiguous` (409); `not_synced` is the 503 before the first window;
 bad input is `invalid_platform`, `invalid_address`, `invalid_node`,
 `invalid_chain`, `invalid_cursor`, `invalid_argument`, or, for a path or query
 string that does not parse at all, `invalid_path` and `invalid_query`;

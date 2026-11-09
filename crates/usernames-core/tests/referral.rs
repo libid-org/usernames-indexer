@@ -1,7 +1,7 @@
 //! Referral codes, end to end: binds go through the apply path the indexer
 //! uses, and every assertion goes through the axum handlers a caller hits.
 //!
-//! Skips silently when `DATABASE_URL` is unset; everything past that check
+//! Skips, saying so, when `DATABASE_URL` is unset; everything past that check
 //! panics on failure. The suite's chains are its own; its nodes start with
 //! bytes no other suite's handles do.
 
@@ -174,71 +174,63 @@ async fn a_handle_nobody_published_as_a_name_keeps_its_text_hidden() {
 }
 
 #[tokio::test]
-async fn the_node_bound_first_keeps_a_shared_code_and_a_later_one_takes_a_longer_one() {
+async fn a_code_two_bound_nodes_start_names_neither_and_each_takes_a_longer_one() {
     let Some(referrals) = Referrals::open().await else {
         return;
     };
     let head = [0x5e, 0xf3, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
-    // The node bound later sorts first, so only the bind order decides.
     let first = crafted(&head, 0x22);
     let later = crafted(&head, 0x11);
     referrals.bind(OTHER_CHAIN, 3, first, HOLDER).await;
     let shortest = referrals.code_of(first).await.answer().code;
     assert_eq!(shortest.prefix(), head);
+    let named = referrals.named(&shortest.to_string()).await.answer();
+    assert_eq!(named.handle_node, first);
+    assert_eq!(named.chains, vec![OTHER_CHAIN]);
 
     referrals.bind(CHAIN, 5, later, OTHER_HOLDER).await;
-    let still = referrals.named(&shortest.to_string()).await.answer();
-    assert_eq!(still.handle_node, first);
-    assert_eq!(still.chains, vec![OTHER_CHAIN]);
-
-    let longer = referrals.code_of(later).await.answer();
-    assert_eq!(longer.code.prefix(), &later[..9]);
     assert_eq!(
-        referrals
-            .named(&longer.code.to_string())
-            .await
-            .answer()
-            .handle_node,
-        later
+        referrals.named(&shortest.to_string()).await.refusal(),
+        (StatusCode::CONFLICT, ErrorCode::CodeAmbiguous),
+        "a shared code never passes to the node bound later"
     );
-    assert_eq!(referrals.code_of(first).await.answer().code, shortest);
+    for node in [first, later] {
+        let longer = referrals.code_of(node).await.answer().code;
+        assert_eq!(longer.prefix(), &node[..9]);
+        assert_eq!(
+            referrals
+                .named(&longer.to_string())
+                .await
+                .answer()
+                .handle_node,
+            node
+        );
+    }
     referrals.done();
 }
 
 #[tokio::test]
-async fn a_code_goes_to_the_first_bind_by_time_then_by_chain() {
+async fn a_lagging_chains_earlier_bind_takes_no_code_already_named() {
     let Some(referrals) = Referrals::open().await else {
         return;
     };
-    let head = [0x5e, 0xf3, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
-    let on_other = crafted(&head, 0x33);
-    let on_chain = crafted(&head, 0x44);
-    // Bound at the same block time: the lower chain id is first.
-    referrals.bind(OTHER_CHAIN, 7, on_other, HOLDER).await;
-    referrals.bind(CHAIN, 7, on_chain, OTHER_HOLDER).await;
-
-    let code = Code::prefixes(on_chain).next().unwrap().to_string();
-    assert_eq!(referrals.named(&code).await.answer().handle_node, on_chain);
-    assert_eq!(
-        referrals
-            .code_of(on_other)
-            .await
-            .answer()
-            .code
-            .prefix()
-            .len(),
-        9
-    );
-
-    // A lagging chain's indexer writes the earlier bind last, and the node
-    // bound later sorts first: the block time alone decides.
     let head = [0x5e, 0xf3, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f];
     let earlier = crafted(&head, 0x66);
     let later = crafted(&head, 0x55);
     referrals.bind(CHAIN, 9, later, OTHER_HOLDER).await;
+    let code = referrals.code_of(later).await.answer().code;
+    assert_eq!(code.prefix(), head);
+
+    // The other chain's indexer writes a bind from an earlier block last.
     referrals.bind(OTHER_CHAIN, 8, earlier, HOLDER).await;
-    let code = Code::prefixes(earlier).next().unwrap().to_string();
-    assert_eq!(referrals.named(&code).await.answer().handle_node, earlier);
+    assert_eq!(
+        referrals.named(&code.to_string()).await.refusal(),
+        (StatusCode::CONFLICT, ErrorCode::CodeAmbiguous)
+    );
+    assert_eq!(
+        referrals.code_of(earlier).await.answer().code.prefix(),
+        &earlier[..9]
+    );
     referrals.done();
 }
 

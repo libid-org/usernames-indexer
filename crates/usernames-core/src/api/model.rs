@@ -58,6 +58,9 @@ pub enum ErrorCode {
     IdNotBound,
     /// No chain has bound a handle node the referral code names.
     CodeNotIssued,
+    /// More than one bound handle node starts with the referral code's
+    /// bytes, so it names none; each node goes by a longer code.
+    CodeAmbiguous,
     /// Text the platform could never hold as a handle.
     HandleImpossible,
     /// No indexer has committed a first window for the chains in scope.

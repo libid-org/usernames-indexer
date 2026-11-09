@@ -86,7 +86,10 @@ pub use self::{
         Search,
         SearchRow,
     },
-    referral::ReferrerRow,
+    referral::{
+        CodeOwner,
+        ReferrerRow,
+    },
     referrals::ReferralRow,
     stats::{
         EscrowFlowRow,

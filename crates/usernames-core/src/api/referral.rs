@@ -18,7 +18,10 @@ use super::{
     Param,
 };
 use crate::{
-    db::ReferrerRow,
+    db::{
+        CodeOwner,
+        ReferrerRow,
+    },
     nodes,
     referral::Code,
 };
@@ -45,8 +48,9 @@ impl Referrer {
     }
 }
 
-/// `GET /v1/referral/code/{code}` — the handle a referral code names: of the
-/// nodes bound on any chain that its bytes start, the one bound first.
+/// `GET /v1/referral/code/{code}` — the handle a referral code names: the one
+/// node bound on any chain that its bytes start. While two are, it names
+/// neither.
 pub(crate) async fn code(
     State(state): State<AppState>,
     ApiPath(code): ApiPath<String>,
@@ -54,10 +58,11 @@ pub(crate) async fn code(
     let code: Code = code.parse()?;
     state.synced(None).await?;
 
-    let Some(node) = state.store.code_owner(&code).await? else {
-        return Err(ApiError::code_not_issued());
-    };
-    state.referrer(code, node).await
+    match state.store.code_owner(&code).await? {
+        CodeOwner::Node(node) => state.referrer(code, node).await,
+        CodeOwner::Shared => Err(ApiError::code_ambiguous()),
+        CodeOwner::Unissued => Err(ApiError::code_not_issued()),
+    }
 }
 
 /// `GET /v1/referral/node/{node}/code` — the shortest code that names a

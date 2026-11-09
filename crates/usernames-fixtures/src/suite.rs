@@ -101,7 +101,10 @@ impl Suite {
     /// The suite's `chain`, emptied; `None` when `DATABASE_URL` is unset.
     pub async fn open(lock: &'static Mutex<()>, chain: i64) -> Option<Self> {
         let lock = lock.lock().await;
-        let url = database_url()?;
+        let Some(url) = database_url() else {
+            eprintln!("skipping: DATABASE_URL not set");
+            return None;
+        };
         let pool = PgPool::connect(&url)
             .await
             .expect("DATABASE_URL is set but connecting failed");
