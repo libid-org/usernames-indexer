@@ -3,18 +3,26 @@
 -- once over the whole journal (day NULL) and once per UTC day with the
 -- wallets seen that day for the first time: on that chain, or across every
 -- chain on any of them. On the whole journal those are all of them.
+-- A referral splitter any chain watches, which sends every paid share, is
+-- no user.
 -- Each part is its own aggregate, so each reads one covering index in
 -- its order.
-WITH cdw AS MATERIALIZED (
+WITH splitters AS MATERIALIZED (
+    SELECT referral_splitter AS wallet
+    FROM names.chains
+    WHERE referral_splitter IS NOT NULL
+), cdw AS MATERIALIZED (
     SELECT DISTINCT chain_id, day, wallet
     FROM names.events
     WHERE kind IN ('identity_bound', 'deposited', 'forwarded', 'claimed')
       AND wallet IS NOT NULL
+      AND wallet NOT IN (SELECT wallet FROM splitters)
 ), firsts AS MATERIALIZED (
     SELECT chain_id, wallet, min(day) AS first_day
     FROM names.events
     WHERE kind IN ('identity_bound', 'deposited', 'forwarded', 'claimed')
       AND wallet IS NOT NULL
+      AND wallet NOT IN (SELECT wallet FROM splitters)
     GROUP BY chain_id, wallet
 ), anywhere AS MATERIALIZED (
     SELECT wallet, min(first_day) AS first_day FROM firsts GROUP BY wallet
@@ -23,6 +31,7 @@ WITH cdw AS MATERIALIZED (
     FROM names.events
     WHERE kind IN ('identity_bound', 'deposited', 'forwarded', 'claimed')
       AND wallet IS NOT NULL
+      AND wallet NOT IN (SELECT wallet FROM splitters)
 )
 SELECT c.chain_id, c.day, c.users, coalesce(n.new_users, 0) AS new_users
 FROM (SELECT chain_id, day, count(*) AS users FROM cdw GROUP BY 1, 2) c

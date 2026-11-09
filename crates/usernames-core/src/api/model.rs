@@ -800,8 +800,9 @@ pub struct AddressReferrals {
 
 /// `GET /v1/stats`: what the chains this store holds recorded, chain by
 /// chain, and the users across them: totals and a series per UTC day.
-/// Every address counts. Amounts
-/// are token units, never converted. Tokens are named only when they are
+/// Every address counts but a referral splitter any chain watches, which
+/// sends every paid share: its deposits and forwards count, its wallet does
+/// not. Amounts are token units, never converted. Tokens are named only when they are
 /// the chain's own coin, EIP-7528 `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`,
 /// or a token the deployment lists (`STATS_TOKENS`); anybody can write a
 /// token, so every other one is counted under `other`, without an amount.
