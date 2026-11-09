@@ -1,7 +1,7 @@
 //! Referral codes, end to end: binds go through the apply path the indexer
 //! uses, and every assertion goes through the axum handlers a caller hits.
 //!
-//! Skips silently when `DATABASE_URL` is unset; everything past that check
+//! Skips, saying so, when `DATABASE_URL` is unset; everything past that check
 //! panics on failure. The suite's chains are its own; its nodes start with
 //! bytes no other suite's handles do.
 

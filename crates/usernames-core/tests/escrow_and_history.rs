@@ -2,7 +2,7 @@
 //! through the apply path the indexer uses, and every assertion goes through
 //! the axum handlers a caller hits.
 //!
-//! Skips silently when `DATABASE_URL` is unset; everything past that check
+//! Skips, saying so, when `DATABASE_URL` is unset; everything past that check
 //! panics on failure. The suite's chain and handles are its own.
 
 use std::{
