@@ -66,6 +66,7 @@ use usernames_fixtures::{
     Seed,
     Suite,
     Writes,
+    SPLITTER,
 };
 
 const CHAIN: i64 = 31351;
@@ -92,6 +93,9 @@ const PAYER: Address = Address::repeat_byte(0x52);
 const SAFE: Address = Address::repeat_byte(0xFE);
 /// A wallet on both of the suite's chains, and on no other suite's.
 const ROAMER: Address = Address::repeat_byte(0x7C);
+/// A wallet on no other suite's chains: the users across chains count it
+/// once, whatever other suites left behind.
+const REFERRER: Address = Address::repeat_byte(0x7D);
 
 const ETHER: u64 = 1_000_000_000_000_000_000;
 const FEE: u64 = 3_700_000_000_000_000;
@@ -582,6 +586,53 @@ async fn a_wallet_on_two_chains_counts_once_across_them() {
     ChainStore::new(suite.pool.clone(), OTHER_CHAIN)
         .forget()
         .await;
+    suite.store().forget().await;
+    suite.done();
+}
+
+/// The referral splitter sends every paid share through the escrow: its
+/// deposits and forwards count as such, and it counts as no user and among
+/// no movement's wallets.
+#[tokio::test]
+async fn the_referral_splitter_is_no_user() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        return;
+    };
+    let before: Stats = suite.get("/v1/stats").await.answer();
+    suite
+        .apply_tx(
+            IN_A,
+            NamesEvent::bind(REFERRER, X, "9", "referrer", 1, false),
+        )
+        .await;
+    let forward = NamesEvent::Escrow(EscrowEvent::Forwarded {
+        handle_node: node("referrer"),
+        token: NATIVE,
+        sender: SPLITTER,
+        holder: REFERRER,
+        amount: U256::from(5u64),
+        received: U256::from(5u64),
+    });
+    suite.apply(IN_A + 1, forward).await;
+    let held = NamesEvent::deposited("dave", NATIVE, SPLITTER, 7);
+    suite.apply(IN_A + 2, held).await;
+    let after: Stats = suite.get("/v1/stats").await.answer();
+
+    assert_eq!(after.total.users - before.total.users, 1);
+    let chain = after.chain(CHAIN);
+    assert_eq!(chain.total.users, 1);
+    assert_eq!(
+        chain.total.escrow.deposits,
+        vec![flow(NATIVE, 1, 7, 0)].named()
+    );
+    assert_eq!(
+        chain.total.escrow.forwards,
+        vec![flow(NATIVE, 1, 5, 0)].named()
+    );
+    let [day] = chain.days.as_slice() else {
+        panic!("one day listed, not {:?}", chain.days);
+    };
+    assert_eq!((day.activity.users, day.new_users), (1, 1));
     suite.store().forget().await;
     suite.done();
 }

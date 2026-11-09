@@ -1,5 +1,6 @@
-//! The indexer: one process per chain, mirroring `IdentityRegistry` and
-//! `HandleEscrow` events into Postgres under that chain's writer lease.
+//! The indexer: one process per chain, mirroring `IdentityRegistry`,
+//! `HandleEscrow` and `ReferralSplitter` events into Postgres under that
+//! chain's writer lease.
 //!
 //! It exposes no port. An indexer that stops advancing exits, and the
 //! supervisor notices; the read API is a separate binary over the same
@@ -61,6 +62,13 @@ pub struct Config {
     #[arg(long, env = "HANDLE_ESCROW_ADDRESS")]
     pub handle_escrow_address: Option<Address>,
 
+    /// The ReferralSplitter, when the chain has one. It needs
+    /// `HANDLE_ESCROW_ADDRESS`, and its `REGISTRY()` and `ESCROW()` must be
+    /// the two configured: a paid referral is read beside the escrow's
+    /// deposit. Setting it, changing it or unsetting it replays the chain.
+    #[arg(long, env = "REFERRAL_SPLITTER_ADDRESS")]
+    pub referral_splitter_address: Option<Address>,
+
     /// Refuse to start unless the RPC reports this chain id. Optional, but a
     /// deployment that sets it cannot silently index the wrong chain.
     #[arg(long, env = "CHAIN_ID")]
@@ -107,6 +115,7 @@ impl Config {
         Contracts {
             registry: self.identity_registry_address,
             escrow: self.handle_escrow_address,
+            referral_splitter: self.referral_splitter_address,
         }
     }
 
@@ -154,6 +163,7 @@ impl Config {
             chain_id,
             contract = %contracts.registry,
             escrow = ?contracts.escrow,
+            referral_splitter = ?contracts.referral_splitter,
             "indexing"
         );
         Ok((lease, indexer))
@@ -187,6 +197,10 @@ impl Config {
             .check_escrow(provider)
             .await
             .context("HANDLE_ESCROW_ADDRESS")?;
+        contracts
+            .check_referrals(provider)
+            .await
+            .context("REFERRAL_SPLITTER_ADDRESS")?;
         Ok(chain_id)
     }
 

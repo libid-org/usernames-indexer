@@ -1,4 +1,5 @@
-//! Decoding `IdentityRegistry` and `HandleEscrow` logs into one typed stream.
+//! Decoding `IdentityRegistry`, `HandleEscrow` and `ReferralSplitter` logs
+//! into one typed stream.
 //!
 //! The enum exists so the apply path and its tests speak decoded values, not
 //! `alloy` logs: a test builds a `NamesEvent` directly and never touches RPC
@@ -30,6 +31,7 @@ use libid_contracts::bindings::{
         self,
         HandleRevealed,
     },
+    referral::ReferralSplitter,
 };
 
 use crate::nodes::{
@@ -56,7 +58,8 @@ pub struct LogPosition {
     pub block_time: u64,
 }
 
-/// One decoded `IdentityRegistry` or `HandleEscrow` event. Field names track
+/// One decoded `IdentityRegistry`, `HandleEscrow` or `ReferralSplitter`
+/// event. Field names track
 /// the Solidity event parameters one to one, so they carry no docs of their
 /// own — the contracts' natspec is the reference. Every `uint256` stays a
 /// `U256`: escrowed amounts are token units, and nothing bounds them.
@@ -121,6 +124,144 @@ pub enum NamesEvent {
     },
     /// One of `HandleEscrow`'s events, journaled under its own kind.
     Escrow(EscrowEvent),
+    /// A bind paid its fee to the referral splitter naming a referrer's
+    /// handle; `share` is the referrer's part and `outcome` what became of
+    /// it. A paid share's escrow event comes before this in the transaction.
+    Referred {
+        referrer_node: B256,
+        binder: Address,
+        session_id: B256,
+        referrer_platform_id: B256,
+        platform_id: B256,
+        handle_node: B256,
+        fee: U256,
+        share: U256,
+        outcome: Outcome,
+    },
+}
+
+/// What became of a referrer's share, as the splitter logs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SerializeDisplay, DeserializeFromStr)]
+pub enum Outcome {
+    /// Deposited with the escrow, which forwarded it to the referrer's
+    /// holder or holds it for the node.
+    Paid,
+    /// The binder holds the referrer's node; the treasury took the share.
+    SelfReferral,
+    /// The escrow refused the deposit; the treasury took the share.
+    Refused,
+}
+
+/// A stored outcome name this build does not know.
+#[derive(Debug, thiserror::Error)]
+#[error("unknown referral outcome {0:?}")]
+pub struct UnknownOutcome(String);
+
+impl Outcome {
+    /// Every outcome in the splitter's enum order, so a logged value and a
+    /// stored name each read back by the same table.
+    const ALL: [Self; 3] = [Self::Paid, Self::SelfReferral, Self::Refused];
+
+    /// The outcome a `Referred` log carries as its enum's `uint8`.
+    fn of(value: u8) -> Result<Self, DecodeError> {
+        Self::ALL
+            .get(usize::from(value))
+            .copied()
+            .ok_or(DecodeError::Outcome(value))
+    }
+
+    /// The name stored and served.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Paid => "paid",
+            Self::SelfReferral => "self_referral",
+            Self::Refused => "refused",
+        }
+    }
+}
+
+impl fmt::Display for Outcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Outcome {
+    type Err = UnknownOutcome;
+
+    fn from_str(name: &str) -> Result<Self, UnknownOutcome> {
+        Self::ALL
+            .into_iter()
+            .find(|outcome| outcome.as_str() == name)
+            .ok_or_else(|| UnknownOutcome(name.to_string()))
+    }
+}
+
+/// Where a paid share went: forwarded to the referrer's holder, or held by
+/// the escrow until the node's holder claims it or the splitter takes it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SerializeDisplay, DeserializeFromStr)]
+pub enum Delivery {
+    /// Paid straight to the referrer's holder on this chain.
+    Forwarded,
+    /// Held for the referrer's node, which nobody held on this chain.
+    Held,
+    /// Held, then claimed by the node's holder.
+    Claimed,
+    /// Held, then refunded to the splitter, which sends an expired share to
+    /// its treasury.
+    Refunded,
+}
+
+/// A stored delivery name this build does not know.
+#[derive(Debug, thiserror::Error)]
+#[error("unknown delivery {0:?}")]
+pub struct UnknownDelivery(String);
+
+impl Delivery {
+    /// Every delivery, so a stored name parses back by the same table.
+    const ALL: [Self; 4] = [Self::Forwarded, Self::Held, Self::Claimed, Self::Refunded];
+
+    /// The name stored and served.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Forwarded => "forwarded",
+            Self::Held => "held",
+            Self::Claimed => "claimed",
+            Self::Refunded => "refunded",
+        }
+    }
+}
+
+impl fmt::Display for Delivery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Delivery {
+    type Err = UnknownDelivery;
+
+    fn from_str(name: &str) -> Result<Self, UnknownDelivery> {
+        Self::ALL
+            .into_iter()
+            .find(|delivery| delivery.as_str() == name)
+            .ok_or_else(|| UnknownDelivery(name.to_string()))
+    }
+}
+
+/// What an escrow event did with the referral splitter's shares for one
+/// node: a deposit forwarded or held in a slot's round, or every share that
+/// round held claimed or refunded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShareMove {
+    /// The referrer's node.
+    pub handle_node: B256,
+    /// The token the shares are in.
+    pub token: Address,
+    /// The slot's round; none for a forwarded share, which no slot holds.
+    pub round: Option<U256>,
+    /// Where the move leaves the shares.
+    pub delivery: Delivery,
 }
 
 /// One decoded `HandleEscrow` event: what moves the escrow's books.
@@ -270,6 +411,8 @@ pub enum EventKind {
     Claimed,
     /// [`EscrowEvent::Refunded`].
     Refunded,
+    /// [`NamesEvent::Referred`].
+    Referred,
 }
 
 /// A stored kind this build does not know.
@@ -279,7 +422,7 @@ pub struct UnknownKind(String);
 
 impl EventKind {
     /// Every kind, so a stored name parses back by the same table.
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::IdentityBound,
         Self::HandleRevealed,
         Self::HandlePublished,
@@ -292,6 +435,7 @@ impl EventKind {
         Self::Forwarded,
         Self::Claimed,
         Self::Refunded,
+        Self::Referred,
     ];
 
     /// The name the journal stores.
@@ -309,6 +453,7 @@ impl EventKind {
             Self::Forwarded => "forwarded",
             Self::Claimed => "claimed",
             Self::Refunded => "refunded",
+            Self::Referred => "referred",
         }
     }
 }
@@ -343,16 +488,19 @@ impl NamesEvent {
             Self::CeremonyBound { .. } => EventKind::CeremonyBound,
             Self::BindFeePaid { .. } => EventKind::BindFeePaid,
             Self::Escrow(event) => event.kind(),
+            Self::Referred { .. } => EventKind::Referred,
         }
     }
 
-    /// The handle node the event names itself, when it names one.
+    /// The handle node the event names itself, when it names one: a
+    /// referral's is the handle bound, not the referrer's.
     pub fn handle_node(&self) -> Option<B256> {
         match self {
             Self::IdentityBound { handle_node, .. }
             | Self::HandleRevealed { handle_node, .. }
             | Self::HandlePublished { handle_node, .. }
             | Self::HandleRetired { handle_node, .. }
+            | Self::Referred { handle_node, .. }
             | Self::Escrow(
                 EscrowEvent::Deposited { handle_node, .. }
                 | EscrowEvent::Forwarded { handle_node, .. }
@@ -373,7 +521,8 @@ impl NamesEvent {
             Self::IdentityBound { holder, .. }
             | Self::HandlePublished { holder, .. }
             | Self::HandleUnpublished { holder, .. }
-            | Self::CeremonyBound { holder, .. } => vec![(*holder, Role::Holder)],
+            | Self::CeremonyBound { holder, .. }
+            | Self::Referred { binder: holder, .. } => vec![(*holder, Role::Holder)],
             Self::HandleRetired { holder, .. } => {
                 vec![(*holder, Role::PreviousHandleHolder)]
             }
@@ -421,6 +570,68 @@ impl EscrowEvent {
         }
     }
 
+    /// Where a deposit by `splitter` went: forwarded, or held in a round.
+    /// `None` for any other event, or a deposit somebody else sent.
+    pub fn deposit_by(&self, splitter: Address) -> Option<ShareMove> {
+        match *self {
+            Self::Forwarded {
+                handle_node,
+                token,
+                sender,
+                ..
+            } if sender == splitter => Some(ShareMove {
+                handle_node,
+                token,
+                round: None,
+                delivery: Delivery::Forwarded,
+            }),
+            Self::Deposited {
+                handle_node,
+                token,
+                sender,
+                round,
+                ..
+            } if sender == splitter => Some(ShareMove {
+                handle_node,
+                token,
+                round: Some(round),
+                delivery: Delivery::Held,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The round a claim, or `splitter`'s refund, settles for the shares it
+    /// held. `None` for any other event, or a refund somebody else took.
+    pub fn settles_for(&self, splitter: Address) -> Option<ShareMove> {
+        match *self {
+            Self::Claimed {
+                handle_node,
+                token,
+                round,
+                ..
+            } => Some(ShareMove {
+                handle_node,
+                token,
+                round: Some(round),
+                delivery: Delivery::Claimed,
+            }),
+            Self::Refunded {
+                handle_node,
+                token,
+                sender,
+                round,
+                ..
+            } if sender == splitter => Some(ShareMove {
+                handle_node,
+                token,
+                round: Some(round),
+                delivery: Delivery::Refunded,
+            }),
+            _ => None,
+        }
+    }
+
     /// The addresses the event names, each with the part it plays.
     fn parties(&self) -> Vec<(Address, Role)> {
         match self {
@@ -456,6 +667,9 @@ pub enum DecodeError {
         /// The decoder's reason.
         source: sol_types::Error,
     },
+    /// A `Referred` whose outcome is past the splitter's enum.
+    #[error("Referred: outcome {0} is no Outcome")]
+    Outcome(u8),
 }
 
 /// A watched log's payload, read by its topic.
@@ -663,6 +877,31 @@ impl NamesEvent {
         };
 
         Ok(Some((NamesEvent::Escrow(event), position)))
+    }
+
+    /// Decode one log from the `ReferralSplitter`, under the same rules as
+    /// [`Self::from_registry`]. Only `Referred` is read: the settings change
+    /// what later referrals pay, which their own events carry, and an expired
+    /// share comes back through the escrow's `Refunded`.
+    pub fn from_splitter(log: &Log) -> Result<Option<(Self, LogPosition)>, DecodeError> {
+        let position = LogPosition::of(log)?;
+        if log.topic0() != Some(&ReferralSplitter::Referred::SIGNATURE_HASH) {
+            return Ok(None);
+        }
+        let d: ReferralSplitter::Referred = log.payload("Referred")?;
+        let outcome = Outcome::of(d.outcome)?;
+        let event = NamesEvent::Referred {
+            referrer_node: d.referrerNode,
+            binder: d.binder,
+            session_id: d.sessionId,
+            referrer_platform_id: d.referrerPlatformId,
+            platform_id: d.platformId,
+            handle_node: d.handleNode,
+            fee: d.fee,
+            share: d.share,
+            outcome,
+        };
+        Ok(Some((event, position)))
     }
 }
 
@@ -903,6 +1142,90 @@ mod tests {
                 .map(|(_, n, text)| (n, text.as_str())),
             Some((node, "bob_1"))
         );
+    }
+
+    /// A `Referred` log, outcome as the splitter's enum carries it.
+    fn referred(outcome: u8) -> Log {
+        mined(
+            ReferralSplitter::Referred {
+                referrerNode: B256::repeat_byte(0x0A),
+                binder: HOLDER,
+                sessionId: B256::repeat_byte(0x5E),
+                referrerPlatformId: KnownPlatform::X.id(),
+                platformId: KnownPlatform::GitHub.id(),
+                handleNode: B256::repeat_byte(0x0B),
+                fee: U256::MAX,
+                share: U256::from(3u64),
+                outcome,
+            }
+            .encode_log_data(),
+        )
+    }
+
+    /// The fixed point from `cast keccak` over the event signature in
+    /// `ReferralSplitter.sol`, its enum as `uint8`.
+    #[test]
+    fn splitter_topic_matches_the_contract() {
+        assert_eq!(
+            ReferralSplitter::Referred::SIGNATURE_HASH,
+            b256!("5a7143a89e5ba1b9f91f71af11ac6db2ff16743bc25391994d13a8866478f47a")
+        );
+    }
+
+    #[test]
+    fn a_referral_decodes_with_its_outcome_and_binder() {
+        let (event, _) = NamesEvent::from_splitter(&referred(1))
+            .unwrap()
+            .expect("a known topic");
+        assert_eq!(
+            event,
+            NamesEvent::Referred {
+                referrer_node: B256::repeat_byte(0x0A),
+                binder: HOLDER,
+                session_id: B256::repeat_byte(0x5E),
+                referrer_platform_id: KnownPlatform::X.id(),
+                platform_id: KnownPlatform::GitHub.id(),
+                handle_node: B256::repeat_byte(0x0B),
+                fee: U256::MAX,
+                share: U256::from(3u64),
+                outcome: Outcome::SelfReferral,
+            }
+        );
+        assert_eq!(event.kind(), EventKind::Referred);
+        assert_eq!(event.parties(), [(HOLDER, Role::Holder)]);
+        assert_eq!(event.handle_node(), Some(B256::repeat_byte(0x0B)));
+    }
+
+    #[test]
+    fn an_outcome_past_the_splitters_enum_fails_the_decode() {
+        assert!(matches!(
+            NamesEvent::from_splitter(&referred(3)),
+            Err(DecodeError::Outcome(3))
+        ));
+    }
+
+    /// The splitter's logs are read only as the splitter's, and its decoder
+    /// reads neither the registry's nor the escrow's.
+    #[test]
+    fn the_splitter_decoder_knows_only_its_own_contract() {
+        assert!(NamesEvent::from_registry(&referred(0)).unwrap().is_none());
+        assert!(NamesEvent::from_escrow(&referred(0)).unwrap().is_none());
+        let registry_log = mined(
+            IdentityRegistry::HandleUnpublished { holder: HOLDER }.encode_log_data(),
+        );
+        assert!(NamesEvent::from_splitter(&registry_log).unwrap().is_none());
+    }
+
+    #[test]
+    fn every_outcome_and_delivery_parses_back_from_its_name() {
+        for outcome in Outcome::ALL {
+            assert_eq!(outcome.as_str().parse::<Outcome>().ok(), Some(outcome));
+        }
+        for delivery in [Delivery::Forwarded, Delivery::Held] {
+            assert_eq!(delivery.as_str().parse::<Delivery>().ok(), Some(delivery));
+        }
+        assert!("pending".parse::<Outcome>().is_err());
+        assert!("lost".parse::<Delivery>().is_err());
     }
 
     #[test]

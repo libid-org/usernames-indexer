@@ -571,6 +571,8 @@ impl KnownPlatform {
                 });
                 local_ok.then(|| format!("{}@gmail.com", labels.join(".")))
             }
+            // No name form is defined for Telegram handles yet.
+            Self::Telegram => None,
         }
     }
 }

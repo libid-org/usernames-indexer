@@ -29,6 +29,23 @@ pub const WRITER_UNLOCK: &str = include_str!("../../sql/writer_unlock.sql");
 pub const WRITER_ALIVE: &str = include_str!("../../sql/writer_alive.sql");
 pub const SET_CHAIN_TARGET: &str = include_str!("../../sql/set_chain_target.sql");
 pub const TOUCH_CHAIN_TARGET: &str = include_str!("../../sql/touch_chain_target.sql");
+pub const RECORD_REFERRAL: &str = include_str!("../../sql/record_referral.sql");
+/// The held shares of a slot's round, marked claimed or refunded.
+pub const SETTLE_REFERRALS: &str = include_str!("../../sql/settle_referrals.sql");
+/// The nodes a holder holds, once each, opening its referral and awaiting
+/// reads; the caller names the holder and closes the set.
+pub const HOLDER_NODES: &str = include_str!("../../sql/holder_nodes.sql");
+/// A holder's referrals, read per node after [`HOLDER_NODES`]; the caller
+/// narrows and caps them, then appends [`REFERRALS_HOLDER`].
+pub const REFERRALS_BY_NODE: &str = include_str!("../../sql/referrals_by_node.sql");
+pub const REFERRALS_HOLDER: &str = include_str!("../../sql/referrals_holder.sql");
+/// What waits for a holder where nobody holds its handles, read per node
+/// after [`HOLDER_NODES`]; the caller narrows and caps the slots, then appends
+/// [`ESCROW_AWAITING_HOLDER`].
+pub const ESCROW_AWAITING_SLOTS: &str =
+    include_str!("../../sql/escrow_awaiting_slots.sql");
+pub const ESCROW_AWAITING_HOLDER: &str =
+    include_str!("../../sql/escrow_awaiting_holder.sql");
 pub const JOURNAL_EVENT: &str = include_str!("../../sql/journal_event.sql");
 pub const UPSERT_ID: &str = include_str!("../../sql/upsert_id.sql");
 pub const UPSERT_HANDLE: &str = include_str!("../../sql/upsert_handle.sql");
