@@ -270,7 +270,6 @@ impl StatsRoute for Router {
 #[tokio::test]
 async fn the_journal_adds_up_per_chain_and_day() {
     let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
         return;
     };
     // Day A: a paid link and a free one, then three deposits for dave, who has none.
@@ -417,7 +416,6 @@ async fn the_journal_adds_up_per_chain_and_day() {
 #[tokio::test]
 async fn a_freed_handle_onboards_its_next_holder() {
     let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
         return;
     };
     // Day A: frank links "frank", then moves his account to another handle,
@@ -475,7 +473,6 @@ async fn a_freed_handle_onboards_its_next_holder() {
 #[tokio::test]
 async fn unlisted_tokens_count_together() {
     let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
         return;
     };
     let junk = |tokens: Range<u64>| -> Vec<NamesEvent> {
@@ -534,7 +531,6 @@ async fn unlisted_tokens_count_together() {
 #[tokio::test]
 async fn a_wallet_on_two_chains_counts_once_across_them() {
     let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
         return;
     };
     let other = ChainStore::new(suite.pool.clone(), OTHER_CHAIN);
@@ -595,7 +591,6 @@ async fn a_wallet_on_two_chains_counts_once_across_them() {
 #[tokio::test]
 async fn an_answer_is_served_again_until_it_expires() {
     let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
         return;
     };
     suite
