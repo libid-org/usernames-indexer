@@ -925,7 +925,7 @@ impl Window {
         // rows it is about to overwrite, and the journal row files the event
         // under the handle it concerns.
         let involvement = self.involvement(event, &at).await?;
-        let delivery = self.delivery(event, &at)?;
+        let deposit = self.deposit(event, &at)?;
 
         let row = EventColumns::of(event, involvement.handle_node)?;
         if !row.journal(&mut self.tx, chain_id, &at).await? {
@@ -1023,10 +1023,11 @@ impl Window {
 
             NamesEvent::Escrow(escrow) => {
                 self.book_escrow(escrow, &at).await?;
+                self.settle_referrals(escrow).await?;
             }
 
             NamesEvent::Referred { .. } => {
-                self.book_referral(event, delivery, &at).await?;
+                self.book_referral(event, deposit, &at).await?;
             }
         }
 

@@ -780,8 +780,8 @@ pub struct Referral {
     pub share: U256,
     /// What became of the share.
     pub outcome: Outcome,
-    /// For a paid share, where the escrow put it: forwarded to the handle's
-    /// holder on that chain, or held for its claim.
+    /// For a paid share, where it went: forwarded to the handle's holder on
+    /// that chain, or held for its claim, then claimed or refunded.
     pub delivery: Option<Delivery>,
 }
 

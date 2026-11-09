@@ -30,6 +30,8 @@ pub const WRITER_ALIVE: &str = include_str!("../../sql/writer_alive.sql");
 pub const SET_CHAIN_TARGET: &str = include_str!("../../sql/set_chain_target.sql");
 pub const TOUCH_CHAIN_TARGET: &str = include_str!("../../sql/touch_chain_target.sql");
 pub const RECORD_REFERRAL: &str = include_str!("../../sql/record_referral.sql");
+/// The held shares of a slot's round, marked claimed or refunded.
+pub const SETTLE_REFERRALS: &str = include_str!("../../sql/settle_referrals.sql");
 /// The nodes a holder holds, once each, opening its referral and awaiting
 /// reads; the caller names the holder and closes the set.
 pub const HOLDER_NODES: &str = include_str!("../../sql/holder_nodes.sql");

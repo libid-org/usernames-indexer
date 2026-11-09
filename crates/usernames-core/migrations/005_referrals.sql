@@ -26,16 +26,17 @@ ALTER TABLE names.events ADD CONSTRAINT events_kind_check CHECK (kind IN (
     'referred'
 )) NOT VALID;
 
--- One row per `Referred`: a bind that named a referrer, what the referrer's
--- share came to, and for a paid share whether the escrow forwarded it to the
--- referrer's holder or holds it for the node. Amounts are uint256, exact.
+-- One row per `Referred`: a bind that named a referrer and what the
+-- referrer's share came to. A paid share keeps its token and where the escrow
+-- put it: forwarded to the referrer's holder, or held for the node in a slot's
+-- round until the holder's claim or the splitter's refund of that round makes
+-- it claimed or refunded. Amounts are uint256, exact.
 CREATE TABLE IF NOT EXISTS names.referrals (
     chain_id          BIGINT        NOT NULL,
     block_number      BIGINT        NOT NULL,
     log_index         BIGINT        NOT NULL,
     block_time        BIGINT        NOT NULL,   -- unix seconds
     referrer_node     BYTEA         NOT NULL,
-    referrer_platform BYTEA         NOT NULL,
     binder            BYTEA         NOT NULL,
     platform_id       BYTEA         NOT NULL,
     handle_node       BYTEA         NOT NULL,
@@ -44,10 +45,19 @@ CREATE TABLE IF NOT EXISTS names.referrals (
     outcome           TEXT          NOT NULL
         CHECK (outcome IN ('paid', 'self_referral', 'refused')),
     delivery          TEXT
-        CHECK (delivery IN ('forwarded', 'held')),
+        CHECK (delivery IN ('forwarded', 'held', 'claimed', 'refunded')),
+    token             BYTEA,
+    round             NUMERIC(78,0),
     CHECK ((outcome = 'paid') = (delivery IS NOT NULL)),
+    CHECK ((outcome = 'paid') = (token IS NOT NULL)),
+    CHECK ((round IS NOT NULL) = (delivery IS NOT NULL AND delivery <> 'forwarded')),
     PRIMARY KEY (chain_id, block_number, log_index)
 );
 -- A referrer's history across every chain, newest first, read backwards.
 CREATE INDEX IF NOT EXISTS referrals_referrer_idx
     ON names.referrals (referrer_node, block_time, chain_id, block_number, log_index);
+-- The shares one slot's round holds, which its claim or the splitter's refund
+-- settles.
+CREATE INDEX IF NOT EXISTS referrals_held_idx
+    ON names.referrals (chain_id, referrer_node, token, round)
+    WHERE delivery = 'held';

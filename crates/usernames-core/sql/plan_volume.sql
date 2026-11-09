@@ -90,18 +90,19 @@ SELECT substring(sha256(('address' || i % 1000)::bytea) FROM 1 FOR 20), 1,
        substring(sha256(('token' || i % 5)::bytea) FROM 1 FOR 20), i, i
 FROM generate_series(1, 5000) i;
 -- 5000 referrals over the 1000 nodes the first 1000 handles hold, paid,
--- forwarded or held, and unpaid.
+-- forwarded or held in the node's round 0, and unpaid.
 INSERT INTO names.referrals
-    (chain_id, block_number, log_index, block_time, referrer_node,
-     referrer_platform, binder, platform_id, handle_node, fee, share, outcome,
-     delivery)
+    (chain_id, block_number, log_index, block_time, referrer_node, binder,
+     platform_id, handle_node, fee, share, outcome, delivery, token, round)
 SELECT 1, i, 3, i, sha256(('node' || i % 1000)::bytea),
-       sha256(('platform' || i % 3)::bytea),
        substring(sha256(('address' || (i + 7) % 1000)::bytea) FROM 1 FOR 20),
        sha256(('platform' || i % 3)::bytea), sha256(('node' || i)::bytea),
        10000, 3000,
        CASE WHEN i % 4 = 0 THEN 'refused' ELSE 'paid' END,
-       CASE i % 4 WHEN 0 THEN NULL WHEN 1 THEN 'held' ELSE 'forwarded' END
+       CASE i % 4 WHEN 0 THEN NULL WHEN 1 THEN 'held' ELSE 'forwarded' END,
+       CASE WHEN i % 4 <> 0
+            THEN substring(sha256(('token' || i % 5)::bytea) FROM 1 FOR 20) END,
+       CASE WHEN i % 4 = 1 THEN 0 END
 FROM generate_series(1, 5000) i;
 -- A holder of many handles, 0x4e..4e: the first 1000 nodes, on chains 2 and
 -- 3, where nobody else holds them. Their referrals and their slots on chains

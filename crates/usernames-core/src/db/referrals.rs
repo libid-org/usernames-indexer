@@ -15,9 +15,10 @@ use super::{
     Window,
 };
 use crate::events::{
-    Delivery,
+    EscrowEvent,
     NamesEvent,
     Outcome,
+    ShareMove,
 };
 use alloy::primitives::{
     Address,
@@ -29,8 +30,7 @@ use alloy::primitives::{
 /// comes after it in the same transaction.
 pub(crate) struct Deposit {
     tx_hash: B256,
-    handle_node: B256,
-    delivery: Delivery,
+    share: ShareMove,
 }
 
 impl Window {
@@ -43,21 +43,20 @@ impl Window {
     /// A paid referral without that deposit fails the window: the splitter
     /// checked at startup never logs one, so only another contract at its
     /// address could.
-    pub(crate) fn delivery(
+    pub(crate) fn deposit(
         &mut self,
         event: &NamesEvent,
         at: &Position,
-    ) -> Result<Option<Delivery>, ApplyError> {
+    ) -> Result<Option<ShareMove>, ApplyError> {
         match event {
             NamesEvent::Escrow(escrow) => {
-                let deposit = self
+                let share = self
                     .splitter
-                    .and_then(|splitter| escrow.delivery_from(splitter));
-                if let Some((handle_node, delivery)) = deposit {
+                    .and_then(|splitter| escrow.deposit_by(splitter));
+                if let Some(share) = share {
                     self.deposit = Some(Deposit {
                         tx_hash: at.tx_hash,
-                        handle_node,
-                        delivery,
+                        share,
                     });
                 }
                 Ok(None)
@@ -70,9 +69,10 @@ impl Window {
                 .deposit
                 .take()
                 .filter(|deposit| {
-                    deposit.tx_hash == at.tx_hash && deposit.handle_node == *referrer_node
+                    deposit.tx_hash == at.tx_hash
+                        && deposit.share.handle_node == *referrer_node
                 })
-                .map(|deposit| Some(deposit.delivery))
+                .map(|deposit| Some(deposit.share))
                 .ok_or(ApplyError::UnpairedReferral {
                     block: at.block,
                     log_index: at.log_index,
@@ -81,18 +81,17 @@ impl Window {
         }
     }
 
-    /// Project a `Referred` into the referrer's history, with where the
-    /// escrow put a paid share.
+    /// Project a `Referred` into the referrer's history, with the deposit
+    /// that took a paid share.
     pub(crate) async fn book_referral(
         &mut self,
         event: &NamesEvent,
-        delivery: Option<Delivery>,
+        deposit: Option<ShareMove>,
         at: &Position,
     ) -> Result<(), ApplyError> {
         let NamesEvent::Referred {
             referrer_node,
             binder,
-            referrer_platform_id,
             platform_id,
             handle_node,
             fee,
@@ -109,14 +108,42 @@ impl Window {
             .bind(at.log_index)
             .bind(at.block_time)
             .bind(referrer_node)
-            .bind(referrer_platform_id)
             .bind(binder)
             .bind(platform_id)
             .bind(handle_node)
             .bind(fee.to_string())
             .bind(share.to_string())
             .bind(outcome.as_str())
-            .bind(delivery.map(Delivery::as_str))
+            .bind(deposit.map(|deposit| deposit.delivery.as_str()))
+            .bind(deposit.map(|deposit| deposit.token))
+            .bind(
+                deposit
+                    .and_then(|deposit| deposit.round)
+                    .map(|round| round.to_string()),
+            )
+            .execute(&mut *self.tx)
+            .await?;
+        Ok(())
+    }
+
+    /// Mark the shares a claim, or the splitter's refund, took out of a slot's
+    /// round as claimed or refunded.
+    pub(crate) async fn settle_referrals(
+        &mut self,
+        escrow: &EscrowEvent,
+    ) -> Result<(), ApplyError> {
+        let Some(settled) = self
+            .splitter
+            .and_then(|splitter| escrow.settles_for(splitter))
+        else {
+            return Ok(());
+        };
+        sqlx::query(sql::SETTLE_REFERRALS)
+            .bind(self.chain_id)
+            .bind(settled.handle_node)
+            .bind(settled.token)
+            .bind(settled.round.map(|round| round.to_string()))
+            .bind(settled.delivery.as_str())
             .execute(&mut *self.tx)
             .await?;
         Ok(())
@@ -136,7 +163,7 @@ pub struct ReferralRow {
     pub block_time: i64,
     /// The referrer's handle node, which the share is for.
     pub referrer_node: B256,
-    /// The referrer's platform.
+    /// The platform the referrer's node is bound on.
     pub referrer_platform: B256,
     /// The wallet that bound.
     pub binder: Address,
@@ -223,11 +250,18 @@ pub(crate) mod plans {
     use sqlx::PgConnection;
 
     use super::*;
-    use crate::db::plan_tests::Plan;
+    use crate::{
+        db::plan_tests::{
+            explain,
+            Plan,
+        },
+        events::Delivery,
+    };
 
     /// A holder's referrals, planned.
     pub(crate) trait ReferralHistoryPlans {
-        /// The referral history, in every shape it is asked in.
+        /// The referral history, in every shape it is asked in, and the write
+        /// that settles held referrals.
         async fn referral_history_plans(&mut self) -> Vec<Plan>;
     }
 
@@ -281,6 +315,22 @@ pub(crate) mod plans {
                 let plan = Plan::of(self, name, Some(seeks), statement).await;
                 plans.push(plan.reading_once(holder));
             }
+
+            let name = "a claim settling its round's held referrals";
+            let settle: Vec<String> = sqlx::query_scalar(&explain(sql::SETTLE_REFERRALS))
+                .bind(1i64)
+                .bind(B256::repeat_byte(1))
+                .bind(Address::repeat_byte(0xEE))
+                .bind("0")
+                .bind(Delivery::Claimed.as_str())
+                .fetch_all(&mut *self)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            plans.push(Plan {
+                name,
+                seeks: Some(&["referrals_held_idx"]),
+                text: settle.join("\n"),
+            });
             plans
         }
     }

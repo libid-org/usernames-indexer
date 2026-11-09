@@ -197,15 +197,19 @@ impl FromStr for Outcome {
     }
 }
 
-/// Where the escrow put a paid share: the splitter's deposit came back as
-/// `Forwarded` or as `Deposited`.
+/// Where a paid share went: forwarded to the referrer's holder, or held by
+/// the escrow until the node's holder claims it or the splitter takes it back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, SerializeDisplay, DeserializeFromStr)]
 pub enum Delivery {
     /// Paid straight to the referrer's holder on this chain.
     Forwarded,
-    /// Held for the referrer's node, which nobody holds on this chain, until
-    /// its holder claims it.
+    /// Held for the referrer's node, which nobody held on this chain.
     Held,
+    /// Held, then claimed by the node's holder.
+    Claimed,
+    /// Held, then refunded to the splitter, which sends an expired share to
+    /// its treasury.
+    Refunded,
 }
 
 /// A stored delivery name this build does not know.
@@ -215,13 +219,15 @@ pub struct UnknownDelivery(String);
 
 impl Delivery {
     /// Every delivery, so a stored name parses back by the same table.
-    const ALL: [Self; 2] = [Self::Forwarded, Self::Held];
+    const ALL: [Self; 4] = [Self::Forwarded, Self::Held, Self::Claimed, Self::Refunded];
 
     /// The name stored and served.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Forwarded => "forwarded",
             Self::Held => "held",
+            Self::Claimed => "claimed",
+            Self::Refunded => "refunded",
         }
     }
 }
@@ -241,6 +247,21 @@ impl FromStr for Delivery {
             .find(|delivery| delivery.as_str() == name)
             .ok_or_else(|| UnknownDelivery(name.to_string()))
     }
+}
+
+/// What an escrow event did with the referral splitter's shares for one
+/// node: a deposit forwarded or held in a slot's round, or every share that
+/// round held claimed or refunded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShareMove {
+    /// The referrer's node.
+    pub handle_node: B256,
+    /// The token the shares are in.
+    pub token: Address,
+    /// The slot's round; none for a forwarded share, which no slot holds.
+    pub round: Option<U256>,
+    /// Where the move leaves the shares.
+    pub delivery: Delivery,
 }
 
 /// One decoded `HandleEscrow` event: what moves the escrow's books.
@@ -549,20 +570,64 @@ impl EscrowEvent {
         }
     }
 
-    /// Where a deposit by `sender` went: forwarded or held. `None` for any
-    /// other event, or a deposit somebody else sent.
-    pub fn delivery_from(&self, sender: Address) -> Option<(B256, Delivery)> {
-        match self {
+    /// Where a deposit by `splitter` went: forwarded, or held in a round.
+    /// `None` for any other event, or a deposit somebody else sent.
+    pub fn deposit_by(&self, splitter: Address) -> Option<ShareMove> {
+        match *self {
             Self::Forwarded {
                 handle_node,
-                sender: by,
+                token,
+                sender,
                 ..
-            } if *by == sender => Some((*handle_node, Delivery::Forwarded)),
+            } if sender == splitter => Some(ShareMove {
+                handle_node,
+                token,
+                round: None,
+                delivery: Delivery::Forwarded,
+            }),
             Self::Deposited {
                 handle_node,
-                sender: by,
+                token,
+                sender,
+                round,
                 ..
-            } if *by == sender => Some((*handle_node, Delivery::Held)),
+            } if sender == splitter => Some(ShareMove {
+                handle_node,
+                token,
+                round: Some(round),
+                delivery: Delivery::Held,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The round a claim, or `splitter`'s refund, settles for the shares it
+    /// held. `None` for any other event, or a refund somebody else took.
+    pub fn settles_for(&self, splitter: Address) -> Option<ShareMove> {
+        match *self {
+            Self::Claimed {
+                handle_node,
+                token,
+                round,
+                ..
+            } => Some(ShareMove {
+                handle_node,
+                token,
+                round: Some(round),
+                delivery: Delivery::Claimed,
+            }),
+            Self::Refunded {
+                handle_node,
+                token,
+                sender,
+                round,
+                ..
+            } if sender == splitter => Some(ShareMove {
+                handle_node,
+                token,
+                round: Some(round),
+                delivery: Delivery::Refunded,
+            }),
             _ => None,
         }
     }

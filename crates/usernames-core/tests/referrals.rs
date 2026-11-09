@@ -2,7 +2,7 @@
 //! through the apply path the indexer uses, and every assertion goes through
 //! the axum handlers a caller hits.
 //!
-//! Skips silently when `DATABASE_URL` is unset; everything past that check
+//! Skips, saying so, when `DATABASE_URL` is unset; everything past that check
 //! panics on failure. The suite's chains and handles are its own.
 
 use alloy::primitives::{
@@ -215,6 +215,12 @@ trait SplitterEvents {
     /// An escrow deposit to `handle` by `sender`.
     fn deposit_by(handle: &str, sender: Address, amount: u64) -> Self;
 
+    /// Alice's claim of what `handle`'s round 0 holds in `token`.
+    fn claimed(handle: &str, token: Address) -> Self;
+
+    /// `sender`'s refund of its round 0 deposit to `handle`.
+    fn refunded(handle: &str, sender: Address) -> Self;
+
     /// The splitter's `Referred` for `binder`'s bind of `handle`.
     fn referred(referrer: &str, binder: Address, handle: &str, outcome: Outcome) -> Self;
 }
@@ -231,7 +237,34 @@ impl SplitterEvents for NamesEvent {
                 received: U256::from(SHARE),
             }),
             Delivery::Held => Self::deposit_by(referrer, SPLITTER, SHARE),
+            Delivery::Claimed | Delivery::Refunded => {
+                unreachable!("the escrow answers a deposit by forwarding or holding it")
+            }
         }
+    }
+
+    fn claimed(handle: &str, token: Address) -> Self {
+        Self::Escrow(EscrowEvent::Claimed {
+            handle_node: node(handle),
+            token,
+            claimer: ALICE,
+            recipient: ALICE,
+            round: U256::ZERO,
+            released: U256::from(SHARE),
+            received: U256::from(SHARE),
+        })
+    }
+
+    fn refunded(handle: &str, sender: Address) -> Self {
+        Self::Escrow(EscrowEvent::Refunded {
+            handle_node: node(handle),
+            token: NATIVE,
+            sender,
+            recipient: sender,
+            round: U256::ZERO,
+            released: U256::from(SHARE),
+            received: U256::from(SHARE),
+        })
     }
 
     fn deposit_by(handle: &str, sender: Address, amount: u64) -> Self {
@@ -289,7 +322,6 @@ impl Shape for [Referral] {
 #[tokio::test]
 async fn a_paid_share_is_listed_as_forwarded_or_held_where_it_went() {
     let Some(suite) = Referrals::open().await else {
-        eprintln!("skipping: DATABASE_URL not set");
         return;
     };
     suite.bind(CHAIN, 1, "alice_r", ALICE).await;
@@ -363,7 +395,6 @@ async fn a_paid_share_is_listed_as_forwarded_or_held_where_it_went() {
 #[tokio::test]
 async fn a_self_referral_and_a_refused_share_are_listed_without_a_delivery() {
     let Some(suite) = Referrals::open().await else {
-        eprintln!("skipping: DATABASE_URL not set");
         return;
     };
     suite.bind(CHAIN, 1, "alice_s", ALICE).await;
@@ -382,12 +413,90 @@ async fn a_self_referral_and_a_refused_share_are_listed_without_a_delivery() {
     suite.done();
 }
 
+/// A referral shows the platform the referrer's node is bound on, whatever
+/// platform its `Referred` names.
+#[tokio::test]
+async fn a_referral_shows_the_platform_its_referrers_node_is_bound_on() {
+    let Some(suite) = Referrals::open().await else {
+        return;
+    };
+    suite.bind(CHAIN, 1, "alice_p", ALICE).await;
+    let mut events =
+        Referred::paid(BOB, "bob_p", "alice_p", Delivery::Forwarded).events();
+    let Some(NamesEvent::Referred {
+        referrer_platform_id,
+        ..
+    }) = events.last_mut()
+    else {
+        panic!("a referred bind ends with its Referred");
+    };
+    *referrer_platform_id = KnownPlatform::GitHub.id();
+    suite.suite.apply_tx(2, events).await;
+
+    let referrals = suite.referrals(ALICE).await.referrals;
+    let [referral] = referrals.as_slice() else {
+        panic!("one referral, not {referrals:?}");
+    };
+    assert_eq!(referral.referrer.platform, Some(X));
+    assert_eq!(referral.referrer.platform_id, Some(X.id()));
+    assert_eq!(referral.referrer.handle.as_deref(), Some("alice_p"));
+    suite.done();
+}
+
+/// A held share settles with its slot's round: claimed once the node's
+/// holder claims it, refunded once the splitter takes it back. A claim in
+/// another token, or another sender's refund, leaves it held.
+#[tokio::test]
+async fn a_held_share_reads_claimed_or_refunded_once_its_round_settles() {
+    let Some(suite) = Referrals::open().await else {
+        return;
+    };
+    suite.bind(CHAIN, 1, "alice_w", ALICE).await;
+    suite.bind(CHAIN, 2, "erin_w", ERIN).await;
+    // Nobody holds either handle on the other chain, so both shares are held.
+    let held = Delivery::Held;
+    let bob = Referred::paid(BOB, "bob_w", "alice_w", held);
+    suite.referred(OTHER_CHAIN, 3, bob).await;
+    let carol = Referred::paid(CAROL, "carol_w", "erin_w", held);
+    suite.referred(OTHER_CHAIN, 4, carol).await;
+    let delivery = |referrals: AddressReferrals| {
+        referrals
+            .referrals
+            .iter()
+            .map(|r| (r.binder, r.delivery))
+            .collect::<Vec<_>>()
+    };
+
+    let unrelated = vec![
+        NamesEvent::claimed("alice_w", Address::repeat_byte(0x70)),
+        NamesEvent::refunded("erin_w", DAVE),
+    ];
+    suite.on(OTHER_CHAIN).apply_tx(5, unrelated).await;
+    assert_eq!(delivery(suite.referrals(ALICE).await), [(BOB, Some(held))]);
+    assert_eq!(delivery(suite.referrals(ERIN).await), [(CAROL, Some(held))]);
+
+    suite.bind(OTHER_CHAIN, 6, "alice_w", ALICE).await;
+    let settling = vec![
+        NamesEvent::claimed("alice_w", NATIVE),
+        NamesEvent::refunded("erin_w", SPLITTER),
+    ];
+    suite.on(OTHER_CHAIN).apply_tx(7, settling).await;
+    assert_eq!(
+        delivery(suite.referrals(ALICE).await),
+        [(BOB, Some(Delivery::Claimed))]
+    );
+    assert_eq!(
+        delivery(suite.referrals(ERIN).await),
+        [(CAROL, Some(Delivery::Refunded))]
+    );
+    suite.done();
+}
+
 /// Two referred binds in one transaction: each `Referred` takes the
 /// splitter's deposit just before it, for its own referrer.
 #[tokio::test]
 async fn two_referred_binds_in_one_transaction_pair_each_with_its_own_deposit() {
     let Some(suite) = Referrals::open().await else {
-        eprintln!("skipping: DATABASE_URL not set");
         return;
     };
     suite.bind(CHAIN, 1, "alice_t", ALICE).await;
@@ -414,7 +523,6 @@ async fn two_referred_binds_in_one_transaction_pair_each_with_its_own_deposit() 
 #[tokio::test]
 async fn a_paid_share_without_the_splitters_deposit_fails_the_window() {
     let Some(suite) = Referrals::open().await else {
-        eprintln!("skipping: DATABASE_URL not set");
         return;
     };
     suite.bind(CHAIN, 1, "alice_u", ALICE).await;
@@ -468,7 +576,6 @@ async fn a_paid_share_without_the_splitters_deposit_fails_the_window() {
 #[tokio::test]
 async fn a_slot_awaits_the_holder_only_where_nobody_holds_its_handle() {
     let Some(suite) = Referrals::open().await else {
-        eprintln!("skipping: DATABASE_URL not set");
         return;
     };
     let payer = Address::repeat_byte(0xF0);
@@ -509,7 +616,6 @@ async fn a_slot_awaits_the_holder_only_where_nobody_holds_its_handle() {
 #[tokio::test]
 async fn referrals_are_listed_once_per_node_and_page_in_order() {
     let Some(suite) = Referrals::open().await else {
-        eprintln!("skipping: DATABASE_URL not set");
         return;
     };
     suite.bind(CHAIN, 1, "alice_p", ALICE).await;
