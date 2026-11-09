@@ -28,47 +28,66 @@ pub struct ReferrerRow {
     pub published_handle: Option<String>,
 }
 
+/// What a referral code names among the bound handle nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeOwner {
+    /// No chain has bound a node the code's bytes start.
+    Unissued,
+    /// The one bound node the code's bytes start.
+    Node(B256),
+    /// Two or more bound nodes start with the code's bytes: it names none of
+    /// them, so a code never passes from one node to another.
+    Shared,
+}
+
+impl CodeOwner {
+    fn of(nodes: &[B256]) -> Self {
+        match nodes {
+            [] => Self::Unissued,
+            [node] => Self::Node(*node),
+            _ => Self::Shared,
+        }
+    }
+}
+
 impl Code {
-    /// The node this code names, behind `prefix`: of the bound nodes its
-    /// bytes start, the one bound first. Above a prefix of all 0xff the
-    /// range is open.
+    /// The bound nodes this code's bytes start, behind `prefix`, two at most.
+    /// Above a prefix of all 0xff the range is open.
     pub(crate) fn owner_lookup(&self, prefix: &str) -> Statement {
         let mut statement =
             QueryBuilder::new(format!("{prefix}{}", sql::REFERRAL_CODE_OWNER));
         statement
-            .push(" WHERE h.handle_node >= ")
+            .push(" AND h.handle_node >= ")
             .push_bind(self.prefix().to_vec());
         if let Some(past) = self.past() {
             statement.push(" AND h.handle_node < ").push_bind(past);
         }
-        statement.push(
-            " ORDER BY bound.block_time, bound.chain_id, bound.block_number, \
-             bound.log_index LIMIT 1",
-        );
+        statement.push(" ORDER BY h.handle_node LIMIT 2");
         statement
     }
 }
 
 impl Store {
-    /// The node `code` names, `None` while no chain has bound a node it
-    /// starts.
-    pub async fn code_owner(&self, code: &Code) -> Result<Option<B256>, sqlx::Error> {
-        code.owner_lookup("")
+    /// What `code` names: the one bound node its bytes start, none, or more
+    /// than one.
+    pub async fn code_owner(&self, code: &Code) -> Result<CodeOwner, sqlx::Error> {
+        let nodes: Vec<B256> = code
+            .owner_lookup("")
             .build_query_scalar()
-            .fetch_optional(&self.pool)
-            .await
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(CodeOwner::of(&nodes))
     }
 
     /// The shortest code that names `node`, `None` when no chain has bound
-    /// it. A code goes to the node bound first, so a node bound later than
-    /// another sharing its first bytes takes a longer one; its whole 32
-    /// bytes name it alone.
+    /// it. A code another bound node also starts names neither, so such a
+    /// node takes a longer one; its whole 32 bytes name it alone.
     pub async fn code_of(&self, node: B256) -> Result<Option<Code>, sqlx::Error> {
         for code in Code::prefixes(node) {
             match self.code_owner(&code).await? {
-                Some(owner) if owner == node => return Ok(Some(code)),
-                Some(_) => continue,
-                None => return Ok(None),
+                CodeOwner::Node(owner) if owner == node => return Ok(Some(code)),
+                CodeOwner::Shared => continue,
+                CodeOwner::Node(_) | CodeOwner::Unissued => return Ok(None),
             }
         }
         Ok(None)

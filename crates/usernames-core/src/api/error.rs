@@ -85,6 +85,16 @@ impl ApiError {
         )
     }
 
+    /// A referral code two or more bound handle nodes start: it names none.
+    pub(crate) fn code_ambiguous() -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: ErrorCode::CodeAmbiguous,
+            message: "more than one bound handle starts with this code; ask for its longer code".into(),
+            source: None,
+        }
+    }
+
     pub(crate) fn not_synced(chain: Option<i64>) -> Self {
         let message = match chain {
             Some(chain) => {

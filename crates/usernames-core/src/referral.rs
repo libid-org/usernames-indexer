@@ -15,8 +15,8 @@ use serde_with::{
 
 /// A referral code: the base58 of a handle node's first 8 to 32 bytes,
 /// leading zero bytes kept as leading `1`s. Which node a code names is the
-/// store's to say: of the bound nodes those bytes start, the one bound
-/// first.
+/// store's to say: the one bound node those bytes start, and none while two
+/// do.
 #[derive(Clone, Debug, PartialEq, Eq, SerializeDisplay, DeserializeFromStr)]
 pub struct Code(Vec<u8>);
 

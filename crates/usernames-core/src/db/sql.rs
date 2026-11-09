@@ -102,8 +102,8 @@ pub const STATS_FEES: &str = include_str!("../../sql/stats_fees.sql");
 pub const STATS_ESCROW: &str = include_str!("../../sql/stats_escrow.sql");
 pub const STATS_ONBOARDING: &str = include_str!("../../sql/stats_onboarding.sql");
 pub const STATS_USERS: &str = include_str!("../../sql/stats_users.sql");
-/// Bound handle nodes with their first bind; the caller bounds them by a
-/// referral code's prefix and takes the first bound.
+/// The bound handle nodes; the caller bounds them by a referral code's prefix
+/// and takes two.
 pub const REFERRAL_CODE_OWNER: &str = include_str!("../../sql/referral_code_owner.sql");
 pub const REFERRAL_CODE_REFERRER: &str =
     include_str!("../../sql/referral_code_referrer.sql");
