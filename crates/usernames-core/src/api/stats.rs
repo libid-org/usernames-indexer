@@ -1,5 +1,5 @@
-//! `GET /v1/stats`: the store's numbers, computed at most once per
-//! [`STATS_TTL`] however many requests arrive.
+//! `GET /v1/stats`: the store's numbers, computed at most once per time to
+//! live, [`STATS_TTL`] by default, however many requests arrive.
 
 use std::{
     collections::BTreeMap,
@@ -61,13 +61,14 @@ use crate::{
     nodes::Platform,
 };
 
-/// How long one computation is served. The aggregates read whole tables, and
-/// a burst of requests must not run them again on a small database.
-const STATS_TTL: Duration = Duration::from_secs(5 * 60);
+/// How long one computation is served by default. The aggregates read whole
+/// tables, and a burst of requests must not run them again on a small
+/// database.
+pub const STATS_TTL: Duration = Duration::from_secs(5 * 60);
 
-/// How long one computation may take, its statements together. The lock is
-/// held through it, and every request behind it waits that long.
-const STATS_DEADLINE: Duration = Duration::from_secs(30);
+/// How long one computation may take by default, its statements together.
+/// The lock is held through it, and every request behind it waits that long.
+pub const STATS_DEADLINE: Duration = Duration::from_secs(30);
 
 /// `GET /v1/stats` — totals and a daily series per chain, from one
 /// snapshot of the store.
@@ -77,6 +78,7 @@ pub(crate) async fn stats(State(state): State<AppState>) -> Result<Response, Api
         prices,
         stats,
     } = state;
+    let deadline = stats.deadline;
     let body = stats
         .get(|| async move {
             let kept = prices
@@ -84,7 +86,7 @@ pub(crate) async fn stats(State(state): State<AppState>) -> Result<Response, Api
                 .map(PriceSource::priced_before)
                 .unwrap_or_default();
             let (snapshot, quotes) = store
-                .stats(&kept, STATS_DEADLINE, |candidates| async move {
+                .stats(&kept, deadline, |candidates| async move {
                     match prices.as_deref() {
                         Some(source) => source.quotes(&candidates).await,
                         None => Quotes::default(),
@@ -97,10 +99,19 @@ pub(crate) async fn stats(State(state): State<AppState>) -> Result<Response, Api
     Ok(([(CONTENT_TYPE, "application/json")], body).into_response())
 }
 
-/// The latest answer, serialized once and shared by every request.
-#[derive(Clone, Default)]
+/// The latest answer, serialized once and shared by every request, served
+/// for `ttl`; a computation may take `deadline`.
+#[derive(Clone)]
 pub(crate) struct StatsCache {
     latest: Arc<Mutex<Option<Computed>>>,
+    ttl: Duration,
+    deadline: Duration,
+}
+
+impl Default for StatsCache {
+    fn default() -> Self {
+        Self::new(STATS_TTL, STATS_DEADLINE)
+    }
 }
 
 /// One computation's answer as served, and when it finished.
@@ -119,14 +130,25 @@ impl Computed {
         })
     }
 
-    /// Whether the answer may still be served at `now`.
-    fn fresh(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.at) < STATS_TTL
+    /// Whether the answer may still be served at `now`, for `ttl` after it
+    /// was computed.
+    fn fresh(&self, now: Instant, ttl: Duration) -> bool {
+        now.saturating_duration_since(self.at) < ttl
     }
 }
 
 impl StatsCache {
-    /// The answer, from `compute` when none younger than [`STATS_TTL`] is
+    /// An empty cache serving each answer for `ttl`, each computation
+    /// given `deadline`.
+    pub(crate) fn new(ttl: Duration, deadline: Duration) -> Self {
+        Self {
+            latest: Arc::default(),
+            ttl,
+            deadline,
+        }
+    }
+
+    /// The answer, from `compute` when none younger than the cache's `ttl` is
     /// held. The lock is held through the computation, so requests arriving
     /// meanwhile wait for its answer instead of computing again; after a
     /// failure the next of them computes. The computation runs in a task of
@@ -141,7 +163,7 @@ impl StatsCache {
         let mut latest = Arc::clone(&self.latest).lock_owned().await;
         let held = latest
             .as_ref()
-            .filter(|computed| computed.fresh(Instant::now()))
+            .filter(|computed| computed.fresh(Instant::now(), self.ttl))
             .map(|computed| computed.body.clone());
         if let Some(body) = held {
             drop(latest);
@@ -585,16 +607,28 @@ mod tests {
         assert!(served.is_ok(), "the next request computes again");
     }
 
-    /// An answer is served for five minutes after its computation.
+    /// An answer is served for its time to live after its computation.
     #[test]
-    fn an_answer_is_served_for_five_minutes() {
+    fn an_answer_is_served_for_its_time_to_live() {
         let at = Instant::now();
         let computed = Computed {
             at,
             body: Bytes::new(),
         };
-        assert!(computed.fresh(at));
-        assert!(computed.fresh(at + STATS_TTL - Duration::from_secs(1)));
-        assert!(!computed.fresh(at + STATS_TTL));
+        let ttl = Duration::from_secs(90);
+        assert!(computed.fresh(at, ttl));
+        assert!(computed.fresh(at + ttl - Duration::from_secs(1), ttl));
+        assert!(!computed.fresh(at + ttl, ttl));
+    }
+
+    /// A cache serves for the time to live it was given: with none, every
+    /// request computes.
+    #[tokio::test]
+    async fn a_cache_serves_for_the_time_to_live_it_was_given() {
+        let cache = StatsCache::new(Duration::ZERO, STATS_DEADLINE);
+        let first = cache.get(|| async { Ok(answer(0)) }).await;
+        assert_eq!(first.served(), answer(0));
+        let next = cache.get(|| async { Ok(answer(1)) }).await;
+        assert_eq!(next.served(), answer(1));
     }
 }

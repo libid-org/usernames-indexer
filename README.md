@@ -69,6 +69,8 @@ indexer's settings.
 | `LISTEN_ADDR` | api | `127.0.0.1:8080` | Read-API listen address |
 | `PRICE_SOURCE` | api | `https://coins.llama.fi` | Where `/v1/stats` reads USD prices, a source answering DefiLlama's `prices/current/<coins>`. A token priced with confidence 0.9 or more is named and valued; every other token's movements count together under `other`, without an amount: anybody can write a token |
 | `PRICE_CHAINS` | api | `1=ethereum,56=bsc,714=eden,8453=base,42161=arbitrum` | The name the price source gives each chain it prices, by chain id. A chain missing here, a testnet, is never priced: its tokens count under `other` |
+| `STATS_TTL` | api | `5m` | How long `/v1/stats` serves one computation. Each computation reads whole tables; a longer time spares a large database |
+| `STATS_DEADLINE` | api | `30s` | How long one `/v1/stats` computation may take. Requests wait behind it; past it the computation fails and the next request tries again |
 
 ### Polling
 

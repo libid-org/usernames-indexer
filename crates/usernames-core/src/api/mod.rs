@@ -13,7 +13,10 @@ mod params;
 mod prices;
 mod stats;
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::Duration,
+};
 
 use alloy::primitives::B256;
 use axum::{
@@ -24,14 +27,6 @@ use axum::{
 };
 use serde::Deserialize;
 
-pub use self::prices::{
-    PriceChains,
-    PriceChainsError,
-    PriceSource,
-    DEFILLAMA,
-    DEFILLAMA_CHAINS,
-    KEPT_PER_CHAIN,
-};
 use self::{
     error::{
         ApiError,
@@ -59,6 +54,20 @@ use self::{
         Param,
     },
     stats::StatsCache,
+};
+pub use self::{
+    prices::{
+        PriceChains,
+        PriceChainsError,
+        PriceSource,
+        DEFILLAMA,
+        DEFILLAMA_CHAINS,
+        KEPT_PER_CHAIN,
+    },
+    stats::{
+        STATS_DEADLINE,
+        STATS_TTL,
+    },
 };
 use crate::{
     db::{
@@ -98,6 +107,15 @@ impl AppState {
     pub fn pricing(self, source: Arc<PriceSource>) -> Self {
         Self {
             prices: Some(source),
+            ..self
+        }
+    }
+
+    /// The same state, serving each `/v1/stats` answer for `ttl` and giving
+    /// each computation `deadline`.
+    pub fn stats_timing(self, ttl: Duration, deadline: Duration) -> Self {
+        Self {
+            stats: StatsCache::new(ttl, deadline),
             ..self
         }
     }

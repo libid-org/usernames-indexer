@@ -49,6 +49,8 @@ use usernames_core::{
         PriceSource,
         DEFILLAMA,
         DEFILLAMA_CHAINS,
+        STATS_DEADLINE,
+        STATS_TTL,
     },
     db::{
         self,
@@ -135,6 +137,16 @@ pub struct Config {
     /// under `other`.
     #[arg(long, env = "PRICE_CHAINS", default_value = DEFILLAMA_CHAINS)]
     pub price_chains: PriceChains,
+
+    /// How long `/v1/stats` serves one computation. Each computation reads
+    /// whole tables; a longer time spares a large database.
+    #[arg(long, env = "STATS_TTL", default_value_t = STATS_TTL.into())]
+    pub stats_ttl: humantime::Duration,
+
+    /// How long one `/v1/stats` computation may take. Requests wait behind
+    /// it; past it the computation fails and the next request tries again.
+    #[arg(long, env = "STATS_DEADLINE", default_value_t = STATS_DEADLINE.into())]
+    pub stats_deadline: humantime::Duration,
 }
 
 /// The API serving as a task, and the token that stops it.
@@ -246,10 +258,12 @@ impl Config {
             }
         }
         let app = Service {
-            api: api::AppState::new(store).pricing(Arc::new(PriceSource::new(
-                self.price_source,
-                self.price_chains,
-            ))),
+            api: api::AppState::new(store)
+                .pricing(Arc::new(PriceSource::new(
+                    self.price_source,
+                    self.price_chains,
+                )))
+                .stats_timing(self.stats_ttl.into(), self.stats_deadline.into()),
             gateway,
         }
         .router();
