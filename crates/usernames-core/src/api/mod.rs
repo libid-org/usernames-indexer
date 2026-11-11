@@ -25,8 +25,11 @@ use axum::{
 use serde::Deserialize;
 
 pub use self::prices::{
+    PriceChains,
+    PriceChainsError,
     PriceSource,
     DEFILLAMA,
+    DEFILLAMA_CHAINS,
     KEPT_PER_CHAIN,
 };
 use self::{

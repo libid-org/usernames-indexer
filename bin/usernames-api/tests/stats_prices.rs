@@ -210,7 +210,8 @@ impl MockSource {
 
     /// A price source over this one, naming the suite's chain.
     fn source(&self) -> Arc<PriceSource> {
-        Arc::new(PriceSource::new(self.base.clone()).naming(CHAIN, CHAIN_NAME))
+        let chains = format!("{CHAIN}={CHAIN_NAME}").parse().expect("chains");
+        Arc::new(PriceSource::new(self.base.clone(), chains))
     }
 }
 

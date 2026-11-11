@@ -4,7 +4,11 @@
 //! value them when the answer is computed.
 
 use std::{
-    collections::HashMap,
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
+    fmt,
     future::Future,
     ops::RangeInclusive,
     str::FromStr,
@@ -41,15 +45,9 @@ use crate::{
 /// The source DefiLlama runs, with no key.
 pub const DEFILLAMA: &str = "https://coins.llama.fi";
 
-/// The chains the source names, by chain id; a chain missing here, a
-/// testnet, is never priced.
-const CHAINS: [(i64, &str); 5] = [
-    (1, "ethereum"),
-    (42161, "arbitrum"),
-    (8453, "base"),
-    (56, "bsc"),
-    (714, "eden"),
-];
+/// The chains DefiLlama names among those the indexer serves, as
+/// [`PriceChains`] parses them.
+pub const DEFILLAMA_CHAINS: &str = "1=ethereum,56=bsc,714=eden,8453=base,42161=arbitrum";
 
 /// How the source names a chain's own coin.
 const SOURCE_COIN: Address = Address::ZERO;
@@ -93,6 +91,56 @@ const HIDDEN: [RangeInclusive<char>; 3] = [
     '\u{202A}'..='\u{202E}',
     '\u{2066}'..='\u{2069}',
 ];
+
+/// The name the source gives each chain it prices, by chain id:
+/// `1=ethereum,8453=base`. A chain missing here, a testnet, is never priced.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PriceChains(BTreeMap<i64, String>);
+
+/// Why a list of chains does not parse.
+#[derive(Debug, thiserror::Error)]
+#[error("not `<chain id>=<source name>`, comma-separated, each chain once: {0:?}")]
+pub struct PriceChainsError(String);
+
+impl PriceChains {
+    /// The source's name for `chain_id`.
+    fn name(&self, chain_id: i64) -> Option<&str> {
+        self.0.get(&chain_id).map(String::as_str)
+    }
+}
+
+impl FromStr for PriceChains {
+    type Err = PriceChainsError;
+
+    /// Names go into the source's URL path, so each is ASCII letters,
+    /// digits, `-` and `_`. An empty list prices no chain.
+    fn from_str(text: &str) -> Result<Self, PriceChainsError> {
+        let mut chains = BTreeMap::new();
+        for entry in text.split(',').filter(|entry| !entry.is_empty()) {
+            let refused = || PriceChainsError(entry.to_string());
+            let (chain_id, name) = entry.split_once('=').ok_or_else(refused)?;
+            let chain_id = chain_id.parse::<i64>().map_err(|_| refused())?;
+            let named = !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+            if !named || chains.insert(chain_id, name.to_string()).is_some() {
+                return Err(refused());
+            }
+        }
+        Ok(Self(chains))
+    }
+}
+
+impl fmt::Display for PriceChains {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, (chain_id, name)) in self.0.iter().enumerate() {
+            let comma = if i == 0 { "" } else { "," };
+            write!(f, "{comma}{chain_id}={name}")?;
+        }
+        Ok(())
+    }
+}
 
 /// A price in units of 10^-18 USD.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -353,37 +401,26 @@ impl Book {
 /// computation running at a time asks it, so it has one writer.
 pub struct PriceSource {
     base: Url,
-    chains: HashMap<i64, String>,
+    chains: PriceChains,
     client: reqwest::Client,
     book: Mutex<Book>,
 }
 impl PriceSource {
     /// The source at `base`, DefiLlama's [`DEFILLAMA`] or one that answers
-    /// the same way.
-    pub fn new(base: Url) -> Self {
+    /// the same way, pricing the `chains` it names.
+    pub fn new(base: Url, chains: PriceChains) -> Self {
         Self {
             base,
-            chains: CHAINS
-                .iter()
-                .map(|(chain_id, name)| (*chain_id, name.to_string()))
-                .collect(),
+            chains,
             client: reqwest::Client::new(),
             book: Mutex::default(),
         }
     }
 
-    /// The same source, naming `chain_id` `name` too: a test chain priced
-    /// by a test's source.
-    #[cfg(feature = "test-helpers")]
-    pub fn naming(mut self, chain_id: i64, name: &str) -> Self {
-        self.chains.insert(chain_id, name.to_string());
-        self
-    }
-
     /// The source's id of `coin`: `<chain>:0x…`, the chain's own coin as
     /// the zero address; `None` on a chain the source does not name.
     fn coin_id(&self, coin: &ChainToken) -> Option<String> {
-        let chain = self.chains.get(&coin.chain_id)?;
+        let chain = self.chains.name(coin.chain_id)?;
         let token = if coin.token == NATIVE_COIN {
             SOURCE_COIN
         } else {
@@ -540,8 +577,26 @@ mod tests {
     }
 
     #[test]
+    fn price_chains_parse_back_from_their_display() {
+        let chains: PriceChains = DEFILLAMA_CHAINS.parse().expect("chains");
+        assert_eq!(chains.name(8453), Some("base"));
+        assert_eq!(chains.name(11155111), None);
+        assert_eq!(chains.to_string(), DEFILLAMA_CHAINS);
+        assert_eq!(
+            "".parse::<PriceChains>().expect("none"),
+            PriceChains::default()
+        );
+        for refused in ["1", "1=", "x=ethereum", "1=eth/x", "1=a,1=b", "1=a:b"] {
+            assert!(refused.parse::<PriceChains>().is_err(), "{refused}");
+        }
+    }
+
+    #[test]
     fn a_coin_id_names_the_chain_and_the_source_coin() {
-        let source = PriceSource::new(DEFILLAMA.parse().expect("a URL"));
+        let source = PriceSource::new(
+            DEFILLAMA.parse().expect("a URL"),
+            DEFILLAMA_CHAINS.parse().expect("chains"),
+        );
         let usdc = ChainToken {
             chain_id: 8453,
             token: Address::repeat_byte(0xAB),

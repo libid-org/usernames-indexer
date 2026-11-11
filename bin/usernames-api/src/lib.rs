@@ -45,8 +45,10 @@ use url::Url;
 use usernames_core::{
     api::{
         self,
+        PriceChains,
         PriceSource,
         DEFILLAMA,
+        DEFILLAMA_CHAINS,
     },
     db::{
         self,
@@ -127,6 +129,12 @@ pub struct Config {
     /// and valued in USD; every other one counts under `other`.
     #[arg(long, env = "PRICE_SOURCE", default_value = DEFILLAMA)]
     pub price_source: Url,
+
+    /// The name the price source gives each chain it prices, by chain id:
+    /// `1=ethereum,8453=base`. A chain missing here counts its tokens
+    /// under `other`.
+    #[arg(long, env = "PRICE_CHAINS", default_value = DEFILLAMA_CHAINS)]
+    pub price_chains: PriceChains,
 }
 
 /// The API serving as a task, and the token that stops it.
@@ -238,8 +246,10 @@ impl Config {
             }
         }
         let app = Service {
-            api: api::AppState::new(store)
-                .pricing(Arc::new(PriceSource::new(self.price_source))),
+            api: api::AppState::new(store).pricing(Arc::new(PriceSource::new(
+                self.price_source,
+                self.price_chains,
+            ))),
             gateway,
         }
         .router();
