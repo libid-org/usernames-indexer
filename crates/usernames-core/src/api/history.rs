@@ -9,6 +9,7 @@ use axum::{
 use super::{
     model::{
         AddressHistory,
+        ChainHistory,
         HandleHistory,
         HandleRef,
         HistoryEntry,
@@ -17,6 +18,7 @@ use super::{
     ApiPath,
     ApiQuery,
     AppState,
+    ChainHistoryParams,
     HandleKey,
     PageParams,
     Param,
@@ -81,6 +83,31 @@ pub(crate) async fn address(
         .served(HistoryEntry::of)?;
     Ok(Json(AddressHistory {
         address,
+        entries,
+        next,
+    }))
+}
+
+/// `GET /v1/history/chain/{chain}?day=&kind=&token=&before=&limit=` — what
+/// happened on one chain, newest first: on one UTC day or over its whole
+/// journal, of one kind and in one token when asked. Each page is one index
+/// seek and at most `limit` entries, however busy the day.
+pub(crate) async fn chain(
+    State(state): State<AppState>,
+    ApiPath(chain): ApiPath<String>,
+    ApiQuery(params): ApiQuery<ChainHistoryParams>,
+) -> Result<Json<ChainHistory>, ApiError> {
+    let (events, page) = params.on(&chain)?;
+    state.synced(page.chain).await?;
+
+    let (entries, next) = state
+        .store
+        .chain_history(events, page)
+        .await?
+        .served(HistoryEntry::of)?;
+    Ok(Json(ChainHistory {
+        chain_id: events.chain_id,
+        day: events.day,
         entries,
         next,
     }))

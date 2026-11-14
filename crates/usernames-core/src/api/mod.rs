@@ -45,6 +45,7 @@ use self::{
     },
     params::{
         ChainFilter,
+        ChainHistoryParams,
         HandleKey,
         PageParams,
         Param,
@@ -133,6 +134,7 @@ impl AppState {
                 get(history::handle),
             )
             .route("/v1/history/node/{node}", get(history::node))
+            .route("/v1/history/chain/{chain}", get(history::chain))
             .route("/v1/escrow/claimable/{address}", get(escrow::claimable))
             .route("/v1/escrow/refundable/{address}", get(escrow::refundable))
             .route("/v1/escrow/handle/{platform}/{handle}", get(escrow::handle))
@@ -582,6 +584,30 @@ mod tests {
             (
                 "/v1/stats/days?limit=ten".to_string(),
                 bad(ErrorCode::InvalidArgument),
+            ),
+            (
+                "/v1/history/chain/base".to_string(),
+                bad(ErrorCode::InvalidChain),
+            ),
+            (
+                "/v1/history/chain/1?day=1700000001".to_string(),
+                bad(ErrorCode::InvalidArgument),
+            ),
+            (
+                "/v1/history/chain/1?day=today".to_string(),
+                bad(ErrorCode::InvalidArgument),
+            ),
+            (
+                "/v1/history/chain/1?kind=minted".to_string(),
+                bad(ErrorCode::InvalidArgument),
+            ),
+            (
+                "/v1/history/chain/1?token=usdc".to_string(),
+                bad(ErrorCode::InvalidAddress),
+            ),
+            (
+                "/v1/history/chain/1?before=yesterday".to_string(),
+                bad(ErrorCode::InvalidCursor),
             ),
             (
                 format!("/v1/history/address/{address}?before=yesterday"),

@@ -589,6 +589,21 @@ pub struct HandleHistory {
     pub next: Option<String>,
 }
 
+/// `GET /v1/history/chain/{chain}`: what happened on one chain, on one UTC
+/// day or over its whole journal, in one kind or one token when asked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainHistory {
+    /// The chain asked about.
+    pub chain_id: i64,
+    /// The UTC day asked about, in unix seconds; absent for the whole journal.
+    pub day: Option<i64>,
+    /// Newest first: by block time, then block and log index.
+    pub entries: Vec<HistoryEntry>,
+    /// Pass as `before` for the next page; absent on the last one.
+    pub next: Option<String>,
+}
+
 /// One amount waiting in the escrow, and what it waits for.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

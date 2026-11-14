@@ -62,8 +62,10 @@ pub use self::{
         UnclaimedCursor,
     },
     history::{
+        ChainEvents,
         HistoryCursor,
         HistoryRow,
+        SECONDS_PER_DAY,
     },
     journal::{
         EventColumns,

@@ -1,8 +1,9 @@
-//! `GET /v1/stats` and `GET /v1/stats/days` over a journal written through
-//! the indexer's apply path: users, links, fees and escrow movements counted
-//! per chain, in total and per UTC day, users counted once across chains,
-//! tokens nobody listed counted together, and one answer served until it
-//! expires.
+//! `GET /v1/stats`, `GET /v1/stats/days` and `GET /v1/history/chain/{chain}`
+//! over a journal written through the indexer's apply path: users, links,
+//! fees and escrow movements counted per chain, in total and per UTC day,
+//! users counted once across chains, tokens nobody listed counted together,
+//! one answer served until it expires, and one day's events listed page by
+//! page.
 //!
 //! Skips without `DATABASE_URL`, unless `CI` is set: there its absence
 //! fails. The suite's chain is its own; the answer lists every chain the
@@ -39,6 +40,7 @@ use usernames_core::{
         model::{
             Activity,
             AllChainsDay,
+            ChainHistory,
             ChainStats,
             DayActivity,
             EscrowActivity,
@@ -290,6 +292,20 @@ impl StatsRoute for Router {
         assert_eq!(response.status(), StatusCode::OK, "{path}");
         let body = response.into_body().collect().await.expect("body");
         serde_json::from_slice(&body.to_bytes()).expect("the answer's shape")
+    }
+}
+
+/// Where each entry of a chain history sits: block and log index.
+trait Positions {
+    fn positions(&self) -> Vec<(i64, i64)>;
+}
+
+impl Positions for ChainHistory {
+    fn positions(&self) -> Vec<(i64, i64)> {
+        self.entries
+            .iter()
+            .map(|entry| (entry.block_number, entry.log_index))
+            .collect()
     }
 }
 
@@ -660,6 +676,83 @@ async fn an_answer_is_served_again_until_it_expires() {
 
     let restarted: Stats = suite.get("/v1/stats").await.answer();
     assert_eq!(restarted.chain(CHAIN).total.links, [links(X, 2, 2)]);
+    suite.store().forget().await;
+    suite.done();
+}
+
+/// A day's events come newest first, a page at a time, narrowed to a kind, a
+/// token or both; the journal's other days and a day with nothing stay out.
+#[tokio::test]
+async fn a_day_lists_its_events_page_by_page() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let mut day_a = Vec::new();
+    let bind = NamesEvent::paid_bind(ALICE, "1", "alice");
+    day_a.extend((0..bind.len()).map(|log| (IN_A, log)));
+    suite.apply_tx(IN_A, bind).await;
+    for (block, token) in [(IN_A + 1, NATIVE), (IN_A + 2, USDC)] {
+        suite
+            .apply(block, NamesEvent::deposited("dave", token, SENDER, 1_000))
+            .await;
+        day_a.push((block, 0));
+    }
+    suite
+        .apply_tx(IN_B, NamesEvent::paid_bind(DAVE, "4", "dave"))
+        .await;
+    suite
+        .apply(IN_B + 1, NamesEvent::claimed("dave", NATIVE, DAVE, 1_000))
+        .await;
+    let newest_first = |positions: &[(u64, usize)]| -> Vec<(i64, i64)> {
+        positions
+            .iter()
+            .rev()
+            .map(|&(block, log)| (block as i64, log as i64))
+            .collect()
+    };
+
+    let api = api(&suite);
+    let history = |query: String| {
+        let api = api.clone();
+        async move {
+            let page: ChainHistory = api
+                .answer(&format!("/v1/history/chain/{CHAIN}?{query}"))
+                .await;
+            page
+        }
+    };
+    let whole = history(format!("day={DAY_A}&limit=100")).await;
+    assert_eq!(whole.chain_id, CHAIN);
+    assert_eq!(whole.day, Some(DAY_A));
+    assert_eq!(whole.positions(), newest_first(&day_a));
+    assert_eq!(whole.next, None);
+
+    let mut paged = Vec::new();
+    let mut before = String::new();
+    loop {
+        let page = history(format!("day={DAY_A}&limit=2{before}")).await;
+        assert!(page.entries.len() <= 2);
+        paged.extend(page.positions());
+        match page.next {
+            Some(next) => before = format!("&before={next}"),
+            None => break,
+        }
+    }
+    assert_eq!(paged, whole.positions());
+
+    let deposits = history(format!("day={DAY_A}&kind=deposited")).await;
+    assert_eq!(
+        deposits.positions(),
+        newest_first(&[(IN_A + 1, 0), (IN_A + 2, 0)])
+    );
+    let usdc = history(format!("token={USDC}")).await;
+    assert_eq!(usdc.positions(), newest_first(&[(IN_A + 2, 0)]));
+    let claims = history(format!("day={DAY_B}&kind=claimed&token={NATIVE}")).await;
+    assert_eq!(claims.positions(), newest_first(&[(IN_B + 1, 0)]));
+    let quiet = history(format!("day={}", DAY_A + 86_400)).await;
+    assert_eq!(quiet.positions(), []);
+    assert_eq!(quiet.next, None);
     suite.store().forget().await;
     suite.done();
 }
