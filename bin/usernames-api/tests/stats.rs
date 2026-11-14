@@ -1,8 +1,8 @@
-//! `GET /v1/stats` over a journal written through the indexer's apply path:
-//! users, links, fees and escrow movements counted per chain, in total and
-//! per UTC day, users counted once across chains, tokens without a price
-//! counted together, and one answer served until it expires. Nothing here
-//! is priced: `stats_prices.rs` values tokens.
+//! `GET /v1/stats` and `GET /v1/stats/days` over a journal written through
+//! the indexer's apply path: users, links, fees and escrow movements counted
+//! per chain, in total and per UTC day, users counted once across chains,
+//! tokens without a price counted together, and one answer served until it
+//! expires. Nothing here is priced: `stats_prices.rs` values tokens.
 //!
 //! Skips without `DATABASE_URL`, unless `CI` is set: there its absence
 //! fails. The suite's chain is its own; the answer lists every chain the
@@ -19,6 +19,7 @@ use alloy::primitives::{
     U256,
     U512,
 };
+use axum::Router;
 use tokio::{
     sync::Mutex,
     task::JoinSet,
@@ -224,10 +225,9 @@ trait AllChainsEntry {
     fn on(&self, day: i64) -> AllChainsDay;
 }
 
-impl AllChainsEntry for Stats {
+impl AllChainsEntry for Vec<AllChainsDay> {
     fn on(&self, day: i64) -> AllChainsDay {
-        self.days
-            .iter()
+        self.iter()
             .find(|entry| entry.day == day)
             .cloned()
             .unwrap_or(AllChainsDay {
@@ -236,6 +236,11 @@ impl AllChainsEntry for Stats {
                 new_users: 0,
             })
     }
+}
+
+/// An API over the suite's database, with its own cache.
+fn api(suite: &Suite) -> Router {
+    AppState::new(Store::new(suite.pool.clone())).router()
 }
 
 /// Users, links, live handles, fees and every escrow movement add up per
@@ -305,10 +310,9 @@ async fn the_journal_adds_up_per_chain_and_day() {
         .apply(IN_B + 6, NamesEvent::claimed("eve", NATIVE, EVE, 7))
         .await;
 
-    let stats = AppState::new(Store::new(suite.pool.clone()))
-        .router()
-        .stats()
-        .await;
+    let api = api(&suite);
+    let stats = api.stats().await;
+    let days: Vec<DayActivity> = api.days(Some(CHAIN)).await;
     let ether = u128::from(ETHER);
     let handles = vec![
         PlatformHandles {
@@ -339,7 +343,11 @@ async fn the_journal_adds_up_per_chain_and_day() {
             },
             onboarding_claims: vec![flow(NATIVE, 1, 3 * ether, 1)].named(),
         },
-        days: vec![
+    };
+    assert_eq!(stats.chain(CHAIN), expected);
+    assert_eq!(
+        days,
+        [
             DayActivity {
                 day: DAY_A,
                 new_users: 4,
@@ -370,9 +378,8 @@ async fn the_journal_adds_up_per_chain_and_day() {
                     onboarding_claims: vec![flow(NATIVE, 1, 3 * ether, 1)].named(),
                 },
             },
-        ],
-    };
-    assert_eq!(stats.chain(CHAIN), expected);
+        ]
+    );
     suite.store().forget().await;
     suite.done();
 }
@@ -417,14 +424,13 @@ async fn a_freed_handle_onboards_its_next_holder() {
         )
         .await;
 
-    let stats: Stats = suite.get("/v1/stats").await.answer();
-    let chain = stats.chain(CHAIN);
+    let api = api(&suite);
+    let chain = api.stats().await.chain(CHAIN);
+    let days: Vec<DayActivity> = api.days(Some(CHAIN)).await;
     let grace = || vec![flow(NATIVE, 1, 3 * u128::from(ETHER), 1)].named();
     assert_eq!(chain.total.onboarding_claims, grace());
     let onboarding_on = |day: i64| {
-        chain
-            .days
-            .iter()
+        days.iter()
             .find(|entry| entry.day == day)
             .map(|entry| entry.activity.onboarding_claims.clone())
             .unwrap_or_else(|| panic!("day {day} listed"))
@@ -456,12 +462,11 @@ async fn unpriced_tokens_count_together() {
     suite.apply_tx(IN_A, day_a).await;
     suite.apply_tx(IN_B, junk(500..1_000)).await;
 
-    let stats: Stats = suite.get("/v1/stats").await.answer();
-    let chain = stats.chain(CHAIN);
+    let api = api(&suite);
+    let chain = api.stats().await.chain(CHAIN);
+    let days: Vec<DayActivity> = api.days(Some(CHAIN)).await;
     let deposits_on = |day: i64| {
-        chain
-            .days
-            .iter()
+        days.iter()
             .find(|entry| entry.day == day)
             .map(|entry| entry.activity.escrow.deposits.clone())
             .unwrap_or_else(|| panic!("day {day} listed"))
@@ -487,7 +492,9 @@ async fn a_wallet_on_two_chains_counts_once_across_them() {
     let other = ChainStore::new(suite.pool.clone(), OTHER_CHAIN);
     other.forget().await;
     let other = other.writer().await;
-    let before: Stats = suite.get("/v1/stats").await.answer();
+    let then = api(&suite);
+    let before = then.stats().await;
+    let days_before: Vec<AllChainsDay> = then.days(None).await;
 
     other
         .apply_tx(IN_A, NamesEvent::bind(ROAMER, X, "6", "roamer", 1, false))
@@ -495,15 +502,17 @@ async fn a_wallet_on_two_chains_counts_once_across_them() {
     suite
         .apply_tx(IN_B, NamesEvent::bind(ROAMER, X, "6", "roamer", 1, false))
         .await;
-    let after: Stats = suite.get("/v1/stats").await.answer();
+    let now = api(&suite);
+    let after = now.stats().await;
+    let days_after: Vec<AllChainsDay> = now.days(None).await;
 
     assert_eq!(after.total.users - before.total.users, 1);
     let added = |day: i64| {
-        let (now, then) = (after.on(day), before.on(day));
+        let (added, had) = (days_after.on(day), days_before.on(day));
         AllChainsDay {
             day,
-            users: now.users - then.users,
-            new_users: now.new_users - then.new_users,
+            users: added.users - had.users,
+            new_users: added.new_users - had.new_users,
         }
     };
     assert_eq!(
@@ -524,8 +533,8 @@ async fn a_wallet_on_two_chains_counts_once_across_them() {
     );
     let chain = after.chain(CHAIN);
     assert_eq!(chain.total.users, 1);
-    let day_b = chain
-        .days
+    let chain_days: Vec<DayActivity> = now.days(Some(CHAIN)).await;
+    let day_b = chain_days
         .iter()
         .find(|entry| entry.day == DAY_B)
         .expect("day B listed");
@@ -548,7 +557,7 @@ async fn an_answer_is_served_again_until_it_expires() {
     suite
         .apply_tx(IN_A, NamesEvent::bind(ALICE, X, "1", "alice", 1, false))
         .await;
-    let api = AppState::new(Store::new(suite.pool.clone())).router();
+    let api = api(&suite);
     let first = api.stats().await;
     assert_eq!(first.clone().chain(CHAIN).total.links, [links(X, 1, 1)]);
 

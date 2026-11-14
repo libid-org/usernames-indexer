@@ -166,6 +166,7 @@ impl AppState {
             .route("/v1/escrow/node/{node}", get(escrow::node))
             .route("/v1/escrow/unclaimed", get(escrow::unclaimed))
             .route("/v1/stats", get(stats::stats))
+            .route("/v1/stats/days", get(stats::days))
             .with_state(self)
     }
 
@@ -596,6 +597,18 @@ mod tests {
             (
                 "/v1/escrow/unclaimed?before=nope".to_string(),
                 bad(ErrorCode::InvalidCursor),
+            ),
+            (
+                "/v1/stats/days?before=yesterday".to_string(),
+                bad(ErrorCode::InvalidCursor),
+            ),
+            (
+                "/v1/stats/days?chain=base".to_string(),
+                bad(ErrorCode::InvalidChain),
+            ),
+            (
+                "/v1/stats/days?limit=ten".to_string(),
+                bad(ErrorCode::InvalidArgument),
             ),
             (
                 format!("/v1/history/address/{address}?before=yesterday"),

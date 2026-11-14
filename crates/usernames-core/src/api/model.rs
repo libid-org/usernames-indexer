@@ -685,12 +685,13 @@ pub struct Unclaimed {
 }
 
 /// `GET /v1/stats`: what the chains this store holds recorded, chain by
-/// chain, and the users across them: totals and a series per UTC day.
-/// Every address counts. Amounts are token units; a priced token also
-/// carries them after its decimals and in USD, every day valued at the
-/// prices of [`Stats::priced_at`]. Tokens are named only when they are the
-/// chain's own coin, EIP-7528 `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`,
-/// or a token the price source prices with confidence; anybody can write a
+/// chain, and the users across them, since the index's first block; the
+/// same day by day is `GET /v1/stats/days`. Every address counts. Amounts
+/// are token units; a priced token also carries them after its decimals and
+/// in USD, valued at the prices of [`Stats::priced_at`]. Tokens are named
+/// only when they are the chain's own coin, EIP-7528
+/// `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`, or a token the price source
+/// prices with confidence; anybody can write a
 /// token, so every other one is counted under `other`, without an amount.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -704,9 +705,6 @@ pub struct Stats {
     /// The wallets across every chain the store holds: one that used
     /// several chains counts once.
     pub total: AllChains,
-    /// The same, day by day, oldest first; a day with nothing recorded is
-    /// absent.
-    pub days: Vec<AllChainsDay>,
     /// Every chain the store holds, by id; a chain with nothing recorded
     /// yet included.
     pub chains: Vec<ChainStats>,
@@ -805,9 +803,25 @@ pub struct ChainStats {
     pub handles: Vec<PlatformHandles>,
     /// Everything the chain recorded since the index's first block.
     pub total: Activity,
-    /// The same, day by day, oldest first; a day with nothing recorded is
-    /// absent.
-    pub days: Vec<DayActivity>,
+}
+
+/// `GET /v1/stats/days`: one page of the daily series, across every chain
+/// (`AllChainsDay`) or on the chain `?chain=` names (`DayActivity`), from
+/// the snapshot `/v1/stats` serves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsDays<D> {
+    /// Unix seconds of the snapshot, as `/v1/stats` gives it.
+    pub computed_at: i64,
+    /// Unix seconds of the oldest price the snapshot uses, as `/v1/stats`
+    /// gives it; absent when it uses none.
+    pub priced_at: Option<i64>,
+    /// The chain asked about; absent across every chain.
+    pub chain_id: Option<i64>,
+    /// Newest first; a day with nothing recorded is absent.
+    pub days: Vec<D>,
+    /// Pass as `before` for the next page; absent on the last one.
+    pub next: Option<String>,
 }
 
 /// The handles one platform has that resolve now.
