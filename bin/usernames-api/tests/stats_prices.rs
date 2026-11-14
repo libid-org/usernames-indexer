@@ -1,8 +1,8 @@
 //! `GET /v1/stats` valued in USD, against a price source on this machine
 //! that answers DefiLlama's `prices/current/<coins>`: a token priced with
 //! confidence is named and valued, every other one counts under `other`,
-//! a failed request keeps the last prices, and a token priced once keeps
-//! its place among the coins asked.
+//! each day valued at the same prices, a failed request keeps the last
+//! prices, and a token priced once keeps its place among the coins asked.
 //!
 //! Skips without `DATABASE_URL`, unless `CI` is set: there its absence
 //! fails. The suite's chain is its own, named to the source as
@@ -46,8 +46,10 @@ use url::Url;
 use usernames_core::{
     api::{
         model::{
+            DayActivity,
             OtherTokens,
             Stats,
+            StatsDays,
             TokenFlow,
             TokenFlows,
             Usd,
@@ -371,6 +373,47 @@ async fn priced_tokens_are_valued_in_usd() {
         after.total.payments.unpriced - before.total.payments.unpriced,
         1
     );
+    suite.store().forget().await;
+    suite.done();
+}
+
+/// `GET /v1/stats/days` values each day's tokens at the prices of the
+/// computation `/v1/stats` serves, and gives its `pricedAt`.
+#[tokio::test]
+async fn days_are_valued_at_the_answers_prices() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let mock = MockSource::start().await;
+    mock.price(NATIVE, Coin::priced(2000.5, 18, "ETH"));
+    let api = AppState::new(Store::new(suite.pool.clone()))
+        .pricing(mock.source())
+        .router();
+    suite
+        .apply(10, NamesEvent::deposited(NATIVE, SENDER, ether(15)))
+        .await;
+
+    let stats = api.stats().await;
+    let days: Vec<DayActivity> = api.days(Some(CHAIN)).await;
+    let page: StatsDays<DayActivity> =
+        api.answer(&format!("/v1/stats/days?chain={CHAIN}")).await;
+    let deposits = TokenFlows {
+        tokens: vec![TokenFlow::unpriced(NATIVE, ether(15).to()).valued(
+            ("ETH", 18),
+            "1.5",
+            "3000.75",
+        )],
+        usd: usd("3000.75"),
+        other: None,
+    };
+    assert_eq!(stats.clone().chain(CHAIN).total.escrow.deposits, deposits);
+    let [day] = days.as_slice() else {
+        panic!("one day recorded: {days:?}");
+    };
+    assert_eq!(day.activity.escrow.deposits, deposits);
+    assert_eq!(page.computed_at, stats.computed_at);
+    assert_eq!(page.priced_at, stats.priced_at);
     suite.store().forget().await;
     suite.done();
 }
