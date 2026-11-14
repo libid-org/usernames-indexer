@@ -84,15 +84,17 @@ pub use self::{
         SearchRow,
     },
     stats::{
+        Candidate,
+        ChainToken,
         EscrowFlowRow,
         FeesRow,
         HandlesRow,
         LinksRow,
-        ListedToken,
-        ListedTokenError,
+        NamedTokens,
         StatsSnapshot,
         TokenFlowRow,
         UsersRow,
+        CANDIDATES_PER_CHAIN,
     },
 };
 

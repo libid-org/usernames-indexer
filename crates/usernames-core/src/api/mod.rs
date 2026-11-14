@@ -10,9 +10,13 @@ mod escrow;
 mod history;
 pub mod model;
 mod params;
+mod prices;
 mod stats;
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::Duration,
+};
 
 use alloy::primitives::B256;
 use axum::{
@@ -51,12 +55,25 @@ use self::{
     },
     stats::StatsCache,
 };
+pub use self::{
+    prices::{
+        PriceChains,
+        PriceChainsError,
+        PriceSource,
+        DEFILLAMA,
+        DEFILLAMA_CHAINS,
+        KEPT_PER_CHAIN,
+    },
+    stats::{
+        STATS_DEADLINE,
+        STATS_TTL,
+    },
+};
 use crate::{
     db::{
         self,
         ChainStatusRow,
         HandleNodeRow,
-        ListedToken,
         Search,
         Store,
     },
@@ -65,30 +82,40 @@ use crate::{
 
 /// What every handler needs: the store. Which chains it holds, and which
 /// contract each was indexed from, is read from what the indexers wrote.
-/// Beside it, the tokens `/v1/stats` names and its latest answer, shared by
-/// every clone.
+/// Beside it, the source `/v1/stats` prices tokens from and its latest
+/// answer, shared by every clone.
 #[derive(Clone)]
 pub struct AppState {
     store: Store,
-    listed: Arc<[ListedToken]>,
+    prices: Option<Arc<PriceSource>>,
     stats: StatsCache,
 }
 
 impl AppState {
     /// State over one database, however many chains it holds. `/v1/stats`
-    /// names each chain's own coin and no other token.
+    /// prices nothing and names each chain's own coin and no other token.
     pub fn new(store: Store) -> Self {
         Self {
             store,
-            listed: Arc::new([]),
+            prices: None,
             stats: StatsCache::default(),
         }
     }
 
-    /// The same state, with `/v1/stats` also naming the `listed` tokens.
-    pub fn listing(self, listed: Vec<ListedToken>) -> Self {
+    /// The same state, with `/v1/stats` valuing tokens at the prices of
+    /// `source` and naming each token it prices.
+    pub fn pricing(self, source: Arc<PriceSource>) -> Self {
         Self {
-            listed: listed.into(),
+            prices: Some(source),
+            ..self
+        }
+    }
+
+    /// The same state, serving each `/v1/stats` answer for `ttl` and giving
+    /// each computation `deadline`.
+    pub fn stats_timing(self, ttl: Duration, deadline: Duration) -> Self {
+        Self {
+            stats: StatsCache::new(ttl, deadline),
             ..self
         }
     }

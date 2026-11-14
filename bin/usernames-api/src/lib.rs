@@ -41,11 +41,19 @@ use tower_http::cors::{
     Any,
     CorsLayer,
 };
+use url::Url;
 use usernames_core::{
-    api,
+    api::{
+        self,
+        PriceChains,
+        PriceSource,
+        DEFILLAMA,
+        DEFILLAMA_CHAINS,
+        STATS_DEADLINE,
+        STATS_TTL,
+    },
     db::{
         self,
-        ListedToken,
         Store,
     },
     ens::{
@@ -118,12 +126,27 @@ pub struct Config {
     #[arg(long, env = "ENS_MAX_LAG_BLOCKS", default_value_t = 32)]
     pub ens_max_lag_blocks: u64,
 
-    /// The tokens `/v1/stats` names by address beside each chain's own coin,
-    /// comma-separated `<chain id>:<address>` pairs: `8453:0x8335…`. Every
-    /// other token counts under `other`, without an amount: anybody can
-    /// write a token, and naming each would let them grow every answer.
-    #[arg(long, env = "STATS_TOKENS", value_delimiter = ',')]
-    pub stats_tokens: Vec<ListedToken>,
+    /// The source `/v1/stats` prices tokens from, answering DefiLlama's
+    /// `prices/current/<coins>`. A token it prices with confidence is named
+    /// and valued in USD; every other one counts under `other`.
+    #[arg(long, env = "PRICE_SOURCE", default_value = DEFILLAMA)]
+    pub price_source: Url,
+
+    /// The name the price source gives each chain it prices, by chain id:
+    /// `1=ethereum,8453=base`. A chain missing here counts its tokens
+    /// under `other`.
+    #[arg(long, env = "PRICE_CHAINS", default_value = DEFILLAMA_CHAINS)]
+    pub price_chains: PriceChains,
+
+    /// How long `/v1/stats` serves one computation. Each computation reads
+    /// whole tables; a longer time spares a large database.
+    #[arg(long, env = "STATS_TTL", default_value_t = STATS_TTL.into())]
+    pub stats_ttl: humantime::Duration,
+
+    /// How long one `/v1/stats` computation may take. Requests wait behind
+    /// it; past it the computation fails and the next request tries again.
+    #[arg(long, env = "STATS_DEADLINE", default_value_t = STATS_DEADLINE.into())]
+    pub stats_deadline: humantime::Duration,
 }
 
 /// The API serving as a task, and the token that stops it.
@@ -235,7 +258,12 @@ impl Config {
             }
         }
         let app = Service {
-            api: api::AppState::new(store).listing(self.stats_tokens),
+            api: api::AppState::new(store)
+                .pricing(Arc::new(PriceSource::new(
+                    self.price_source,
+                    self.price_chains,
+                )))
+                .stats_timing(self.stats_ttl.into(), self.stats_deadline.into()),
             gateway,
         }
         .router();

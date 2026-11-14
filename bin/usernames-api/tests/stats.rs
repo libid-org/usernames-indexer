@@ -1,8 +1,8 @@
 //! `GET /v1/stats` and `GET /v1/stats/days` over a journal written through
 //! the indexer's apply path: users, links, fees and escrow movements counted
 //! per chain, in total and per UTC day, users counted once across chains,
-//! tokens nobody listed counted together, and one answer served until it
-//! expires.
+//! tokens without a price counted together, and one answer served until it
+//! expires. Nothing here is priced: `stats_prices.rs` values tokens.
 //!
 //! Skips without `DATABASE_URL`, unless `CI` is set: there its absence
 //! fails. The suite's chain is its own; the answer lists every chain the
@@ -19,21 +19,11 @@ use alloy::primitives::{
     U256,
     U512,
 };
-use axum::{
-    body::Body,
-    http::{
-        Request,
-        StatusCode,
-    },
-    Router,
-};
-use http_body_util::BodyExt;
-use serde::de::DeserializeOwned;
+use axum::Router;
 use tokio::{
     sync::Mutex,
     task::JoinSet,
 };
-use tower::ServiceExt;
 use usernames_core::{
     api::{
         model::{
@@ -47,15 +37,14 @@ use usernames_core::{
             PlatformHandles,
             PlatformLinks,
             Stats,
-            StatsDays,
             TokenFlow,
             TokenFlows,
+            Usd,
         },
         AppState,
     },
     db::{
         ChainStore,
-        ListedToken,
         Store,
     },
     events::{
@@ -65,8 +54,10 @@ use usernames_core::{
     nodes::KnownPlatform,
 };
 use usernames_fixtures::{
+    ChainEntry,
     Events,
     Seed,
+    StatsRoute,
     Suite,
     Writes,
 };
@@ -171,6 +162,10 @@ fn flow(token: Address, count: i64, amount: u128, wallets: i64) -> TokenFlow {
         count,
         amount: U512::from(amount),
         wallets,
+        symbol: None,
+        decimals: None,
+        value: None,
+        usd: None,
     }
 }
 
@@ -201,31 +196,26 @@ impl ByPlatform for Vec<PlatformHandles> {
     }
 }
 
-/// Flows of named tokens only, none under `other`.
+/// Flows of unpriced tokens: named ones, and those under `other`.
 trait Named {
     fn named(self) -> TokenFlows;
+    fn and_other(self, count: i64, wallets: i64) -> TokenFlows;
 }
 
 impl Named for Vec<TokenFlow> {
     fn named(self) -> TokenFlows {
         TokenFlows {
             tokens: self,
+            usd: Usd::default(),
             other: None,
         }
     }
-}
 
-/// One chain's entry in an answer.
-trait ChainEntry {
-    fn chain(self, chain_id: i64) -> ChainStats;
-}
-
-impl ChainEntry for Stats {
-    fn chain(self, chain_id: i64) -> ChainStats {
-        self.chains
-            .into_iter()
-            .find(|chain| chain.chain_id == chain_id)
-            .unwrap_or_else(|| panic!("chain {chain_id} listed"))
+    fn and_other(self, count: i64, wallets: i64) -> TokenFlows {
+        TokenFlows {
+            other: Some(OtherTokens { count, wallets }),
+            ..self.named()
+        }
     }
 }
 
@@ -248,59 +238,14 @@ impl AllChainsEntry for Vec<AllChainsDay> {
     }
 }
 
-/// A running API: its cache lives as long as it does.
-trait StatsRoute {
-    /// `GET /v1/stats`.
-    async fn stats(&self) -> Stats;
-    /// Every page of `GET /v1/stats/days`, on `chain` or across every chain
-    /// without it, oldest first.
-    async fn days<D: DeserializeOwned>(&self, chain: Option<i64>) -> Vec<D>;
-    /// One GET answered 200, in its type.
-    async fn answer<T: DeserializeOwned>(&self, path: &str) -> T;
-}
-
-impl StatsRoute for Router {
-    async fn stats(&self) -> Stats {
-        self.answer("/v1/stats").await
-    }
-
-    async fn days<D: DeserializeOwned>(&self, chain: Option<i64>) -> Vec<D> {
-        let on = chain
-            .map(|chain| format!("&chain={chain}"))
-            .unwrap_or_default();
-        let mut days = Vec::new();
-        let mut before = String::new();
-        loop {
-            let path = format!("/v1/stats/days?limit=100{on}{before}");
-            let page: StatsDays<D> = self.answer(&path).await;
-            assert_eq!(page.chain_id, chain);
-            days.extend(page.days);
-            match page.next {
-                Some(next) => before = format!("&before={next}"),
-                None => break,
-            }
-        }
-        days.reverse();
-        days
-    }
-
-    async fn answer<T: DeserializeOwned>(&self, path: &str) -> T {
-        let request = Request::get(path).body(Body::empty()).unwrap();
-        let response = self.clone().oneshot(request).await.expect("request");
-        assert_eq!(response.status(), StatusCode::OK, "{path}");
-        let body = response.into_body().collect().await.expect("body");
-        serde_json::from_slice(&body.to_bytes()).expect("the answer's shape")
-    }
-}
-
 /// An API over the suite's database, with its own cache.
 fn api(suite: &Suite) -> Router {
     AppState::new(Store::new(suite.pool.clone())).router()
 }
 
 /// Users, links, live handles, fees and every escrow movement add up per
-/// chain, over the whole journal and per UTC day, each listed token by
-/// name. A deposit to a handle nobody held, claimed by the holder who bound
+/// chain, over the whole journal and per UTC day: the chain's coin by name,
+/// a token without a price under `other`. A deposit to a handle nobody held, claimed by the holder who bound
 /// it after, is an onboarding claim; a claim of deposits made before the
 /// index's first block is not.
 #[tokio::test]
@@ -365,13 +310,7 @@ async fn the_journal_adds_up_per_chain_and_day() {
         .apply(IN_B + 6, NamesEvent::claimed("eve", NATIVE, EVE, 7))
         .await;
 
-    let listed = vec![ListedToken {
-        chain_id: CHAIN,
-        token: USDC,
-    }];
-    let api = AppState::new(Store::new(suite.pool.clone()))
-        .listing(listed)
-        .router();
+    let api = api(&suite);
     let stats = api.stats().await;
     let days: Vec<DayActivity> = api.days(Some(CHAIN)).await;
     let ether = u128::from(ETHER);
@@ -397,11 +336,10 @@ async fn the_journal_adds_up_per_chain_and_day() {
             links: vec![links(X, 4, 4), links(GITHUB, 1, 1)].by_platform(),
             registration_fees: fees(2),
             escrow: EscrowActivity {
-                deposits: vec![flow(USDC, 1, 1_000, 1), flow(NATIVE, 2, 3 * ether, 2)]
-                    .named(),
+                deposits: vec![flow(NATIVE, 2, 3 * ether, 2)].and_other(1, 1),
                 forwards: vec![flow(NATIVE, 1, 5, 1)].named(),
                 claims: vec![flow(NATIVE, 2, 3 * ether + 7, 2)].named(),
-                refunds: vec![flow(USDC, 1, 1_000, 1)].named(),
+                refunds: Vec::new().and_other(1, 1),
             },
             onboarding_claims: vec![flow(NATIVE, 1, 3 * ether, 1)].named(),
         },
@@ -418,11 +356,7 @@ async fn the_journal_adds_up_per_chain_and_day() {
                     links: vec![links(X, 2, 2)],
                     registration_fees: fees(1),
                     escrow: EscrowActivity {
-                        deposits: vec![
-                            flow(USDC, 1, 1_000, 1),
-                            flow(NATIVE, 2, 3 * ether, 2),
-                        ]
-                        .named(),
+                        deposits: vec![flow(NATIVE, 2, 3 * ether, 2)].and_other(1, 1),
                         ..EscrowActivity::default()
                     },
                     onboarding_claims: TokenFlows::default(),
@@ -439,7 +373,7 @@ async fn the_journal_adds_up_per_chain_and_day() {
                         deposits: TokenFlows::default(),
                         forwards: vec![flow(NATIVE, 1, 5, 1)].named(),
                         claims: vec![flow(NATIVE, 2, 3 * ether + 7, 2)].named(),
-                        refunds: vec![flow(USDC, 1, 1_000, 1)].named(),
+                        refunds: Vec::new().and_other(1, 1),
                     },
                     onboarding_claims: vec![flow(NATIVE, 1, 3 * ether, 1)].named(),
                 },
@@ -508,10 +442,10 @@ async fn a_freed_handle_onboards_its_next_holder() {
 }
 
 /// Anybody can deposit a token they wrote. A thousand of them, and a token
-/// the deployment did not list, count together under one `other` per kind
-/// and day, without an amount, so the answer does not grow with them.
+/// without a price, count together under one `other` per kind and day,
+/// without an amount, so the answer does not grow with them.
 #[tokio::test]
-async fn unlisted_tokens_count_together() {
+async fn unpriced_tokens_count_together() {
     let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
         eprintln!("skipping: DATABASE_URL not set");
         return;
@@ -538,28 +472,9 @@ async fn unlisted_tokens_count_together() {
             .unwrap_or_else(|| panic!("day {day} listed"))
     };
     let coin = || vec![flow(NATIVE, 1, u128::from(ETHER), 1)];
-    let other = |count, wallets| Some(OtherTokens { count, wallets });
-    assert_eq!(
-        chain.total.escrow.deposits,
-        TokenFlows {
-            tokens: coin(),
-            other: other(1_001, 2),
-        }
-    );
-    assert_eq!(
-        deposits_on(DAY_A),
-        TokenFlows {
-            tokens: coin(),
-            other: other(501, 2),
-        }
-    );
-    assert_eq!(
-        deposits_on(DAY_B),
-        TokenFlows {
-            tokens: Vec::new(),
-            other: other(500, 1),
-        }
-    );
+    assert_eq!(chain.total.escrow.deposits, coin().and_other(1_001, 2));
+    assert_eq!(deposits_on(DAY_A), coin().and_other(501, 2));
+    assert_eq!(deposits_on(DAY_B), Vec::new().and_other(500, 1));
     suite.store().forget().await;
     suite.done();
 }

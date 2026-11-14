@@ -29,6 +29,8 @@
 //! - [`Events`]: the events the contracts emit, as the suites write them.
 //! - [`ChainWatch`]: a chain's row, followed through the notices of its
 //!   changes.
+//! - [`StatsRoute`] and [`ChainEntry`]: `/v1/stats` from a router of the
+//!   suite's own, one chain's entry at a time.
 //! - [`libid`]: the libid contracts deployed on anvil, and the calls a
 //!   holder or a payer makes to them.
 
@@ -36,6 +38,7 @@
 #![deny(dead_code)]
 
 pub mod libid;
+mod stats;
 mod suite;
 
 use std::{
@@ -145,6 +148,10 @@ pub fn resolve_call(name: &[u8], inner: &[u8]) -> Vec<u8> {
     .abi_encode()
 }
 
+pub use stats::{
+    ChainEntry,
+    StatsRoute,
+};
 pub use suite::{
     anvil_available,
     database_url,

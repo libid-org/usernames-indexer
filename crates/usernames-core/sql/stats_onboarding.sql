@@ -5,10 +5,10 @@
 -- first deposit alone, so a handle's deposits and binds cost their sum, not
 -- their product. Per chain and token: once over the whole journal (day
 -- NULL), and once per UTC day. Tokens are named or folded as in
--- stats_escrow.sql: the chain's coin ($1) and the listed (chain, token)
+-- stats_escrow.sql: the chain's coin ($1) and the priced (chain, token)
 -- pairs ($2, $3) by name, every other one in a row with no token and no
 -- amount.
-WITH listed (chain_id, token) AS (
+WITH named (chain_id, token) AS (
     SELECT * FROM unnest($2::bigint[], $3::bytea[])
 )
 SELECT chain_id, day, token,
@@ -18,7 +18,7 @@ SELECT chain_id, day, token,
 FROM (
     SELECT c.chain_id,
            CASE WHEN c.token = $1
-                  OR (c.chain_id, c.token) IN (SELECT chain_id, token FROM listed)
+                  OR (c.chain_id, c.token) IN (SELECT chain_id, token FROM named)
                 THEN c.token END AS token,
            c.released, c.wallet AS claimer, c.day
     FROM names.events c
