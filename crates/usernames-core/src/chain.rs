@@ -13,6 +13,7 @@ use alloy::{
     eips::BlockNumberOrTag,
     network::BlockResponse,
     primitives::{
+        address,
         Address,
         B256,
     },
@@ -45,6 +46,9 @@ use crate::events::{
 /// How many block headers a window asks for at once, when its endpoint
 /// leaves the block times out of the logs.
 const HEADERS_AT_ONCE: usize = 8;
+
+/// The address `HandleEscrow` names the chain's own coin by (EIP-7528).
+pub const NATIVE_COIN: Address = address!("EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
 
 /// The libid contracts one indexer follows on its chain: the registry, and
 /// the escrow when it watches one. Each is the ERC1967 proxy, the address
