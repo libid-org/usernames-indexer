@@ -680,8 +680,8 @@ pub struct Unclaimed {
 }
 
 /// `GET /v1/stats`: what the chains this store holds recorded, chain by
-/// chain, and the users across them: totals and a series per UTC day.
-/// Every address counts. Amounts
+/// chain, and the users across them, since the index's first block; the
+/// same day by day is `GET /v1/stats/days`. Every address counts. Amounts
 /// are token units, never converted. Tokens are named only when they are
 /// the chain's own coin, EIP-7528 `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`,
 /// or a token the deployment lists (`STATS_TOKENS`); anybody can write a
@@ -695,9 +695,6 @@ pub struct Stats {
     /// The wallets across every chain the store holds: one that used
     /// several chains counts once.
     pub total: AllChains,
-    /// The same, day by day, oldest first; a day with nothing recorded is
-    /// absent.
-    pub days: Vec<AllChainsDay>,
     /// Every chain the store holds, by id; a chain with nothing recorded
     /// yet included.
     pub chains: Vec<ChainStats>,
@@ -734,9 +731,22 @@ pub struct ChainStats {
     pub handles: Vec<PlatformHandles>,
     /// Everything the chain recorded since the index's first block.
     pub total: Activity,
-    /// The same, day by day, oldest first; a day with nothing recorded is
-    /// absent.
-    pub days: Vec<DayActivity>,
+}
+
+/// `GET /v1/stats/days`: one page of the daily series, across every chain
+/// (`AllChainsDay`) or on the chain `?chain=` names (`DayActivity`), from
+/// the snapshot `/v1/stats` serves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsDays<D> {
+    /// Unix seconds of the snapshot, as `/v1/stats` gives it.
+    pub computed_at: i64,
+    /// The chain asked about; absent across every chain.
+    pub chain_id: Option<i64>,
+    /// Newest first; a day with nothing recorded is absent.
+    pub days: Vec<D>,
+    /// Pass as `before` for the next page; absent on the last one.
+    pub next: Option<String>,
 }
 
 /// The handles one platform has that resolve now.
