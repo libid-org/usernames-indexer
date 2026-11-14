@@ -34,6 +34,7 @@ use usernames_core::{
     api::model::{
         HandleHistory,
         HandleResolution,
+        Stats,
     },
     db::{
         self,
@@ -62,6 +63,7 @@ use usernames_fixtures::{
         Proof,
     },
     ChainWatch,
+    LockWaits,
     Reads,
     Seed,
     PATIENCE,
@@ -113,7 +115,16 @@ impl Chain {
         ChainStore::new(pool.clone(), chain_id as i64)
             .forget()
             .await;
-        let store = ChainStore::new(pool.clone(), chain_id as i64);
+        // The indexer writes on sessions of its own name, so a wait of its
+        // is told from any other session's.
+        let indexer_pool = PgPool::connect_with(
+            (*pool.connect_options())
+                .clone()
+                .application_name(&Self::indexer_session(chain_id)),
+        )
+        .await
+        .expect("the indexer's pool");
+        let store = ChainStore::new(indexer_pool, chain_id as i64);
 
         let node = Node::spawn(chain_id);
         let libid = Libid::deploy(&node.provider, node.accounts()[0]).await;
@@ -134,6 +145,11 @@ impl Chain {
             writer,
             lease,
         })
+    }
+
+    /// The name of the sessions the indexer of chain `chain_id` writes on.
+    fn indexer_session(chain_id: u64) -> String {
+        format!("indexer of chain {chain_id}")
     }
 
     /// The suite's indexer settings: polling through the relay,
@@ -440,6 +456,59 @@ async fn an_indexer_whose_chain_was_taken_stops() {
         matches!(stopped, Err(Superseded { chain_id }) if chain_id == store.chain_id()),
         "{stopped:?}"
     );
+}
+
+/// A window whose commit fails in its stats fold, as a deadlock would abort
+/// it, leaves nothing behind: the indexer retries it from the cursor, and
+/// its rows count once.
+#[tokio::test]
+async fn a_window_aborted_in_its_fold_is_retried_and_counts_once() {
+    const CHAIN_ID: u64 = 43181;
+    let Some(mut chain) = Chain::start(CHAIN_ID).await else {
+        return;
+    };
+    let (alice, bob) = (chain.accounts()[0], chain.accounts()[1]);
+    let first = chain.bind("alice", alice).await;
+    let running = chain.run(chain.config(0));
+    chain.wait_for_index(first).await;
+
+    // The chain's users total is held, so the next window's fold waits on
+    // it; the wait is cancelled, which fails the window as a deadlock does.
+    let mut hold = chain.pool.begin().await.expect("a transaction");
+    sqlx::query(include_str!("sql/hold_chain_users.sql"))
+        .bind(CHAIN_ID as i64)
+        .fetch_one(&mut *hold)
+        .await
+        .expect("the chain's users total is held");
+    let second = chain.bind("bob", bob).await;
+    let indexer = Chain::indexer_session(CHAIN_ID);
+    chain.pool.waits_on_a_lock(&indexer).await;
+    let cancelled: bool = sqlx::query_scalar(include_str!("sql/cancel_lock_wait.sql"))
+        .bind(&indexer)
+        .fetch_one(&chain.pool)
+        .await
+        .expect("the window's wait is cancelled");
+    assert!(cancelled, "the window waited on the chain's users total");
+    hold.rollback().await.expect("the hold ends");
+    chain.wait_for_index(second).await;
+
+    let stats: Stats = chain.pool.get("/v1/stats").await.answer();
+    let ours = stats
+        .chains
+        .into_iter()
+        .find(|entry| entry.chain_id == CHAIN_ID as i64)
+        .expect("the chain is listed");
+    assert_eq!(ours.total.users, 2);
+    assert_eq!(
+        ours.total
+            .links
+            .iter()
+            .map(|links| links.count)
+            .sum::<i64>(),
+        2,
+        "each bind links once"
+    );
+    chain.stop(running).await;
 }
 
 /// An endpoint whose `eth_getLogs` answers leave out `blockTimestamp` still

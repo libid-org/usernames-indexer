@@ -35,10 +35,25 @@ use crate::{
     },
 };
 
-/// A list page holds this many entries when the request names no `limit`.
-const PAGE_DEFAULT_LIMIT: i64 = 20;
-/// The most entries one list page holds.
-const PAGE_MAX_LIMIT: i64 = 100;
+/// How many entries a page holds: when the request names no `limit`, and
+/// at most.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Limits {
+    default: i64,
+    max: i64,
+}
+
+/// A list page: 20 entries, at most 100.
+pub(crate) const LIST_PAGE: Limits = Limits {
+    default: 20,
+    max: 100,
+};
+
+/// A page of days: the last 30, at most a year's 366.
+pub(crate) const DAYS_PAGE: Limits = Limits {
+    default: 30,
+    max: 366,
+};
 
 /// `?chain=8453&before=<next>&limit=20`: one page of a list, the cursor the
 /// one the previous page handed out.
@@ -53,6 +68,14 @@ impl PageParams {
     pub(crate) fn page<C: FromStr<Err = InvalidCursor>>(
         self,
     ) -> Result<Page<C>, ApiError> {
+        self.page_within(LIST_PAGE)
+    }
+
+    /// The page, its size within `limits`.
+    pub(crate) fn page_within<C: FromStr<Err = InvalidCursor>>(
+        self,
+        limits: Limits,
+    ) -> Result<Page<C>, ApiError> {
         Ok(Page {
             chain: ChainFilter { chain: self.chain }.chain_id()?,
             before: self.before.as_deref().map(str::parse).transpose()?,
@@ -61,8 +84,8 @@ impl PageParams {
                 .as_deref()
                 .map(|limit| limit.parse_count("limit"))
                 .transpose()?
-                .unwrap_or(PAGE_DEFAULT_LIMIT)
-                .clamp(1, PAGE_MAX_LIMIT),
+                .unwrap_or(limits.default)
+                .clamp(1, limits.max),
         })
     }
 }

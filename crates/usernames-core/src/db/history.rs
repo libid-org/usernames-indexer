@@ -447,19 +447,36 @@ impl Page<HistoryCursor> {
     }
 }
 
+/// A page of a chain's events as the store read it.
+pub struct ChainEventsPage {
+    /// When it was read, in unix seconds by the database's clock.
+    pub taken_at: i64,
+    /// The events, and the cursor of the next page.
+    pub rows: Rows<HistoryRow, HistoryCursor>,
+}
+
 impl Store {
-    /// A chain's events, newest first, as `events` narrows them.
+    /// A chain's events, newest first, as `events` narrows them, and when
+    /// they were read.
     pub async fn chain_history(
         &self,
         events: ChainEvents,
         page: Page<HistoryCursor>,
-    ) -> Result<Rows<HistoryRow, HistoryCursor>, sqlx::Error> {
+    ) -> Result<ChainEventsPage, sqlx::Error> {
+        let mut tx = self.pool.begin_with(sql::STATS_SNAPSHOT).await?;
+        let taken_at = sqlx::query_scalar(sql::STATS_TAKEN_AT)
+            .fetch_one(&mut *tx)
+            .await?;
         let rows = page
             .chain_lookup("", events)
             .build_query_as()
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
-        Ok(page.split(rows))
+        tx.commit().await?;
+        Ok(ChainEventsPage {
+            taken_at,
+            rows: page.split(rows),
+        })
     }
 
     /// The events an address took part in, newest first.

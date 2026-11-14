@@ -100,12 +100,10 @@ pub(crate) async fn chain(
     let (events, page) = params.on(&chain)?;
     state.synced(page.chain).await?;
 
-    let (entries, next) = state
-        .store
-        .chain_history(events, page)
-        .await?
-        .served(HistoryEntry::of)?;
+    let read = state.store.chain_history(events, page).await?;
+    let (entries, next) = read.rows.served(HistoryEntry::of)?;
     Ok(Json(ChainHistory {
+        computed_at: read.taken_at,
         chain_id: events.chain_id,
         day: events.day,
         entries,

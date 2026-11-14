@@ -594,6 +594,9 @@ pub struct HandleHistory {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChainHistory {
+    /// Unix seconds, by the database's clock, of the snapshot the page
+    /// comes from.
+    pub computed_at: i64,
     /// The chain asked about.
     pub chain_id: i64,
     /// The UTC day asked about, in unix seconds; absent for the whole journal.
@@ -749,12 +752,12 @@ pub struct ChainStats {
 }
 
 /// `GET /v1/stats/days`: one page of the daily series, across every chain
-/// (`AllChainsDay`) or on the chain `?chain=` names (`DayActivity`), from
-/// the snapshot `/v1/stats` serves.
+/// (`AllChainsDay`) or on the chain `?chain=` names (`DayActivity`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatsDays<D> {
-    /// Unix seconds of the snapshot, as `/v1/stats` gives it.
+    /// Unix seconds, by the database's clock, of the snapshot the page
+    /// comes from.
     pub computed_at: i64,
     /// The chain asked about; absent across every chain.
     pub chain_id: Option<i64>,
@@ -885,13 +888,11 @@ pub struct TokenFlow {
 }
 
 /// The movements of every token `/v1/stats` does not name, together: a
-/// count and wallets, but no amount, since a sum across tokens means
-/// nothing.
+/// count alone, since a sum across tokens means nothing and the wallets of
+/// any number of tokens cannot be read in a bounded time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OtherTokens {
     /// Movements.
     pub count: i64,
-    /// Distinct wallets that made them.
-    pub wallets: i64,
 }

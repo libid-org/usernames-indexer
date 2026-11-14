@@ -1,13 +1,10 @@
-//! `GET /v1/stats` and `GET /v1/stats/days`: the store's numbers, computed
-//! at most once per [`STATS_TTL`] however many requests arrive. The totals
-//! are one body; the daily series is held beside it and served a page at a
-//! time.
+//! `GET /v1/stats` and `GET /v1/stats/days`: the store's rollups. The
+//! totals are computed at most once per [`STATS_TTL`] however many requests
+//! arrive; a page of days is read per request, its size capped.
 
 use std::{
     collections::BTreeMap,
-    fmt,
     future::Future,
-    str::FromStr,
     sync::Arc,
     time::{
         Duration,
@@ -15,7 +12,10 @@ use std::{
     },
 };
 
-use alloy::primitives::Address;
+use alloy::primitives::{
+    B256,
+    U512,
+};
 use axum::{
     body::Bytes,
     extract::State,
@@ -39,7 +39,6 @@ use super::{
         AllChainsDay,
         ChainStats,
         DayActivity,
-        EscrowActivity,
         FeesPaid,
         OtherTokens,
         PlatformHandles,
@@ -49,27 +48,26 @@ use super::{
         TokenFlow,
         TokenFlows,
     },
-    params::PageParams,
+    params::{
+        PageParams,
+        DAYS_PAGE,
+    },
     AppState,
 };
 use crate::{
     db::{
-        Cursor,
-        FeesRow,
+        CountRow,
+        Flow,
         HandlesRow,
-        InvalidCursor,
-        LinksRow,
-        Page,
-        Rows,
+        Measure,
+        StatsDay,
         StatsSnapshot,
-        TokenFlowRow,
     },
-    events::EventKind,
     nodes::Platform,
 };
 
-/// How long one computation is served. The aggregates read whole tables, and
-/// a burst of requests must not run them again on a small database.
+/// How long one computation of the totals is served. They sum every day of
+/// every chain, and a burst of requests must not run them again.
 const STATS_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// How long one computation may take, its statements together. The lock is
@@ -84,30 +82,44 @@ pub(crate) async fn stats(State(state): State<AppState>) -> Result<Response, Api
 }
 
 /// `GET /v1/stats/days?chain=&before=&limit=` — the daily series, newest
-/// first, across every chain or on the one named, from the snapshot
-/// `/v1/stats` serves.
+/// first, across every chain or on the one named: the last 30 days unless
+/// `limit` asks for more, at most 366.
 pub(crate) async fn days(
     State(state): State<AppState>,
     ApiQuery(params): ApiQuery<PageParams>,
 ) -> Result<Response, ApiError> {
-    let page = params.page::<Day>()?;
-    let served = state.served_stats().await?;
-    Ok(match page.chain {
-        None => Json(served.page(&served.history.days, page)).into_response(),
-        Some(chain_id) => {
-            let days = served
-                .history
+    let page = params.page_within::<StatsDay>(DAYS_PAGE)?;
+    let chain_id = page.chain;
+    let read = state.store.stats_days(page, &state.listed).await?;
+    let next = read.next.map(|day| day.to_string());
+    let Report { stats, mut history } = Report::of(read.snapshot)?;
+    let computed_at = stats.computed_at;
+    Ok(match chain_id {
+        None => Json(StatsDays {
+            computed_at,
+            chain_id,
+            days: history.days.into_iter().rev().collect(),
+            next,
+        })
+        .into_response(),
+        Some(chain) => Json(StatsDays {
+            computed_at,
+            chain_id,
+            days: history
                 .chains
-                .get(&chain_id)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            Json(served.page(days, page)).into_response()
-        }
+                .remove(&chain)
+                .unwrap_or_default()
+                .into_iter()
+                .rev()
+                .collect(),
+            next,
+        })
+        .into_response(),
     })
 }
 
 impl AppState {
-    /// The latest answer, computed when none is fresh.
+    /// The latest totals, computed when none are fresh.
     async fn served_stats(self) -> Result<Served, ApiError> {
         let AppState {
             store,
@@ -115,27 +127,29 @@ impl AppState {
             stats,
         } = self;
         stats
-            .get(
-                || async move { Report::of(store.stats(&listed, STATS_DEADLINE).await?) },
-            )
+            .get(|| async move {
+                let report = Report::of(store.stats(&listed, STATS_DEADLINE).await?)?;
+                Ok(report.stats)
+            })
             .await
     }
 }
 
-/// The latest answer, serialized once and shared by every request.
+/// The latest totals, serialized once and shared by every request.
 #[derive(Clone, Default)]
 pub(crate) struct StatsCache {
     latest: Arc<Mutex<Option<Computed>>>,
 }
 
-/// One computation as the stats routes read it: the totals, and the daily
-/// series beside them.
+/// The numbers a snapshot holds, as the stats routes serve them: the totals,
+/// and the days, oldest first.
 pub(crate) struct Report {
     stats: Stats,
     history: History,
 }
 
-/// The daily series, oldest first; a day with nothing recorded is absent.
+/// The days of a snapshot, oldest first; a day with nothing recorded is
+/// absent.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct History {
     /// Across every chain.
@@ -144,75 +158,10 @@ struct History {
     chains: BTreeMap<i64, Vec<DayActivity>>,
 }
 
-/// One computation's answer as served: the totals serialized once, and the
-/// series the pages are cut from.
+/// The totals as served: serialized once.
 #[derive(Clone)]
 pub(crate) struct Served {
-    computed_at: i64,
     body: Bytes,
-    history: Arc<History>,
-}
-
-impl Served {
-    /// The days before the page's cursor, newest first, at most its limit.
-    fn page<D: Dated + Clone>(&self, days: &[D], page: Page<Day>) -> StatsDays<D> {
-        let older = match page.before {
-            Some(Day(before)) => &days[..days.partition_point(|day| day.day() < before)],
-            None => days,
-        };
-        let fetch = usize::try_from(page.fetch()).unwrap_or(usize::MAX);
-        let rows = older.iter().rev().take(fetch).cloned().collect();
-        let Rows { rows, next } = page.split(rows);
-        StatsDays {
-            computed_at: self.computed_at,
-            chain_id: page.chain,
-            days: rows,
-            next: next.map(|day| day.to_string()),
-        }
-    }
-}
-
-/// An entry of a daily series.
-trait Dated {
-    /// Unix seconds of the day's start.
-    fn day(&self) -> i64;
-}
-
-impl Dated for AllChainsDay {
-    fn day(&self) -> i64 {
-        self.day
-    }
-}
-
-impl Dated for DayActivity {
-    fn day(&self) -> i64 {
-        self.day
-    }
-}
-
-/// Where a page of a daily series ends: the start of the last day it
-/// served, in unix seconds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Day(i64);
-
-impl<D: Dated> Cursor<D> for Day {
-    fn after(row: &D) -> Option<Self> {
-        Some(Self(row.day()))
-    }
-}
-
-impl FromStr for Day {
-    type Err = InvalidCursor;
-
-    fn from_str(raw: &str) -> Result<Self, InvalidCursor> {
-        raw.parse().map(Self).map_err(|_| InvalidCursor)
-    }
-}
-
-impl fmt::Display for Day {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
 }
 
 /// One computation's answer as served, and when it finished.
@@ -222,16 +171,12 @@ struct Computed {
 }
 
 impl Computed {
-    /// `report` as served from now on.
-    fn of(report: Report) -> Result<Self, ApiError> {
-        let body = serde_json::to_vec(&report.stats).map_err(ApiError::internal)?;
+    /// `stats` as served from now on.
+    fn of(stats: Stats) -> Result<Self, ApiError> {
+        let body = serde_json::to_vec(&stats).map_err(ApiError::internal)?;
         Ok(Self {
             at: Instant::now(),
-            served: Served {
-                computed_at: report.stats.computed_at,
-                body: body.into(),
-                history: Arc::new(report.history),
-            },
+            served: Served { body: body.into() },
         })
     }
 
@@ -252,7 +197,7 @@ impl StatsCache {
         compute: impl FnOnce() -> F,
     ) -> Result<Served, ApiError>
     where
-        F: Future<Output = Result<Report, ApiError>> + Send + 'static,
+        F: Future<Output = Result<Stats, ApiError>> + Send + 'static,
     {
         let mut latest = Arc::clone(&self.latest).lock_owned().await;
         let held = latest
@@ -280,7 +225,7 @@ impl StatsCache {
 }
 
 impl Report {
-    /// The answer from the store's aggregates: every chain the store holds,
+    /// The answer from the store's rollups: every chain the snapshot read,
     /// each with its totals and its days.
     fn of(snapshot: StatsSnapshot) -> Result<Self, ApiError> {
         let mut chains = Tallies(
@@ -298,52 +243,33 @@ impl Report {
         }
         let mut total = AllChains::default();
         let mut days = BTreeMap::new();
-        for row in snapshot.users {
-            match (row.chain_id, row.day) {
-                (Some(chain_id), Some(day)) => {
-                    let day = chains.chain(chain_id).day(day);
-                    day.new_users = row.new_users;
-                    day.activity.users = row.users;
+        for row in &snapshot.counts {
+            let chain = chains.chain(row.chain_id);
+            match (row.measure, row.day) {
+                (Measure::Users, Some(day)) => {
+                    let day = chain.day(day);
+                    day.new_users = row.new_wallets;
+                    day.activity.users = row.wallets;
                 }
-                (Some(chain_id), None) => chains.chain(chain_id).total.users = row.users,
-                (None, Some(day)) => {
-                    let all = AllChainsDay {
+                (Measure::Users, None) => chain.total.users = row.wallets,
+                (Measure::AllChainsUsers, Some(day)) => {
+                    let all = days.entry(day).or_insert(AllChainsDay {
                         day,
-                        users: row.users,
-                        new_users: row.new_users,
-                    };
-                    days.insert(day, all);
+                        users: 0,
+                        new_users: 0,
+                    });
+                    all.users += row.wallets;
+                    all.new_users += row.new_wallets;
                 }
-                (None, None) => total.users = row.users,
+                (Measure::AllChainsUsers, None) => total.users += row.wallets,
+                (Measure::Links, day) => {
+                    chain.span(day).links.push(PlatformLinks::of(row)?)
+                }
+                (Measure::Fees, day) => {
+                    chain.span(day).registration_fees.push(FeesPaid::of(row)?)
+                }
+                (Measure::Flow(flow), day) => chain.span(day).flows(flow).add(row)?,
             }
-        }
-        for row in snapshot.links {
-            let links = PlatformLinks::of(&row);
-            chains.chain(row.chain_id).span(row.day).links.push(links);
-        }
-        for row in snapshot.fees {
-            let fees = FeesPaid::of(&row)?;
-            chains
-                .chain(row.chain_id)
-                .span(row.day)
-                .registration_fees
-                .push(fees);
-        }
-        for row in snapshot.escrow {
-            let kind: EventKind = row.kind.parse().map_err(ApiError::internal)?;
-            chains
-                .chain(row.flow.chain_id)
-                .span(row.flow.day)
-                .escrow
-                .flows(kind)?
-                .add(&row.flow)?;
-        }
-        for row in snapshot.onboarding_claims {
-            chains
-                .chain(row.chain_id)
-                .span(row.day)
-                .onboarding_claims
-                .add(&row)?;
         }
         let mut history = History {
             days: days.into_values().collect(),
@@ -352,10 +278,13 @@ impl Report {
         let chains = chains
             .0
             .into_values()
-            .map(|tally| {
-                history
-                    .chains
-                    .insert(tally.chain_id, tally.days.into_values().collect());
+            .map(|mut tally| {
+                tally.total.settle();
+                let days = tally.days.into_values().map(|mut day| {
+                    day.activity.settle();
+                    day
+                });
+                history.chains.insert(tally.chain_id, days.collect());
                 ChainStats {
                     chain_id: tally.chain_id,
                     handles: tally.handles,
@@ -424,17 +353,24 @@ impl Tally {
     }
 }
 
-impl EscrowActivity {
-    /// The flows an escrow event of `kind` counts in.
-    fn flows(&mut self, kind: EventKind) -> Result<&mut TokenFlows, ApiError> {
-        match kind {
-            EventKind::Deposited => Ok(&mut self.deposits),
-            EventKind::Forwarded => Ok(&mut self.forwards),
-            EventKind::Claimed => Ok(&mut self.claims),
-            EventKind::Refunded => Ok(&mut self.refunds),
-            other => Err(ApiError::internal(format_args!(
-                "escrow statistics of a {other} row"
-            ))),
+impl Activity {
+    /// The flows a row of `flow` counts in.
+    fn flows(&mut self, flow: Flow) -> &mut TokenFlows {
+        match flow {
+            Flow::Deposited => &mut self.escrow.deposits,
+            Flow::Forwarded => &mut self.escrow.forwards,
+            Flow::Claimed => &mut self.escrow.claims,
+            Flow::Refunded => &mut self.escrow.refunds,
+            Flow::Onboarding => &mut self.onboarding_claims,
+        }
+    }
+
+    /// Once every row is in: `other` only where the tokens nobody named
+    /// moved.
+    fn settle(&mut self) {
+        for flow in Flow::ALL {
+            let flows = self.flows(flow);
+            flows.other = flows.other.take().filter(|other| other.count > 0);
         }
     }
 }
@@ -450,61 +386,82 @@ impl PlatformHandles {
     }
 }
 
+/// A rollup row's parts, as the wire names them.
+trait Parts {
+    /// The key, as the type the measure keys by.
+    fn key_as<K: for<'a> TryFrom<&'a [u8]>>(&self) -> Result<K, ApiError>;
+    /// The amount.
+    fn amount_of(&self) -> Result<U512, ApiError>;
+}
+
+impl Parts for CountRow {
+    fn key_as<K: for<'a> TryFrom<&'a [u8]>>(&self) -> Result<K, ApiError> {
+        K::try_from(&self.key).map_err(|_| {
+            ApiError::internal(format_args!(
+                "{} on chain {}: key 0x{}",
+                self.measure.as_str(),
+                self.chain_id,
+                alloy::hex::encode(&self.key)
+            ))
+        })
+    }
+
+    fn amount_of(&self) -> Result<U512, ApiError> {
+        self.amount().ok_or_else(|| {
+            ApiError::internal(format_args!(
+                "{} on chain {}: amount {:?}",
+                self.measure.as_str(),
+                self.chain_id,
+                self.amount
+            ))
+        })
+    }
+}
+
 impl PlatformLinks {
-    fn of(row: &LinksRow) -> Self {
-        Self {
-            platform: Platform::known_of(row.platform_id),
-            platform_id: row.platform_id,
+    fn of(row: &CountRow) -> Result<Self, ApiError> {
+        let platform_id: B256 = row.key_as()?;
+        Ok(Self {
+            platform: Platform::known_of(platform_id),
+            platform_id,
             count: row.count,
-            holders: row.holders,
-        }
+            holders: row.wallets,
+        })
     }
 }
 
 impl FeesPaid {
-    fn of(row: &FeesRow) -> Result<Self, ApiError> {
-        let amount = row.amount().ok_or_else(|| {
-            ApiError::internal(format_args!(
-                "fees to {} on chain {}: amount {:?}",
-                row.receiver, row.chain_id, row.amount
-            ))
-        })?;
+    fn of(row: &CountRow) -> Result<Self, ApiError> {
         Ok(Self {
-            receiver: row.receiver,
+            receiver: row.key_as()?,
             count: row.count,
-            amount,
+            amount: row.amount_of()?,
         })
     }
 }
 
 impl TokenFlows {
-    /// Count `row`: under its token, or under `other` when it names none.
-    fn add(&mut self, row: &TokenFlowRow) -> Result<(), ApiError> {
-        match row.token {
-            Some(token) => self.tokens.push(TokenFlow::of(token, row)?),
-            None => {
-                self.other = Some(OtherTokens {
-                    count: row.count,
-                    wallets: row.wallets,
-                })
+    /// Count `row`: under its token, or, when it names none, as every
+    /// token's movements, which `other` holds less the named tokens'.
+    fn add(&mut self, row: &CountRow) -> Result<(), ApiError> {
+        let unnamed = match row.key.is_empty() {
+            true => row.count,
+            false => {
+                self.tokens.push(TokenFlow::of(row)?);
+                -row.count
             }
-        }
+        };
+        self.other.get_or_insert(OtherTokens { count: 0 }).count += unnamed;
         Ok(())
     }
 }
 
 impl TokenFlow {
-    fn of(token: Address, row: &TokenFlowRow) -> Result<Self, ApiError> {
-        let amount = row.amount().ok_or_else(|| {
-            ApiError::internal(format_args!(
-                "{token} flows on chain {}: amount {:?}",
-                row.chain_id, row.amount
-            ))
-        })?;
+    fn of(row: &CountRow) -> Result<Self, ApiError> {
         Ok(Self {
-            token,
+            token: row.key_as()?,
             count: row.count,
-            amount,
+            amount: row.amount_of()?,
             wallets: row.wallets,
         })
     }
@@ -536,13 +493,6 @@ mod tests {
         }
     }
 
-    fn answer(computed_at: i64) -> Report {
-        Report {
-            stats: stats(computed_at),
-            history: History::default(),
-        }
-    }
-
     /// The totals a cached answer serves.
     trait Totals {
         fn served(self) -> Stats;
@@ -552,34 +502,6 @@ mod tests {
         fn served(self) -> Stats {
             let served = self.ok().expect("an answer");
             serde_json::from_slice(&served.body).expect("a stats answer")
-        }
-    }
-
-    fn across(day: i64) -> AllChainsDay {
-        AllChainsDay {
-            day,
-            users: 1,
-            new_users: 1,
-        }
-    }
-
-    /// Three days across every chain, the snapshot taken at second 7.
-    fn three_days() -> Served {
-        Served {
-            computed_at: 7,
-            body: Bytes::new(),
-            history: Arc::new(History {
-                days: vec![across(86_400), across(2 * 86_400), across(3 * 86_400)],
-                chains: BTreeMap::new(),
-            }),
-        }
-    }
-
-    fn page(before: Option<i64>, limit: i64) -> Page<Day> {
-        Page {
-            chain: None,
-            before: before.map(Day),
-            limit,
         }
     }
 
@@ -595,7 +517,7 @@ mod tests {
                 let computation = computations.fetch_add(1, Ordering::SeqCst);
                 // The other requests are polled while this one computes.
                 tokio::task::yield_now().await;
-                Ok(answer(computation))
+                Ok(stats(computation))
             })
         }))
         .await;
@@ -615,14 +537,14 @@ mod tests {
         let first = cache.get(|| async move {
             started.send(()).expect("the test waits for the start");
             finishes.await.expect("the test lets it finish");
-            Ok(answer(0))
+            Ok(stats(0))
         });
         // axum drops a request's future when its client disconnects.
         tokio::select! {
             _ = first => panic!("the computation finished before it was let go"),
             started = has_started => started.expect("the computation started"),
         }
-        let second = cache.get(|| async { Ok(answer(1)) });
+        let second = cache.get(|| async { Ok(stats(1)) });
         finish.send(()).expect("the computation still runs");
         assert_eq!(second.await.served(), stats(0));
     }
@@ -635,7 +557,7 @@ mod tests {
             .get(|| async { Err(ApiError::internal("the database is down")) })
             .await;
         assert!(failed.is_err());
-        let body = cache.get(|| async { Ok(answer(1)) }).await;
+        let body = cache.get(|| async { Ok(stats(1)) }).await;
         assert_eq!(body.served(), stats(1));
     }
 
@@ -651,28 +573,31 @@ mod tests {
         MIGRATOR.run(&pool).await.expect("migrations");
         let store = Store::new(pool.clone());
         let budget = Duration::from_secs(1);
-        // Another session holds the journal every aggregate reads, so the
+        // Another session holds the users' rollup the totals read, so the
         // computation waits on it until its deadline.
         let mut holder = pool.begin().await.expect("transaction");
-        sqlx::query("LOCK TABLE names.events IN ACCESS EXCLUSIVE MODE")
+        sqlx::query("LOCK TABLE names.stats_totals IN ACCESS EXCLUSIVE MODE")
             .execute(&mut *holder)
             .await
-            .expect("the journal locked");
+            .expect("the rollup locked");
         let cache = StatsCache::default();
         let waiting = store.clone();
         let started = Instant::now();
-        let failed = cache
-            .get(|| async move { Report::of(waiting.stats(&[], budget).await?) })
-            .await;
+        let failed =
+            cache
+                .get(|| async move {
+                    Ok(Report::of(waiting.stats(&[], budget).await?)?.stats)
+                })
+                .await;
         let waited = started.elapsed();
         assert!(failed.is_err(), "the computation outlasted its deadline");
         assert!(
             waited >= budget && waited < 2 * budget,
             "stopped after {waited:?}"
         );
-        holder.rollback().await.expect("the journal free");
+        holder.rollback().await.expect("the rollup free");
         let served = cache
-            .get(|| async move { Report::of(store.stats(&[], budget).await?) })
+            .get(|| async move { Ok(Report::of(store.stats(&[], budget).await?)?.stats) })
             .await;
         assert!(served.is_ok(), "the next request computes again");
     }
@@ -683,42 +608,10 @@ mod tests {
         let at = Instant::now();
         let computed = Computed {
             at,
-            served: three_days(),
+            served: Served { body: Bytes::new() },
         };
         assert!(computed.fresh(at));
         assert!(computed.fresh(at + STATS_TTL - Duration::from_secs(1)));
         assert!(!computed.fresh(at + STATS_TTL));
-    }
-
-    /// A page holds the newest days first, up to its limit, and hands out
-    /// the cursor of its last day while older ones remain.
-    #[test]
-    fn a_page_of_days_runs_newest_first() {
-        let served = three_days();
-        let days = &served.history.days;
-        let first = served.page(days, page(None, 2));
-        assert_eq!(first.computed_at, 7);
-        assert_eq!(first.days, [across(3 * 86_400), across(2 * 86_400)]);
-        assert_eq!(first.next.as_deref(), Some("172800"));
-        let before: Day = "172800".parse().expect("the cursor");
-        let last = served.page(days, page(Some(before.0), 2));
-        assert_eq!(last.days, [across(86_400)]);
-        assert_eq!(last.next, None);
-    }
-
-    /// `before` is exclusive and need not be a day the series holds; a page
-    /// of exactly the days left hands out no cursor.
-    #[test]
-    fn before_reads_the_days_older_than_it() {
-        let served = three_days();
-        let days = &served.history.days;
-        let mid_day = served.page(days, page(Some(2 * 86_400 + 1), 1));
-        assert_eq!(mid_day.days, [across(2 * 86_400)]);
-        assert_eq!(mid_day.next.as_deref(), Some("172800"));
-        let exact = served.page(days, page(None, 3));
-        assert_eq!(exact.days.len(), 3);
-        assert_eq!(exact.next, None);
-        let none = served.page(days, page(Some(86_400), 3));
-        assert!(none.days.is_empty() && none.next.is_none());
     }
 }
