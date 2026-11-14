@@ -651,6 +651,16 @@ pub(crate) mod plans {
                     },
                 ),
                 (
+                    "chain history, one kind, one token",
+                    "chain history, one kind, one token, past a cursor",
+                    token_kind,
+                    ChainEvents {
+                        kind: deposits,
+                        token,
+                        ..on_chain
+                    },
+                ),
+                (
                     "chain history, one day, one kind, one token",
                     "chain history, one day, one kind, one token, past a cursor",
                     token_kind,

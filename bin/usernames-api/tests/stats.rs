@@ -2,9 +2,9 @@
 //! over a journal written through the indexer's apply path: users, links,
 //! fees and escrow movements counted per chain, in total and per UTC day,
 //! the same whether folded window by window or whole, users counted once
-//! across chains in whatever order the chains fold, tokens nobody listed
-//! counted together, 30 days to a page, one answer served until it expires,
-//! and one day's events listed page by page.
+//! across chains in whatever order the chains fold, tokens and fee
+//! receivers nobody listed counted together, 30 days to a page, one answer
+//! served until it expires, and one day's events listed page by page.
 //!
 //! Skips without `DATABASE_URL`, unless `CI` is set: there its absence
 //! fails. The suite's chain is its own; the answer lists every chain the
@@ -47,9 +47,11 @@ use usernames_core::{
             DayActivity,
             EscrowActivity,
             FeesPaid,
+            OtherFees,
             OtherTokens,
             PlatformHandles,
             PlatformLinks,
+            RegistrationFees,
             Stats,
             StatsDays,
             TokenFlow,
@@ -59,7 +61,8 @@ use usernames_core::{
     },
     db::{
         ChainStore,
-        ListedToken,
+        ListedAddress,
+        Listing,
         Store,
     },
     events::{
@@ -180,12 +183,30 @@ fn flow(token: Address, count: i64, amount: u128, wallets: i64) -> TokenFlow {
     }
 }
 
-fn fees(count: i64) -> Vec<FeesPaid> {
-    vec![FeesPaid {
-        receiver: SAFE,
-        count,
-        amount: U512::from(FEE) * U512::from(count),
-    }]
+/// `count` fees paid to the listed receiver, none to any other.
+fn fees(count: i64) -> RegistrationFees {
+    RegistrationFees {
+        receivers: vec![FeesPaid {
+            receiver: SAFE,
+            count,
+            amount: U512::from(FEE) * U512::from(count),
+        }],
+        other: None,
+    }
+}
+
+/// The suite's lists: USDC and the fee Safe on its chain.
+fn listing() -> Listing {
+    let on_chain = |address| {
+        vec![ListedAddress {
+            chain_id: CHAIN,
+            address,
+        }]
+    };
+    Listing {
+        tokens: on_chain(USDC),
+        fee_receivers: on_chain(SAFE),
+    }
 }
 
 /// Per-platform rows in the order the answer lists them: by platform id.
@@ -394,12 +415,8 @@ async fn the_journal_adds_up_per_chain_and_day() {
         .apply(IN_B + 6, NamesEvent::claimed("eve", NATIVE, EVE, 7))
         .await;
 
-    let listed = vec![ListedToken {
-        chain_id: CHAIN,
-        token: USDC,
-    }];
     let api = AppState::new(Store::new(suite.pool.clone()))
-        .listing(listed.clone())
+        .listing(listing())
         .router();
     let stats = api.stats().await;
     let days: Vec<DayActivity> = api.days(Some(CHAIN)).await;
@@ -476,21 +493,21 @@ async fn the_journal_adds_up_per_chain_and_day() {
         ]
     );
 
-    let folded = |listed: Vec<ListedToken>| {
+    let folded = || {
         AppState::new(Store::new(suite.pool.clone()))
-            .listing(listed)
+            .listing(listing())
             .router()
     };
     suite.store().unfold().await;
     suite.store().fold_one_page(5).await;
-    let one_page = folded(listed.clone()).stats().await.chain(CHAIN);
+    let one_page = folded().stats().await.chain(CHAIN);
     assert_eq!(
         (one_page.total.users, one_page.total.escrow.deposits),
         (4, vec![flow(NATIVE, 2, 3 * ether, 2)].named()),
         "five rows: alice's paid bind, bob's bind and two coin deposits"
     );
     suite.store().writer().await;
-    let restarted = folded(listed);
+    let restarted = folded();
     assert_eq!(restarted.stats().await.chain(CHAIN), expected);
     let days_restarted: Vec<DayActivity> = restarted.days(Some(CHAIN)).await;
     assert_eq!(days_restarted, days);
@@ -605,6 +622,72 @@ async fn unlisted_tokens_count_together() {
         deposits_on(DAY_B),
         TokenFlows {
             tokens: Vec::new(),
+            other: other(500),
+        }
+    );
+    suite.store().forget().await;
+    suite.done();
+}
+
+/// A bind may name any fee receiver. A thousand of them count together
+/// under one `other` per day and in total, with their amount, beside the
+/// receiver the deployment listed, so the answer does not grow with them.
+#[tokio::test]
+async fn unlisted_fee_receivers_count_together() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let paid = |receivers: Range<u64>| -> Vec<NamesEvent> {
+        receivers
+            .map(|i| NamesEvent::BindFeePaid {
+                authorization_digest: U256::from(i).into(),
+                receiver: Address::from_word(U256::from(i + 1).into()),
+                amount: U256::from(1u64),
+            })
+            .collect()
+    };
+    suite
+        .apply_tx(IN_A, NamesEvent::paid_bind(ALICE, "1", "alice"))
+        .await;
+    suite.apply_tx(IN_A + 1, paid(0..500)).await;
+    suite.apply_tx(IN_B, paid(500..1_000)).await;
+
+    let api = AppState::new(Store::new(suite.pool.clone()))
+        .listing(listing())
+        .router();
+    let chain = api.stats().await.chain(CHAIN);
+    let days: Vec<DayActivity> = api.days(Some(CHAIN)).await;
+    let fees_on = |day: i64| {
+        days.iter()
+            .find(|entry| entry.day == day)
+            .map(|entry| entry.activity.registration_fees.clone())
+            .unwrap_or_else(|| panic!("day {day} listed"))
+    };
+    let other = |count: i64| {
+        Some(OtherFees {
+            count,
+            amount: U512::from(count),
+        })
+    };
+    assert_eq!(
+        chain.total.registration_fees,
+        RegistrationFees {
+            other: other(1_000),
+            ..fees(1)
+        }
+    );
+    assert_eq!(
+        fees_on(DAY_A),
+        RegistrationFees {
+            other: other(500),
+            ..fees(1)
+        }
+    );
+    assert_eq!(
+        fees_on(DAY_B),
+        RegistrationFees {
+            receivers: Vec::new(),
             other: other(500),
         }
     );

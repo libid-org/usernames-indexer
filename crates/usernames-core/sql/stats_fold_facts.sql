@@ -6,7 +6,9 @@
 --
 -- Every row counts under `users`, its wallet when it binds, sends through
 -- the escrow or claims from it. Every movement counts under its token and
--- under every token together, a count only. A claim onboards when the
+-- under every token together, a count only. Every fee counts under its
+-- receiver and under every receiver together, with its amount: fees are
+-- paid in the chain's own coin. A claim onboards when the
 -- claimed round took a deposit of the token while nobody held the node, and
 -- the node was bound after that deposit and before the claim: the binds are
 -- tested against the round's first deposit alone, one seek each.
@@ -64,6 +66,10 @@
         WHERE kind = 'identity_bound'
         UNION ALL
         SELECT $1, 'fees', receiver, day, 1, amount, NULL
+        FROM seen
+        WHERE kind = 'bind_fee_paid'
+        UNION ALL
+        SELECT $1, 'fees', '', day, 1, amount, NULL
         FROM seen
         WHERE kind = 'bind_fee_paid'
         UNION ALL

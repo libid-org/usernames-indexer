@@ -5,8 +5,8 @@
 --
 -- A row counts one measure under one key: `users` (no key), a chain's share
 -- of `all_chains_users` (no key), `links` per platform id, `fees` per
--- receiver, and each escrow flow per token, plus every token together under
--- no key. A wallet counts once per day under a measure and key, and is new
+-- receiver, and each escrow flow per token; fees and flows also count
+-- every receiver or token together under no key. A wallet counts once per day under a measure and key, and is new
 -- on its first day there.
 
 -- The journal's reads and writes queue behind the locks below: wait 5 s at

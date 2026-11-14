@@ -57,7 +57,7 @@ use crate::{
         self,
         ChainStatusRow,
         HandleNodeRow,
-        ListedToken,
+        Listing,
         Search,
         Store,
     },
@@ -66,30 +66,31 @@ use crate::{
 
 /// What every handler needs: the store. Which chains it holds, and which
 /// contract each was indexed from, is read from what the indexers wrote.
-/// Beside it, the tokens `/v1/stats` names and its latest answer, shared by
-/// every clone.
+/// Beside it, the tokens and fee receivers `/v1/stats` names and its latest
+/// answer, shared by every clone.
 #[derive(Clone)]
 pub struct AppState {
     store: Store,
-    listed: Arc<[ListedToken]>,
+    listing: Arc<Listing>,
     stats: StatsCache,
 }
 
 impl AppState {
     /// State over one database, however many chains it holds. `/v1/stats`
-    /// names each chain's own coin and no other token.
+    /// names each chain's own coin, and no other token and no fee receiver.
     pub fn new(store: Store) -> Self {
         Self {
             store,
-            listed: Arc::new([]),
+            listing: Arc::default(),
             stats: StatsCache::default(),
         }
     }
 
-    /// The same state, with `/v1/stats` also naming the `listed` tokens.
-    pub fn listing(self, listed: Vec<ListedToken>) -> Self {
+    /// The same state, with `/v1/stats` also naming the tokens and fee
+    /// receivers `listing` lists.
+    pub fn listing(self, listing: Listing) -> Self {
         Self {
-            listed: listed.into(),
+            listing: listing.into(),
             ..self
         }
     }

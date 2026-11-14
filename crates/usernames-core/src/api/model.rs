@@ -704,6 +704,10 @@ pub struct Unclaimed {
 /// the chain's own coin, EIP-7528 `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`,
 /// or a token the deployment lists (`STATS_TOKENS`); anybody can write a
 /// token, so every other one is counted under `other`, without an amount.
+/// Fee receivers are named only when the deployment lists them
+/// (`STATS_FEE_RECEIVERS`); a bind may name any receiver, so every other
+/// one is counted under `other`, with its amount, since every fee is paid
+/// in the chain's own coin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Stats {
@@ -791,8 +795,9 @@ pub struct Activity {
     pub users: i64,
     /// Bindings (`IdentityBound`) per platform, by platform id.
     pub links: Vec<PlatformLinks>,
-    /// Registration fees paid (`BindFeePaid`) per receiver, by address.
-    pub registration_fees: Vec<FeesPaid>,
+    /// Registration fees paid (`BindFeePaid`): per listed receiver, and
+    /// every other receiver's together.
+    pub registration_fees: RegistrationFees,
     /// What moved through `HandleEscrow`.
     pub escrow: EscrowActivity,
     /// Claims of deposits made to a handle nobody held, claimed by the
@@ -828,6 +833,17 @@ pub struct PlatformLinks {
     pub holders: i64,
 }
 
+/// Registration fees: per receiver the deployment lists, and every other
+/// receiver's together.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistrationFees {
+    /// The listed receivers paid, by address.
+    pub receivers: Vec<FeesPaid>,
+    /// Every other receiver's fees, together; absent when there were none.
+    pub other: Option<OtherFees>,
+}
+
 /// The registration fees one address was paid.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -835,6 +851,19 @@ pub struct PlatformLinks {
 pub struct FeesPaid {
     /// The fee receiver a binding named.
     pub receiver: Address,
+    /// Fees paid.
+    pub count: i64,
+    /// Their sum in the chain's own coin, base units, as a decimal string.
+    #[serde_as(as = "DisplayFromStr")]
+    pub amount: U512,
+}
+
+/// The registration fees of every receiver `/v1/stats` does not name,
+/// together: one sum, since every fee is in the chain's own coin.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OtherFees {
     /// Fees paid.
     pub count: i64,
     /// Their sum in the chain's own coin, base units, as a decimal string.

@@ -68,6 +68,7 @@ indexer's settings.
 | `START_BLOCK` | indexer | unset | Where a FRESH scan starts — consulted only when no cursor exists (new database, or right after a re-index). Unset means the deployment block is found by binary search over `eth_getCode`; only a successful detection is cached, and an RPC failure mid-search retries next cycle |
 | `LISTEN_ADDR` | api | `127.0.0.1:8080` | Read-API listen address |
 | `STATS_TOKENS` | api | unset | The tokens `/v1/stats` names beside each chain's own coin, comma-separated `<chain id>:<address>` pairs (`8453:0x8335…`). Every other token's movements count together under `other`, without an amount: anybody can write a token |
+| `STATS_FEE_RECEIVERS` | api | unset | The registration fee receivers `/v1/stats` names, comma-separated `<chain id>:<address>` pairs. Every other receiver's fees count together under `other`, with their amount: a bind may name any receiver |
 
 ### Polling
 
@@ -101,8 +102,8 @@ set `STALE_AFTER` past the chain's longest gap between blocks.
 | `GET /v1/escrow/refundable/{address}?before=&limit=` | What the address sent that nobody has claimed yet, each contribution with its `refundableAt`: when `refund` opens for it |
 | `GET /v1/escrow/handle/{platform}/{handle}?before=&limit=` | What a handle holds, token by token, and its holder; `/v1/escrow/node/{node}` by node |
 | `GET /v1/escrow/unclaimed?token=0x…&before=&limit=` | Every slot still holding something, bound or not: token by token, descending, the largest amount first within each |
-| `GET /v1/stats` | Users (wallets that linked, sent through the escrow or claimed) and new users across every chain, a wallet counted once, in total. Per chain, in total: users, links and live handles per platform, registration fees per receiver, escrow deposits, forwards, claims and refunds, and onboarding claims (deposits to a handle nobody held, claimed after its holder linked). Token movements are listed per token for the chain's own coin and the `STATS_TOKENS`, and together under `other` for every other token, with a count only. Amounts are token units as decimal strings. It reads the rollups' totals, never the journal or the days: its work grows with chains, platforms, fee receivers and named tokens, and with the live handles, not with events or days. One computation is served for five minutes, stopped by the database after 30 s; `computedAt` says when it was taken. It answers one row per chain and platform, fee receiver, named token and flow, and one `other` per chain and flow. Fee receivers are whoever a bind names (`bind`'s `feeReceiver`), so their list grows with distinct receivers, each paid for by a bind proof and its notary fee |
-| `GET /v1/stats/days?chain=&before=&limit=` | The same counts per UTC day, newest first, for a chart: users and new users across every chain, or with `chain` that chain's day by day activity, tokens named as in `/v1/stats`. A day with nothing recorded is absent. `limit` defaults to 30, at most 366; `next` is the `before` of the next page. Read per request from the rollups, one index seek per day and key, with its own `computedAt`: a page answers at most `limit` days, each with one row per platform, fee receiver, named token and flow, and one `other` per flow; across chains, two numbers per day. Fee receivers grow as in `/v1/stats`. The day's events are `/v1/history/chain/{chain}?day=` |
+| `GET /v1/stats` | Users (wallets that linked, sent through the escrow or claimed) and new users across every chain, a wallet counted once, in total. Per chain, in total: users, links and live handles per platform, registration fees, escrow deposits, forwards, claims and refunds, and onboarding claims (deposits to a handle nobody held, claimed after its holder linked). Token movements are listed per token for the chain's own coin and the `STATS_TOKENS`, and together under `other` for every other token, with a count only. Fees are listed per receiver for the `STATS_FEE_RECEIVERS`, and together under `other` for every other receiver, with a count and an amount: every fee is paid in the chain's own coin, and a bind may name any receiver. Amounts are token units as decimal strings. It reads the rollups' totals, never the journal or the days: its work grows with chains, platforms, named tokens and named receivers, and with the live handles, not with events or days. One computation is served for five minutes, stopped by the database after 30 s; `computedAt` says when it was taken. It answers one row per chain and platform, named receiver, named token and flow, and one `other` per chain for fees and per chain and flow |
+| `GET /v1/stats/days?chain=&before=&limit=` | The same counts per UTC day, newest first, for a chart: users and new users across every chain, or with `chain` that chain's day by day activity, tokens named as in `/v1/stats`. A day with nothing recorded is absent. `limit` defaults to 30, at most 366; `next` is the `before` of the next page. Read per request from the rollups, one index seek per day and key, with its own `computedAt`: a page answers at most `limit` days, each with one row per platform, named receiver, named token and flow, and one `other` for fees and per flow; across chains, two numbers per day. The day's events are `/v1/history/chain/{chain}?day=` |
 | `GET /v1/status` | Every chain the store holds: chain id, contract, escrow, last indexed block, chain head, lag, when the indexer last reported and how long that report is still good, last window error, the Proof Verifier the contract is wired to; and the read-model version |
 | `GET /health` | Liveness |
 
@@ -339,9 +340,10 @@ chain; a second deployment can share the database):
 - `stats_counts` — what `/v1/stats/days` reads, per chain, measure, UTC
   day and key: the rows counted, the amount they moved, the distinct wallets
   and the new ones among them. The measures are `users`, the chain's share
-  of `all_chains_users`, `links` per platform, `fees` per receiver, and
-  `deposited`, `forwarded`, `claimed`, `refunded` and `onboarding` per
-  token and under an empty key for every token together
+  of `all_chains_users`, `links` per platform, `fees` per receiver and
+  under an empty key for every receiver together, and `deposited`,
+  `forwarded`, `claimed`, `refunded` and `onboarding` per token and under
+  an empty key for every token together
 - `stats_totals` — the same over every day: what `/v1/stats` reads
 - `stats_wallet_days` — each wallet once per day under a measure and key,
   so a wallet counts once a day; the users across chains sit under chain 0

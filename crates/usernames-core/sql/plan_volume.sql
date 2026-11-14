@@ -104,8 +104,9 @@ SELECT chain, 1 FROM generate_series(1, 5) chain
 ON CONFLICT DO NOTHING;
 -- The stats rollups: 200 days on five chains. Every day counts its users,
 -- each chain's share of the users across chains, links on three platforms,
--- fees to two receivers, and each flow under 20 tokens and every token
--- together; on chain 1, 300 more tokens deposited every day.
+-- fees to two receivers and every receiver together, and each flow under
+-- 20 tokens and every token together; on chain 1, 300 more tokens deposited
+-- and 300 more receivers paid every day.
 INSERT INTO names.stats_counts
     (chain_id, measure, day, key, count, amount, wallets, new_wallets)
 SELECT chain, measure, day * 86400, key, 10, 300, 8, 1
@@ -115,8 +116,10 @@ FROM generate_series(1, 5) chain, generate_series(1, 200) day,
       UNION ALL SELECT 'links', sha256(('platform' || p)::bytea)
       FROM generate_series(1, 3) p
       UNION ALL SELECT 'fees',
-                       substring(sha256(('receiver' || r)::bytea) FROM 1 FOR 20)
-      FROM generate_series(1, 2) r
+                       CASE r WHEN 0 THEN ''::bytea
+                              ELSE substring(sha256(('receiver' || r)::bytea)
+                                             FROM 1 FOR 20) END
+      FROM generate_series(0, 2) r
       UNION ALL SELECT flow,
                        CASE t WHEN -1 THEN ''::bytea
                               WHEN 0 THEN decode(repeat('ee', 20), 'hex')
@@ -127,9 +130,10 @@ FROM generate_series(1, 5) chain, generate_series(1, 200) day,
            generate_series(-1, 19) t) k;
 INSERT INTO names.stats_counts
     (chain_id, measure, day, key, count, amount, wallets, new_wallets)
-SELECT 1, 'deposited', day * 86400,
-       substring(sha256(('junk' || t)::bytea) FROM 1 FOR 20), 1, 1, 1, 1
-FROM generate_series(1, 200) day, generate_series(1, 300) t;
+SELECT 1, measure, day * 86400,
+       substring(sha256((measure || t)::bytea) FROM 1 FOR 20), 1, 1, 1, 1
+FROM generate_series(1, 200) day, generate_series(1, 300) t,
+     unnest(ARRAY['deposited', 'fees']) measure;
 INSERT INTO names.stats_totals (chain_id, measure, key, count, amount, wallets)
 SELECT chain_id, measure, key, sum(count), sum(amount), sum(new_wallets)
 FROM names.stats_counts

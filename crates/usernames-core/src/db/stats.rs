@@ -5,6 +5,7 @@
 
 use std::{
     fmt,
+    iter,
     num::ParseIntError,
     str::FromStr,
     time::{
@@ -69,7 +70,7 @@ pub struct CountRow {
     #[sqlx(try_from = "String")]
     pub measure: Measure,
     /// The platform id, receiver or token the row counts under; empty for
-    /// none, and for every token together.
+    /// none, and for every receiver or token together.
     pub key: Vec<u8>,
     /// The day's start in unix seconds; `None` over every day.
     pub day: Option<i64>,
@@ -104,7 +105,7 @@ pub enum Measure {
     AllChainsUsers,
     /// Bindings per platform id, and the wallets they bound to.
     Links,
-    /// Registration fees per receiver.
+    /// Registration fees per receiver, and every receiver's together.
     Fees,
     /// Escrow movements of one flow per token, and of every token together.
     Flow(Flow),
@@ -140,12 +141,35 @@ impl Measure {
         }
     }
 
-    /// Whether a read takes every key the measure counted, or only those it
-    /// names: anybody can write a token, so a flow is read by the tokens
-    /// named and every token together.
-    fn named(self) -> bool {
-        matches!(self, Self::Flow(_))
+    /// Which keys a read takes of the measure. Anybody can write a token or
+    /// name a fee receiver, so a flow is read by its chain's coin and the
+    /// listed tokens, fees by the listed receivers, and both by every key
+    /// together.
+    fn read(self, listing: &Listing) -> KeyRead<'_> {
+        match self {
+            Self::Users | Self::AllChainsUsers | Self::Links => KeyRead::Every,
+            Self::Fees => KeyRead::Named {
+                fixed: &[],
+                listed: &listing.fee_receivers,
+            },
+            Self::Flow(_) => KeyRead::Named {
+                fixed: &[NATIVE_COIN],
+                listed: &listing.tokens,
+            },
+        }
     }
+}
+
+/// The keys a read takes of one measure.
+enum KeyRead<'a> {
+    /// Every key the measure counted.
+    Every,
+    /// Every key together (no key), the keys `fixed`, and the entries of
+    /// `listed` on the chain read.
+    Named {
+        fixed: &'static [Address],
+        listed: &'a [ListedAddress],
+    },
 }
 
 impl FromStr for Measure {
@@ -167,64 +191,72 @@ impl TryFrom<String> for Measure {
     }
 }
 
-/// The measures a read takes, by how it reads their keys.
-struct Measures {
-    /// Read under every key.
-    every: Vec<&'static str>,
-    /// Read under the keys a chain names.
-    named: Vec<&'static str>,
-}
-
-impl Measures {
-    fn of(measures: impl IntoIterator<Item = Measure>) -> Self {
-        let (named, every): (Vec<Measure>, Vec<Measure>) =
-            measures.into_iter().partition(|measure| measure.named());
-        Self {
-            every: every.into_iter().map(Measure::as_str).collect(),
-            named: named.into_iter().map(Measure::as_str).collect(),
-        }
-    }
-}
-
-/// The keys a read takes of the measures read by key, per chain, pairwise:
-/// every token together (no key), the chain's own coin and the tokens
-/// listed for it.
+/// What a read takes: every key of some measures, and of the others the
+/// keys each chain names, as chain, measure and key, pairwise.
 #[derive(Default)]
-struct NamedKeys {
+struct Keys {
+    /// The measures read under every key.
+    every: Vec<&'static str>,
     chains: Vec<i64>,
+    measures: Vec<&'static str>,
     keys: Vec<Vec<u8>>,
 }
 
-impl NamedKeys {
-    fn of(chains: &[i64], listed: &[ListedToken]) -> Self {
-        let mut named = Self::default();
-        for &chain_id in chains {
-            let tokens = listed
-                .iter()
-                .filter(|listed| listed.chain_id == chain_id)
-                .map(|listed| listed.token.to_vec());
-            for key in [Vec::new(), NATIVE_COIN.to_vec()].into_iter().chain(tokens) {
-                named.chains.push(chain_id);
-                named.keys.push(key);
+impl Keys {
+    fn of(
+        chains: &[i64],
+        measures: impl IntoIterator<Item = Measure>,
+        listing: &Listing,
+    ) -> Self {
+        let mut read = Self::default();
+        for measure in measures {
+            let (fixed, listed) = match measure.read(listing) {
+                KeyRead::Every => {
+                    read.every.push(measure.as_str());
+                    continue;
+                }
+                KeyRead::Named { fixed, listed } => (fixed, listed),
+            };
+            for &chain_id in chains {
+                let on_chain = listed
+                    .iter()
+                    .filter(|listed| listed.chain_id == chain_id)
+                    .map(|listed| listed.address);
+                let named = fixed.iter().copied().chain(on_chain);
+                for key in iter::once(Vec::new()).chain(named.map(|key| key.to_vec())) {
+                    read.chains.push(chain_id);
+                    read.measures.push(measure.as_str());
+                    read.keys.push(key);
+                }
             }
         }
-        named
+        read
     }
 }
 
-/// A token `/v1/stats` names on one chain, beside the chain's own coin,
-/// written `<chain id>:<address>`. Every other token counts under `other`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ListedToken {
-    /// The chain.
-    pub chain_id: i64,
-    /// The token's address there.
-    pub token: Address,
+/// The addresses `/v1/stats` names per chain; every other one counts under
+/// `other`.
+#[derive(Debug, Clone, Default)]
+pub struct Listing {
+    /// Tokens, beside each chain's own coin.
+    pub tokens: Vec<ListedAddress>,
+    /// Registration fee receivers.
+    pub fee_receivers: Vec<ListedAddress>,
 }
 
-/// Why a listed token does not parse.
+/// An address `/v1/stats` names on one chain, a token or a fee receiver,
+/// written `<chain id>:<address>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListedAddress {
+    /// The chain.
+    pub chain_id: i64,
+    /// The address there.
+    pub address: Address,
+}
+
+/// Why a listed address does not parse.
 #[derive(Debug, thiserror::Error)]
-pub enum ListedTokenError {
+pub enum ListedAddressError {
     /// No `:` between the chain id and the address.
     #[error("{0:?} is not <chain id>:<address>")]
     Shape(String),
@@ -232,31 +264,31 @@ pub enum ListedTokenError {
     #[error("chain id {0:?}: {1}")]
     Chain(String, ParseIntError),
     /// The address is not one.
-    #[error("token {0:?}: {1}")]
-    Token(String, FromHexError),
+    #[error("address {0:?}: {1}")]
+    Address(String, FromHexError),
 }
 
-impl FromStr for ListedToken {
-    type Err = ListedTokenError;
+impl FromStr for ListedAddress {
+    type Err = ListedAddressError;
 
-    fn from_str(listed: &str) -> Result<Self, ListedTokenError> {
-        let (chain, token) = listed
+    fn from_str(listed: &str) -> Result<Self, ListedAddressError> {
+        let (chain, address) = listed
             .split_once(':')
-            .ok_or_else(|| ListedTokenError::Shape(listed.to_string()))?;
+            .ok_or_else(|| ListedAddressError::Shape(listed.to_string()))?;
         Ok(Self {
             chain_id: chain
                 .parse()
-                .map_err(|e| ListedTokenError::Chain(chain.to_string(), e))?,
-            token: token
+                .map_err(|e| ListedAddressError::Chain(chain.to_string(), e))?,
+            address: address
                 .parse()
-                .map_err(|e| ListedTokenError::Token(token.to_string(), e))?,
+                .map_err(|e| ListedAddressError::Address(address.to_string(), e))?,
         })
     }
 }
 
-impl fmt::Display for ListedToken {
+impl fmt::Display for ListedAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.chain_id, self.token)
+        write!(f, "{}:{}", self.chain_id, self.address)
     }
 }
 
@@ -301,14 +333,14 @@ impl Flow {
 
 impl Store {
     /// Every number `/v1/stats` serves, read in one snapshot so they agree
-    /// with each other. Token flows name each chain's coin and the `listed`
-    /// tokens, and every token together. The live handles count the handles
-    /// table, so a caller runs this once per period, not per request. The
-    /// statements share `budget`: the database stops the one running when
-    /// it is spent.
+    /// with each other. Token flows name each chain's coin and the listed
+    /// tokens, fees the listed receivers, and both every key together. The
+    /// live handles count the handles table, so a caller runs this once per
+    /// period, not per request. The statements share `budget`: the database
+    /// stops the one running when it is spent.
     pub async fn stats(
         &self,
-        listed: &[ListedToken],
+        listing: &Listing,
         budget: Duration,
     ) -> Result<StatsSnapshot, sqlx::Error> {
         let deadline = Deadline::after(budget);
@@ -322,13 +354,12 @@ impl Store {
         let handles = sqlx::query_as(sql::STATS_HANDLES)
             .fetch_all(deadline.bound(&mut tx).await?)
             .await?;
-        let measures = Measures::of(Measure::ALL);
-        let named = NamedKeys::of(&chains, listed);
+        let keys = Keys::of(&chains, Measure::ALL, listing);
         let counts = sqlx::query_as(sql::STATS_TOTALS)
-            .bind(&measures.every)
-            .bind(&measures.named)
-            .bind(&named.chains)
-            .bind(&named.keys)
+            .bind(&keys.every)
+            .bind(&keys.chains)
+            .bind(&keys.measures)
+            .bind(&keys.keys)
             .fetch_all(deadline.bound(&mut tx).await?)
             .await?;
         tx.commit().await?;
@@ -342,20 +373,20 @@ impl Store {
 
     /// A page of days, newest first: on one chain with everything the chain
     /// recorded on them, or across every chain with their users. Token
-    /// flows name the chain's coin and its `listed` tokens. A page reads
-    /// its days and then each day's rows by key: never the journal, and
-    /// never a token nobody named.
+    /// flows name the chain's coin and its listed tokens, fees its listed
+    /// receivers. A page reads its days and then each day's rows by key:
+    /// never the journal, and never a token or receiver nobody named.
     pub async fn stats_days(
         &self,
         page: Page<StatsDay>,
-        listed: &[ListedToken],
+        listing: &Listing,
     ) -> Result<StatsDays, sqlx::Error> {
         let before = page.before.map_or(i64::MAX, |StatsDay(day)| day);
         let mut tx = self.pool.begin_with(sql::STATS_SNAPSHOT).await?;
         let taken_at = sqlx::query_scalar(sql::STATS_TAKEN_AT)
             .fetch_one(&mut *tx)
             .await?;
-        let (days, chains, measures, named) = match page.chain {
+        let (days, chains, keys) = match page.chain {
             Some(chain_id) => {
                 let days = sqlx::query_scalar(sql::STATS_CHAIN_DAYS)
                     .bind(chain_id)
@@ -366,8 +397,8 @@ impl Store {
                 let measures = Measure::ALL
                     .into_iter()
                     .filter(|measure| *measure != Measure::AllChainsUsers);
-                let named = NamedKeys::of(&[chain_id], listed);
-                (days, vec![chain_id], Measures::of(measures), named)
+                let keys = Keys::of(&[chain_id], measures, listing);
+                (days, vec![chain_id], keys)
             }
             None => {
                 let days = sqlx::query_scalar(sql::STATS_ALL_DAYS)
@@ -375,19 +406,20 @@ impl Store {
                     .bind(page.fetch())
                     .fetch_all(&mut *tx)
                     .await?;
-                let chains = sqlx::query_scalar(sql::CHAINS).fetch_all(&mut *tx).await?;
-                let measures = Measures::of([Measure::AllChainsUsers]);
-                (days, chains, measures, NamedKeys::default())
+                let chains: Vec<i64> =
+                    sqlx::query_scalar(sql::CHAINS).fetch_all(&mut *tx).await?;
+                let keys = Keys::of(&chains, [Measure::AllChainsUsers], listing);
+                (days, chains, keys)
             }
         };
         let Rows { rows: days, next } = page.split(days);
         let counts = sqlx::query_as(sql::STATS_DAY_COUNTS)
             .bind(&chains)
             .bind(&days)
-            .bind(&measures.every)
-            .bind(&measures.named)
-            .bind(&named.chains)
-            .bind(&named.keys)
+            .bind(&keys.every)
+            .bind(&keys.chains)
+            .bind(&keys.measures)
+            .bind(&keys.keys)
             .fetch_all(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -497,20 +529,25 @@ pub(crate) mod plans {
             // has most of the days still ahead of it.
             let before = 190 * 86_400i64;
             let days: Vec<i64> = (161..190).map(|day| day * 86_400).collect();
-            let listed = [ListedToken {
-                chain_id: 1,
-                token: Address::repeat_byte(0xEE),
-            }];
-            let named = NamedKeys::of(&[1], &listed);
-            let chain_measures = Measures::of(
-                Measure::ALL
-                    .into_iter()
-                    .filter(|measure| *measure != Measure::AllChainsUsers),
-            );
-            let all_chains = Measures::of([Measure::AllChainsUsers]);
-            let every = Measures::of(Measure::ALL);
+            // Every day the volume holds: the longest page it can serve.
+            let all_days: Vec<i64> = (1..=200).map(|day| day * 86_400).collect();
+            let listed = |byte| {
+                vec![ListedAddress {
+                    chain_id: 1,
+                    address: Address::repeat_byte(byte),
+                }]
+            };
+            let listing = Listing {
+                tokens: listed(0xEE),
+                fee_receivers: listed(0xFE),
+            };
             let chains = [1i64, 2, 3, 4, 5];
-            let all_named = NamedKeys::of(&chains, &listed);
+            let chain_measures = Measure::ALL
+                .into_iter()
+                .filter(|measure| *measure != Measure::AllChainsUsers);
+            let chain_keys = Keys::of(&[1], chain_measures, &listing);
+            let all_chains = Keys::of(&chains, [Measure::AllChainsUsers], &listing);
+            let every = Keys::of(&chains, Measure::ALL, &listing);
             let measures: Vec<&str> = Measure::ALL.iter().map(|m| m.as_str()).collect();
             let (blocks, logs) = ([10i64, 20, 30], [0i64, 0, 0]);
             let (after, through) = (
@@ -541,9 +578,9 @@ pub(crate) mod plans {
                     &["stats_totals_pkey"][..],
                     sqlx::query_scalar(&explain(sql::STATS_TOTALS))
                         .bind(&every.every)
-                        .bind(&every.named)
-                        .bind(&all_named.chains)
-                        .bind(&all_named.keys)
+                        .bind(&every.chains)
+                        .bind(&every.measures)
+                        .bind(&every.keys)
                         .fetch_all(&mut *self)
                         .await,
                 ),
@@ -572,10 +609,23 @@ pub(crate) mod plans {
                     sqlx::query_scalar(&explain(sql::STATS_DAY_COUNTS))
                         .bind(&[1i64][..])
                         .bind(&days)
-                        .bind(&chain_measures.every)
-                        .bind(&chain_measures.named)
-                        .bind(&named.chains)
-                        .bind(&named.keys)
+                        .bind(&chain_keys.every)
+                        .bind(&chain_keys.chains)
+                        .bind(&chain_keys.measures)
+                        .bind(&chain_keys.keys)
+                        .fetch_all(&mut *self)
+                        .await,
+                ),
+                (
+                    "a chain's longest day page",
+                    &["stats_counts_pkey"][..],
+                    sqlx::query_scalar(&explain(sql::STATS_DAY_COUNTS))
+                        .bind(&[1i64][..])
+                        .bind(&all_days)
+                        .bind(&chain_keys.every)
+                        .bind(&chain_keys.chains)
+                        .bind(&chain_keys.measures)
+                        .bind(&chain_keys.keys)
                         .fetch_all(&mut *self)
                         .await,
                 ),
@@ -586,9 +636,9 @@ pub(crate) mod plans {
                         .bind(&chains[..])
                         .bind(&days)
                         .bind(&all_chains.every)
-                        .bind(&all_chains.named)
-                        .bind(Vec::<i64>::new())
-                        .bind(Vec::<Vec<u8>>::new())
+                        .bind(&all_chains.chains)
+                        .bind(&all_chains.measures)
+                        .bind(&all_chains.keys)
                         .fetch_all(&mut *self)
                         .await,
                 ),
@@ -683,12 +733,12 @@ mod tests {
         assert_eq!(code.as_deref(), Some("57014"), "{stopped}");
     }
 
-    /// A listed token reads from its `<chain id>:<address>` text and prints
-    /// back to it; anything else is refused.
+    /// A listed address reads from its `<chain id>:<address>` text and
+    /// prints back to it; anything else is refused.
     #[test]
-    fn a_listed_token_parses_from_its_text() {
+    fn a_listed_address_parses_from_its_text() {
         let text = "8453:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
-        let listed: ListedToken = text.parse().expect("a listed token");
+        let listed: ListedAddress = text.parse().expect("a listed address");
         assert_eq!(listed.chain_id, 8453);
         assert_eq!(listed.to_string(), text);
         for refused in [
@@ -696,7 +746,7 @@ mod tests {
             "base:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
             "8453:0x8335",
         ] {
-            assert!(refused.parse::<ListedToken>().is_err(), "{refused}");
+            assert!(refused.parse::<ListedAddress>().is_err(), "{refused}");
         }
     }
 }

@@ -40,9 +40,11 @@ use super::{
         ChainStats,
         DayActivity,
         FeesPaid,
+        OtherFees,
         OtherTokens,
         PlatformHandles,
         PlatformLinks,
+        RegistrationFees,
         Stats,
         StatsDays,
         TokenFlow,
@@ -90,7 +92,7 @@ pub(crate) async fn days(
 ) -> Result<Response, ApiError> {
     let page = params.page_within::<StatsDay>(DAYS_PAGE)?;
     let chain_id = page.chain;
-    let read = state.store.stats_days(page, &state.listed).await?;
+    let read = state.store.stats_days(page, &state.listing).await?;
     let next = read.next.map(|day| day.to_string());
     let Report { stats, mut history } = Report::of(read.snapshot)?;
     let computed_at = stats.computed_at;
@@ -123,12 +125,12 @@ impl AppState {
     async fn served_stats(self) -> Result<Served, ApiError> {
         let AppState {
             store,
-            listed,
+            listing,
             stats,
         } = self;
         stats
             .get(|| async move {
-                let report = Report::of(store.stats(&listed, STATS_DEADLINE).await?)?;
+                let report = Report::of(store.stats(&listing, STATS_DEADLINE).await?)?;
                 Ok(report.stats)
             })
             .await
@@ -265,9 +267,7 @@ impl Report {
                 (Measure::Links, day) => {
                     chain.span(day).links.push(PlatformLinks::of(row)?)
                 }
-                (Measure::Fees, day) => {
-                    chain.span(day).registration_fees.push(FeesPaid::of(row)?)
-                }
+                (Measure::Fees, day) => chain.span(day).registration_fees.add(row)?,
                 (Measure::Flow(flow), day) => chain.span(day).flows(flow).add(row)?,
             }
         }
@@ -365,13 +365,14 @@ impl Activity {
         }
     }
 
-    /// Once every row is in: `other` only where the tokens nobody named
-    /// moved.
+    /// Once every row is in: `other` only where the tokens or receivers
+    /// nobody named moved or were paid.
     fn settle(&mut self) {
         for flow in Flow::ALL {
             let flows = self.flows(flow);
             flows.other = flows.other.take().filter(|other| other.count > 0);
         }
+        self.registration_fees.settle();
     }
 }
 
@@ -440,6 +441,44 @@ impl FeesPaid {
     }
 }
 
+impl RegistrationFees {
+    /// Count `row`: under its receiver, or, when it names none, as every
+    /// receiver's fees, which `other` holds until `settle`.
+    fn add(&mut self, row: &CountRow) -> Result<(), ApiError> {
+        match row.key.is_empty() {
+            true => {
+                self.other = Some(OtherFees {
+                    count: row.count,
+                    amount: row.amount_of()?,
+                })
+            }
+            false => self.receivers.push(FeesPaid::of(row)?),
+        }
+        Ok(())
+    }
+
+    /// Once every row is in: `other` holds every receiver's fees less the
+    /// listed receivers', and only when there were any. The listed rows are
+    /// part of every receiver's, from the same snapshot, so neither
+    /// difference goes below zero.
+    fn settle(&mut self) {
+        let (count, amount) =
+            self.receivers
+                .iter()
+                .fold((0, U512::ZERO), |(count, amount), paid| {
+                    (count + paid.count, amount.saturating_add(paid.amount))
+                });
+        self.other = self
+            .other
+            .take()
+            .map(|every| OtherFees {
+                count: every.count - count,
+                amount: every.amount.saturating_sub(amount),
+            })
+            .filter(|other| other.count > 0);
+    }
+}
+
 impl TokenFlows {
     /// Count `row`: under its token, or, when it names none, as every
     /// token's movements, which `other` holds less the named tokens'.
@@ -481,6 +520,7 @@ mod tests {
 
     use super::*;
     use crate::db::{
+        Listing,
         Store,
         MIGRATOR,
     };
@@ -583,12 +623,11 @@ mod tests {
         let cache = StatsCache::default();
         let waiting = store.clone();
         let started = Instant::now();
-        let failed =
-            cache
-                .get(|| async move {
-                    Ok(Report::of(waiting.stats(&[], budget).await?)?.stats)
-                })
-                .await;
+        let failed = cache
+            .get(|| async move {
+                Ok(Report::of(waiting.stats(&Listing::default(), budget).await?)?.stats)
+            })
+            .await;
         let waited = started.elapsed();
         assert!(failed.is_err(), "the computation outlasted its deadline");
         assert!(
@@ -597,7 +636,9 @@ mod tests {
         );
         holder.rollback().await.expect("the rollup free");
         let served = cache
-            .get(|| async move { Ok(Report::of(store.stats(&[], budget).await?)?.stats) })
+            .get(|| async move {
+                Ok(Report::of(store.stats(&Listing::default(), budget).await?)?.stats)
+            })
             .await;
         assert!(served.is_ok(), "the next request computes again");
     }
