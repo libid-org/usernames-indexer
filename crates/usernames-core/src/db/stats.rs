@@ -640,7 +640,7 @@ pub(crate) mod plans {
                 ),
                 (
                     "the totals",
-                    &["stats_totals_pkey"][..],
+                    &["stats_totals_pkey:chain_id,measure"][..],
                     sqlx::query_scalar(&explain(sql::STATS_TOTALS))
                         .bind(&every.every)
                         .bind(&every.chains)
@@ -651,7 +651,7 @@ pub(crate) mod plans {
                 ),
                 (
                     "the price candidates",
-                    &["stats_totals_pkey"][..],
+                    &["stats_totals_pkey:chain_id,measure"][..],
                     sqlx::query_scalar(&explain(sql::STATS_CANDIDATES))
                         .bind(NATIVE_COIN.to_vec())
                         .bind(&[1i64][..])
