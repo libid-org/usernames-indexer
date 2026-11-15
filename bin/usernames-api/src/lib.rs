@@ -45,7 +45,8 @@ use usernames_core::{
     api,
     db::{
         self,
-        ListedToken,
+        ListedAddress,
+        Listing,
         Store,
     },
     ens::{
@@ -123,7 +124,15 @@ pub struct Config {
     /// other token counts under `other`, without an amount: anybody can
     /// write a token, and naming each would let them grow every answer.
     #[arg(long, env = "STATS_TOKENS", value_delimiter = ',')]
-    pub stats_tokens: Vec<ListedToken>,
+    pub stats_tokens: Vec<ListedAddress>,
+
+    /// The registration fee receivers `/v1/stats` names by address,
+    /// comma-separated `<chain id>:<address>` pairs. Every other receiver's
+    /// fees count together under `other`, with their amount: a bind may
+    /// name any receiver, and naming each would let anybody grow every
+    /// answer.
+    #[arg(long, env = "STATS_FEE_RECEIVERS", value_delimiter = ',')]
+    pub stats_fee_receivers: Vec<ListedAddress>,
 }
 
 /// The API serving as a task, and the token that stops it.
@@ -235,7 +244,10 @@ impl Config {
             }
         }
         let app = Service {
-            api: api::AppState::new(store).listing(self.stats_tokens),
+            api: api::AppState::new(store).listing(Listing {
+                tokens: self.stats_tokens,
+                fee_receivers: self.stats_fee_receivers,
+            }),
             gateway,
         }
         .router();

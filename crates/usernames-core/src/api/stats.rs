@@ -1,5 +1,6 @@
-//! `GET /v1/stats`: the store's numbers, computed at most once per
-//! [`STATS_TTL`] however many requests arrive.
+//! `GET /v1/stats` and `GET /v1/stats/days`: the store's rollups. The
+//! totals are computed at most once per [`STATS_TTL`] however many requests
+//! arrive; a page of days is read per request, its size capped.
 
 use std::{
     collections::BTreeMap,
@@ -11,7 +12,10 @@ use std::{
     },
 };
 
-use alloy::primitives::Address;
+use alloy::primitives::{
+    B256,
+    U512,
+};
 use axum::{
     body::Bytes,
     extract::State,
@@ -20,81 +24,161 @@ use axum::{
         IntoResponse,
         Response,
     },
+    Json,
 };
 use tokio::sync::Mutex;
 
 use super::{
-    error::ApiError,
+    error::{
+        ApiError,
+        ApiQuery,
+    },
     model::{
         Activity,
         AllChains,
         AllChainsDay,
         ChainStats,
         DayActivity,
-        EscrowActivity,
         FeesPaid,
+        OtherFees,
         OtherTokens,
         PlatformHandles,
         PlatformLinks,
+        RegistrationFees,
         Stats,
+        StatsDays,
         TokenFlow,
         TokenFlows,
+    },
+    params::{
+        PageParams,
+        DAYS_PAGE,
     },
     AppState,
 };
 use crate::{
     db::{
-        FeesRow,
+        CountRow,
+        Flow,
         HandlesRow,
-        LinksRow,
+        Measure,
+        StatsDay,
         StatsSnapshot,
-        TokenFlowRow,
     },
-    events::EventKind,
     nodes::Platform,
 };
 
-/// How long one computation is served. The aggregates read whole tables, and
-/// a burst of requests must not run them again on a small database.
+/// How long one computation of the totals is served. They sum every day of
+/// every chain, and a burst of requests must not run them again.
 const STATS_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// How long one computation may take, its statements together. The lock is
 /// held through it, and every request behind it waits that long.
 const STATS_DEADLINE: Duration = Duration::from_secs(30);
 
-/// `GET /v1/stats` — totals and a daily series per chain, from one
-/// snapshot of the store.
+/// `GET /v1/stats` — totals per chain and across them, from one snapshot of
+/// the store.
 pub(crate) async fn stats(State(state): State<AppState>) -> Result<Response, ApiError> {
-    let AppState {
-        store,
-        listed,
-        stats,
-    } = state;
-    let body = stats
-        .get(|| async move { Stats::of(store.stats(&listed, STATS_DEADLINE).await?) })
-        .await?;
-    Ok(([(CONTENT_TYPE, "application/json")], body).into_response())
+    let served = state.served_stats().await?;
+    Ok(([(CONTENT_TYPE, "application/json")], served.body).into_response())
 }
 
-/// The latest answer, serialized once and shared by every request.
+/// `GET /v1/stats/days?chain=&before=&limit=` — the daily series, newest
+/// first, across every chain or on the one named: the last 30 days unless
+/// `limit` asks for more, at most 366.
+pub(crate) async fn days(
+    State(state): State<AppState>,
+    ApiQuery(params): ApiQuery<PageParams>,
+) -> Result<Response, ApiError> {
+    let page = params.page_within::<StatsDay>(DAYS_PAGE)?;
+    let chain_id = page.chain;
+    let read = state.store.stats_days(page, &state.listing).await?;
+    let next = read.next.map(|day| day.to_string());
+    let Report { stats, mut history } = Report::of(read.snapshot)?;
+    let computed_at = stats.computed_at;
+    Ok(match chain_id {
+        None => Json(StatsDays {
+            computed_at,
+            chain_id,
+            days: history.days.into_iter().rev().collect(),
+            next,
+        })
+        .into_response(),
+        Some(chain) => Json(StatsDays {
+            computed_at,
+            chain_id,
+            days: history
+                .chains
+                .remove(&chain)
+                .unwrap_or_default()
+                .into_iter()
+                .rev()
+                .collect(),
+            next,
+        })
+        .into_response(),
+    })
+}
+
+impl AppState {
+    /// The latest totals, computed when none are fresh.
+    async fn served_stats(self) -> Result<Served, ApiError> {
+        let AppState {
+            store,
+            listing,
+            stats,
+        } = self;
+        stats
+            .get(|| async move {
+                let report = Report::of(store.stats(&listing, STATS_DEADLINE).await?)?;
+                Ok(report.stats)
+            })
+            .await
+    }
+}
+
+/// The latest totals, serialized once and shared by every request.
 #[derive(Clone, Default)]
 pub(crate) struct StatsCache {
     latest: Arc<Mutex<Option<Computed>>>,
 }
 
+/// The numbers a snapshot holds, as the stats routes serve them: the totals,
+/// and the days, oldest first.
+pub(crate) struct Report {
+    stats: Stats,
+    history: History,
+}
+
+/// The days of a snapshot, oldest first; a day with nothing recorded is
+/// absent.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct History {
+    /// Across every chain.
+    days: Vec<AllChainsDay>,
+    /// Per chain, by chain id.
+    chains: BTreeMap<i64, Vec<DayActivity>>,
+}
+
+/// The totals as served: serialized once.
+#[derive(Clone)]
+pub(crate) struct Served {
+    body: Bytes,
+}
+
 /// One computation's answer as served, and when it finished.
 struct Computed {
     at: Instant,
-    body: Bytes,
+    served: Served,
 }
 
 impl Computed {
     /// `stats` as served from now on.
-    fn of(stats: &Stats) -> Result<Self, ApiError> {
-        let body = serde_json::to_vec(stats).map_err(ApiError::internal)?;
+    fn of(stats: Stats) -> Result<Self, ApiError> {
+        let body = serde_json::to_vec(&stats).map_err(ApiError::internal)?;
         Ok(Self {
             at: Instant::now(),
-            body: body.into(),
+            served: Served { body: body.into() },
         })
     }
 
@@ -113,7 +197,7 @@ impl StatsCache {
     pub(crate) async fn get<F>(
         &self,
         compute: impl FnOnce() -> F,
-    ) -> Result<Bytes, ApiError>
+    ) -> Result<Served, ApiError>
     where
         F: Future<Output = Result<Stats, ApiError>> + Send + 'static,
     {
@@ -121,17 +205,17 @@ impl StatsCache {
         let held = latest
             .as_ref()
             .filter(|computed| computed.fresh(Instant::now()))
-            .map(|computed| computed.body.clone());
-        if let Some(body) = held {
+            .map(|computed| computed.served.clone());
+        if let Some(served) = held {
             drop(latest);
-            return Ok(body);
+            return Ok(served);
         }
         let computation = compute();
         tokio::spawn(async move {
             let answer = computation
                 .await
-                .and_then(|stats| Computed::of(&stats))
-                .map(|computed| latest.insert(computed).body.clone());
+                .and_then(Computed::of)
+                .map(|computed| latest.insert(computed).served.clone());
             drop(latest);
             answer
         })
@@ -142,8 +226,8 @@ impl StatsCache {
     }
 }
 
-impl Stats {
-    /// The answer from the store's aggregates: every chain the store holds,
+impl Report {
+    /// The answer from the store's rollups: every chain the snapshot read,
     /// each with its totals and its days.
     fn of(snapshot: StatsSnapshot) -> Result<Self, ApiError> {
         let mut chains = Tallies(
@@ -161,58 +245,60 @@ impl Stats {
         }
         let mut total = AllChains::default();
         let mut days = BTreeMap::new();
-        for row in snapshot.users {
-            match (row.chain_id, row.day) {
-                (Some(chain_id), Some(day)) => {
-                    let day = chains.chain(chain_id).day(day);
-                    day.new_users = row.new_users;
-                    day.activity.users = row.users;
+        for row in &snapshot.counts {
+            let chain = chains.chain(row.chain_id);
+            match (row.measure, row.day) {
+                (Measure::Users, Some(day)) => {
+                    let day = chain.day(day);
+                    day.new_users = row.new_wallets;
+                    day.activity.users = row.wallets;
                 }
-                (Some(chain_id), None) => chains.chain(chain_id).total.users = row.users,
-                (None, Some(day)) => {
-                    let all = AllChainsDay {
+                (Measure::Users, None) => chain.total.users = row.wallets,
+                (Measure::AllChainsUsers, Some(day)) => {
+                    let all = days.entry(day).or_insert(AllChainsDay {
                         day,
-                        users: row.users,
-                        new_users: row.new_users,
-                    };
-                    days.insert(day, all);
+                        users: 0,
+                        new_users: 0,
+                    });
+                    all.users += row.wallets;
+                    all.new_users += row.new_wallets;
                 }
-                (None, None) => total.users = row.users,
+                (Measure::AllChainsUsers, None) => total.users += row.wallets,
+                (Measure::Links, day) => {
+                    chain.span(day).links.push(PlatformLinks::of(row)?)
+                }
+                (Measure::Fees, day) => chain.span(day).registration_fees.add(row)?,
+                (Measure::Flow(flow), day) => chain.span(day).flows(flow).add(row)?,
             }
         }
-        for row in snapshot.links {
-            let links = PlatformLinks::of(&row);
-            chains.chain(row.chain_id).span(row.day).links.push(links);
-        }
-        for row in snapshot.fees {
-            let fees = FeesPaid::of(&row)?;
-            chains
-                .chain(row.chain_id)
-                .span(row.day)
-                .registration_fees
-                .push(fees);
-        }
-        for row in snapshot.escrow {
-            let kind: EventKind = row.kind.parse().map_err(ApiError::internal)?;
-            chains
-                .chain(row.flow.chain_id)
-                .span(row.flow.day)
-                .escrow
-                .flows(kind)?
-                .add(&row.flow)?;
-        }
-        for row in snapshot.onboarding_claims {
-            chains
-                .chain(row.chain_id)
-                .span(row.day)
-                .onboarding_claims
-                .add(&row)?;
-        }
-        Ok(Self {
-            computed_at: snapshot.taken_at,
-            total,
+        let mut history = History {
             days: days.into_values().collect(),
-            chains: chains.0.into_values().map(ChainStats::from).collect(),
+            chains: BTreeMap::new(),
+        };
+        let chains = chains
+            .0
+            .into_values()
+            .map(|mut tally| {
+                tally.total.settle();
+                let days = tally.days.into_values().map(|mut day| {
+                    day.activity.settle();
+                    day
+                });
+                history.chains.insert(tally.chain_id, days.collect());
+                ChainStats {
+                    chain_id: tally.chain_id,
+                    handles: tally.handles,
+                    total: tally.total,
+                }
+            })
+            .collect();
+        Ok(Self {
+            stats: Stats {
+                computed_at: snapshot.taken_at,
+                total,
+                chains,
+            },
+            history,
         })
     }
 }
@@ -267,29 +353,26 @@ impl Tally {
     }
 }
 
-impl From<Tally> for ChainStats {
-    fn from(tally: Tally) -> Self {
-        Self {
-            chain_id: tally.chain_id,
-            handles: tally.handles,
-            total: tally.total,
-            days: tally.days.into_values().collect(),
+impl Activity {
+    /// The flows a row of `flow` counts in.
+    fn flows(&mut self, flow: Flow) -> &mut TokenFlows {
+        match flow {
+            Flow::Deposited => &mut self.escrow.deposits,
+            Flow::Forwarded => &mut self.escrow.forwards,
+            Flow::Claimed => &mut self.escrow.claims,
+            Flow::Refunded => &mut self.escrow.refunds,
+            Flow::Onboarding => &mut self.onboarding_claims,
         }
     }
-}
 
-impl EscrowActivity {
-    /// The flows an escrow event of `kind` counts in.
-    fn flows(&mut self, kind: EventKind) -> Result<&mut TokenFlows, ApiError> {
-        match kind {
-            EventKind::Deposited => Ok(&mut self.deposits),
-            EventKind::Forwarded => Ok(&mut self.forwards),
-            EventKind::Claimed => Ok(&mut self.claims),
-            EventKind::Refunded => Ok(&mut self.refunds),
-            other => Err(ApiError::internal(format_args!(
-                "escrow statistics of a {other} row"
-            ))),
+    /// Once every row is in: `other` only where the tokens or receivers
+    /// nobody named moved or were paid.
+    fn settle(&mut self) {
+        for flow in Flow::ALL {
+            let flows = self.flows(flow);
+            flows.other = flows.other.take().filter(|other| other.count > 0);
         }
+        self.registration_fees.settle();
     }
 }
 
@@ -304,61 +387,120 @@ impl PlatformHandles {
     }
 }
 
-impl PlatformLinks {
-    fn of(row: &LinksRow) -> Self {
-        Self {
-            platform: Platform::known_of(row.platform_id),
-            platform_id: row.platform_id,
-            count: row.count,
-            holders: row.holders,
-        }
-    }
+/// A rollup row's parts, as the wire names them.
+trait Parts {
+    /// The key, as the type the measure keys by.
+    fn key_as<K: for<'a> TryFrom<&'a [u8]>>(&self) -> Result<K, ApiError>;
+    /// The amount.
+    fn amount_of(&self) -> Result<U512, ApiError>;
 }
 
-impl FeesPaid {
-    fn of(row: &FeesRow) -> Result<Self, ApiError> {
-        let amount = row.amount().ok_or_else(|| {
+impl Parts for CountRow {
+    fn key_as<K: for<'a> TryFrom<&'a [u8]>>(&self) -> Result<K, ApiError> {
+        K::try_from(&self.key).map_err(|_| {
             ApiError::internal(format_args!(
-                "fees to {} on chain {}: amount {:?}",
-                row.receiver, row.chain_id, row.amount
+                "{} on chain {}: key 0x{}",
+                self.measure.as_str(),
+                self.chain_id,
+                alloy::hex::encode(&self.key)
             ))
-        })?;
-        Ok(Self {
-            receiver: row.receiver,
-            count: row.count,
-            amount,
+        })
+    }
+
+    fn amount_of(&self) -> Result<U512, ApiError> {
+        self.amount().ok_or_else(|| {
+            ApiError::internal(format_args!(
+                "{} on chain {}: amount {:?}",
+                self.measure.as_str(),
+                self.chain_id,
+                self.amount
+            ))
         })
     }
 }
 
-impl TokenFlows {
-    /// Count `row`: under its token, or under `other` when it names none.
-    fn add(&mut self, row: &TokenFlowRow) -> Result<(), ApiError> {
-        match row.token {
-            Some(token) => self.tokens.push(TokenFlow::of(token, row)?),
-            None => {
-                self.other = Some(OtherTokens {
+impl PlatformLinks {
+    fn of(row: &CountRow) -> Result<Self, ApiError> {
+        let platform_id: B256 = row.key_as()?;
+        Ok(Self {
+            platform: Platform::known_of(platform_id),
+            platform_id,
+            count: row.count,
+            holders: row.wallets,
+        })
+    }
+}
+
+impl FeesPaid {
+    fn of(row: &CountRow) -> Result<Self, ApiError> {
+        Ok(Self {
+            receiver: row.key_as()?,
+            count: row.count,
+            amount: row.amount_of()?,
+        })
+    }
+}
+
+impl RegistrationFees {
+    /// Count `row`: under its receiver, or, when it names none, as every
+    /// receiver's fees, which `other` holds until `settle`.
+    fn add(&mut self, row: &CountRow) -> Result<(), ApiError> {
+        match row.key.is_empty() {
+            true => {
+                self.other = Some(OtherFees {
                     count: row.count,
-                    wallets: row.wallets,
+                    amount: row.amount_of()?,
                 })
             }
+            false => self.receivers.push(FeesPaid::of(row)?),
         }
+        Ok(())
+    }
+
+    /// Once every row is in: `other` holds every receiver's fees less the
+    /// listed receivers', and only when there were any. The listed rows are
+    /// part of every receiver's, from the same snapshot, so neither
+    /// difference goes below zero.
+    fn settle(&mut self) {
+        let (count, amount) =
+            self.receivers
+                .iter()
+                .fold((0, U512::ZERO), |(count, amount), paid| {
+                    (count + paid.count, amount.saturating_add(paid.amount))
+                });
+        self.other = self
+            .other
+            .take()
+            .map(|every| OtherFees {
+                count: every.count - count,
+                amount: every.amount.saturating_sub(amount),
+            })
+            .filter(|other| other.count > 0);
+    }
+}
+
+impl TokenFlows {
+    /// Count `row`: under its token, or, when it names none, as every
+    /// token's movements, which `other` holds less the named tokens'.
+    fn add(&mut self, row: &CountRow) -> Result<(), ApiError> {
+        let unnamed = match row.key.is_empty() {
+            true => row.count,
+            false => {
+                self.tokens.push(TokenFlow::of(row)?);
+                -row.count
+            }
+        };
+        self.other.get_or_insert(OtherTokens { count: 0 }).count += unnamed;
         Ok(())
     }
 }
 
 impl TokenFlow {
-    fn of(token: Address, row: &TokenFlowRow) -> Result<Self, ApiError> {
-        let amount = row.amount().ok_or_else(|| {
-            ApiError::internal(format_args!(
-                "{token} flows on chain {}: amount {:?}",
-                row.chain_id, row.amount
-            ))
-        })?;
+    fn of(row: &CountRow) -> Result<Self, ApiError> {
         Ok(Self {
-            token,
+            token: row.key_as()?,
             count: row.count,
-            amount,
+            amount: row.amount_of()?,
             wallets: row.wallets,
         })
     }
@@ -378,28 +520,28 @@ mod tests {
 
     use super::*;
     use crate::db::{
+        Listing,
         Store,
         MIGRATOR,
     };
 
-    fn answer(computed_at: i64) -> Stats {
+    fn stats(computed_at: i64) -> Stats {
         Stats {
             computed_at,
             total: AllChains::default(),
-            days: Vec::new(),
             chains: Vec::new(),
         }
     }
 
-    /// The answer a cached body serves.
-    trait Served {
+    /// The totals a cached answer serves.
+    trait Totals {
         fn served(self) -> Stats;
     }
 
-    impl Served for Result<Bytes, ApiError> {
+    impl Totals for Result<Served, ApiError> {
         fn served(self) -> Stats {
-            let body = self.ok().expect("an answer");
-            serde_json::from_slice(&body).expect("a stats answer")
+            let served = self.ok().expect("an answer");
+            serde_json::from_slice(&served.body).expect("a stats answer")
         }
     }
 
@@ -415,13 +557,13 @@ mod tests {
                 let computation = computations.fetch_add(1, Ordering::SeqCst);
                 // The other requests are polled while this one computes.
                 tokio::task::yield_now().await;
-                Ok(answer(computation))
+                Ok(stats(computation))
             })
         }))
         .await;
         assert_eq!(computations.load(Ordering::SeqCst), 1);
         for body in answers {
-            assert_eq!(body.served(), answer(0));
+            assert_eq!(body.served(), stats(0));
         }
     }
 
@@ -435,16 +577,16 @@ mod tests {
         let first = cache.get(|| async move {
             started.send(()).expect("the test waits for the start");
             finishes.await.expect("the test lets it finish");
-            Ok(answer(0))
+            Ok(stats(0))
         });
         // axum drops a request's future when its client disconnects.
         tokio::select! {
             _ = first => panic!("the computation finished before it was let go"),
             started = has_started => started.expect("the computation started"),
         }
-        let second = cache.get(|| async { Ok(answer(1)) });
+        let second = cache.get(|| async { Ok(stats(1)) });
         finish.send(()).expect("the computation still runs");
-        assert_eq!(second.await.served(), answer(0));
+        assert_eq!(second.await.served(), stats(0));
     }
 
     /// A failed computation is not served: the next request computes.
@@ -455,8 +597,8 @@ mod tests {
             .get(|| async { Err(ApiError::internal("the database is down")) })
             .await;
         assert!(failed.is_err());
-        let body = cache.get(|| async { Ok(answer(1)) }).await;
-        assert_eq!(body.served(), answer(1));
+        let body = cache.get(|| async { Ok(stats(1)) }).await;
+        assert_eq!(body.served(), stats(1));
     }
 
     /// A computation past its deadline fails on the database and is not
@@ -471,18 +613,20 @@ mod tests {
         MIGRATOR.run(&pool).await.expect("migrations");
         let store = Store::new(pool.clone());
         let budget = Duration::from_secs(1);
-        // Another session holds the journal every aggregate reads, so the
+        // Another session holds the users' rollup the totals read, so the
         // computation waits on it until its deadline.
         let mut holder = pool.begin().await.expect("transaction");
-        sqlx::query("LOCK TABLE names.events IN ACCESS EXCLUSIVE MODE")
+        sqlx::query("LOCK TABLE names.stats_totals IN ACCESS EXCLUSIVE MODE")
             .execute(&mut *holder)
             .await
-            .expect("the journal locked");
+            .expect("the rollup locked");
         let cache = StatsCache::default();
         let waiting = store.clone();
         let started = Instant::now();
         let failed = cache
-            .get(|| async move { Stats::of(waiting.stats(&[], budget).await?) })
+            .get(|| async move {
+                Ok(Report::of(waiting.stats(&Listing::default(), budget).await?)?.stats)
+            })
             .await;
         let waited = started.elapsed();
         assert!(failed.is_err(), "the computation outlasted its deadline");
@@ -490,9 +634,11 @@ mod tests {
             waited >= budget && waited < 2 * budget,
             "stopped after {waited:?}"
         );
-        holder.rollback().await.expect("the journal free");
+        holder.rollback().await.expect("the rollup free");
         let served = cache
-            .get(|| async move { Stats::of(store.stats(&[], budget).await?) })
+            .get(|| async move {
+                Ok(Report::of(store.stats(&Listing::default(), budget).await?)?.stats)
+            })
             .await;
         assert!(served.is_ok(), "the next request computes again");
     }
@@ -503,7 +649,7 @@ mod tests {
         let at = Instant::now();
         let computed = Computed {
             at,
-            body: Bytes::new(),
+            served: Served { body: Bytes::new() },
         };
         assert!(computed.fresh(at));
         assert!(computed.fresh(at + STATS_TTL - Duration::from_secs(1)));

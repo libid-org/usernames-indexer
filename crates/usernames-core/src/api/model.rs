@@ -618,6 +618,24 @@ pub struct HandleHistory {
     pub next: Option<String>,
 }
 
+/// `GET /v1/history/chain/{chain}`: what happened on one chain, on one UTC
+/// day or over its whole journal, in one kind or one token when asked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainHistory {
+    /// Unix seconds, by the database's clock, of the snapshot the page
+    /// comes from.
+    pub computed_at: i64,
+    /// The chain asked about.
+    pub chain_id: i64,
+    /// The UTC day asked about, in unix seconds; absent for the whole journal.
+    pub day: Option<i64>,
+    /// Newest first: by block time, then block and log index.
+    pub entries: Vec<HistoryEntry>,
+    /// Pass as `before` for the next page; absent on the last one.
+    pub next: Option<String>,
+}
+
 /// One amount waiting in the escrow, and what it waits for.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -709,12 +727,16 @@ pub struct Unclaimed {
 }
 
 /// `GET /v1/stats`: what the chains this store holds recorded, chain by
-/// chain, and the users across them: totals and a series per UTC day.
-/// Every address counts. Amounts
+/// chain, and the users across them, since the index's first block; the
+/// same day by day is `GET /v1/stats/days`. Every address counts. Amounts
 /// are token units, never converted. Tokens are named only when they are
 /// the chain's own coin, EIP-7528 `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`,
 /// or a token the deployment lists (`STATS_TOKENS`); anybody can write a
 /// token, so every other one is counted under `other`, without an amount.
+/// Fee receivers are named only when the deployment lists them
+/// (`STATS_FEE_RECEIVERS`); a bind may name any receiver, so every other
+/// one is counted under `other`, with its amount, since every fee is paid
+/// in the chain's own coin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Stats {
@@ -724,9 +746,6 @@ pub struct Stats {
     /// The wallets across every chain the store holds: one that used
     /// several chains counts once.
     pub total: AllChains,
-    /// The same, day by day, oldest first; a day with nothing recorded is
-    /// absent.
-    pub days: Vec<AllChainsDay>,
     /// Every chain the store holds, by id; a chain with nothing recorded
     /// yet included.
     pub chains: Vec<ChainStats>,
@@ -763,9 +782,22 @@ pub struct ChainStats {
     pub handles: Vec<PlatformHandles>,
     /// Everything the chain recorded since the index's first block.
     pub total: Activity,
-    /// The same, day by day, oldest first; a day with nothing recorded is
-    /// absent.
-    pub days: Vec<DayActivity>,
+}
+
+/// `GET /v1/stats/days`: one page of the daily series, across every chain
+/// (`AllChainsDay`) or on the chain `?chain=` names (`DayActivity`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsDays<D> {
+    /// Unix seconds, by the database's clock, of the snapshot the page
+    /// comes from.
+    pub computed_at: i64,
+    /// The chain asked about; absent across every chain.
+    pub chain_id: Option<i64>,
+    /// Newest first; a day with nothing recorded is absent.
+    pub days: Vec<D>,
+    /// Pass as `before` for the next page; absent on the last one.
+    pub next: Option<String>,
 }
 
 /// The handles one platform has that resolve now.
@@ -792,8 +824,9 @@ pub struct Activity {
     pub users: i64,
     /// Bindings (`IdentityBound`) per platform, by platform id.
     pub links: Vec<PlatformLinks>,
-    /// Registration fees paid (`BindFeePaid`) per receiver, by address.
-    pub registration_fees: Vec<FeesPaid>,
+    /// Registration fees paid (`BindFeePaid`): per listed receiver, and
+    /// every other receiver's together.
+    pub registration_fees: RegistrationFees,
     /// What moved through `HandleEscrow`.
     pub escrow: EscrowActivity,
     /// Claims of deposits made to a handle nobody held, claimed by the
@@ -829,6 +862,17 @@ pub struct PlatformLinks {
     pub holders: i64,
 }
 
+/// Registration fees: per receiver the deployment lists, and every other
+/// receiver's together.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistrationFees {
+    /// The listed receivers paid, by address.
+    pub receivers: Vec<FeesPaid>,
+    /// Every other receiver's fees, together; absent when there were none.
+    pub other: Option<OtherFees>,
+}
+
 /// The registration fees one address was paid.
 #[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -836,6 +880,19 @@ pub struct PlatformLinks {
 pub struct FeesPaid {
     /// The fee receiver a binding named.
     pub receiver: Address,
+    /// Fees paid.
+    pub count: i64,
+    /// Their sum in the chain's own coin, base units, as a decimal string.
+    #[serde_as(as = "DisplayFromStr")]
+    pub amount: U512,
+}
+
+/// The registration fees of every receiver `/v1/stats` does not name,
+/// together: one sum, since every fee is in the chain's own coin.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OtherFees {
     /// Fees paid.
     pub count: i64,
     /// Their sum in the chain's own coin, base units, as a decimal string.
@@ -889,13 +946,11 @@ pub struct TokenFlow {
 }
 
 /// The movements of every token `/v1/stats` does not name, together: a
-/// count and wallets, but no amount, since a sum across tokens means
-/// nothing.
+/// count alone, since a sum across tokens means nothing and the wallets of
+/// any number of tokens cannot be read in a bounded time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OtherTokens {
     /// Movements.
     pub count: i64,
-    /// Distinct wallets that made them.
-    pub wallets: i64,
 }

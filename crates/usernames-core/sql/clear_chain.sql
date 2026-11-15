@@ -1,6 +1,7 @@
 -- Every row an indexer wrote for one chain into the read model, for a replay
 -- from the deployment block: the journal, the projections, the escrow's books
--- and the histories, in one statement.
+-- and the histories, in one statement. Its stats rollups go beside it
+-- (stats_clear.sql).
 WITH events AS (DELETE FROM names.events WHERE chain_id = $1),
      ids AS (DELETE FROM names.ids WHERE chain_id = $1),
      handles AS (DELETE FROM names.handles WHERE chain_id = $1),

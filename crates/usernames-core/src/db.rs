@@ -45,6 +45,7 @@ use crate::{
 };
 
 mod escrow;
+mod fold;
 mod history;
 mod journal;
 mod page;
@@ -55,6 +56,12 @@ mod referral;
 mod sql;
 mod stats;
 
+use self::fold::{
+    Fold,
+    JournalPosition,
+    Rollups,
+    FOLD_PAGE,
+};
 pub use self::{
     escrow::{
         ContributionRow,
@@ -63,8 +70,11 @@ pub use self::{
         UnclaimedCursor,
     },
     history::{
+        ChainEvents,
+        ChainEventsPage,
         HistoryCursor,
         HistoryRow,
+        SECONDS_PER_DAY,
     },
     journal::{
         EventColumns,
@@ -89,15 +99,17 @@ pub use self::{
         ReferrerRow,
     },
     stats::{
-        EscrowFlowRow,
-        FeesRow,
+        CountRow,
+        Flow,
         HandlesRow,
-        LinksRow,
-        ListedToken,
-        ListedTokenError,
+        ListedAddress,
+        ListedAddressError,
+        Listing,
+        Measure,
+        StatsDay,
+        StatsDays,
         StatsSnapshot,
-        TokenFlowRow,
-        UsersRow,
+        UnknownMeasure,
     },
 };
 
@@ -542,6 +554,17 @@ impl ChainStore {
                 .fetch_one(&mut *tx)
                 .await?;
             tx.commit().await?;
+            if self.fold_journal_page(lease, FOLD_PAGE).await? {
+                tracing::info!(
+                    chain_id = self.chain_id,
+                    "folding the journal into the stats rollups"
+                );
+                while self.fold_journal_page(lease, FOLD_PAGE).await? {}
+                tracing::info!(
+                    chain_id = self.chain_id,
+                    "the journal is folded into the stats rollups"
+                );
+            }
             return Ok(ChainWriter {
                 store: self.clone(),
                 writer,
@@ -561,6 +584,7 @@ impl ChainStore {
             .bind(self.chain_id)
             .execute(&mut *tx)
             .await?;
+        tx.clear_rollups(self.chain_id).await?;
         // The row starts over, so nothing it holds survives the replay unless
         // it is carried here: the deployment block, while the registry stays.
         sqlx::query(sql::FORGET_CHAIN)
@@ -586,6 +610,52 @@ impl ChainStore {
             store: self.clone(),
             writer,
         })
+    }
+
+    /// Fold the next `rows` rows of this chain's journal into the stats
+    /// rollups while they do not hold it whole: a journal written before
+    /// them. The page commits with how far the fold got, so a restart goes
+    /// on from there and never folds a row twice. On the writer lease's
+    /// session, like [`Self::prepare`], which folds every page before the
+    /// chain is indexed. `Ok(false)` once the rollups hold the journal whole.
+    pub(crate) async fn fold_journal_page(
+        &self,
+        lease: &mut WriterLease,
+        rows: i64,
+    ) -> Result<bool, sqlx::Error> {
+        assert_eq!(
+            lease.chain_id, self.chain_id,
+            "writer lease locks chain {}, but this store folds chain {}",
+            lease.chain_id, self.chain_id
+        );
+        let mut tx = lease.conn.begin().await?;
+        let folded: Option<JournalPosition> = sqlx::query_as(sql::STATS_BACKFILL)
+            .bind(self.chain_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(after) = folded else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+        let Some(through) = tx.page_end(self.chain_id, after, rows).await? else {
+            sqlx::query(sql::STATS_FOLDED)
+                .bind(self.chain_id)
+                .bind(true)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            return Ok(false);
+        };
+        tx.fold(self.chain_id, Fold::Page { after, through }, &Measure::ALL)
+            .await?;
+        sqlx::query(sql::STATS_BACKFILLED)
+            .bind(self.chain_id)
+            .bind(through.block_number)
+            .bind(through.log_index)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Declare the names this chain goes by in an ENS name, replacing whatever
@@ -659,7 +729,41 @@ impl ChainStore {
                 .await
                 .expect("the chain is forgotten");
         }
+        tx.clear_rollups(self.chain_id)
+            .await
+            .expect("the chain's rollups are cleared");
         tx.commit().await.expect("the chain is forgotten");
+    }
+
+    /// Clear the chain's stats rollups and mark its journal unfolded, as a
+    /// journal written before the rollups existed: the next
+    /// [`Self::prepare`] folds it page by page.
+    #[cfg(feature = "test-helpers")]
+    pub async fn unfold(&self) {
+        let mut tx = self.pool.begin().await.expect("a transaction");
+        tx.clear_rollups(self.chain_id)
+            .await
+            .expect("the chain's rollups are cleared");
+        sqlx::query(sql::STATS_FOLDED)
+            .bind(self.chain_id)
+            .bind(false)
+            .execute(&mut *tx)
+            .await
+            .expect("the journal is marked unfolded");
+        tx.commit().await.expect("the chain is unfolded");
+    }
+
+    /// Fold the first `rows` rows of an unfolded journal, as a first start
+    /// does, and stop there: a first start that ended between two pages.
+    #[cfg(feature = "test-helpers")]
+    pub async fn fold_one_page(&self, rows: i64) {
+        let mut lease = self.acquire_writer().await.expect("the writer lease");
+        let more = self
+            .fold_journal_page(&mut lease, rows)
+            .await
+            .expect("a page of the journal is folded");
+        assert!(more, "the journal had a page to fold");
+        lease.release().await.expect("the lease goes back");
     }
 
     /// Drop the chain's cursor and keep everything else: an index that
@@ -824,6 +928,8 @@ impl ChainWriter {
             tx,
             chain_id,
             bind: None,
+            fresh_blocks: Vec::new(),
+            fresh_logs: Vec::new(),
         })
     }
 }
@@ -862,6 +968,10 @@ pub struct Window {
     /// `CeremonyBound` and `BindFeePaid` follow its `IdentityBound` in the
     /// same transaction, and a window holds whole blocks.
     bind: Option<history::Bind>,
+    /// The blocks and log indexes of the journal rows this window added,
+    /// pairwise: what its commit folds into the stats rollups.
+    fresh_blocks: Vec<i64>,
+    fresh_logs: Vec<i64>,
 }
 
 impl Window {
@@ -869,6 +979,13 @@ impl Window {
     /// transaction: the cursor and the writes it stands for land together or
     /// not at all.
     pub async fn commit(mut self, through_block: u64) -> Result<(), ApplyError> {
+        if !self.fresh_blocks.is_empty() {
+            let fresh = Fold::Window {
+                blocks: &self.fresh_blocks,
+                logs: &self.fresh_logs,
+            };
+            self.tx.fold(self.chain_id, fresh, &Measure::ALL).await?;
+        }
         sqlx::query(sql::SET_CURSOR)
             .bind(self.chain_id)
             .bind(as_i64(through_block, "block")?)
@@ -903,6 +1020,8 @@ impl Window {
             // idempotency gate for everything.
             return Ok(false);
         }
+        self.fresh_blocks.push(at.block);
+        self.fresh_logs.push(at.log_index);
 
         match event {
             NamesEvent::IdentityBound {
