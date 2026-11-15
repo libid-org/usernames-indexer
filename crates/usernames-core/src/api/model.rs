@@ -97,6 +97,7 @@ pub struct ErrorDetail {
 }
 
 /// One chain the store holds, as its indexer last left it.
+#[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChainStatus {
@@ -138,6 +139,11 @@ pub struct ChainStatus {
     /// `ProofVerifierConfigured`: the one contract that checks every claim
     /// on this chain. Absent until the indexer has seen one.
     pub proof_verifier: Option<Address>,
+    /// What a bind through `referral_splitter` pays, in wei as a decimal
+    /// string, from its last `FeeSet`: exactly this, with a referral or
+    /// without. Absent until the indexer has seen one.
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub bind_fee: Option<U256>,
 }
 
 /// `GET /v1/status`: every chain the store holds. Empty on a database no
@@ -443,6 +449,10 @@ pub enum HistoryEvent {
         share: U256,
         outcome: Outcome,
     },
+    BindFeeSet {
+        #[serde_as(as = "DisplayFromStr")]
+        fee: U256,
+    },
 }
 
 /// The wire's copy of a journaled event: the same fields, so a client reads
@@ -604,6 +614,7 @@ impl From<NamesEvent> for HistoryEvent {
                 share,
                 outcome,
             },
+            NamesEvent::BindFeeSet { fee } => Self::BindFeeSet { fee },
         }
     }
 }

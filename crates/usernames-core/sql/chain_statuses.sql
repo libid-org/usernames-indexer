@@ -2,7 +2,7 @@
 SELECT c.chain_id, c.indexer_version, c.contract, c.escrow, c.referral_splitter, c.deploy_block,
        c.cursor, c.head, c.target, c.reported_at,
        c.valid_until - EXTRACT(EPOCH FROM now())::bigint AS valid_for,
-       c.window_error, c.proof_verifier,
+       c.window_error, c.proof_verifier, c.bind_fee::text AS bind_fee,
        COALESCE(n.names, '{}') AS names
 FROM names.chains c
 LEFT JOIN LATERAL (

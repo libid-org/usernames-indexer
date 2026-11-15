@@ -263,6 +263,7 @@ impl ChainStatus {
     fn of(row: ChainStatusRow) -> Self {
         let ChainStatusRow { state, names } = row;
         let position = state.position();
+        let bind_fee = state.bind_fee();
         Self {
             chain_id: state.chain_id,
             names,
@@ -276,6 +277,7 @@ impl ChainStatus {
             report_valid_for: position.valid_for_seconds(),
             last_window_error: state.window_error,
             proof_verifier: state.proof_verifier,
+            bind_fee,
         }
     }
 }

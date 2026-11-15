@@ -233,6 +233,7 @@ impl Shape for AddressHistory {
                     HistoryEvent::Claimed { .. } => EventKind::Claimed,
                     HistoryEvent::Refunded { .. } => EventKind::Refunded,
                     HistoryEvent::Referred { .. } => EventKind::Referred,
+                    HistoryEvent::BindFeeSet { .. } => EventKind::BindFeeSet,
                 };
                 (
                     kind,

@@ -148,6 +148,9 @@ pub struct ChainState {
     pub window_error: Option<String>,
     /// The Proof Verifier the registry was last pointed at.
     pub proof_verifier: Option<Address>,
+    /// What a bind through the referral splitter pays, as its last `FeeSet`
+    /// set it, in decimal.
+    pub bind_fee: Option<String>,
 }
 
 impl ChainState {
@@ -161,6 +164,12 @@ impl ChainState {
     pub fn deploy_block_of(&self, contract: Address) -> Option<i64> {
         self.deploy_block
             .filter(|_| self.contract == Some(contract))
+    }
+
+    /// What a bind through the referral splitter pays, once a `FeeSet` was
+    /// indexed.
+    pub fn bind_fee(&self) -> Option<U256> {
+        self.bind_fee.as_deref().and_then(|fee| fee.parse().ok())
     }
 
     /// Where the index stands.
@@ -1013,6 +1022,14 @@ impl Window {
                 sqlx::query(sql::SET_PROOF_VERIFIER)
                     .bind(chain_id)
                     .bind(verifier)
+                    .execute(&mut *self.tx)
+                    .await?;
+            }
+
+            NamesEvent::BindFeeSet { fee } => {
+                sqlx::query(sql::SET_BIND_FEE)
+                    .bind(chain_id)
+                    .bind(fee.to_string())
                     .execute(&mut *self.tx)
                     .await?;
             }

@@ -28,6 +28,7 @@ use usernames_core::{
         EscrowAmount,
         HandleAmounts,
         Outcome,
+        Status,
     },
     chain::{
         self,
@@ -50,6 +51,7 @@ use usernames_fixtures::{
         Node,
         Proof,
         Transacts,
+        BIND_FEE,
         SHARE_BPS,
         TREASURY,
     },
@@ -65,12 +67,9 @@ const CHAIN: u64 = 43118;
 /// the splitter holds on the indexed chain waits for that holder there.
 const SEEDED_CHAIN: i64 = 43119;
 
-/// What each bind pays, above the splitter's minimum for a referral.
-const FEE: u64 = 10_000;
-
-/// The share of [`FEE`] at the splitter's rate.
+/// The share of [`BIND_FEE`] at the splitter's rate.
 fn share() -> U256 {
-    U256::from(FEE) * U256::from(SHARE_BPS) / U256::from(10_000u64)
+    U256::from(BIND_FEE) * U256::from(SHARE_BPS) / U256::from(10_000u64)
 }
 
 /// What the suite compares of a referrer's referrals.
@@ -113,7 +112,7 @@ async fn indexes_the_splitters_referrals_and_reconciles_them() {
     };
     let mut libid = Libid::deploy(provider, owner).await;
     let (x, google) = (KnownPlatform::X, KnownPlatform::Google);
-    let fee = U256::from(FEE);
+    let fee = U256::from(BIND_FEE);
     let proof = |handle, id| Proof {
         handle,
         id,
@@ -155,6 +154,10 @@ async fn indexes_the_splitters_referrals_and_reconciles_them() {
     libid
         .bind_referred(dave, proof(Handle(x, "dave_a"), "444"), erin_r, fee)
         .await;
+
+    // The owner doubles the price after the binds that paid the old one.
+    let price = fee * U256::from(2u64);
+    libid.set_bind_fee(price).await;
 
     let latest = provider.get_block_number().await.expect("latest");
     provider.anvil_mine(Some(1), None).await.expect("mine");
@@ -268,6 +271,17 @@ async fn indexes_the_splitters_referrals_and_reconciles_them() {
         fee * U256::from(4u64) - share() * U256::from(2u64)
     );
     assert_eq!(libid.balance(*libid.splitter.address()).await, U256::ZERO);
+
+    // The status shows the price the splitter charges now, from its last
+    // `FeeSet`.
+    let status: Status = pool.get("/v1/status").await.answer();
+    let indexed = status
+        .chains
+        .iter()
+        .find(|c| c.chain_id == chain_id as i64)
+        .expect("the indexed chain");
+    assert_eq!(indexed.bind_fee, Some(price));
+    assert_eq!(libid.splitter.fee().call().await.expect("fee()"), price);
 }
 
 /// A splitter is followed only beside the escrow it pays through, of the

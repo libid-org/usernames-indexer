@@ -7,8 +7,11 @@
 -- added NOT VALID, so no row is read under the lock; 006 validates it.
 SET LOCAL lock_timeout = '5s';
 
--- The ReferralSplitter the chain's indexer watches, beside its escrow.
-ALTER TABLE names.chains ADD COLUMN IF NOT EXISTS referral_splitter BYTEA;
+-- The ReferralSplitter the chain's indexer watches, beside its escrow, and
+-- what a bind through it pays, from its last `FeeSet`.
+ALTER TABLE names.chains
+    ADD COLUMN IF NOT EXISTS referral_splitter BYTEA,
+    ADD COLUMN IF NOT EXISTS bind_fee          NUMERIC(78,0);
 
 -- A `referred` row keeps the bind in the columns a bind's fee uses: the
 -- bound handle in `handle_node` and `platform_id`, the binder in `holder`,
@@ -23,7 +26,7 @@ ALTER TABLE names.events ADD CONSTRAINT events_kind_check CHECK (kind IN (
     'identity_bound', 'handle_revealed', 'handle_published', 'handle_retired',
     'handle_unpublished', 'proof_verifier_configured', 'ceremony_bound',
     'bind_fee_paid', 'deposited', 'forwarded', 'claimed', 'refunded',
-    'referred'
+    'referred', 'bind_fee_set'
 )) NOT VALID;
 
 -- One row per `Referred`: a bind that named a referrer and what the

@@ -185,6 +185,10 @@ impl EventColumns {
                 refundable_at: Some(as_i64(*refundable_at, "refundableAt")?),
                 ..base
             },
+            NamesEvent::BindFeeSet { fee } => Self {
+                amount: text(fee),
+                ..base
+            },
             // In the columns a bind's fee uses, beside the referrer's own.
             NamesEvent::Referred {
                 referrer_node,
@@ -436,6 +440,9 @@ impl TryFrom<&EventColumns> for NamesEvent {
                 share: row.number(&row.share, "share")?,
                 outcome: row.need(row.outcome.as_deref(), "outcome")?.parse()?,
             },
+            EventKind::BindFeeSet => Self::BindFeeSet {
+                fee: row.number(&row.amount, "amount")?,
+            },
         })
     }
 }
@@ -578,6 +585,7 @@ mod tests {
                 },
                 Some(alice),
             ),
+            (NamesEvent::BindFeeSet { fee: U256::MAX }, None),
         ];
         for (event, handle_node) in events {
             let row = EventColumns::of(&event, handle_node).unwrap();

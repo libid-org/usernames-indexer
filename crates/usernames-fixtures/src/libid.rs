@@ -85,8 +85,9 @@ pub const TREASURY: Address = Address::repeat_byte(0x7E);
 /// The referrer's part of a referred fee, in basis points.
 pub const SHARE_BPS: u16 = 3_000;
 
-/// The smallest fee that pays a referrer: below it the treasury takes all.
-pub const MIN_REFERRAL_FEE: u64 = 1_000;
+/// What a bind through the splitter pays as deployed: exactly this, with a
+/// referral or without.
+pub const BIND_FEE: u64 = 10_000;
 
 /// Runtime code that reverts every call: a holder wallet that refuses
 /// payment (`PUSH0 PUSH0 REVERT`).
@@ -381,6 +382,13 @@ impl Libid {
             .value(fee)
     }
 
+    /// The splitter's owner sets what a bind through it pays; the block the
+    /// change landed in.
+    pub async fn set_bind_fee(&self, fee: U256) -> u64 {
+        let request = self.splitter.setFee(fee).into_transaction_request();
+        self.send(request).await
+    }
+
     /// `holder` becomes a wallet that refuses every payment, as a contract
     /// wallet that reverts on receipt does.
     pub async fn refuse_payments(&self, holder: Address) {
@@ -575,7 +583,7 @@ impl Transacts for DynProvider {
             owner_: owner,
             treasury_: TREASURY,
             shareBps_: SHARE_BPS,
-            minReferralFee_: U256::from(MIN_REFERRAL_FEE),
+            fee_: U256::from(BIND_FEE),
         }
         .abi_encode();
         let bytecode = ARTIFACTS

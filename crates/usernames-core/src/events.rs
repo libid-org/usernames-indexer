@@ -138,6 +138,9 @@ pub enum NamesEvent {
         share: U256,
         outcome: Outcome,
     },
+    /// The referral splitter set what a bind through it pays: exactly `fee`,
+    /// with a referral or without.
+    BindFeeSet { fee: U256 },
 }
 
 /// What became of a referrer's share, as the splitter logs it.
@@ -413,6 +416,8 @@ pub enum EventKind {
     Refunded,
     /// [`NamesEvent::Referred`].
     Referred,
+    /// [`NamesEvent::BindFeeSet`].
+    BindFeeSet,
 }
 
 /// A stored kind this build does not know.
@@ -422,7 +427,7 @@ pub struct UnknownKind(String);
 
 impl EventKind {
     /// Every kind, so a stored name parses back by the same table.
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 14] = [
         Self::IdentityBound,
         Self::HandleRevealed,
         Self::HandlePublished,
@@ -436,6 +441,7 @@ impl EventKind {
         Self::Claimed,
         Self::Refunded,
         Self::Referred,
+        Self::BindFeeSet,
     ];
 
     /// The name the journal stores.
@@ -454,6 +460,7 @@ impl EventKind {
             Self::Claimed => "claimed",
             Self::Refunded => "refunded",
             Self::Referred => "referred",
+            Self::BindFeeSet => "bind_fee_set",
         }
     }
 }
@@ -489,6 +496,7 @@ impl NamesEvent {
             Self::BindFeePaid { .. } => EventKind::BindFeePaid,
             Self::Escrow(event) => event.kind(),
             Self::Referred { .. } => EventKind::Referred,
+            Self::BindFeeSet { .. } => EventKind::BindFeeSet,
         }
     }
 
@@ -510,7 +518,8 @@ impl NamesEvent {
             Self::HandleUnpublished { .. }
             | Self::ProofVerifierConfigured { .. }
             | Self::CeremonyBound { .. }
-            | Self::BindFeePaid { .. } => None,
+            | Self::BindFeePaid { .. }
+            | Self::BindFeeSet { .. } => None,
         }
     }
 
@@ -527,9 +536,9 @@ impl NamesEvent {
                 vec![(*holder, Role::PreviousHandleHolder)]
             }
             Self::BindFeePaid { receiver, .. } => vec![(*receiver, Role::FeeReceiver)],
-            Self::HandleRevealed { .. } | Self::ProofVerifierConfigured { .. } => {
-                Vec::new()
-            }
+            Self::HandleRevealed { .. }
+            | Self::ProofVerifierConfigured { .. }
+            | Self::BindFeeSet { .. } => Vec::new(),
             Self::Escrow(event) => event.parties(),
         }
     }
@@ -880,26 +889,32 @@ impl NamesEvent {
     }
 
     /// Decode one log from the `ReferralSplitter`, under the same rules as
-    /// [`Self::from_registry`]. Only `Referred` is read: the settings change
-    /// what later referrals pay, which their own events carry, and an expired
-    /// share comes back through the escrow's `Refunded`.
+    /// [`Self::from_registry`]: `Referred` and `FeeSet`. The share and the
+    /// treasury change what later referrals pay, which their own events carry,
+    /// and an expired share comes back through the escrow's `Refunded`.
     pub fn from_splitter(log: &Log) -> Result<Option<(Self, LogPosition)>, DecodeError> {
         let position = LogPosition::of(log)?;
-        if log.topic0() != Some(&ReferralSplitter::Referred::SIGNATURE_HASH) {
+        let Some(topic0) = log.topic0() else {
             return Ok(None);
-        }
-        let d: ReferralSplitter::Referred = log.payload("Referred")?;
-        let outcome = Outcome::of(d.outcome)?;
-        let event = NamesEvent::Referred {
-            referrer_node: d.referrerNode,
-            binder: d.binder,
-            session_id: d.sessionId,
-            referrer_platform_id: d.referrerPlatformId,
-            platform_id: d.platformId,
-            handle_node: d.handleNode,
-            fee: d.fee,
-            share: d.share,
-            outcome,
+        };
+        let event = if *topic0 == ReferralSplitter::Referred::SIGNATURE_HASH {
+            let d: ReferralSplitter::Referred = log.payload("Referred")?;
+            NamesEvent::Referred {
+                referrer_node: d.referrerNode,
+                binder: d.binder,
+                session_id: d.sessionId,
+                referrer_platform_id: d.referrerPlatformId,
+                platform_id: d.platformId,
+                handle_node: d.handleNode,
+                fee: d.fee,
+                share: d.share,
+                outcome: Outcome::of(d.outcome)?,
+            }
+        } else if *topic0 == ReferralSplitter::FeeSet::SIGNATURE_HASH {
+            let d: ReferralSplitter::FeeSet = log.payload("FeeSet")?;
+            NamesEvent::BindFeeSet { fee: d.fee }
+        } else {
+            return Ok(None);
         };
         Ok(Some((event, position)))
     }
@@ -1170,6 +1185,32 @@ mod tests {
             ReferralSplitter::Referred::SIGNATURE_HASH,
             b256!("5a7143a89e5ba1b9f91f71af11ac6db2ff16743bc25391994d13a8866478f47a")
         );
+        assert_eq!(
+            ReferralSplitter::FeeSet::SIGNATURE_HASH,
+            b256!("20461e09b8e557b77e107939f9ce6544698123aad0fc964ac5cc59b7df2e608f")
+        );
+    }
+
+    #[test]
+    fn a_fee_set_decodes_as_the_bind_fee() {
+        let log = mined(
+            ReferralSplitter::FeeSet {
+                fee: U256::from(7u64),
+            }
+            .encode_log_data(),
+        );
+        let (event, _) = NamesEvent::from_splitter(&log)
+            .unwrap()
+            .expect("a known topic");
+        assert_eq!(
+            event,
+            NamesEvent::BindFeeSet {
+                fee: U256::from(7u64)
+            }
+        );
+        assert_eq!(event.kind(), EventKind::BindFeeSet);
+        assert!(event.parties().is_empty());
+        assert_eq!(event.handle_node(), None);
     }
 
     #[test]

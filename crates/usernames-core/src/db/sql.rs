@@ -14,6 +14,7 @@ pub const SET_CURSOR: &str = include_str!("../../sql/set_cursor.sql");
 pub const SET_CHAIN_HEAD: &str = include_str!("../../sql/set_chain_head.sql");
 pub const SET_DEPLOY_BLOCK: &str = include_str!("../../sql/set_deploy_block.sql");
 pub const SET_PROOF_VERIFIER: &str = include_str!("../../sql/set_proof_verifier.sql");
+pub const SET_BIND_FEE: &str = include_str!("../../sql/set_bind_fee.sql");
 pub const SET_WINDOW_ERROR: &str = include_str!("../../sql/set_window_error.sql");
 #[cfg(feature = "test-helpers")]
 pub const SET_VALID_UNTIL: &str = include_str!("../../sql/set_valid_until.sql");

@@ -191,7 +191,8 @@ impl Window {
 
             NamesEvent::Escrow(EscrowEvent::Refunded { .. }) => {}
 
-            NamesEvent::ProofVerifierConfigured { .. } => {}
+            NamesEvent::ProofVerifierConfigured { .. }
+            | NamesEvent::BindFeeSet { .. } => {}
         }
 
         Ok(involvement)
