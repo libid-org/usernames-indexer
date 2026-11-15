@@ -192,8 +192,9 @@ impl Referrals {
             .answer()
     }
 
-    /// Per chain, the coin `holder` may claim and that awaits it, as
-    /// `(chain, claimable, awaiting)`.
+    /// Per chain of this suite, the coin `holder` may claim and that awaits
+    /// it, as `(chain, claimable, awaiting)`: the answer spans every chain,
+    /// and other suites' chains may hold slots for the same address.
     async fn totals(&self, holder: Address) -> Vec<(i64, u64, u64)> {
         let totals: AddressTotals = self
             .suite
@@ -204,6 +205,7 @@ impl Referrals {
         totals
             .chains
             .iter()
+            .filter(|chain| [CHAIN, OTHER_CHAIN].contains(&chain.chain_id))
             .flat_map(|chain| {
                 chain.tokens.iter().map(|token| {
                     (

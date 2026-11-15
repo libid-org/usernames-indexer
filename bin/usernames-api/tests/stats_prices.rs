@@ -103,11 +103,14 @@ static SUITE: Mutex<()> = Mutex::const_new(());
 /// The chain's own coin, as the escrow names it (EIP-7528).
 const NATIVE: Address = address!("EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
 const USDC: Address = Address::repeat_byte(0x05);
+/// Priced, and sorted between `USDC` and `JUNK`.
+const DAI: Address = Address::repeat_byte(0x07);
 const JUNK: Address = Address::repeat_byte(0x0B);
 
 const SENDER: Address = Address::repeat_byte(0x51);
 const PAYER: Address = Address::repeat_byte(0x52);
-const HOLDER: Address = Address::repeat_byte(0xA1);
+/// Owned by this suite alone: totals read every chain.
+const HOLDER: Address = Address::repeat_byte(0xA5);
 
 const ETHER: u64 = 1_000_000_000_000_000_000;
 const DAY: i64 = 24 * 60 * 60;
@@ -691,9 +694,13 @@ async fn totals_are_valued_at_the_served_prices() {
     let oldest = ether_price.timestamp;
     mock.price(NATIVE, ether_price);
     mock.price(USDC, Coin::priced(0.9998, 6, "USDC"));
+    mock.price(DAI, Coin::priced(1.0, 18, "DAI"));
+    // DAI is priced but held in no slot: its seek finds nothing, not the
+    // junk token above it.
     let deposits = vec![
         NamesEvent::deposited(NATIVE, SENDER, ether(15)),
         NamesEvent::deposited(USDC, PAYER, U256::from(1_234_567u64)),
+        NamesEvent::forwarded(DAI, PAYER, U256::from(3u64)),
         NamesEvent::deposited(JUNK, SENDER, U256::from(5u64)),
     ];
     suite.apply_tx(10, deposits).await;
