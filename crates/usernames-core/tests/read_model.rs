@@ -2,9 +2,7 @@
 //! apply path the indexer uses, and the assertions go through the same axum
 //! handlers a caller would hit.
 //!
-//! Tests skip silently when `DATABASE_URL` is unset — that is the only
-//! legitimate reason. Everything past that check panics on failure, so a
-//! broken migration cannot masquerade as "no database around".
+//! Runs against the Postgres at `DATABASE_URL`, and fails without it.
 
 mod proxy;
 
@@ -88,11 +86,10 @@ struct Chains {
 }
 
 impl Chains {
-    /// The suite's chains, emptied, over a pool of `connections`; `None`
-    /// when `DATABASE_URL` is unset.
-    async fn open(connections: u32) -> Option<Self> {
+    /// The suite's chains, emptied, over a pool of `connections`.
+    async fn open(connections: u32) -> Self {
         let lock = DB_LOCK.lock().await;
-        let url = database_url()?;
+        let url = database_url();
         let pool = PgPoolOptions::new()
             .max_connections(connections)
             .connect(&url)
@@ -102,11 +99,11 @@ impl Chains {
         for chain in [CHAIN, OTHER_CHAIN] {
             ChainStore::new(pool.clone(), chain).forget().await;
         }
-        Some(Self {
+        Self {
             store: ChainStore::new(pool.clone(), CHAIN),
             pool,
             lock,
-        })
+        }
     }
 
     /// The test is done with the database; the suite's next test may take it.
@@ -228,10 +225,7 @@ impl Seeded for ChainWriter {
 
 #[tokio::test]
 async fn bind_resolves_all_three_directions() {
-    let Some(chains) = Chains::open(1).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let chains = Chains::open(1).await;
     let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     let alice = Address::repeat_byte(0xA1);
@@ -281,10 +275,7 @@ async fn bind_resolves_all_three_directions() {
 
 #[tokio::test]
 async fn rename_retires_the_previous_handle() {
-    let Some(chains) = Chains::open(1).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let chains = Chains::open(1).await;
     let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     let alice = Address::repeat_byte(0xA1);
@@ -333,10 +324,7 @@ async fn rename_retires_the_previous_handle() {
 
 #[tokio::test]
 async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
-    let Some(chains) = Chains::open(1).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let chains = Chains::open(1).await;
     let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     let (alice, bob) = (Address::repeat_byte(0xA1), Address::repeat_byte(0xB2));
@@ -375,10 +363,7 @@ async fn takeover_repoints_the_handle_and_orphans_the_old_id() {
 /// under the new holder, whether that bind disclosed it or not.
 #[tokio::test]
 async fn a_takeover_keeps_the_disclosed_text() {
-    let Some(chains) = Chains::open(1).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let chains = Chains::open(1).await;
     let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     let (tom, uma, val) = (
@@ -471,10 +456,7 @@ async fn a_takeover_keeps_the_disclosed_text() {
 /// someone else too.
 #[tokio::test]
 async fn publishing_another_name_keeps_the_one_it_replaces_disclosed() {
-    let Some(chains) = Chains::open(1).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let chains = Chains::open(1).await;
     let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     let (alice, bob) = (Address::repeat_byte(0xD1), Address::repeat_byte(0xD2));
@@ -528,10 +510,7 @@ async fn publishing_another_name_keeps_the_one_it_replaces_disclosed() {
 /// still shows everywhere, histories included.
 #[tokio::test]
 async fn a_withdrawn_name_is_no_longer_published_but_still_shows() {
-    let Some(chains) = Chains::open(1).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let chains = Chains::open(1).await;
     let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     let alice = Address::repeat_byte(0xA1);
@@ -601,10 +580,7 @@ async fn a_withdrawn_name_is_no_longer_published_but_still_shows() {
 /// handle again moves the name back.
 #[tokio::test]
 async fn a_name_on_another_platform_replaces_the_one_before() {
-    let Some(chains) = Chains::open(1).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let chains = Chains::open(1).await;
     let writer = chains.store.writer().await;
     let (x, github) = (KnownPlatform::X, KnownPlatform::GitHub);
     let eve = Address::repeat_byte(0xE1);
@@ -667,10 +643,7 @@ async fn a_name_on_another_platform_replaces_the_one_before() {
 /// wherever it is, and the other platform's identity shows none either.
 #[tokio::test]
 async fn a_withdrawal_clears_the_name_whatever_its_platform() {
-    let Some(chains) = Chains::open(1).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let chains = Chains::open(1).await;
     let writer = chains.store.writer().await;
     let (x, github) = (KnownPlatform::X, KnownPlatform::GitHub);
     let eve = Address::repeat_byte(0xE2);
@@ -709,10 +682,7 @@ async fn a_withdrawal_clears_the_name_whatever_its_platform() {
 /// a name.
 #[tokio::test]
 async fn every_reveal_fills_one_map_and_sets_no_name() {
-    let Some(chains) = Chains::open(1).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let chains = Chains::open(1).await;
     let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     let (eve, fay) = (Address::repeat_byte(0xE3), Address::repeat_byte(0xE5));
@@ -752,10 +722,7 @@ async fn every_reveal_fills_one_map_and_sets_no_name() {
 
 #[tokio::test]
 async fn search_ranks_exact_prefix_substring() {
-    let Some(chains) = Chains::open(1).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let chains = Chains::open(1).await;
     let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     let github = KnownPlatform::GitHub;
@@ -959,10 +926,7 @@ async fn search_ranks_exact_prefix_substring() {
 
 #[tokio::test]
 async fn replay_converges_instead_of_duplicating() {
-    let Some(chains) = Chains::open(1).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let chains = Chains::open(1).await;
     let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     let alice = Address::repeat_byte(0xA1);
@@ -995,10 +959,7 @@ async fn replay_converges_instead_of_duplicating() {
 
 #[tokio::test]
 async fn unclaimed_names_on_a_configured_platform_are_coded_404s() {
-    let Some(chains) = Chains::open(1).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let chains = Chains::open(1).await;
     let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     // Something was bound on the platform — the branch the absent-platform
@@ -1035,10 +996,7 @@ async fn unclaimed_names_on_a_configured_platform_are_coded_404s() {
 
 #[tokio::test]
 async fn api_refuses_to_answer_before_the_first_window() {
-    let Some(chains) = Chains::open(1).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let chains = Chains::open(1).await;
     // No window ever committed: resolution must say "not synced", never an
     // authoritative-looking "not bound".
     let refusal = chains
@@ -1068,10 +1026,7 @@ async fn api_refuses_to_answer_before_the_first_window() {
 
 #[tokio::test]
 async fn a_nul_byte_in_a_query_is_refused_not_a_500() {
-    let Some(chains) = Chains::open(1).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let chains = Chains::open(1).await;
     let writer = chains.store.writer().await;
     writer
         .apply_tx(
@@ -1107,10 +1062,7 @@ async fn a_nul_byte_in_a_query_is_refused_not_a_500() {
 
 #[tokio::test]
 async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
-    let Some(chains) = Chains::open(1).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let chains = Chains::open(1).await;
     let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     let digest = B256::repeat_byte(0xD1);
@@ -1207,10 +1159,7 @@ async fn admin_events_land_in_ops_metadata_and_ceremony_events_bind_nothing() {
 
 #[tokio::test]
 async fn unbound_handle_and_impossible_text_name_their_codes() {
-    let Some(chains) = Chains::open(1).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let chains = Chains::open(1).await;
     let writer = chains.store.writer().await;
     let x = KnownPlatform::X;
     writer
@@ -1275,10 +1224,7 @@ async fn unbound_handle_and_impossible_text_name_their_codes() {
 /// result says which one it is from; `?chain=` narrows to one.
 #[tokio::test]
 async fn reads_span_every_chain_in_the_store_unless_one_is_named() {
-    let Some(chains) = Chains::open(1).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let chains = Chains::open(1).await;
     let writer = chains.store.writer().await;
     let other = ChainStore::new(chains.pool.clone(), OTHER_CHAIN)
         .writer()
@@ -1383,9 +1329,7 @@ fn a_contract() -> Address {
 
 #[tokio::test]
 async fn preparing_an_unchanged_chain_keeps_everything() {
-    let Some(chains) = Chains::open(2).await else {
-        return;
-    };
+    let chains = Chains::open(2).await;
     let mut lease = chains.store.acquire_writer().await.expect("lease");
     let writer = chains
         .store
@@ -1434,9 +1378,7 @@ async fn preparing_an_unchanged_chain_keeps_everything() {
 async fn watching_another_contract_clears_the_chain() {
     // The old contract's bindings are not the new contract's bindings, so
     // inheriting them would answer for an account nobody bound here.
-    let Some(chains) = Chains::open(2).await else {
-        return;
-    };
+    let chains = Chains::open(2).await;
     let mut lease = chains.store.acquire_writer().await.expect("lease");
     let writer = chains
         .store
@@ -1504,9 +1446,7 @@ async fn the_deployment_block_survives_a_replay_of_the_same_registry() {
     // A replay restarts from the registry's deployment block; losing it would
     // re-run the binary search over the whole chain. Another registry has
     // another deployment block.
-    let Some(chains) = Chains::open(2).await else {
-        return;
-    };
+    let chains = Chains::open(2).await;
     let mut lease = chains.store.acquire_writer().await.expect("lease");
     let writer = chains
         .store
@@ -1567,9 +1507,7 @@ async fn the_deployment_block_survives_a_replay_of_the_same_registry() {
 /// session lives, it is not lost.
 #[tokio::test]
 async fn a_lease_whose_session_ends_reports_itself_lost() {
-    let Some(chains) = Chains::open(2).await else {
-        return;
-    };
+    let chains = Chains::open(2).await;
     let mut lease = chains.store.acquire_writer().await.expect("lease");
     assert!(
         tokio::time::timeout(
@@ -1600,10 +1538,8 @@ async fn a_lease_whose_session_ends_reports_itself_lost() {
 /// lost within two intervals instead of waiting on the socket.
 #[tokio::test]
 async fn a_lease_whose_session_goes_silent_reports_itself_lost() {
-    let Some(chains) = Chains::open(2).await else {
-        return;
-    };
-    let database = database_url().expect("the database is set");
+    let chains = Chains::open(2).await;
+    let database = database_url();
     let proxy = proxy::Proxy::start(&database).await;
     let through = PgPool::connect(proxy.url())
         .await
@@ -1628,9 +1564,7 @@ async fn a_lease_whose_session_goes_silent_reports_itself_lost() {
 /// block the next holder until the pool's idle timeout.
 #[tokio::test]
 async fn a_released_lease_frees_the_chain_for_the_next_holder() {
-    let Some(chains) = Chains::open(2).await else {
-        return;
-    };
+    let chains = Chains::open(2).await;
     let first = chains.store.acquire_writer().await.expect("first lease");
     first.release().await.expect("release");
 
@@ -1650,9 +1584,7 @@ async fn a_released_lease_frees_the_chain_for_the_next_holder() {
 /// the chain under the writer that took it.
 #[tokio::test]
 async fn a_writer_whose_chain_was_prepared_again_writes_nothing() {
-    let Some(chains) = Chains::open(2).await else {
-        return;
-    };
+    let chains = Chains::open(2).await;
     let stale = chains.store.writer().await;
     stale.seed().await;
     let before = chains.store.state().await.unwrap();
@@ -1691,9 +1623,7 @@ async fn a_writer_whose_chain_was_prepared_again_writes_nothing() {
 /// earlier writer could hold, so one from before the delete stays shut out.
 #[tokio::test]
 async fn a_writer_from_before_its_chain_row_was_deleted_writes_nothing() {
-    let Some(chains) = Chains::open(2).await else {
-        return;
-    };
+    let chains = Chains::open(2).await;
     let stale = chains.store.writer().await;
     chains.store.forget().await;
     chains.store.writer().await;
@@ -1714,9 +1644,7 @@ async fn a_writer_from_before_its_chain_row_was_deleted_writes_nothing() {
 /// instance it replaced was mid-window.
 #[tokio::test]
 async fn a_replay_waits_for_the_window_in_flight_and_clears_it() {
-    let Some(chains) = Chains::open(3).await else {
-        return;
-    };
+    let chains = Chains::open(3).await;
     let stale = chains.store.writer().await;
     let mut window = stale.begin_window().await.expect("a window");
     let events = NamesEvent::bind(
@@ -1795,9 +1723,7 @@ async fn a_replay_waits_for_the_window_in_flight_and_clears_it() {
 /// prepare with it, and what the window committed stays.
 #[tokio::test]
 async fn a_prepare_whose_lease_ended_while_it_waited_clears_nothing() {
-    let Some(chains) = Chains::open(3).await else {
-        return;
-    };
+    let chains = Chains::open(3).await;
     let stale = chains.store.writer().await;
     let mut window = stale.begin_window().await.expect("a window");
     let events = NamesEvent::bind(
@@ -1875,9 +1801,7 @@ async fn a_prepare_whose_lease_ended_while_it_waited_clears_nothing() {
 /// moving the target — which is what keeps a long catch-up alive.
 #[tokio::test]
 async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
-    let Some(chains) = Chains::open(1).await else {
-        return;
-    };
+    let chains = Chains::open(1).await;
     let writer = chains.store.writer().await;
     assert!(
         writer.set_chain_target(5, Duration::from_secs(1)).await,
@@ -1933,9 +1857,7 @@ async fn a_report_expires_and_a_renewal_revives_it_without_moving_the_target() {
 /// `/v1/status`.
 #[tokio::test]
 async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
-    let Some(chains) = Chains::open(2).await else {
-        return;
-    };
+    let chains = Chains::open(2).await;
     let name = |s: &str| s.parse::<ens::ChainName>().unwrap();
     let mut lease = chains.store.acquire_writer().await.expect("lease");
     // In the indexer's order: the chain is named, then prepared.

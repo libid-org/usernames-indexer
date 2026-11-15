@@ -153,8 +153,8 @@ pub use stats::{
     StatsRoute,
 };
 pub use suite::{
-    anvil_available,
     database_url,
+    require_anvil,
     ChainWatch,
     Entries,
     Events,

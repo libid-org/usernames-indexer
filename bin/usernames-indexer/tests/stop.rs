@@ -29,12 +29,12 @@ use usernames_core::{
     ens::ChainName,
 };
 use usernames_fixtures::{
-    anvil_available,
     database_url,
     libid::{
         Libid,
         Node,
     },
+    require_anvil,
     ChainWatch,
     PATIENCE,
 };
@@ -60,27 +60,21 @@ struct Running {
 }
 
 impl Chain {
-    /// `chain` on a fresh anvil; `None` when the suite skips.
-    async fn start(chain: u64) -> Option<Self> {
-        let Some(database) = database_url() else {
-            eprintln!("skipping: DATABASE_URL not set");
-            return None;
-        };
-        if !anvil_available() {
-            eprintln!("skipping: anvil not on PATH");
-            return None;
-        }
+    /// `chain` on a fresh anvil.
+    async fn start(chain: u64) -> Self {
+        let database = database_url();
+        require_anvil();
         let pool = db::connect_and_migrate(&database).await.expect("database");
         ChainStore::new(pool.clone(), chain as i64).forget().await;
         let node = Node::spawn(chain);
         let libid = Libid::deploy(&node.provider, node.accounts()[0]).await;
-        Some(Self {
+        Self {
             node,
             libid,
             store: ChainStore::new(pool.clone(), chain as i64),
             pool,
             database,
-        })
+        }
     }
 
     /// The indexer binary for this chain, polling, not yet started.
@@ -158,9 +152,7 @@ impl Running {
 /// stopped then, it exits at once instead of at the supervisor's kill.
 #[tokio::test]
 async fn an_indexer_waiting_for_the_lease_stops_on_sigterm() {
-    let Some(chain) = Chain::start(43129).await else {
-        return;
-    };
+    let chain = Chain::start(43129).await;
     let held = chain.store.acquire_writer().await.expect("the lease");
     let mut indexer = chain.indexer();
     indexer
@@ -175,9 +167,7 @@ async fn an_indexer_waiting_for_the_lease_stops_on_sigterm() {
 /// chain's lease back and exits cleanly.
 #[tokio::test]
 async fn an_indexing_indexer_stops_on_sigterm_and_frees_the_chain() {
-    let Some(chain) = Chain::start(43130).await else {
-        return;
-    };
+    let chain = Chain::start(43130).await;
     let mut watch = ChainWatch::new(&chain.pool, &chain.store).await;
     let indexer = chain.indexer();
     watch.cursor_at(1).await;
@@ -195,9 +185,7 @@ async fn an_indexing_indexer_stops_on_sigterm_and_frees_the_chain() {
 /// chain's rows as they were, even where the start would replay the chain.
 #[tokio::test]
 async fn a_start_refused_for_a_taken_name_keeps_the_chain() {
-    let Some(chain) = Chain::start(43161).await else {
-        return;
-    };
+    let chain = Chain::start(43161).await;
     let mut watch = ChainWatch::new(&chain.pool, &chain.store).await;
     let indexer = chain.indexer();
     watch.cursor_at(1).await;

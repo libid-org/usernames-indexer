@@ -753,10 +753,7 @@ mod tests {
     /// served: once the journal is free, the next request computes again.
     #[tokio::test]
     async fn a_computation_past_its_deadline_is_not_served() {
-        let Some(url) = database_url() else {
-            eprintln!("skipping: DATABASE_URL not set");
-            return;
-        };
+        let url = database_url();
         let pool = PgPool::connect(&url).await.expect("connect");
         MIGRATOR.run(&pool).await.expect("migrations");
         let store = Store::new(pool.clone());
