@@ -656,8 +656,8 @@ pub struct HistoryEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReferralLink {
-    /// The handle the bind named as its referrer, its text from the first
-    /// chain that disclosed it.
+    /// The handle the bind named as its referrer, with the text any chain
+    /// disclosed, read from the lowest chain id.
     pub referrer: HandleRef,
     /// The wallet that bound.
     pub binder: Address,

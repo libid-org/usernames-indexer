@@ -50,7 +50,7 @@ pub struct ReferralLinkRow {
     pub referral_log_index: i64,
     /// The referrer handle's node.
     pub referrer_node: B256,
-    /// Its text, from the first chain that disclosed it.
+    /// The text any chain disclosed for it, read from the lowest chain id.
     pub referrer_handle: Option<String>,
     /// Who bound.
     pub binder: Address,

@@ -276,8 +276,8 @@ impl Scoped for Statement {
     }
 }
 
-/// A handle node's text from the first chain that disclosed it, joined
-/// laterally as `alias.handle`: the [`sql::HANDLE_TEXT`] fragment, written
+/// The text any chain disclosed for a handle node, read from the lowest chain
+/// id that disclosed it and joined laterally as `alias.handle`: the [`sql::HANDLE_TEXT`] fragment, written
 /// for one read's node column.
 pub(crate) struct HandleText {
     /// The column holding the node.

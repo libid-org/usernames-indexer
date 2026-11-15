@@ -1,6 +1,6 @@
--- The text of the handle node in {node}, as {alias}.handle, from the first
--- chain that disclosed it: a node hashes its platform and text, so the text
--- one chain disclosed is the text on every chain.
+-- The text any chain disclosed for the handle node in {node}, as
+-- {alias}.handle, read from the lowest chain id that disclosed it: a node
+-- hashes its platform and text, so every chain's text is the same.
 LEFT JOIN LATERAL (
     SELECT t.handle
     FROM names.handle_nodes t

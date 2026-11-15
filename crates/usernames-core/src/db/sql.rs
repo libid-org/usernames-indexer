@@ -46,8 +46,9 @@ pub const REFERRALS_HOLDER: &str = include_str!("../../sql/referrals_holder.sql"
 /// each slot's [`HANDLE_TEXT`].
 pub const ESCROW_AWAITING_SLOTS: &str =
     include_str!("../../sql/escrow_awaiting_slots.sql");
-/// A handle node's text from the first chain that disclosed it, as a lateral
-/// join; `HandleText` names its node and alias.
+/// The text any chain disclosed for a handle node, read from the lowest chain
+/// id that disclosed it, as a lateral join; `HandleText` names its node and
+/// alias.
 pub const HANDLE_TEXT: &str = include_str!("../../sql/handle_text.sql");
 /// The referrals behind a history page's entries, by their keys; the caller
 /// appends the referrer's [`HANDLE_TEXT`].
