@@ -714,6 +714,10 @@ pub struct EscrowAmount {
     /// The slot's current round: how many claims it has seen.
     #[serde_as(as = "DisplayFromStr")]
     pub round: U256,
+    /// The token's name and `amount`'s worth, at the answer's `pricedAt`;
+    /// absent when unpriced.
+    #[serde(flatten)]
+    pub priced: TokenValue,
 }
 
 /// `GET /v1/escrow/claimable/{address}`: held for the handles the address
@@ -725,6 +729,9 @@ pub struct EscrowAmount {
 pub struct AddressAmounts {
     /// The address asked about.
     pub address: Address,
+    /// The unix second of the oldest price the amounts are valued at;
+    /// absent when none is.
+    pub priced_at: Option<i64>,
     /// Claimable by chain, node and token; awaiting by node, chain and
     /// token; descending.
     pub amounts: Vec<EscrowAmount>,
@@ -753,6 +760,9 @@ pub struct Contribution {
 pub struct AddressContributions {
     /// The address asked about.
     pub address: Address,
+    /// The unix second of the oldest price the amounts are valued at;
+    /// absent when none is.
+    pub priced_at: Option<i64>,
     /// By chain, node and token, descending.
     pub amounts: Vec<Contribution>,
     /// Pass as `before` for the next page; absent on the last one.
@@ -766,6 +776,9 @@ pub struct AddressContributions {
 pub struct HandleAmounts {
     /// The handle, as far as the store knows it.
     pub handle: HandleRef,
+    /// The unix second of the oldest price the amounts are valued at;
+    /// absent when none is.
+    pub priced_at: Option<i64>,
     /// One per chain and token still holding something, descending.
     pub amounts: Vec<EscrowAmount>,
     /// Pass as `before` for the next page; absent on the last one.
@@ -778,6 +791,9 @@ pub struct HandleAmounts {
 pub struct Unclaimed {
     /// The token the list was narrowed to, when one was asked for.
     pub token: Option<Address>,
+    /// The unix second of the oldest price the amounts are valued at;
+    /// absent when none is.
+    pub priced_at: Option<i64>,
     /// The page size served.
     pub limit: i64,
     /// Token by token, descending, the largest amount first within each.
@@ -1127,15 +1143,25 @@ pub struct TokenFlow {
     /// Distinct wallets that made them, as the list that holds this one
     /// names them.
     pub wallets: i64,
+    /// The token's name and `amount`'s worth; absent when unpriced.
+    #[serde(flatten)]
+    pub priced: TokenValue,
+}
+
+/// A token amount as the price source values it: every field is absent
+/// when the token is unpriced.
+#[serde_as]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenValue {
     /// The token's symbol, as its creator wrote it: text to show, never
-    /// markup. Absent when unpriced or not plain.
+    /// markup. Absent when not plain.
     pub symbol: Option<String>,
-    /// The token's decimals; absent when unpriced.
+    /// The token's decimals.
     pub decimals: Option<u8>,
-    /// `amount` after the decimals, as a decimal string; absent when
-    /// unpriced.
+    /// The amount after the decimals, as a decimal string.
     pub value: Option<String>,
-    /// `amount` in USD, truncated to the cent; absent when unpriced.
+    /// The amount in USD, truncated to the cent.
     #[serde_as(as = "Option<DisplayFromStr>")]
     pub usd: Option<Usd>,
 }

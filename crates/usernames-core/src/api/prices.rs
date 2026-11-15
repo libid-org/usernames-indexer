@@ -38,7 +38,10 @@ use serde_json::value::RawValue;
 use tokio::task::JoinSet;
 use url::Url;
 
-use super::model::Usd;
+use super::model::{
+    TokenValue,
+    Usd,
+};
 use crate::{
     chain::NATIVE_COIN,
     db::{
@@ -380,6 +383,20 @@ impl Quote {
             .map(|product| Usd::from_cents(product / divisor))
     }
 
+    /// `amount` token units valued at this quote; unpriced when the
+    /// arithmetic overflows.
+    fn token_value(&self, amount: U512) -> TokenValue {
+        match self.usd(amount) {
+            Some(usd) => TokenValue {
+                symbol: self.symbol.clone(),
+                decimals: Some(self.decimals),
+                value: Some(self.value(amount)),
+                usd: Some(usd),
+            },
+            None => TokenValue::default(),
+        }
+    }
+
     /// `amount` token units in units of 10^-18 USD, a rank finer than
     /// cents; `None` when the arithmetic overflows.
     fn worth(&self, amount: U512) -> Option<U512> {
@@ -453,6 +470,14 @@ impl NamedTokens for Quotes {
 }
 
 impl Quotes {
+    /// The quote of `token` on `chain_id`, when it is priced.
+    pub(crate) fn of(&self, chain_id: i64, token: Address) -> Option<&Quote> {
+        self.0.get(&ListedAddress {
+            chain_id,
+            address: token,
+        })
+    }
+
     /// The unix second of the oldest price held.
     pub(crate) fn taken_at(&self) -> Option<i64> {
         self.0.values().map(|quote| quote.at).min()
@@ -738,6 +763,14 @@ fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|since| since.as_secs() as i64)
         .unwrap_or_default()
+}
+
+impl TokenValue {
+    /// `amount` token units valued at `quote`; unpriced without one, or
+    /// when the arithmetic overflows.
+    pub(crate) fn of(amount: U512, quote: Option<&Quote>) -> Self {
+        quote.map_or_else(Self::default, |quote| quote.token_value(amount))
+    }
 }
 
 #[cfg(test)]

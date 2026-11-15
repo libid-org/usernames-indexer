@@ -47,6 +47,7 @@ use usernames_core::{
             StatsDays,
             TokenFlow,
             TokenFlows,
+            TokenValue,
             Usd,
         },
         AppState,
@@ -178,10 +179,7 @@ fn flow(token: Address, count: i64, amount: u128, wallets: i64) -> TokenFlow {
         count,
         amount: U512::from(amount),
         wallets,
-        symbol: None,
-        decimals: None,
-        value: None,
-        usd: None,
+        priced: TokenValue::default(),
     }
 }
 

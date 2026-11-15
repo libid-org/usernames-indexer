@@ -131,6 +131,15 @@ handle it concerns. Amounts and rounds are `uint256` decimal strings; the
 chain's own coin is the EIP-7528 token `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`.
 Anybody can deposit a token they wrote, so show the tokens you recognize.
 
+Every escrow amount (claimable, awaiting, refundable, a handle's and the
+unclaimed list) of a token `/v1/stats` prices also carries its `symbol`,
+`decimals`, `value` (the amount after decimals, a decimal string) and `usd`,
+at the prices of the `/v1/stats` answer being served; the answer's
+`pricedAt` is the oldest of them. Any other token answers raw units alone. A
+request never asks the price source: when no fresh `/v1/stats` answer is
+held, it waits for that one computation, and when the computation fails the
+amounts answer unpriced with no `pricedAt`.
+
 A `deposit` names a handle by its node alone: the store knows no platform
 for it (`platformId` is absent) until a bind, a `HandleRevealed`, a
 publish or a retire names one, and a bind before `START_BLOCK` names none. Asking by text works from the first deposit: the escrow and history

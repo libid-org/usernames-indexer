@@ -53,6 +53,7 @@ use super::{
         StatsDays,
         TokenFlow,
         TokenFlows,
+        TokenValue,
     },
     params::{
         PageParams,
@@ -70,7 +71,6 @@ use crate::{
         CountRow,
         Flow,
         HandlesRow,
-        ListedAddress,
         Listing,
         Measure,
         NamedTokens,
@@ -144,6 +144,19 @@ pub(crate) async fn days(
 }
 
 impl AppState {
+    /// The prices the served totals hold, to value amounts on a request
+    /// path without asking the source: none, with a warning, when the
+    /// totals cannot be computed, so an amount list never fails on them.
+    pub(crate) async fn quotes(&self) -> Arc<Quotes> {
+        match self.clone().served_stats().await {
+            Ok(served) => served.quotes,
+            Err(error) => {
+                tracing::warn!(%error, "amounts served unpriced: the stats computation failed");
+                Arc::default()
+            }
+        }
+    }
+
     /// The latest totals, computed when none are fresh.
     async fn served_stats(self) -> Result<Served, ApiError> {
         let AppState {
@@ -562,7 +575,7 @@ impl Payments {
     /// Count the payments of `flows`, once every row is in.
     fn add(&mut self, flows: &TokenFlows) {
         for flow in &flows.tokens {
-            match flow.usd.and_then(|usd| self.usd.checked_add(usd)) {
+            match flow.priced.usd.and_then(|usd| self.usd.checked_add(usd)) {
                 Some(usd) => self.usd = usd,
                 None => self.unpriced += flow.count,
             }
@@ -580,12 +593,8 @@ impl TokenFlows {
             true => row.count,
             false => {
                 let token: Address = row.key_as()?;
-                let coin = ListedAddress {
-                    chain_id: row.chain_id,
-                    address: token,
-                };
-                let mut flow = TokenFlow::of(token, row, quotes.0.get(&coin))?;
-                match flow.usd.map(|usd| self.usd.checked_add(usd)) {
+                let mut flow = TokenFlow::of(token, row, quotes.of(row.chain_id, token))?;
+                match flow.priced.usd.map(|usd| self.usd.checked_add(usd)) {
                     Some(Some(usd)) => self.usd = usd,
                     Some(None) => flow.unprice(),
                     None => {}
@@ -608,26 +617,18 @@ impl TokenFlow {
         quote: Option<&Quote>,
     ) -> Result<Self, ApiError> {
         let amount = row.amount_of()?;
-        let usd = quote.and_then(|quote| quote.usd(amount));
-        let quote = quote.filter(|_| usd.is_some());
         Ok(Self {
             token,
             count: row.count,
             amount,
             wallets: row.wallets,
-            symbol: quote.and_then(|quote| quote.symbol.clone()),
-            decimals: quote.map(|quote| quote.decimals),
-            value: quote.map(|quote| quote.value(amount)),
-            usd,
+            priced: TokenValue::of(amount, quote),
         })
     }
 
     /// The flow without a price, as when its sum would overflow.
     fn unprice(&mut self) {
-        self.symbol = None;
-        self.decimals = None;
-        self.value = None;
-        self.usd = None;
+        self.priced = TokenValue::default();
     }
 }
 

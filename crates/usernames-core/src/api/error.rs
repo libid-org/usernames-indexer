@@ -111,6 +111,17 @@ impl ApiError {
     }
 }
 
+impl fmt::Display for ApiError {
+    /// The status and message, and the database's cause when there is one.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}", self.status, self.message)?;
+        match &self.source {
+            Some(source) => write!(f, ": {source}"),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Text the platform could never hold, refused the way the contract's
 /// `resolveHandle` answers it — the zero address, so a 404 and not a 400:
 /// "nobody holds this", not "you asked wrong".

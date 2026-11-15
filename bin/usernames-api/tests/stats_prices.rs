@@ -3,8 +3,9 @@
 //! `v2/chains`: a token priced with confidence is named and valued, every
 //! other one counts under `other`, each day valued at the same prices, a
 //! failed request keeps the last prices and chain list, a chain the list
-//! leaves out is not priced, and a token priced once keeps its place among
-//! the coins asked.
+//! leaves out is not priced, a token priced once keeps its place among
+//! the coins asked, and escrow amounts are valued at the prices served, or
+//! answer unpriced when the computation fails.
 //!
 //! Runs against the Postgres at `DATABASE_URL`, and fails without it.
 //! The suite's chain is its own, listed by the source as
@@ -17,6 +18,7 @@ use std::{
         Mutex as StdMutex,
     },
     time::{
+        Duration,
         SystemTime,
         UNIX_EPOCH,
     },
@@ -49,11 +51,13 @@ use usernames_core::{
     api::{
         model::{
             DayActivity,
+            HandleAmounts,
             OtherTokens,
             Stats,
             StatsDays,
             TokenFlow,
             TokenFlows,
+            TokenValue,
             Usd,
         },
         AppState,
@@ -323,10 +327,7 @@ impl Flow for TokenFlow {
             count: 1,
             amount,
             wallets: 1,
-            symbol: None,
-            decimals: None,
-            value: None,
-            usd: None,
+            priced: TokenValue::default(),
         }
     }
 
@@ -337,12 +338,41 @@ impl Flow for TokenFlow {
         usd_value: &str,
     ) -> Self {
         Self {
+            priced: TokenValue::of((symbol, decimals), value, usd_value),
+            ..self
+        }
+    }
+}
+
+/// A token amount as the source values it.
+trait Valued {
+    /// `symbol` at `decimals`: `value` after them, `usd` in USD.
+    fn of(symbol: (&str, u8), value: &str, usd: &str) -> Self;
+}
+
+impl Valued for TokenValue {
+    fn of((symbol, decimals): (&str, u8), value: &str, usd_value: &str) -> Self {
+        Self {
             symbol: Some(symbol.to_string()),
             decimals: Some(decimals),
             value: Some(value.to_string()),
             usd: Some(usd(usd_value)),
-            ..self
         }
+    }
+}
+
+/// An escrow answer's amounts, by token.
+trait PricedAmounts {
+    /// Each token's valuation.
+    fn priced(&self) -> BTreeMap<Address, TokenValue>;
+}
+
+impl PricedAmounts for HandleAmounts {
+    fn priced(&self) -> BTreeMap<Address, TokenValue> {
+        self.amounts
+            .iter()
+            .map(|amount| (amount.token, amount.priced.clone()))
+            .collect()
     }
 }
 
@@ -576,6 +606,77 @@ async fn a_failed_first_request_prices_nothing() {
     suite.done();
 }
 
+/// An escrow amount of a priced token carries its symbol, decimals, value
+/// and USD at the prices `/v1/stats` serves, and the answer their
+/// `pricedAt`; any other token answers raw units.
+#[tokio::test]
+async fn escrow_amounts_are_valued_at_the_served_prices() {
+    let suite = Suite::open(&SUITE, CHAIN).await;
+    let mock = MockSource::start().await;
+    let ether_price = Coin {
+        timestamp: now() - 100,
+        ..Coin::priced(2000.5, 18, "ETH")
+    };
+    let oldest = ether_price.timestamp;
+    mock.price(NATIVE, ether_price);
+    mock.price(USDC, Coin::priced(0.9998, 6, "USDC"));
+    let deposits = vec![
+        NamesEvent::deposited(NATIVE, SENDER, ether(15)),
+        NamesEvent::deposited(USDC, PAYER, U256::from(1_234_567u64)),
+        NamesEvent::deposited(JUNK, SENDER, U256::from(5u64)),
+    ];
+    suite.apply_tx(10, deposits).await;
+
+    let held: HandleAmounts = AppState::new(Store::new(suite.pool.clone()))
+        .pricing(mock.source())
+        .router()
+        .answer(&format!("/v1/escrow/handle/x/dave?chain={CHAIN}"))
+        .await;
+    assert_eq!(held.priced_at, Some(oldest));
+    assert_eq!(
+        held.priced(),
+        BTreeMap::from([
+            (NATIVE, TokenValue::of(("ETH", 18), "1.5", "3000.75")),
+            (USDC, TokenValue::of(("USDC", 6), "1.234567", "1.23")),
+            (JUNK, TokenValue::default()),
+        ])
+    );
+    suite.store().forget().await;
+    suite.done();
+}
+
+/// When the `/v1/stats` computation fails, escrow amounts still answer, in
+/// raw units and with no `pricedAt`.
+#[tokio::test]
+async fn a_failed_stats_computation_leaves_escrow_amounts_unpriced() {
+    let suite = Suite::open(&SUITE, CHAIN).await;
+    let mock = MockSource::start().await;
+    mock.price(NATIVE, Coin::priced(2000.5, 18, "ETH"));
+    suite
+        .apply(10, NamesEvent::deposited(NATIVE, SENDER, ether(15)))
+        .await;
+    let mut lock = suite.pool.begin().await.expect("a transaction");
+    sqlx::query("LOCK TABLE names.stats_totals IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .expect("the stats rollups locked");
+
+    let held: HandleAmounts = AppState::new(Store::new(suite.pool.clone()))
+        .pricing(mock.source())
+        .stats_timing(Duration::ZERO, Duration::ZERO)
+        .router()
+        .answer(&format!("/v1/escrow/handle/x/dave?chain={CHAIN}"))
+        .await;
+    lock.rollback().await.expect("the lock released");
+    assert_eq!(held.priced_at, None);
+    assert_eq!(
+        held.priced(),
+        BTreeMap::from([(NATIVE, TokenValue::default())])
+    );
+    suite.store().forget().await;
+    suite.done();
+}
+
 /// A chain list that fails after a good one keeps the chains it named:
 /// the chain's tokens are still asked and valued.
 #[tokio::test]
@@ -792,8 +893,8 @@ async fn a_long_symbol_is_not_served() {
         .stats()
         .await;
     let flows = stats.chain(CHAIN).total.escrow.deposits;
-    assert_eq!(flows.tokens[0].symbol, None);
-    assert_eq!(flows.tokens[0].usd, Some(usd("2.50")));
+    assert_eq!(flows.tokens[0].priced.symbol, None);
+    assert_eq!(flows.tokens[0].priced.usd, Some(usd("2.50")));
     suite.store().forget().await;
     suite.done();
 }
