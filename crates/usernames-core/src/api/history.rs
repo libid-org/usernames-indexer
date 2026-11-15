@@ -1,6 +1,9 @@
 //! `GET /v1/history/...`: what an address took part in, and what happened to
 //! a handle, newest first and paged by a cursor.
 
+use std::fmt::Display;
+
+use alloy::primitives::B256;
 use axum::{
     extract::State,
     Json,
@@ -13,6 +16,7 @@ use super::{
         HandleHistory,
         HandleRef,
         HistoryEntry,
+        ReferralLink,
     },
     ApiError,
     ApiPath,
@@ -24,14 +28,31 @@ use super::{
     Param,
 };
 use crate::{
-    db::HistoryRow,
+    db::{
+        HistoryRow,
+        ReferralLinkRow,
+        Rows,
+    },
     events::NamesEvent,
 };
 
+impl ReferralLink {
+    /// The link a stored row stands for, its referrer on `platform_id`.
+    fn of(row: ReferralLinkRow, platform_id: Option<B256>) -> Self {
+        Self {
+            referrer: HandleRef::of(platform_id, row.referrer_node, row.referrer_handle),
+            binder: row.binder,
+            binder_handle: row.binder_handle,
+            log_index: row.referral_log_index,
+        }
+    }
+}
+
 impl HistoryEntry {
-    /// The entry a stored row stands for. The journal is this build's own
-    /// writing, so a row it cannot read back is an internal error.
-    fn of(row: HistoryRow) -> Result<Self, ApiError> {
+    /// The entry a stored row stands for, with the referral it links to.
+    /// The journal is this build's own writing, so a row it cannot read back
+    /// is an internal error.
+    fn of(row: HistoryRow, link: Option<ReferralLinkRow>) -> Result<Self, ApiError> {
         let at = format!(
             "journal row {}/{}/{}",
             row.chain_id, row.block_number, row.log_index
@@ -47,6 +68,11 @@ impl HistoryEntry {
                     .map_err(|e| ApiError::internal(format_args!("{at}: {e}")))
             })
             .collect::<Result<_, _>>()?;
+        // A `referred` entry names its referrer's platform; a payment's
+        // handle is the referrer's.
+        let referral = link.map(|link| {
+            ReferralLink::of(link, row.event.referrer_platform.or(row.node_platform_id))
+        });
         let handle = row.event.handle_node.map(|handle_node| {
             HandleRef::of(row.node_platform_id, handle_node, row.handle)
         });
@@ -58,6 +84,7 @@ impl HistoryEntry {
             block_time: row.block_time,
             roles,
             handle,
+            referral,
             event: event.into(),
         })
     }
@@ -76,11 +103,8 @@ pub(crate) async fn address(
     let page = params.page()?;
     state.synced(page.chain).await?;
 
-    let (entries, next) = state
-        .store
-        .address_history(address, page)
-        .await?
-        .served(HistoryEntry::of)?;
+    let rows = state.store.address_history(address, page).await?;
+    let (entries, next) = state.entries(rows).await?;
     Ok(Json(AddressHistory {
         address,
         entries,
@@ -101,7 +125,7 @@ pub(crate) async fn chain(
     state.synced(page.chain).await?;
 
     let read = state.store.chain_history(events, page).await?;
-    let (entries, next) = read.rows.served(HistoryEntry::of)?;
+    let (entries, next) = state.entries(read.rows).await?;
     Ok(Json(ChainHistory {
         computed_at: read.taken_at,
         chain_id: events.chain_id,
@@ -135,6 +159,19 @@ pub(crate) async fn node(
 }
 
 impl AppState {
+    /// A history page's entries, each with the referral it links to, and
+    /// the cursor of the next page.
+    async fn entries<C: Display>(
+        &self,
+        rows: Rows<HistoryRow, C>,
+    ) -> Result<(Vec<HistoryEntry>, Option<String>), ApiError> {
+        let mut links = self.store.referral_links(&rows.rows).await?;
+        rows.served(|row| {
+            let link = links.take(&row);
+            HistoryEntry::of(row, link)
+        })
+    }
+
     async fn history_of(
         &self,
         key: HandleKey,
@@ -148,7 +185,7 @@ impl AppState {
             self.store.handle_history(key.node(), page),
             self.store.handle_node(key.node(), chain),
         )?;
-        let (entries, next) = rows.served(HistoryEntry::of)?;
+        let (entries, next) = self.entries(rows).await?;
         Ok(Json(HandleHistory {
             handle: HandleRef::asked(&key, known),
             entries,

@@ -3,6 +3,7 @@
 
 use super::{
     holder_nodes,
+    reads::HandleText,
     sql,
     ApplyError,
     Cursor,
@@ -226,6 +227,10 @@ impl Page<HistoryCursor> {
             .push_bind(self.fetch())
             .push(")\n")
             .push(sql::REFERRALS_HOLDER)
+            .push(HandleText {
+                node: "r.referrer_node",
+                alias: "rv",
+            })
             .push(newest);
         statement
     }
@@ -287,6 +292,7 @@ pub(crate) mod plans {
                 "handles_owner_chain_node_idx",
                 "referrals_referrer_idx",
                 "events_pkey",
+                "handle_nodes_node_chain_idx",
             ];
             let mut plans = Vec::new();
             for (name, holder, chain, before) in [

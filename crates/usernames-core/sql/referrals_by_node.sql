@@ -4,10 +4,10 @@
 -- as matching almost nothing, and would walk the whole table past a cursor.
 -- The caller narrows each node's referrals past a page's cursor and caps
 -- them, then orders and caps the page across nodes and closes `page`, so the
--- rest joins onto the page's rows alone. The referrer's platform, and the
--- chain its text is read on, are the ones `h` holds its node on.
+-- rest joins onto the page's rows alone. The referrer's platform is the one
+-- `h` holds its node on.
 , page AS (
-    SELECT r.*, h.chain_id AS node_chain, h.platform_id AS referrer_platform
+    SELECT r.*, h.platform_id AS referrer_platform
     FROM h
     CROSS JOIN LATERAL (
         SELECT r.chain_id, r.block_number, r.log_index, r.block_time,

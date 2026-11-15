@@ -9,6 +9,7 @@ use super::{
     awaiting::plans::AwaitingPlans,
     escrow::plans::EscrowPlans,
     history::plans::HistoryPlans,
+    links::plans::ReferralLinkPlans,
     reads::{
         Scope,
         Search,
@@ -378,6 +379,7 @@ async fn every_read_over_the_big_tables_seeks_its_index() {
     all.extend(conn.referral_plans().await);
     all.extend(conn.referral_history_plans().await);
     all.extend(conn.awaiting_plans().await);
+    all.extend(conn.referral_link_plans().await);
     for plan in all {
         plan.check();
     }

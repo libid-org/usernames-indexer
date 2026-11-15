@@ -644,8 +644,27 @@ pub struct HistoryEntry {
     pub roles: Vec<Role>,
     /// The handle the event concerns, when it concerns one.
     pub handle: Option<HandleRef>,
+    /// The referral the event belongs to: on a `referred` entry, and on a
+    /// deposit or forward the chain's referral splitter sent.
+    pub referral: Option<ReferralLink>,
     /// The event itself.
     pub event: HistoryEvent,
+}
+
+/// A bind that named a referrer: the one a `referred` entry logs, or the one
+/// whose referrer share a splitter deposit or forward paid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferralLink {
+    /// The handle the bind named as its referrer, with the text any chain
+    /// disclosed, read from the lowest chain id.
+    pub referrer: HandleRef,
+    /// The wallet that bound.
+    pub binder: Address,
+    /// The handle the binder publishes on that chain now, if any.
+    pub binder_handle: Option<String>,
+    /// The `Referred` log's index in the entry's block.
+    pub log_index: i64,
 }
 
 /// `GET /v1/history/address/{address}`: what an address took part in.

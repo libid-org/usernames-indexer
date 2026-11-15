@@ -3,6 +3,7 @@
 
 use super::{
     holder_nodes,
+    reads::HandleText,
     sql,
     EscrowSlotRow,
     Page,
@@ -40,7 +41,10 @@ impl Page<SlotCursor> {
             .push(" ORDER BY e.handle_node DESC, e.chain_id DESC, e.token DESC LIMIT ")
             .push_bind(self.fetch())
             .push(") e\n")
-            .push(sql::ESCROW_AWAITING_HOLDER)
+            .push(HandleText {
+                node: "e.handle_node",
+                alias: "v",
+            })
             .push(" ORDER BY e.handle_node DESC, e.chain_id DESC, e.token DESC LIMIT ")
             .push_bind(self.fetch());
         statement
@@ -98,6 +102,7 @@ pub(crate) mod plans {
                 "handles_owner_chain_node_idx",
                 "escrow_held_node_idx|escrow_held_pkey",
                 "handles_pkey|handles_node_chain_idx",
+                "handle_nodes_node_chain_idx",
             ];
             let mut plans = Vec::new();
             for (name, holder, chain, before) in [

@@ -37,16 +37,23 @@ pub const SETTLE_REFERRALS: &str = include_str!("../../sql/settle_referrals.sql"
 /// reads; the caller names the holder and closes the set.
 pub const HOLDER_NODES: &str = include_str!("../../sql/holder_nodes.sql");
 /// A holder's referrals, read per node after [`HOLDER_NODES`]; the caller
-/// narrows and caps them, caps the page, then appends [`REFERRALS_HOLDER`].
+/// narrows and caps them, caps the page, then appends [`REFERRALS_HOLDER`]
+/// and the referrer's [`HANDLE_TEXT`].
 pub const REFERRALS_BY_NODE: &str = include_str!("../../sql/referrals_by_node.sql");
 pub const REFERRALS_HOLDER: &str = include_str!("../../sql/referrals_holder.sql");
 /// What waits for a holder where nobody holds its handles, read per node
 /// after [`HOLDER_NODES`]; the caller narrows and caps the slots, then appends
-/// [`ESCROW_AWAITING_HOLDER`].
+/// each slot's [`HANDLE_TEXT`].
 pub const ESCROW_AWAITING_SLOTS: &str =
     include_str!("../../sql/escrow_awaiting_slots.sql");
-pub const ESCROW_AWAITING_HOLDER: &str =
-    include_str!("../../sql/escrow_awaiting_holder.sql");
+/// The text any chain disclosed for a handle node, read from the lowest chain
+/// id that disclosed it, as a lateral join; `HandleText` names its node and
+/// alias.
+pub const HANDLE_TEXT: &str = include_str!("../../sql/handle_text.sql");
+/// The referrals behind a history page's entries, by their keys; the caller
+/// appends the referrer's [`HANDLE_TEXT`].
+pub const HISTORY_REFERRAL_LINKS: &str =
+    include_str!("../../sql/history_referral_links.sql");
 pub const JOURNAL_EVENT: &str = include_str!("../../sql/journal_event.sql");
 pub const UPSERT_ID: &str = include_str!("../../sql/upsert_id.sql");
 pub const UPSERT_HANDLE: &str = include_str!("../../sql/upsert_handle.sql");
@@ -102,8 +109,8 @@ pub const ESCROW_SLOT_PROJECTION: &str =
 /// The slots a holder may claim, read per handle; the caller narrows
 /// and caps them.
 pub const CLAIMABLE_SLOTS: &str = include_str!("../../sql/claimable_slots.sql");
-/// The holder whose handles a claimable read walks; the caller narrows
-/// the chain and the cursor.
+/// The holder whose handles a claimable read walks, after each slot's
+/// [`HANDLE_TEXT`]; the caller narrows the chain and the cursor.
 pub const CLAIMABLE_HOLDER: &str = include_str!("../../sql/claimable_holder.sql");
 /// One sender's contributions in the same shape, with their refund dates.
 pub const REFUNDABLE_PROJECTION: &str =
