@@ -193,9 +193,11 @@ impl Referrals {
     }
 
     /// Per chain of this suite, the coin `holder` may claim and that awaits
-    /// it, as `(chain, claimable, awaiting)`: the answer spans every chain,
-    /// and other suites' chains may hold slots for the same address.
-    async fn totals(&self, holder: Address) -> Vec<(i64, u64, u64)> {
+    /// it, then the referral shares inside each, as `(chain, claimable,
+    /// awaiting, referred claimable, referred awaiting)`: the answer spans
+    /// every chain, and other suites' chains may hold slots for the same
+    /// address.
+    async fn totals(&self, holder: Address) -> Vec<(i64, u64, u64, u64, u64)> {
         let totals: AddressTotals = self
             .suite
             .pool
@@ -208,10 +210,19 @@ impl Referrals {
             .filter(|chain| [CHAIN, OTHER_CHAIN].contains(&chain.chain_id))
             .flat_map(|chain| {
                 chain.tokens.iter().map(|token| {
+                    let (referred_claimable, referred_awaiting) =
+                        token.referrals.as_ref().map_or((0, 0), |referred| {
+                            (
+                                referred.claimable.amount.to::<u64>(),
+                                referred.awaiting.amount.to::<u64>(),
+                            )
+                        });
                     (
                         chain.chain_id,
                         token.claimable.amount.to::<u64>(),
                         token.awaiting.amount.to::<u64>(),
+                        referred_claimable,
+                        referred_awaiting,
                     )
                 })
             })
@@ -504,6 +515,32 @@ async fn a_held_share_reads_claimed_once_its_holder_claims_the_round() {
     suite.done();
 }
 
+/// A held share counts in its referrer's totals: awaiting where nobody
+/// holds the referrer's handle, claimable once its holder binds it there,
+/// and gone once the holder claims the round.
+#[tokio::test]
+async fn a_held_share_counts_in_its_referrers_totals_until_claimed() {
+    let suite = Referrals::open().await;
+    suite.bind(CHAIN, 1, "alice_g3", ALICE).await;
+    let bob = Referred::paid(BOB, "bob_g3", "alice_g3", Delivery::Held);
+    suite.referred(OTHER_CHAIN, 2, bob).await;
+    assert_eq!(
+        suite.totals(ALICE).await,
+        [(OTHER_CHAIN, 0, SHARE, 0, SHARE)]
+    );
+
+    suite.bind(OTHER_CHAIN, 3, "alice_g3", ALICE).await;
+    assert_eq!(
+        suite.totals(ALICE).await,
+        [(OTHER_CHAIN, SHARE, 0, SHARE, 0)]
+    );
+
+    let settling = NamesEvent::claimed("alice_g3", NATIVE);
+    suite.on(OTHER_CHAIN).apply(4, settling).await;
+    assert_eq!(suite.totals(ALICE).await, []);
+    suite.done();
+}
+
 /// Two referred binds in one transaction: each `Referred` takes the
 /// splitter's deposit just before it, for its own referrer.
 #[tokio::test]
@@ -610,7 +647,7 @@ async fn a_slot_awaits_the_holder_only_where_nobody_holds_its_handle() {
     assert_eq!(amounts(suite.claimable(ALICE).await), [(CHAIN, 7)]);
     assert_eq!(
         suite.totals(ALICE).await,
-        [(CHAIN, 7, 0), (OTHER_CHAIN, 0, 11)]
+        [(CHAIN, 7, 0, 0, 0), (OTHER_CHAIN, 0, 11, 0, 0)]
     );
 
     // Erin binds the handle on the other chain: the slot is Erin's claim,
@@ -619,8 +656,8 @@ async fn a_slot_awaits_the_holder_only_where_nobody_holds_its_handle() {
     assert_eq!(suite.awaiting(ALICE).await.amounts, []);
     assert_eq!(amounts(suite.claimable(ERIN).await), [(OTHER_CHAIN, 11)]);
     // Alice's totals leave the other chain out: nothing there is hers.
-    assert_eq!(suite.totals(ALICE).await, [(CHAIN, 7, 0)]);
-    assert_eq!(suite.totals(ERIN).await, [(OTHER_CHAIN, 11, 0)]);
+    assert_eq!(suite.totals(ALICE).await, [(CHAIN, 7, 0, 0, 0)]);
+    assert_eq!(suite.totals(ERIN).await, [(OTHER_CHAIN, 11, 0, 0, 0)]);
     suite.done();
 }
 

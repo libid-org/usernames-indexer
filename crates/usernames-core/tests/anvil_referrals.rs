@@ -233,8 +233,9 @@ impl Pages<'_> {
     }
 
     /// The profile: the holder's totals per chain, claimable and awaiting,
-    /// in each chain's coin as (chain, claimable, awaiting).
-    async fn totals(&self) -> Vec<(i64, U512, U512)> {
+    /// in each chain's coin, then the referral shares inside each, as
+    /// (chain, claimable, awaiting, referred claimable, referred awaiting).
+    async fn totals(&self) -> Vec<(i64, U512, U512, U512, U512)> {
         let path = format!("/v1/escrow/totals/{}", self.holder);
         let answer: AddressTotals = self.pool.get(&path).await.answer();
         answer
@@ -244,7 +245,15 @@ impl Pages<'_> {
             .flat_map(|c| {
                 c.tokens.iter().map(|t| {
                     assert_eq!(t.token, NATIVE_COIN, "only the coin is named");
-                    (c.chain_id, t.claimable.amount, t.awaiting.amount)
+                    let referred =
+                        t.referrals.as_ref().expect("the coin's referral part");
+                    (
+                        c.chain_id,
+                        t.claimable.amount,
+                        t.awaiting.amount,
+                        referred.claimable.amount,
+                        referred.awaiting.amount,
+                    )
                 })
             })
             .collect()
@@ -540,8 +549,8 @@ async fn a_referral_across_two_chains_reads_on_both_pages() {
     assert_eq!(pages.claimable().await.slots(), []);
     assert_eq!(
         pages.totals().await,
-        [(on_b, U512::ZERO, share().to())],
-        "the share awaits on B"
+        [(on_b, U512::ZERO, share().to(), U512::ZERO, share().to())],
+        "the share awaits on B, a referral share"
     );
 
     // B2 binds on A naming it: the splitter forwards the share to R.
@@ -571,8 +580,8 @@ async fn a_referral_across_two_chains_reads_on_both_pages() {
     assert_eq!(pages.awaiting().await.slots(), []);
     assert_eq!(
         pages.totals().await,
-        [(on_b, share().to(), U512::ZERO)],
-        "the share is claimable on B"
+        [(on_b, share().to(), U512::ZERO, share().to(), U512::ZERO)],
+        "the share is claimable on B, a referral share"
     );
 
     // R claims on B: the share reads claimed, nothing waits on either page,

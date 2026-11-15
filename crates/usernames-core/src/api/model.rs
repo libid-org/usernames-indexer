@@ -859,6 +859,10 @@ pub struct TokenTotals {
     /// Held for its handles' nodes on this chain, where nobody holds them:
     /// binding the handle here makes it claimable.
     pub awaiting: Amount,
+    /// Of `claimable` and `awaiting`, the referral shares the escrow holds
+    /// for the address's handles. On the chain's coin, the token every
+    /// share is paid in; absent on any other token.
+    pub referrals: Option<Totals<Amount>>,
 }
 
 /// A sum of token units, and its worth when the token is priced.
@@ -977,7 +981,6 @@ pub struct AllChains {
 }
 
 /// Payments across every chain, in USD where their token is priced.
-#[serde_as]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Payments {
@@ -1206,7 +1209,6 @@ pub struct EscrowActivity {
 }
 
 /// Movements of one kind: per named token, and every other token together.
-#[serde_as]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenFlows {
@@ -1243,7 +1245,6 @@ pub struct TokenFlow {
 
 /// A token amount as the price source values it: every field is absent
 /// when the token is unpriced.
-#[serde_as]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenValue {
