@@ -237,7 +237,7 @@ impl SplitterEvents for NamesEvent {
                 received: U256::from(SHARE),
             }),
             Delivery::Held => Self::deposit_by(referrer, SPLITTER, SHARE),
-            Delivery::Claimed | Delivery::Refunded => {
+            Delivery::Claimed => {
                 unreachable!("the escrow answers a deposit by forwarding or holding it")
             }
         }
@@ -444,10 +444,9 @@ async fn a_referral_shows_the_platform_its_referrers_node_is_bound_on() {
 }
 
 /// A held share settles with its slot's round: claimed once the node's
-/// holder claims it, refunded once the splitter takes it back. A claim in
-/// another token, or another sender's refund, leaves it held.
+/// holder claims it. A claim in another token, or a refund, leaves it held.
 #[tokio::test]
-async fn a_held_share_reads_claimed_or_refunded_once_its_round_settles() {
+async fn a_held_share_reads_claimed_once_its_holder_claims_the_round() {
     let Some(suite) = Referrals::open().await else {
         return;
     };
@@ -476,19 +475,13 @@ async fn a_held_share_reads_claimed_or_refunded_once_its_round_settles() {
     assert_eq!(delivery(suite.referrals(ERIN).await), [(CAROL, Some(held))]);
 
     suite.bind(OTHER_CHAIN, 6, "alice_w", ALICE).await;
-    let settling = vec![
-        NamesEvent::claimed("alice_w", NATIVE),
-        NamesEvent::refunded("erin_w", SPLITTER),
-    ];
-    suite.on(OTHER_CHAIN).apply_tx(7, settling).await;
+    let settling = NamesEvent::claimed("alice_w", NATIVE);
+    suite.on(OTHER_CHAIN).apply(7, settling).await;
     assert_eq!(
         delivery(suite.referrals(ALICE).await),
         [(BOB, Some(Delivery::Claimed))]
     );
-    assert_eq!(
-        delivery(suite.referrals(ERIN).await),
-        [(CAROL, Some(Delivery::Refunded))]
-    );
+    assert_eq!(delivery(suite.referrals(ERIN).await), [(CAROL, Some(held))]);
     suite.done();
 }
 

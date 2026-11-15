@@ -126,16 +126,12 @@ impl Window {
         Ok(())
     }
 
-    /// Mark the shares a claim, or the splitter's refund, took out of a slot's
-    /// round as claimed or refunded.
+    /// Mark the shares a claim took out of a slot's round as claimed.
     pub(crate) async fn settle_referrals(
         &mut self,
         escrow: &EscrowEvent,
     ) -> Result<(), ApplyError> {
-        let Some(settled) = self
-            .splitter
-            .and_then(|splitter| escrow.settles_for(splitter))
-        else {
+        let Some(settled) = self.splitter.and(escrow.settles()) else {
             return Ok(());
         };
         sqlx::query(sql::SETTLE_REFERRALS)

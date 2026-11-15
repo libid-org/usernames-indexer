@@ -810,7 +810,7 @@ pub struct Referral {
     /// What became of the share.
     pub outcome: Outcome,
     /// For a paid share, where it went: forwarded to the handle's holder on
-    /// that chain, or held for its claim, then claimed or refunded.
+    /// that chain, or held for its claim, then claimed.
     pub delivery: Option<Delivery>,
 }
 
@@ -831,7 +831,8 @@ pub struct AddressReferrals {
 /// chain, and the users across them, since the index's first block; the
 /// same day by day is `GET /v1/stats/days`. Every address counts but a
 /// referral splitter any chain watches, which sends every paid share: its
-/// deposits and forwards count, its wallet does not. Amounts are token units, never converted. Tokens are named only when they are
+/// deposits and forwards count, its wallet does not. Amounts are token
+/// units, never converted. Tokens are named only when they are
 /// the chain's own coin, EIP-7528 `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`,
 /// or a token the deployment lists (`STATS_TOKENS`); anybody can write a
 /// token, so every other one is counted under `other`, without an amount.

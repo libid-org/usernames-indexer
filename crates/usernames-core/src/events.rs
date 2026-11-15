@@ -201,7 +201,7 @@ impl FromStr for Outcome {
 }
 
 /// Where a paid share went: forwarded to the referrer's holder, or held by
-/// the escrow until the node's holder claims it or the splitter takes it back.
+/// the escrow until the node's holder claims it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, SerializeDisplay, DeserializeFromStr)]
 pub enum Delivery {
     /// Paid straight to the referrer's holder on this chain.
@@ -210,9 +210,6 @@ pub enum Delivery {
     Held,
     /// Held, then claimed by the node's holder.
     Claimed,
-    /// Held, then refunded to the splitter, which sends an expired share to
-    /// its treasury.
-    Refunded,
 }
 
 /// A stored delivery name this build does not know.
@@ -222,7 +219,7 @@ pub struct UnknownDelivery(String);
 
 impl Delivery {
     /// Every delivery, so a stored name parses back by the same table.
-    const ALL: [Self; 4] = [Self::Forwarded, Self::Held, Self::Claimed, Self::Refunded];
+    const ALL: [Self; 3] = [Self::Forwarded, Self::Held, Self::Claimed];
 
     /// The name stored and served.
     pub fn as_str(self) -> &'static str {
@@ -230,7 +227,6 @@ impl Delivery {
             Self::Forwarded => "forwarded",
             Self::Held => "held",
             Self::Claimed => "claimed",
-            Self::Refunded => "refunded",
         }
     }
 }
@@ -254,7 +250,7 @@ impl FromStr for Delivery {
 
 /// What an escrow event did with the referral splitter's shares for one
 /// node: a deposit forwarded or held in a slot's round, or every share that
-/// round held claimed or refunded.
+/// round held claimed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShareMove {
     /// The referrer's node.
@@ -610,9 +606,10 @@ impl EscrowEvent {
         }
     }
 
-    /// The round a claim, or `splitter`'s refund, settles for the shares it
-    /// held. `None` for any other event, or a refund somebody else took.
-    pub fn settles_for(&self, splitter: Address) -> Option<ShareMove> {
+    /// The round a claim settles for the shares it held: the splitter never
+    /// takes a share back, so only the node's holder settles one. `None` for
+    /// any other event.
+    pub fn settles(&self) -> Option<ShareMove> {
         match *self {
             Self::Claimed {
                 handle_node,
@@ -624,18 +621,6 @@ impl EscrowEvent {
                 token,
                 round: Some(round),
                 delivery: Delivery::Claimed,
-            }),
-            Self::Refunded {
-                handle_node,
-                token,
-                sender,
-                round,
-                ..
-            } if sender == splitter => Some(ShareMove {
-                handle_node,
-                token,
-                round: Some(round),
-                delivery: Delivery::Refunded,
             }),
             _ => None,
         }
@@ -890,8 +875,7 @@ impl NamesEvent {
 
     /// Decode one log from the `ReferralSplitter`, under the same rules as
     /// [`Self::from_registry`]: `Referred` and `FeeSet`. The share and the
-    /// treasury change what later referrals pay, which their own events carry,
-    /// and an expired share comes back through the escrow's `Refunded`.
+    /// treasury change what later referrals pay, which their own events carry.
     pub fn from_splitter(log: &Log) -> Result<Option<(Self, LogPosition)>, DecodeError> {
         let position = LogPosition::of(log)?;
         let Some(topic0) = log.topic0() else {
@@ -1262,7 +1246,7 @@ mod tests {
         for outcome in Outcome::ALL {
             assert_eq!(outcome.as_str().parse::<Outcome>().ok(), Some(outcome));
         }
-        for delivery in [Delivery::Forwarded, Delivery::Held] {
+        for delivery in Delivery::ALL {
             assert_eq!(delivery.as_str().parse::<Delivery>().ok(), Some(delivery));
         }
         assert!("pending".parse::<Outcome>().is_err());
