@@ -157,3 +157,5 @@ pub const STATS_REFOLDS: &str = include_str!("../../sql/stats_refolds.sql");
 pub const REFERRAL_CODE_OWNER: &str = include_str!("../../sql/referral_code_owner.sql");
 pub const REFERRAL_CODE_REFERRER: &str =
     include_str!("../../sql/referral_code_referrer.sql");
+/// An address's unclaimed totals per chain and named token.
+pub const ESCROW_TOTALS: &str = include_str!("../../sql/escrow_totals.sql");

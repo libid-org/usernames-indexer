@@ -58,6 +58,7 @@ mod referral;
 mod referrals;
 mod sql;
 mod stats;
+mod totals;
 
 use self::fold::{
     Fold,
@@ -122,6 +123,7 @@ pub use self::{
         UnknownMeasure,
         CANDIDATES_PER_CHAIN,
     },
+    totals::TotalsRow,
 };
 
 /// Bump on any change to the shape of what the indexer writes.

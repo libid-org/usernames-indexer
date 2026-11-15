@@ -95,6 +95,17 @@ impl ApiError {
         }
     }
 
+    /// The stats computation failed moments ago and is not run again yet.
+    pub(crate) fn stats_backing_off() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ErrorCode::StatsBackingOff,
+            message: "the stats computation failed moments ago and runs again shortly"
+                .into(),
+            source: None,
+        }
+    }
+
     pub(crate) fn not_synced(chain: Option<i64>) -> Self {
         let message = match chain {
             Some(chain) => {
@@ -107,6 +118,17 @@ impl ApiError {
             code: ErrorCode::NotSynced,
             message,
             source: None,
+        }
+    }
+}
+
+impl fmt::Display for ApiError {
+    /// The status and message, and the database's cause when there is one.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}", self.status, self.message)?;
+        match &self.source {
+            Some(source) => write!(f, ": {source}"),
+            None => Ok(()),
         }
     }
 }

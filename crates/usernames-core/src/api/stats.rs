@@ -53,6 +53,7 @@ use super::{
         StatsDays,
         TokenFlow,
         TokenFlows,
+        TokenValue,
     },
     params::{
         PageParams,
@@ -70,7 +71,6 @@ use crate::{
         CountRow,
         Flow,
         HandlesRow,
-        ListedAddress,
         Listing,
         Measure,
         NamedTokens,
@@ -144,6 +144,19 @@ pub(crate) async fn days(
 }
 
 impl AppState {
+    /// The prices the served totals hold, to value amounts on a request
+    /// path without asking the source: none, with a warning, when the
+    /// totals cannot be computed, so an amount list never fails on them.
+    pub(crate) async fn quotes(&self) -> Arc<Quotes> {
+        match self.clone().served_stats().await {
+            Ok(served) => served.quotes,
+            Err(error) => {
+                tracing::warn!(%error, "amounts served unpriced: the stats computation failed");
+                Arc::default()
+            }
+        }
+    }
+
     /// The latest totals, computed when none are fresh.
     async fn served_stats(self) -> Result<Served, ApiError> {
         let AppState {
@@ -181,12 +194,21 @@ impl AppState {
 }
 
 /// The latest totals, serialized once and shared by every request, served
-/// for `ttl`; a computation may take `deadline`.
+/// for `ttl`; a computation may take `deadline`, and one that failed is not
+/// run again for as long.
 #[derive(Clone)]
 pub(crate) struct StatsCache {
-    latest: Arc<Mutex<Option<Computed>>>,
+    latest: Arc<Mutex<Latest>>,
     ttl: Duration,
     deadline: Duration,
+}
+
+/// What the cache holds: the last answer computed, and when the last
+/// computation failed, if it was the latest.
+#[derive(Default)]
+struct Latest {
+    computed: Option<Computed>,
+    failed: Option<Instant>,
 }
 
 impl Default for StatsCache {
@@ -265,9 +287,11 @@ impl StatsCache {
 
     /// The answer, from `compute` when none younger than the cache's `ttl`
     /// is held. The lock is held through the computation, so requests arriving
-    /// meanwhile wait for its answer instead of computing again; after a
-    /// failure the next of them computes. The computation runs in a task of
-    /// its own: a request whose client goes away leaves it running.
+    /// meanwhile wait for its answer instead of computing again. A failure is
+    /// answered at once for `deadline` after it, so a burst against a failing
+    /// computation waits on none; the first request after that computes. The
+    /// computation runs in a task of its own: a request whose client goes
+    /// away leaves it running.
     pub(crate) async fn get<F>(
         &self,
         compute: impl FnOnce() -> F,
@@ -276,20 +300,34 @@ impl StatsCache {
         F: Future<Output = Result<Valued, ApiError>> + Send + 'static,
     {
         let mut latest = Arc::clone(&self.latest).lock_owned().await;
+        let now = Instant::now();
         let held = latest
+            .computed
             .as_ref()
-            .filter(|computed| computed.fresh(Instant::now(), self.ttl))
+            .filter(|computed| computed.fresh(now, self.ttl))
             .map(|computed| computed.served.clone());
         if let Some(served) = held {
             drop(latest);
             return Ok(served);
         }
+        if let Some(failed) = latest.failed {
+            if now.saturating_duration_since(failed) < self.deadline {
+                drop(latest);
+                return Err(ApiError::stats_backing_off());
+            }
+        }
         let computation = compute();
         tokio::spawn(async move {
-            let answer = computation
-                .await
-                .and_then(Computed::of)
-                .map(|computed| latest.insert(computed).served.clone());
+            let answer = match computation.await.and_then(Computed::of) {
+                Ok(computed) => {
+                    latest.failed = None;
+                    Ok(latest.computed.insert(computed).served.clone())
+                }
+                Err(error) => {
+                    latest.failed = Some(Instant::now());
+                    Err(error)
+                }
+            };
             drop(latest);
             answer
         })
@@ -562,7 +600,7 @@ impl Payments {
     /// Count the payments of `flows`, once every row is in.
     fn add(&mut self, flows: &TokenFlows) {
         for flow in &flows.tokens {
-            match flow.usd.and_then(|usd| self.usd.checked_add(usd)) {
+            match flow.priced.usd.and_then(|usd| self.usd.checked_add(usd)) {
                 Some(usd) => self.usd = usd,
                 None => self.unpriced += flow.count,
             }
@@ -580,12 +618,8 @@ impl TokenFlows {
             true => row.count,
             false => {
                 let token: Address = row.key_as()?;
-                let coin = ListedAddress {
-                    chain_id: row.chain_id,
-                    address: token,
-                };
-                let mut flow = TokenFlow::of(token, row, quotes.0.get(&coin))?;
-                match flow.usd.map(|usd| self.usd.checked_add(usd)) {
+                let mut flow = TokenFlow::of(token, row, quotes.of(row.chain_id, token))?;
+                match flow.priced.usd.map(|usd| self.usd.checked_add(usd)) {
                     Some(Some(usd)) => self.usd = usd,
                     Some(None) => flow.unprice(),
                     None => {}
@@ -608,26 +642,18 @@ impl TokenFlow {
         quote: Option<&Quote>,
     ) -> Result<Self, ApiError> {
         let amount = row.amount_of()?;
-        let usd = quote.and_then(|quote| quote.usd(amount));
-        let quote = quote.filter(|_| usd.is_some());
         Ok(Self {
             token,
             count: row.count,
             amount,
             wallets: row.wallets,
-            symbol: quote.and_then(|quote| quote.symbol.clone()),
-            decimals: quote.map(|quote| quote.decimals),
-            value: quote.map(|quote| quote.value(amount)),
-            usd,
+            priced: TokenValue::of(amount, quote),
         })
     }
 
     /// The flow without a price, as when its sum would overflow.
     fn unprice(&mut self) {
-        self.symbol = None;
-        self.decimals = None;
-        self.value = None;
-        self.usd = None;
+        self.priced = TokenValue::default();
     }
 }
 
@@ -737,10 +763,30 @@ mod tests {
         assert_eq!(second.await.served(), stats(0));
     }
 
-    /// A failed computation is not served: the next request computes.
+    /// A failure is answered at once for the deadline after it: a request
+    /// meanwhile runs no computation of its own.
+    #[tokio::test]
+    async fn a_failure_is_answered_without_computing_for_its_deadline() {
+        let cache = StatsCache::default();
+        let computations = Arc::new(AtomicI64::new(0));
+        let failing = || {
+            let computations = Arc::clone(&computations);
+            async move {
+                computations.fetch_add(1, Ordering::SeqCst);
+                Err(ApiError::internal("the database is down"))
+            }
+        };
+        assert!(cache.get(failing).await.is_err());
+        let next = cache.get(|| async { Ok(answer(1)) }).await;
+        assert!(next.is_err(), "answered the failure");
+        assert_eq!(computations.load(Ordering::SeqCst), 1);
+    }
+
+    /// A failed computation is not served: past its deadline, here none,
+    /// the next request computes.
     #[tokio::test]
     async fn a_failed_computation_is_computed_again() {
-        let cache = StatsCache::default();
+        let cache = StatsCache::new(STATS_TTL, Duration::ZERO);
         let failed = cache
             .get(|| async { Err(ApiError::internal("the database is down")) })
             .await;
@@ -765,7 +811,8 @@ mod tests {
             .execute(&mut *holder)
             .await
             .expect("the rollup locked");
-        let cache = StatsCache::default();
+        // No backoff after the failure, so the next request computes.
+        let cache = StatsCache::new(STATS_TTL, Duration::ZERO);
         let waiting = store.clone();
         let started = Instant::now();
         let failed = cache

@@ -14,6 +14,7 @@ use alloy::{
         Address,
         B256,
         U256,
+        U512,
     },
     providers::{
         ext::AnvilApi,
@@ -27,6 +28,7 @@ use usernames_core::{
         AddressAmounts,
         AddressHistory,
         AddressReferrals,
+        AddressTotals,
         Delivery,
         EscrowAmount,
         HandleAmounts,
@@ -35,10 +37,12 @@ use usernames_core::{
         HistoryEvent,
         Outcome,
         Status,
+        TokenValue,
     },
     chain::{
         self,
         Contracts,
+        NATIVE_COIN,
     },
     db::{
         self,
@@ -292,6 +296,33 @@ impl Pages<'_> {
     /// The profile: what binding its handles elsewhere makes claimable.
     async fn awaiting(&self) -> AddressAmounts {
         self.amounts("awaiting").await
+    }
+
+    /// The profile: the holder's totals per chain, claimable and awaiting,
+    /// in each chain's coin, then the referral shares inside each, as
+    /// (chain, claimable, awaiting, referred claimable, referred awaiting).
+    async fn totals(&self) -> Vec<(i64, U512, U512, U512, U512)> {
+        let path = format!("/v1/escrow/totals/{}", self.holder);
+        let answer: AddressTotals = self.pool.get(&path).await.answer();
+        answer
+            .chains
+            .iter()
+            .filter(|c| self.chains.contains(&c.chain_id))
+            .flat_map(|c| {
+                c.tokens.iter().map(|t| {
+                    assert_eq!(t.token, NATIVE_COIN, "only the coin is named");
+                    let referred =
+                        t.referrals.as_ref().expect("the coin's referral part");
+                    (
+                        c.chain_id,
+                        t.claimable.amount,
+                        t.awaiting.amount,
+                        referred.claimable.amount,
+                        referred.awaiting.amount,
+                    )
+                })
+            })
+            .collect()
     }
 
     /// One of the profile's lists, kept to the journey's chains.
@@ -582,7 +613,15 @@ async fn a_referral_across_two_chains_reads_on_both_pages() {
         awaiting.amounts[0].handle.handle.as_deref(),
         Some("referrer_r")
     );
+    // No price source prices an anvil chain: the share answers raw units.
+    assert_eq!(awaiting.priced_at, None);
+    assert_eq!(awaiting.amounts[0].priced, TokenValue::default());
     assert_eq!(pages.claimable().await.slots(), []);
+    assert_eq!(
+        pages.totals().await,
+        [(on_b, U512::ZERO, share().to(), U512::ZERO, share().to())],
+        "the share awaits on B, a referral share"
+    );
     // B1's `referred` entry is its own referral, and the splitter's deposit
     // on B links to the same one.
     let held_at = pages.referrals().await.logged_on(on_b);
@@ -632,6 +671,11 @@ async fn a_referral_across_two_chains_reads_on_both_pages() {
         [(on_b, node, share(), Some(r))]
     );
     assert_eq!(pages.awaiting().await.slots(), []);
+    assert_eq!(
+        pages.totals().await,
+        [(on_b, share().to(), U512::ZERO, share().to(), U512::ZERO)],
+        "the share is claimable on B, a referral share"
+    );
 
     // R claims on B: the share reads claimed, nothing waits on either page,
     // and R's history shows the forward on A and the claim on B.
@@ -647,6 +691,7 @@ async fn a_referral_across_two_chains_reads_on_both_pages() {
     );
     assert_eq!(pages.claimable().await.slots(), []);
     assert_eq!(pages.awaiting().await.slots(), []);
+    assert_eq!(pages.totals().await, [], "nothing is left to claim");
     let splitter = *a.libid.splitter.address();
     let paid: Vec<_> = pages
         .history()

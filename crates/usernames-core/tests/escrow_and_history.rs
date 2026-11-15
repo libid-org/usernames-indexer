@@ -16,6 +16,7 @@ use alloy::primitives::{
     Bytes,
     B256,
     U256,
+    U512,
 };
 use axum::http::StatusCode;
 use serde::de::DeserializeOwned;
@@ -25,6 +26,9 @@ use usernames_core::{
         AddressAmounts,
         AddressContributions,
         AddressHistory,
+        AddressTotals,
+        Amount,
+        ChainTotals,
         Contribution,
         ErrorCode,
         EscrowAmount,
@@ -34,6 +38,8 @@ use usernames_core::{
         HistoryEvent,
         Role,
         Status,
+        TokenTotals,
+        Totals,
         Unclaimed,
     },
     chain::Contracts,
@@ -575,6 +581,87 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
     // Only USDC is still waiting anywhere on this chain.
     let unclaimed: Unclaimed = suite.get("/v1/escrow/unclaimed").await.answer();
     assert_eq!(unclaimed.amounts.token_amounts(), [(USDC, 7)]);
+    suite.done();
+}
+
+/// An address's totals sum, per chain, what it may claim in each chain's
+/// coin, as its claimable list holds it. A handle another address holds
+/// is not its own, and a token `/v1/stats` does not price is not summed:
+/// with no price source, only the coin is.
+#[tokio::test]
+async fn the_totals_sum_the_claimable_coin_and_leave_out_unnamed_tokens() {
+    let suite = Suite::open(&SUITE, CHAIN).await;
+    let (bob, carol, payer) = (
+        Address::repeat_byte(0xB7),
+        Address::repeat_byte(0xC7),
+        Address::repeat_byte(0xE7),
+    );
+    suite
+        .apply_tx(
+            1,
+            vec![
+                NamesEvent::deposited("bob_t1", NATIVE, payer, 100),
+                NamesEvent::deposited("bob_t1", USDC, payer, 7),
+                NamesEvent::deposited("bob_t2", NATIVE, payer, 5),
+                NamesEvent::deposited("carol_t", NATIVE, payer, 1_000),
+            ],
+        )
+        .await;
+    suite
+        .apply_tx(
+            2,
+            [
+                NamesEvent::bind(bob, X, "701", "bob_t1", 5_000, false),
+                NamesEvent::bind(bob, X, "702", "bob_t2", 5_000, false),
+                NamesEvent::bind(carol, X, "703", "carol_t", 5_000, false),
+            ]
+            .concat(),
+        )
+        .await;
+
+    let totals: AddressTotals = suite
+        .get(&format!("/v1/escrow/totals/{bob}"))
+        .await
+        .answer();
+    let unpriced = |amount: u64| Amount {
+        amount: U512::from(amount),
+        value: None,
+        usd: None,
+    };
+    assert_eq!(
+        totals,
+        AddressTotals {
+            address: bob,
+            priced_at: None,
+            chains: vec![ChainTotals {
+                chain_id: CHAIN,
+                tokens: vec![TokenTotals {
+                    token: NATIVE,
+                    symbol: None,
+                    decimals: None,
+                    claimable: unpriced(105),
+                    awaiting: unpriced(0),
+                    referrals: Some(Totals {
+                        claimable: unpriced(0),
+                        awaiting: unpriced(0),
+                    }),
+                }],
+                usd: Totals::default(),
+            }],
+            usd: Totals::default(),
+        }
+    );
+    let listed: AddressAmounts = suite
+        .get(&format!("/v1/escrow/claimable/{bob}"))
+        .await
+        .answer();
+    let coin: U256 = listed
+        .amounts
+        .iter()
+        .filter(|a| a.token == NATIVE)
+        .map(|a| a.amount)
+        .sum();
+    assert_eq!(coin, U256::from(105u64), "the total is the sum of the list");
     suite.done();
 }
 
