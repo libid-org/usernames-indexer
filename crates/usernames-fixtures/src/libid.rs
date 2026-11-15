@@ -110,9 +110,12 @@ pub struct Node {
 }
 
 impl Node {
-    /// Anvil on `chain`.
+    /// Anvil on `chain`; the test fails when anvil does not start.
     pub fn spawn(chain: u64) -> Self {
-        let instance = Anvil::new().chain_id(chain).spawn();
+        let instance = Anvil::new()
+            .chain_id(chain)
+            .try_spawn()
+            .expect("anvil not on PATH: the chain suites run against anvil");
         let provider = ProviderBuilder::new()
             .wallet(instance.wallet().expect("anvil's dev accounts"))
             .connect_http(instance.endpoint_url())

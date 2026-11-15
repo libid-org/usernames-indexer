@@ -61,29 +61,11 @@ use crate::{
     Seed,
 };
 
-/// `DATABASE_URL`, or `None` to skip the test; under CI, where the job
-/// provides Postgres, its absence fails the test instead.
-pub fn database_url() -> Option<String> {
-    let url = std::env::var("DATABASE_URL").ok();
-    assert!(
-        url.is_some() || std::env::var_os("CI").is_none(),
-        "DATABASE_URL not set: CI runs this suite against Postgres"
-    );
-    url
-}
-
-/// Whether `anvil` runs; under CI, where the job installs it, a missing
-/// anvil fails the test instead.
-pub fn anvil_available() -> bool {
-    let found = std::process::Command::new("anvil")
-        .arg("--version")
-        .output()
-        .is_ok();
-    assert!(
-        found || std::env::var_os("CI").is_none(),
-        "anvil not on PATH: CI runs this suite against anvil"
-    );
-    found
+/// `DATABASE_URL`, the Postgres the suites run against. A suite cannot run
+/// without it, so its absence fails the test.
+pub fn database_url() -> String {
+    std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL not set: the suites run against Postgres at that URL")
 }
 
 /// One suite's chain in the database the suites share: emptied of whatever
@@ -98,24 +80,21 @@ pub struct Suite {
 }
 
 impl Suite {
-    /// The suite's `chain`, emptied; `None` when `DATABASE_URL` is unset.
-    pub async fn open(lock: &'static Mutex<()>, chain: i64) -> Option<Self> {
+    /// The suite's `chain`, emptied.
+    pub async fn open(lock: &'static Mutex<()>, chain: i64) -> Self {
         let lock = lock.lock().await;
-        let Some(url) = database_url() else {
-            eprintln!("skipping: DATABASE_URL not set");
-            return None;
-        };
+        let url = database_url();
         let pool = PgPool::connect(&url)
             .await
             .expect("DATABASE_URL is set but connecting failed");
         db::MIGRATOR.run(&pool).await.expect("migrations failed");
         let store = ChainStore::new(pool.clone(), chain);
         store.forget().await;
-        Some(Self {
+        Self {
             writer: store.writer().await,
             pool,
             lock,
-        })
+        }
     }
 
     /// The suite's chain.

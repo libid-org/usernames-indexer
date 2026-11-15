@@ -5,7 +5,7 @@
 //! which get a signed null, and which get no signature at all. That logic is
 //! the whole gateway, and every branch of it is here.
 //!
-//! Skips silently when `DATABASE_URL` is unset, like the other suites.
+//! Runs against the Postgres at `DATABASE_URL`, and fails without it.
 
 use std::{
     fmt,
@@ -104,10 +104,10 @@ struct Gateway {
 
 impl Gateway {
     /// A gateway serving `chains`, refusing an index more than
-    /// `max_lag_blocks` behind; `None` when `DATABASE_URL` is unset.
-    async fn open(chains: &[i64], max_lag_blocks: u64) -> Option<Self> {
+    /// `max_lag_blocks` behind.
+    async fn open(chains: &[i64], max_lag_blocks: u64) -> Self {
         let lock = DB_LOCK.lock().await;
-        let url = database_url()?;
+        let url = database_url();
         let pool = PgPool::connect(&url)
             .await
             .expect("DATABASE_URL is set but connecting failed");
@@ -151,12 +151,12 @@ impl Gateway {
                 SIGNER_KEY.parse::<PrivateKeySigner>().expect("key"),
             )),
         };
-        Some(Self {
+        Self {
             config,
             store,
             pool,
             lock,
-        })
+        }
     }
 
     /// The gateway route alone, over [`Gateway::config`].
@@ -321,9 +321,7 @@ impl fmt::Display for Reply {
 
 #[tokio::test]
 async fn a_bound_handle_resolves_and_the_signature_verifies() {
-    let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN], 32).await;
     let router = gateway.router();
     let owner = Address::from([0xbe; 20]);
     gateway.store.bind("alice", owner).await;
@@ -341,9 +339,7 @@ async fn a_bound_handle_resolves_and_the_signature_verifies() {
 /// An unlisted binding resolves too, as `resolveHandle` does on chain.
 #[tokio::test]
 async fn an_unlisted_binding_resolves() {
-    let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN], 32).await;
     let router = gateway.router();
     let owner = Address::from([0xbe; 20]);
     gateway.store.bind_private("alice", owner).await;
@@ -362,9 +358,7 @@ async fn an_unlisted_binding_resolves() {
 async fn a_name_nobody_holds_gets_a_signed_null() {
     // The point of signing a null: a wallet must be able to trust "nobody
     // holds this" as much as it trusts an address.
-    let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN], 32).await;
     let router = gateway.router();
     let call = resolve_call(
         &["nobody", "x"].wire_name(),
@@ -386,9 +380,7 @@ async fn a_name_nobody_holds_gets_a_signed_null() {
 /// chains rather than one.
 #[tokio::test]
 async fn a_chain_this_gateway_does_not_serve_is_refused_not_signed() {
-    let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN], 32).await;
     let router = gateway.router();
     gateway.store.bind("alice", Address::from([0xbe; 20])).await;
 
@@ -407,9 +399,7 @@ async fn a_chain_this_gateway_does_not_serve_is_refused_not_signed() {
 /// is ever a Bitcoin address, and knowing that needs no chain.
 #[tokio::test]
 async fn a_non_evm_coin_type_is_answered_null() {
-    let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN], 32).await;
     let router = gateway.router();
     gateway.store.bind("alice", Address::from([0xbe; 20])).await;
 
@@ -422,9 +412,7 @@ async fn a_non_evm_coin_type_is_answered_null() {
 
 #[tokio::test]
 async fn a_chain_label_narrows_and_never_widens() {
-    let Some(gateway) = Gateway::open(&[EDEN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[EDEN], 32).await;
     let router = gateway.router();
     gateway.store.bind("alice", Address::from([0xbe; 20])).await;
     gateway.store.declare_names(&["eden"]).await;
@@ -452,9 +440,7 @@ async fn a_chain_label_narrows_and_never_widens() {
 /// unlabelled form and every declared label resolve to the same binding.
 #[tokio::test]
 async fn every_name_a_chain_declares_resolves_it() {
-    let Some(gateway) = Gateway::open(&[EDEN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[EDEN], 32).await;
     let router = gateway.router();
     let owner = Address::from([0xbe; 20]);
     gateway.store.bind("alice", owner).await;
@@ -478,9 +464,7 @@ async fn every_name_a_chain_declares_resolves_it() {
 async fn a_record_that_is_not_addr_degrades_to_null() {
     // A client asking for `text()` must not see an error on a name that
     // resolves fine for addresses.
-    let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN], 32).await;
     let router = gateway.router();
     gateway.store.bind("alice", Address::from([0xbe; 20])).await;
 
@@ -493,9 +477,7 @@ async fn a_record_that_is_not_addr_degrades_to_null() {
 
 #[tokio::test]
 async fn a_name_this_build_cannot_read_is_null_rather_than_an_error() {
-    let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN], 32).await;
     let router = gateway.router();
     let coin = 0x8000_0000 | CHAIN as u64;
     for labels in [
@@ -520,9 +502,7 @@ async fn a_name_this_build_cannot_read_is_null_rather_than_an_error() {
 async fn an_unreadable_name_is_null_in_the_shape_the_caller_asked_in() {
     // Mainnet, because the legacy form is coin type 60 and a gateway that does
     // not serve it refuses unsigned rather than answering.
-    let Some(gateway) = Gateway::open(&[1], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[1], 32).await;
     let router = gateway.router();
     let labels = ["alice", "myspace"];
     let call = resolve_call(&labels.wire_name(), &labels.legacy_addr_call());
@@ -542,9 +522,7 @@ async fn an_unreadable_name_is_null_in_the_shape_the_caller_asked_in() {
 /// the client walks on to a sibling that may read the name.
 #[tokio::test]
 async fn an_unreadable_name_off_our_chains_is_still_refused_unsigned() {
-    let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN], 32).await;
     let router = gateway.router();
     let labels = ["alice", "myspace"];
     let call = resolve_call(&labels.wire_name(), &labels.addr_call(0x8000_2105));
@@ -558,9 +536,7 @@ async fn an_unreadable_name_off_our_chains_is_still_refused_unsigned() {
 async fn a_request_for_another_resolver_is_refused_not_signed() {
     // The signature names its target, so signing for a caller-supplied sender
     // would lend this key's authority to any contract that asked.
-    let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN], 32).await;
     let router = gateway.router();
     let call = resolve_call(
         &["alice", "x"].wire_name(),
@@ -575,9 +551,7 @@ async fn a_request_for_another_resolver_is_refused_not_signed() {
 /// the subname, and the parent's own names are not its to speak about.
 #[tokio::test]
 async fn a_gateway_under_a_subname_answers_its_names_and_refuses_the_parents() {
-    let Some(mut gateway) = Gateway::open(&[CHAIN], 32).await else {
-        return;
-    };
+    let mut gateway = Gateway::open(&[CHAIN], 32).await;
     gateway.config.domain = "testnet.handles.link".parse().expect("domain");
     let router = gateway.router();
     let owner = Address::from([0xbe; 20]);
@@ -604,9 +578,7 @@ async fn a_gateway_under_a_subname_answers_its_names_and_refuses_the_parents() {
 async fn a_stale_index_refuses_rather_than_signing_a_null() {
     // The distinction the lag gate exists for: a signed null asserts that no
     // binding exists, and an index this far behind has not earned that.
-    let Some(gateway) = Gateway::open(&[CHAIN], 0).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN], 0).await;
     let router = gateway.router();
     gateway.store.bind("alice", Address::from([0xbe; 20])).await;
     // Far ahead of the cursor, as the TARGET: that is the quantity the gate
@@ -630,9 +602,7 @@ async fn a_stale_index_refuses_rather_than_signing_a_null() {
 
 #[tokio::test]
 async fn garbage_in_the_path_is_the_callers_error() {
-    let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN], 32).await;
     let router = gateway.router();
     for call in [vec![0xde, 0xad, 0xbe, 0xef], vec![]] {
         let (status, _) = router.ask(RESOLVER, &call).await;
@@ -645,9 +615,7 @@ async fn garbage_in_the_path_is_the_callers_error() {
 /// than the first one's.
 #[tokio::test]
 async fn one_gateway_answers_for_every_chain_it_serves() {
-    let Some(gateway) = Gateway::open(&[CHAIN, OTHER], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN, OTHER], 32).await;
     let router = gateway.router();
     let here = Address::from([0xbe; 20]);
     let there = Address::from([0xed; 20]);
@@ -683,9 +651,7 @@ async fn one_gateway_answers_for_every_chain_it_serves() {
 /// window.
 #[tokio::test]
 async fn an_index_that_cannot_report_its_position_refuses() {
-    let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN], 32).await;
     let router = gateway.router();
     gateway.store.bind("alice", Address::from([0xbe; 20])).await;
 
@@ -711,9 +677,7 @@ async fn an_index_that_cannot_report_its_position_refuses() {
 /// signing a null over the emptied tables.
 #[tokio::test]
 async fn a_replay_while_the_gateway_reads_is_refused() {
-    let Some(mut gateway) = Gateway::open(&[CHAIN], 32).await else {
-        return;
-    };
+    let mut gateway = Gateway::open(&[CHAIN], 32).await;
     gateway.store.bind("alice", Address::from([0xbe; 20])).await;
     // The gateway reads on sessions of its own name, so the wait below is
     // its wait and no other session's.
@@ -767,9 +731,7 @@ async fn a_replay_while_the_gateway_reads_is_refused() {
 /// what notices.
 #[tokio::test]
 async fn an_expired_report_is_too_stale_however_small_the_lag() {
-    let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN], 32).await;
     let router = gateway.router();
     gateway.store.bind("alice", Address::from([0xbe; 20])).await;
     // Caught up by the block measure, and the report long expired.
@@ -789,9 +751,7 @@ async fn an_expired_report_is_too_stale_however_small_the_lag() {
 /// validity, so the gateway refuses rather than trusts it.
 #[tokio::test]
 async fn a_report_expiring_out_of_range_is_refused() {
-    let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN], 32).await;
     let router = gateway.router();
     gateway.store.bind("alice", Address::from([0xbe; 20])).await;
     gateway
@@ -823,9 +783,7 @@ async fn a_report_expiring_out_of_range_is_refused() {
 /// sees exactly what the gate sees, one row per chain.
 #[tokio::test]
 async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
-    let Some(gateway) = Gateway::open(&[CHAIN, OTHER], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN, OTHER], 32).await;
     let router = gateway.router();
     let here = Address::from([0xbe; 20]);
     gateway.store.bind("alice", here).await;
@@ -868,9 +826,7 @@ async fn a_dead_indexer_on_one_chain_does_not_touch_another() {
 /// name nobody holds.
 #[tokio::test]
 async fn a_chain_with_no_declared_name_answers_only_the_unlabelled_name() {
-    let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN], 32).await;
     let router = gateway.router();
     let here = Address::from([0xbe; 20]);
     gateway.store.bind("alice", here).await;
@@ -896,9 +852,7 @@ async fn a_chain_with_no_declared_name_answers_only_the_unlabelled_name() {
 /// with no restart, and no list anywhere to forget it in.
 #[tokio::test]
 async fn a_chain_that_appears_in_the_store_is_served_without_a_restart() {
-    let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN], 32).await;
     let router = gateway.router();
     let call = resolve_call(
         &["alice", "x"].wire_name(),
@@ -938,9 +892,7 @@ async fn a_chain_that_appears_in_the_store_is_served_without_a_restart() {
 /// gate measures, and not the head, which runs `CONFIRMATIONS` ahead of it.
 #[tokio::test]
 async fn both_statuses_report_the_lag_the_gate_measures() {
-    let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN], 32).await;
     let writer = gateway.store.writer().await;
     writer
         .begin_window()
@@ -971,9 +923,7 @@ async fn both_statuses_report_the_lag_the_gate_measures() {
 /// chains.
 #[tokio::test]
 async fn two_indexed_chains_on_one_coin_type_are_refused_unsigned() {
-    let Some(gateway) = Gateway::open(&[EDEN, TWIN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[EDEN, TWIN], 32).await;
     let router = gateway.router();
     gateway.store.bind("alice", Address::from([0xed; 20])).await;
     let call = resolve_call(
@@ -998,9 +948,7 @@ async fn two_indexed_chains_on_one_coin_type_are_refused_unsigned() {
 /// signing a null for a label not declared yet.
 #[tokio::test]
 async fn a_label_on_a_chain_without_a_cursor_refuses() {
-    let Some(gateway) = Gateway::open(&[EDEN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[EDEN], 32).await;
     let router = gateway.router();
     gateway.store.bind("alice", Address::from([0xed; 20])).await;
     gateway.store.forget_progress().await;
@@ -1022,9 +970,7 @@ async fn a_label_on_a_chain_without_a_cursor_refuses() {
 /// only chain.
 #[tokio::test]
 async fn a_twin_without_a_cursor_still_makes_the_coin_type_ambiguous() {
-    let Some(gateway) = Gateway::open(&[EDEN, TWIN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[EDEN, TWIN], 32).await;
     let router = gateway.router();
     gateway.store.bind("alice", Address::from([0xed; 20])).await;
     ChainStore::new(gateway.pool.clone(), TWIN)
@@ -1051,9 +997,7 @@ async fn a_twin_without_a_cursor_still_makes_the_coin_type_ambiguous() {
 /// per request instead.
 #[tokio::test]
 async fn the_eden_testnet_resolves_despite_its_chain_id() {
-    let Some(gateway) = Gateway::open(&[EDEN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[EDEN], 32).await;
     let router = gateway.router();
     let owner = Address::from([0xed; 20]);
     gateway.store.bind("alice", owner).await;
@@ -1081,9 +1025,7 @@ async fn the_eden_testnet_resolves_despite_its_chain_id() {
 /// "nobody holds this" and would end that walk at the first gateway asked.
 #[tokio::test]
 async fn the_legacy_addr_shape_is_refused_unsigned_off_mainnet() {
-    let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN], 32).await;
     let router = gateway.router();
     gateway.store.bind("alice", Address::from([0xbe; 20])).await;
 
@@ -1109,9 +1051,7 @@ async fn the_legacy_addr_shape_is_refused_unsigned_off_mainnet() {
 /// indexes Sepolia, and the wallet shows no resolution for a bound name.
 #[tokio::test]
 async fn bare_addr_asks_for_the_chain_of_the_gateways_registry() {
-    let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN], 32).await;
     let in_the_mainnet_registry = gateway.router();
     let in_our_chains_registry = GatewayState::new(Config {
         ens_chain: CHAIN as u64,
@@ -1144,9 +1084,7 @@ async fn bare_addr_asks_for_the_chain_of_the_gateways_registry() {
 /// once rather than layered twice.
 #[tokio::test]
 async fn the_merged_router_keeps_both_halves_intact() {
-    let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN], 32).await;
     let owner = Address::from([0xbe; 20]);
     gateway.store.bind("alice", owner).await;
 
@@ -1231,9 +1169,7 @@ async fn the_merged_router_keeps_both_halves_intact() {
 /// would be true of the name and attributed to the node.
 #[tokio::test]
 async fn a_node_that_is_not_this_name_is_refused() {
-    let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN], 32).await;
     let router = gateway.router();
     gateway.store.bind("alice", Address::from([0xbe; 20])).await;
 
@@ -1265,9 +1201,7 @@ async fn a_node_that_is_not_this_name_is_refused() {
 /// unnormalized second, and "unreadable" would have earned it a signed null.
 #[tokio::test]
 async fn a_name_outside_the_domain_is_refused_whatever_the_record() {
-    let Some(gateway) = Gateway::open(&[CHAIN], 32).await else {
-        return;
-    };
+    let gateway = Gateway::open(&[CHAIN], 32).await;
     let router = gateway.router();
     let node = ens::Name::decode(b"\x07vitalik\x03eth\x00")
         .expect("a name in wire format")
