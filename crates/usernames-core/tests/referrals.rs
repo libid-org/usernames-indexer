@@ -515,28 +515,36 @@ async fn a_held_share_reads_claimed_once_its_holder_claims_the_round() {
     suite.done();
 }
 
-/// A held share counts in its referrer's totals: awaiting where nobody
-/// holds the referrer's handle, claimable once its holder binds it there,
-/// and gone once the holder claims the round.
+/// A held share counts in its referrer's totals, as the part of the slot
+/// the share paid: awaiting where nobody holds the referrer's handle,
+/// claimable once its holder binds it there, and gone once the holder
+/// claims the round.
 #[tokio::test]
 async fn a_held_share_counts_in_its_referrers_totals_until_claimed() {
     let suite = Referrals::open().await;
+    let payer = Address::repeat_byte(0xF1);
     suite.bind(CHAIN, 1, "alice_g3", ALICE).await;
     let bob = Referred::paid(BOB, "bob_g3", "alice_g3", Delivery::Held);
     suite.referred(OTHER_CHAIN, 2, bob).await;
+    // A plain deposit beside the share: the slot is more than its referral
+    // part.
+    suite
+        .other
+        .apply(3, NamesEvent::deposit_by("alice_g3", payer, 7))
+        .await;
     assert_eq!(
         suite.totals(ALICE).await,
-        [(OTHER_CHAIN, 0, SHARE, 0, SHARE)]
+        [(OTHER_CHAIN, 0, SHARE + 7, 0, SHARE)]
     );
 
-    suite.bind(OTHER_CHAIN, 3, "alice_g3", ALICE).await;
+    suite.bind(OTHER_CHAIN, 4, "alice_g3", ALICE).await;
     assert_eq!(
         suite.totals(ALICE).await,
-        [(OTHER_CHAIN, SHARE, 0, SHARE, 0)]
+        [(OTHER_CHAIN, SHARE + 7, 0, SHARE, 0)]
     );
 
     let settling = NamesEvent::claimed("alice_g3", NATIVE);
-    suite.on(OTHER_CHAIN).apply(4, settling).await;
+    suite.on(OTHER_CHAIN).apply(5, settling).await;
     assert_eq!(suite.totals(ALICE).await, []);
     suite.done();
 }
