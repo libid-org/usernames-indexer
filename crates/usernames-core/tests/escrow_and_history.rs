@@ -641,6 +641,10 @@ async fn the_totals_sum_the_claimable_coin_and_leave_out_unnamed_tokens() {
                     decimals: None,
                     claimable: unpriced(105),
                     awaiting: unpriced(0),
+                    referrals: Some(Totals {
+                        claimable: unpriced(0),
+                        awaiting: unpriced(0),
+                    }),
                 }],
                 usd: Totals::default(),
             }],

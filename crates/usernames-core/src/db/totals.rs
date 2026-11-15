@@ -26,6 +26,10 @@ pub struct TotalsRow {
     pub claimable: String,
     /// Held for its nodes on this chain, where nobody holds them.
     pub awaiting: String,
+    /// Of `claimable`, the referral shares held for its nodes.
+    pub referred_claimable: String,
+    /// Of `awaiting`, the referral shares held for its nodes.
+    pub referred_awaiting: String,
 }
 
 impl TotalsRow {
@@ -33,6 +37,15 @@ impl TotalsRow {
     /// a sum of `uint256`s, which the books never write.
     pub fn amounts(&self) -> Option<(U512, U512)> {
         Some((self.claimable.parse().ok()?, self.awaiting.parse().ok()?))
+    }
+
+    /// The referral shares inside the two sums, as numbers, like
+    /// [`Self::amounts`].
+    pub fn referred(&self) -> Option<(U512, U512)> {
+        Some((
+            self.referred_claimable.parse().ok()?,
+            self.referred_awaiting.parse().ok()?,
+        ))
     }
 }
 
@@ -68,13 +81,15 @@ pub(crate) mod plans {
     /// An address's totals, planned.
     pub(crate) trait TotalsPlans {
         /// The totals of an address holding nothing, of one holding many
-        /// handles, and of one whose node holds thousands of junk tokens.
+        /// handles, and of one whose node holds thousands of junk tokens and
+        /// referral shares.
         async fn totals_plans(&mut self) -> Vec<Plan>;
     }
 
     impl TotalsPlans for PgConnection {
         async fn totals_plans(&mut self) -> Vec<Plan> {
-            // The volume's junk: 0x7a..7a holds one node, 5000 tokens deep.
+            // The volume's junk: 0x7a..7a holds one node, 5000 tokens deep,
+            // that 10000 binds referred.
             let holders = [
                 ("totals, nothing held", Address::repeat_byte(2)),
                 ("totals, many handles", Address::repeat_byte(0x4E)),
@@ -88,6 +103,7 @@ pub(crate) mod plans {
             let seeks: &[&str] = &[
                 "handles_owner_chain_node_idx",
                 "escrow_held_pkey|escrow_held_node_idx:chain_id,handle_node,token",
+                "referrals_held_idx:chain_id,referrer_node,token",
             ];
             let mut plans = Vec::new();
             for (name, holder) in holders {

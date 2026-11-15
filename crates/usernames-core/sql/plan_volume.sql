@@ -133,6 +133,19 @@ SELECT 1, sha256('junk node'::bytea),
               ELSE substring(sha256(('junk' || i)::bytea) FROM 1 FOR 20) END,
        1 + i, 0
 FROM generate_series(0, 5000) i;
+-- The same node refers heavily: 10000 coin shares, half held in its round
+-- 0 and half claimed, so a total that walked its referrals would read them
+-- all.
+INSERT INTO names.referrals
+    (chain_id, block_number, log_index, block_time, referrer_node, binder,
+     platform_id, handle_node, fee, share, outcome, delivery, token, round)
+SELECT 1, 10000 + i, 3, 10000 + i, sha256('junk node'::bytea),
+       substring(sha256(('binder' || i)::bytea) FROM 1 FOR 20),
+       decode(repeat('01', 32), 'hex'), sha256(('bound' || i)::bytea),
+       10000, 3000, 'paid',
+       CASE WHEN i % 2 = 0 THEN 'held' ELSE 'claimed' END,
+       decode(repeat('ee', 20), 'hex'), 0
+FROM generate_series(1, 10000) i;
 -- Vacuum moves a GIN index's pending entries into it; the rows above wait there.
 SELECT gin_clean_pending_list('names.handle_nodes_handle_trgm_idx');
 ANALYZE names.handles, names.ids, names.published, names.events,

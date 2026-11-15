@@ -859,6 +859,10 @@ pub struct TokenTotals {
     /// Held for its handles' nodes on this chain, where nobody holds them:
     /// binding the handle here makes it claimable.
     pub awaiting: Amount,
+    /// Of `claimable` and `awaiting`, the referral shares the escrow holds
+    /// for the address's handles. On the chain's coin, the token every
+    /// share is paid in; absent on any other token.
+    pub referrals: Option<Totals<Amount>>,
 }
 
 /// A sum of token units, and its worth when the token is priced.

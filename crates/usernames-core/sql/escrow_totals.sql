@@ -2,7 +2,8 @@
 -- pairwise, and $4, the coin, on every chain): `claimable`, held for nodes
 -- it holds on that chain, and `awaiting`, held for its nodes on chains
 -- where nobody holds them, as claimable_slots.sql and
--- escrow_awaiting_slots.sql list them. Each node seeks each named key by
+-- escrow_awaiting_slots.sql list them; `referred_*`, the held referral
+-- shares inside each. Each node seeks each named key by
 -- the escrow's primary key, LIMIT 1 keeping it a seek, so tokens nobody
 -- named cost nothing however many a junk deposit wrote.
 WITH n AS (
@@ -17,7 +18,9 @@ k AS (
 )
 SELECT e.chain_id, e.token,
        COALESCE(SUM(e.held) FILTER (WHERE o.owner = $1), 0)::text AS claimable,
-       COALESCE(SUM(e.held) FILTER (WHERE o.owner IS NULL), 0)::text AS awaiting
+       COALESCE(SUM(e.held) FILTER (WHERE o.owner IS NULL), 0)::text AS awaiting,
+       COALESCE(SUM(r.held) FILTER (WHERE o.owner = $1), 0)::text AS referred_claimable,
+       COALESCE(SUM(r.held) FILTER (WHERE o.owner IS NULL), 0)::text AS referred_awaiting
 FROM n
 CROSS JOIN k
 CROSS JOIN LATERAL (
@@ -26,6 +29,14 @@ CROSS JOIN LATERAL (
     WHERE e.chain_id = k.chain_id AND e.handle_node = n.handle_node
       AND e.token = k.token AND e.held > 0
     LIMIT 1) e
+-- Of that, the referral shares the node's coin slot holds: the splitter
+-- pays a share in the coin, and only the holder's claim settles it.
+CROSS JOIN LATERAL (
+    SELECT SUM(r.share) AS held
+    FROM names.referrals r
+    WHERE e.token = $4::bytea
+      AND r.chain_id = e.chain_id AND r.referrer_node = e.handle_node
+      AND r.token = e.token AND r.delivery = 'held') r
 LEFT JOIN names.handles o
   ON o.chain_id = e.chain_id AND o.handle_node = e.handle_node
 -- A node another wallet holds on a chain is that wallet's claim there.

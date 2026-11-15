@@ -109,12 +109,23 @@ impl TokenTotals {
     /// A stored row valued at `quote`. The books are this build's own
     /// writing, so a sum that is not a number is an internal error.
     fn of(row: TotalsRow, quote: Option<&Quote>) -> Result<Self, ApiError> {
-        let Some((claimable, awaiting)) = row.amounts() else {
+        let (Some((claimable, awaiting)), Some(referred)) =
+            (row.amounts(), row.referred())
+        else {
             return Err(ApiError::internal(format_args!(
-                "escrow totals {}/{}: claimable {:?} awaiting {:?}",
-                row.chain_id, row.token, row.claimable, row.awaiting
+                "escrow totals {}/{}: claimable {:?} awaiting {:?}, referred {:?} {:?}",
+                row.chain_id,
+                row.token,
+                row.claimable,
+                row.awaiting,
+                row.referred_claimable,
+                row.referred_awaiting
             )));
         };
+        let referrals = (row.token == NATIVE_COIN).then(|| Totals {
+            claimable: Amount::of(referred.0, TokenValue::of(referred.0, quote)),
+            awaiting: Amount::of(referred.1, TokenValue::of(referred.1, quote)),
+        });
         let (claimable_value, awaiting_value) = (
             TokenValue::of(claimable, quote),
             TokenValue::of(awaiting, quote),
@@ -128,6 +139,7 @@ impl TokenTotals {
             decimals: claimable_value.decimals.or(awaiting_value.decimals),
             claimable: Amount::of(claimable, claimable_value),
             awaiting: Amount::of(awaiting, awaiting_value),
+            referrals,
         })
     }
 }

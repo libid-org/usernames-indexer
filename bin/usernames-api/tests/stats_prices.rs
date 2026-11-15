@@ -728,6 +728,10 @@ async fn totals_are_valued_at_the_served_prices() {
             decimals: Some(decimals),
             claimable,
             awaiting,
+            referrals: (token == NATIVE).then(|| Totals {
+                claimable: held(U512::ZERO, "0", "0.00"),
+                awaiting: held(U512::ZERO, "0", "0.00"),
+            }),
         };
     let chain_usd = Totals {
         claimable: usd("3001.98"),
