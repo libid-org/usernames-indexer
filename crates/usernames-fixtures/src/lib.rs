@@ -154,7 +154,6 @@ pub use stats::{
 };
 pub use suite::{
     database_url,
-    require_anvil,
     ChainWatch,
     Entries,
     Events,

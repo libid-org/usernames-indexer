@@ -61,7 +61,6 @@ use usernames_fixtures::{
         Node,
         Proof,
     },
-    require_anvil,
     ChainWatch,
     LockWaits,
     Reads,
@@ -102,7 +101,6 @@ impl Chain {
     /// A fresh chain with id `chain_id` and its rows cleared.
     async fn start(chain_id: u64) -> Self {
         let url = database_url();
-        require_anvil();
 
         let pool = db::connect_and_migrate(&url).await.expect("database");
         ChainStore::new(pool.clone(), chain_id as i64)

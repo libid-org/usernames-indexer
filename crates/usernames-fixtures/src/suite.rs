@@ -68,15 +68,6 @@ pub fn database_url() -> String {
         .expect("DATABASE_URL not set: the suites run against Postgres at that URL")
 }
 
-/// Fails the test unless `anvil` runs: the chain suites run against it.
-pub fn require_anvil() {
-    let ran = std::process::Command::new("anvil")
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success());
-    assert!(ran, "anvil not on PATH: the chain suites run against anvil");
-}
-
 /// One suite's chain in the database the suites share: emptied of whatever
 /// an earlier run left there, and held under the suite's lock until
 /// [`Suite::done`].

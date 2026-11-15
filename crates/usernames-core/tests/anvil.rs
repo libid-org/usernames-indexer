@@ -58,7 +58,6 @@ use usernames_fixtures::{
         Transacts,
         CEREMONY_VERSION,
     },
-    require_anvil,
     ChainWatch,
     Entries,
     IdNode,
@@ -79,7 +78,6 @@ const GOOGLE_USER_ID: &str = "123456789012345678901";
 async fn indexes_a_real_chain_end_to_end() {
     let chain_id = CHAIN;
     let url = database_url();
-    require_anvil();
 
     let pool = db::connect_and_migrate(&url).await.expect("database");
     let store = ChainStore::new(pool.clone(), chain_id as i64);
@@ -468,7 +466,6 @@ async fn indexes_a_real_chain_end_to_end() {
 
 #[tokio::test]
 async fn an_escrow_of_another_registry_is_refused() {
-    require_anvil();
     let node = Node::spawn(CHAIN);
     let (provider, owner) = (&node.provider, node.accounts()[0]);
     let indexed = provider.deploy_registry(owner).await;

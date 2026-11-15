@@ -34,7 +34,6 @@ use usernames_fixtures::{
         Libid,
         Node,
     },
-    require_anvil,
     ChainWatch,
     PATIENCE,
 };
@@ -63,7 +62,6 @@ impl Chain {
     /// `chain` on a fresh anvil.
     async fn start(chain: u64) -> Self {
         let database = database_url();
-        require_anvil();
         let pool = db::connect_and_migrate(&database).await.expect("database");
         ChainStore::new(pool.clone(), chain as i64).forget().await;
         let node = Node::spawn(chain);

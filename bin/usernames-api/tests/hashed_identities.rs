@@ -49,7 +49,6 @@ use usernames_fixtures::{
         Node,
         Proof,
     },
-    require_anvil,
     ChainWatch,
     IdNode,
     Reads,
@@ -82,7 +81,6 @@ impl Harness {
     /// A fresh `chain`, indexed.
     async fn open(chain: u64) -> Self {
         let url = database_url();
-        require_anvil();
         let pool = db::connect_and_migrate(&url).await.expect("database");
         ChainStore::new(pool.clone(), chain as i64).forget().await;
         let store = ChainStore::new(pool.clone(), chain as i64);
