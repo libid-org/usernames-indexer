@@ -28,5 +28,7 @@ CROSS JOIN LATERAL (
     LIMIT 1) e
 LEFT JOIN names.handles o
   ON o.chain_id = e.chain_id AND o.handle_node = e.handle_node
+-- A node another wallet holds on a chain is that wallet's claim there.
+WHERE o.owner = $1 OR o.owner IS NULL
 GROUP BY e.chain_id, e.token
 ORDER BY e.chain_id, e.token

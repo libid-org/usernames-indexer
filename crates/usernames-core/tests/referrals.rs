@@ -16,6 +16,7 @@ use usernames_core::{
     api::model::{
         AddressAmounts,
         AddressReferrals,
+        AddressTotals,
         Delivery,
         Outcome,
         Referral,
@@ -189,6 +190,30 @@ impl Referrals {
             .get(&format!("/v1/escrow/awaiting/{holder}"))
             .await
             .answer()
+    }
+
+    /// Per chain, the coin `holder` may claim and that awaits it, as
+    /// `(chain, claimable, awaiting)`.
+    async fn totals(&self, holder: Address) -> Vec<(i64, u64, u64)> {
+        let totals: AddressTotals = self
+            .suite
+            .pool
+            .get(&format!("/v1/escrow/totals/{holder}"))
+            .await
+            .answer();
+        totals
+            .chains
+            .iter()
+            .flat_map(|chain| {
+                chain.tokens.iter().map(|token| {
+                    (
+                        chain.chain_id,
+                        token.claimable.amount.to::<u64>(),
+                        token.awaiting.amount.to::<u64>(),
+                    )
+                })
+            })
+            .collect()
     }
 
     /// What `holder` may claim, across every chain.
@@ -581,12 +606,19 @@ async fn a_slot_awaits_the_holder_only_where_nobody_holds_its_handle() {
     };
     assert_eq!(amounts(suite.awaiting(ALICE).await), [(OTHER_CHAIN, 11)]);
     assert_eq!(amounts(suite.claimable(ALICE).await), [(CHAIN, 7)]);
+    assert_eq!(
+        suite.totals(ALICE).await,
+        [(CHAIN, 7, 0), (OTHER_CHAIN, 0, 11)]
+    );
 
     // Erin binds the handle on the other chain: the slot is Erin's claim,
     // and waits for Alice no longer.
     suite.bind(OTHER_CHAIN, 5, "alice_w", ERIN).await;
     assert_eq!(suite.awaiting(ALICE).await.amounts, []);
     assert_eq!(amounts(suite.claimable(ERIN).await), [(OTHER_CHAIN, 11)]);
+    // Alice's totals leave the other chain out: nothing there is hers.
+    assert_eq!(suite.totals(ALICE).await, [(CHAIN, 7, 0)]);
+    assert_eq!(suite.totals(ERIN).await, [(OTHER_CHAIN, 11, 0)]);
     suite.done();
 }
 
