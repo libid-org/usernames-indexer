@@ -981,7 +981,6 @@ pub struct AllChains {
 }
 
 /// Payments across every chain, in USD where their token is priced.
-#[serde_as]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Payments {
@@ -1210,7 +1209,6 @@ pub struct EscrowActivity {
 }
 
 /// Movements of one kind: per named token, and every other token together.
-#[serde_as]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenFlows {
@@ -1247,7 +1245,6 @@ pub struct TokenFlow {
 
 /// A token amount as the price source values it: every field is absent
 /// when the token is unpriced.
-#[serde_as]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenValue {
