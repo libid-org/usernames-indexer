@@ -115,11 +115,34 @@ pub const STATS_SNAPSHOT: &str = include_str!("../../sql/stats_snapshot.sql");
 pub const STATS_DEADLINE: &str = include_str!("../../sql/stats_deadline.sql");
 pub const STATS_TAKEN_AT: &str = include_str!("../../sql/stats_taken_at.sql");
 pub const STATS_HANDLES: &str = include_str!("../../sql/stats_handles.sql");
-pub const STATS_LINKS: &str = include_str!("../../sql/stats_links.sql");
-pub const STATS_FEES: &str = include_str!("../../sql/stats_fees.sql");
-pub const STATS_ESCROW: &str = include_str!("../../sql/stats_escrow.sql");
-pub const STATS_ONBOARDING: &str = include_str!("../../sql/stats_onboarding.sql");
-pub const STATS_USERS: &str = include_str!("../../sql/stats_users.sql");
+/// Every chain's totals, by measure and key.
+pub const STATS_TOTALS: &str = include_str!("../../sql/stats_totals.sql");
+/// A page of one chain's days, and of the days across every chain.
+pub const STATS_CHAIN_DAYS: &str = include_str!("../../sql/stats_chain_days.sql");
+pub const STATS_ALL_DAYS: &str = include_str!("../../sql/stats_all_days.sql");
+/// The rollups of a page's days.
+pub const STATS_DAY_COUNTS: &str = include_str!("../../sql/stats_day_counts.sql");
+/// The fold heads: the journal rows a window added, or a page of a journal
+/// the rollups do not hold yet, as the CTE `fresh`.
+pub const STATS_FOLD_WINDOW: &str = include_str!("../../sql/stats_fold_window.sql");
+pub const STATS_FOLD_PAGE: &str = include_str!("../../sql/stats_fold_page.sql");
+/// What the fresh rows count, as the CTE `facts`, after a head.
+pub const STATS_FOLD_FACTS: &str = include_str!("../../sql/stats_fold_facts.sql");
+/// The fold itself, after the facts.
+pub const STATS_FOLD: &str = include_str!("../../sql/stats_fold.sql");
+/// Folds run together, a clear alone, until the transaction ends.
+pub const STATS_FOLD_LOCK: &str = include_str!("../../sql/stats_fold_lock.sql");
+pub const STATS_CLEAR_LOCK: &str = include_str!("../../sql/stats_clear_lock.sql");
+/// Where the next page of a journal ends.
+pub const STATS_PAGE_END: &str = include_str!("../../sql/stats_page_end.sql");
+/// How far a chain's journal is folded, and moving it on.
+pub const STATS_BACKFILL: &str = include_str!("../../sql/stats_backfill.sql");
+pub const STATS_BACKFILLED: &str = include_str!("../../sql/stats_backfilled.sql");
+pub const STATS_FOLDED: &str = include_str!("../../sql/stats_folded.sql");
+/// One chain's rollups and the users across every chain, and the chains
+/// whose journals count those users again.
+pub const STATS_CLEAR: &str = include_str!("../../sql/stats_clear.sql");
+pub const STATS_REFOLDS: &str = include_str!("../../sql/stats_refolds.sql");
 /// The bound handle nodes; the caller bounds them by a referral code's prefix
 /// and takes two.
 pub const REFERRAL_CODE_OWNER: &str = include_str!("../../sql/referral_code_owner.sql");

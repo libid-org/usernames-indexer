@@ -1269,6 +1269,19 @@ mod tests {
         assert!("lost".parse::<Delivery>().is_err());
     }
 
+    /// What a chain history's `?kind=` takes, the splitter's kinds included.
+    #[test]
+    fn every_kind_parses_back_from_its_name() {
+        for kind in EventKind::ALL {
+            assert_eq!(kind.as_str().parse::<EventKind>().ok(), Some(kind));
+        }
+        assert_eq!(
+            ["referred", "bind_fee_set"].map(|name| name.parse::<EventKind>().ok()),
+            [Some(EventKind::Referred), Some(EventKind::BindFeeSet)]
+        );
+        assert!("minted".parse::<EventKind>().is_err());
+    }
+
     #[test]
     fn every_role_parses_back_from_its_name() {
         for role in Role::ALL {

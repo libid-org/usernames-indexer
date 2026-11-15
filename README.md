@@ -69,6 +69,7 @@ indexer's settings.
 | `START_BLOCK` | indexer | unset | Where a FRESH scan starts — consulted only when no cursor exists (new database, or right after a re-index). Unset means the deployment block is found by binary search over `eth_getCode`; only a successful detection is cached, and an RPC failure mid-search retries next cycle |
 | `LISTEN_ADDR` | api | `127.0.0.1:8080` | Read-API listen address |
 | `STATS_TOKENS` | api | unset | The tokens `/v1/stats` names beside each chain's own coin, comma-separated `<chain id>:<address>` pairs (`8453:0x8335…`). Every other token's movements count together under `other`, without an amount: anybody can write a token |
+| `STATS_FEE_RECEIVERS` | api | unset | The registration fee receivers `/v1/stats` names, comma-separated `<chain id>:<address>` pairs. Every other receiver's fees count together under `other`, with their amount: a bind may name any receiver |
 
 ### Polling
 
@@ -97,12 +98,14 @@ set `STALE_AFTER` past the chain's longest gap between blocks.
 | `GET /v1/history/address/{address}?before=&limit=` | Every event the address took part in, newest first, each with its `roles`: `holder`, `previousHandleHolder` and `previousIdHolder` (an event took that handle or account from it), `feeReceiver`, `sender` (of a deposit; a claim that took it names it too), `claimer`, `recipient` |
 | `GET /v1/history/handle/{platform}/{handle}?before=&limit=` | Every event on the handle: deposits while nobody held it, the binds that gave it a holder, and every claim, refund and payment after |
 | `GET /v1/history/node/{node}?before=&limit=` | The same, by handle node: for a handle nobody has bound, whose text no event carried |
+| `GET /v1/history/chain/{chain}?day=&kind=&token=&before=&limit=` | What happened on one chain, newest first, as `entries` like the other histories: one UTC day (`day` = its first second) or the whole journal, of one `kind` (`deposited`, `claimed`, …) and in one `token` when asked. Each page is one index seek and at most `limit` entries (default 20, at most 100), however busy the day; `computedAt` says when it was read |
 | `GET /v1/escrow/claimable/{address}?before=&limit=` | What `claim` would pay the address: everything held for the handles it holds now |
 | `GET /v1/escrow/awaiting/{address}?before=&limit=` | What is held for the handles the address holds, on each chain where nobody holds that handle: binding it there makes the amount claimable. By node, chain and token, descending |
 | `GET /v1/escrow/refundable/{address}?before=&limit=` | What the address sent that nobody has claimed yet, each contribution with its `refundableAt`: when `refund` opens for it |
 | `GET /v1/escrow/handle/{platform}/{handle}?before=&limit=` | What a handle holds, token by token, and its holder; `/v1/escrow/node/{node}` by node |
 | `GET /v1/escrow/unclaimed?token=0x…&before=&limit=` | Every slot still holding something, bound or not: token by token, descending, the largest amount first within each |
-| `GET /v1/stats` | Users (wallets that linked, sent through the escrow or claimed, but no chain's referral splitter, whose share deposits and forwards still count as such) and new users across every chain, a wallet counted once, in total and per UTC day. Per chain, in total and per UTC day: users and new users, links and live handles per platform, registration fees per receiver, escrow deposits, forwards, claims and refunds, and onboarding claims (deposits to a handle nobody held, claimed after its holder linked). Token movements are listed per token for the chain's own coin and the `STATS_TOKENS`, and together under `other` for every other token, with a count and wallets but no amount. Amounts are token units as decimal strings. One computation is served for five minutes; `computedAt` says when it was taken |
+| `GET /v1/stats` | Users (wallets that linked, sent through the escrow or claimed, but no chain's referral splitter, whose share deposits and forwards still count as such) and new users across every chain, a wallet counted once, in total. Per chain, in total: users, links and live handles per platform, registration fees, escrow deposits, forwards, claims and refunds, and onboarding claims (deposits to a handle nobody held, claimed after its holder linked). Token movements are listed per token for the chain's own coin and the `STATS_TOKENS`, and together under `other` for every other token, with a count only. Fees are listed per receiver for the `STATS_FEE_RECEIVERS`, and together under `other` for every other receiver, with a count and an amount: every fee is paid in the chain's own coin, and a bind may name any receiver. Amounts are token units as decimal strings. It reads the rollups' totals, never the journal or the days: its work grows with chains, platforms, named tokens and named receivers, and with the live handles, not with events or days. One computation is served for five minutes, stopped by the database after 30 s; `computedAt` says when it was taken. It answers one row per chain and platform, named receiver, named token and flow, and one `other` per chain for fees and per chain and flow |
+| `GET /v1/stats/days?chain=&before=&limit=` | The same counts per UTC day, newest first, for a chart: users and new users across every chain, or with `chain` that chain's day by day activity, tokens named as in `/v1/stats`. A day with nothing recorded is absent. `limit` defaults to 30, at most 366; `next` is the `before` of the next page. Read per request from the rollups, one index seek per day and key, with its own `computedAt`: a page answers at most `limit` days, each with one row per platform, named receiver, named token and flow, and one `other` for fees and per flow; across chains, two numbers per day. The day's events are `/v1/history/chain/{chain}?day=` |
 | `GET /v1/referral/code/{code}` | The handle a referral code names: `platform`, `handleNode`, `primaryHandle` (its text, only where a holder published it as its name) and the `chains` it is bound on now. A code is the base58 of a bound node's first 8 to 32 bytes; it names the one node bound on any chain that those bytes start, retired or not. While two are, it names neither: 409 `code_ambiguous` |
 | `GET /v1/referral/node/{node}/code` | The same for a bound node, with the shortest `code` that names it: 8 bytes, or more where another bound node shares them |
 | `GET /v1/referrals/address/{address}?before=&limit=` | Every bind on any chain that named a handle the address holds as its referrer, newest first: the `referrer` handle on the platform its node is bound on, the `binder` and its published `binderHandle` on that chain, the `fee` and the referrer's `share` (decimal strings), the `outcome` (`paid`, `self_referral`, `refused`), and for a paid share its `delivery`: `forwarded` to the holder, or `held` in the escrow for the handle's claim, then `claimed` by its holder or `refunded` to the splitter |
@@ -340,15 +343,37 @@ chain; a second deployment can share the database):
   roles, dated by its block. A bind's previous holders are read from the
   rows it changes; a ceremony's and a fee's handle and payer are the bind's
   before them in their transaction
+- `stats_counts` — what `/v1/stats/days` reads, per chain, measure, UTC
+  day and key: the rows counted, the amount they moved, the distinct wallets
+  and the new ones among them. The measures are `users`, the chain's share
+  of `all_chains_users`, `links` per platform, `fees` per receiver and
+  under an empty key for every receiver together, and `deposited`,
+  `forwarded`, `claimed`, `refunded` and `onboarding` per token and under
+  an empty key for every token together
+- `stats_totals` — the same over every day: what `/v1/stats` reads
+- `stats_wallet_days` — each wallet once per day under a measure and key,
+  so a wallet counts once a day; the users across chains sit under chain 0
+- `stats_firsts` — each wallet's first day under a measure and key, under
+  chain 0 across chains; a fold that sees the wallet earlier moves it there
+  and names the day it left in `moved_from`
 
 `chains` holds one row per chain: the version and contracts its rows were
 written from, the registry's deployment block, the cursor, head and target,
 the last report and window error, and the Proof Verifier, which
 `/v1/status` reports.
 
-Each window commits in one transaction — journal, projections and cursor
-together — and the journal's `(chain, block, log)` conflict gates the
-projection writes, so a crash or an overlap replays a window and converges.
+Each window commits in one transaction — journal, projections, the rows it
+journaled folded into the stats rollups, and cursor together — and the
+journal's `(chain, block, log)` conflict gates the projection writes and
+the fold, so a crash or an overlap replays a window and converges. A chain
+whose journal was written before the rollups existed is folded page by page
+(10,000 rows) when its indexer next starts, before it indexes; each page
+commits with how far the fold got, so a restart goes on from there. Clearing
+a chain clears its rollups and the users across chains, then folds every
+other chain's journal into those again. Folds share an advisory lock that a
+clear takes alone. Two chains' folds of one wallet write its rows across
+chains in wallet order, so the second waits on the first and they never
+deadlock; a window that fails anyway is retried from the cursor.
 One process holds a per-chain Postgres advisory lock while it may write; a
 second instance (a rolling-deploy overlap) blocks on it instead of
 interleaving.

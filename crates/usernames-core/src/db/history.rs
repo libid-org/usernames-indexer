@@ -36,6 +36,7 @@ use super::{
 use crate::{
     events::{
         EscrowEvent,
+        EventKind,
         NamesEvent,
         Role,
     },
@@ -287,6 +288,24 @@ impl Cursor<HistoryRow> for HistoryCursor {
     }
 }
 
+/// A UTC day's length in seconds: a day is named by its first second.
+pub const SECONDS_PER_DAY: i64 = 86_400;
+
+/// Which of a chain's events a chain history lists: one UTC day's or all of
+/// them, of one kind or all, in one token or any. Each shape seeks an index
+/// led by the chain, then the filter it names, then the block time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainEvents {
+    /// The chain.
+    pub chain_id: i64,
+    /// The first second of a UTC day; its events only.
+    pub day: Option<i64>,
+    /// Events of this kind only.
+    pub kind: Option<EventKind>,
+    /// Events moving this token only.
+    pub token: Option<Address>,
+}
+
 /// One history entry as the store holds it: the journal row, where it sat,
 /// the roles an address history asked about, and the handle it concerns.
 #[derive(sqlx::FromRow)]
@@ -335,62 +354,131 @@ impl Page<HistoryCursor> {
         statement
     }
 
+    /// A chain's history page: the projection's rows on the chain, narrowed
+    /// to the day, kind and token the filter names.
+    pub(crate) fn chain_lookup(&self, prefix: &str, events: ChainEvents) -> Statement {
+        let mut statement = QueryBuilder::new(format!(
+            "{prefix}{} WHERE e.chain_id = ",
+            sql::HANDLE_HISTORY_PROJECTION
+        ));
+        statement.push_bind(events.chain_id);
+        if let Some(day) = events.day {
+            statement
+                .push(" AND e.block_time >= ")
+                .push_bind(day)
+                .push(" AND e.block_time < ")
+                .push_bind(day + SECONDS_PER_DAY);
+        }
+        if let Some(kind) = events.kind {
+            statement.push(" AND e.kind = ").push_bind(kind.as_str());
+        }
+        if let Some(token) = events.token {
+            statement.push(" AND e.token = ").push_bind(token);
+        }
+        self.on_one_chain(&mut statement, "e");
+        statement
+    }
+
     /// The chain, the cursor, the order and the fetch limit. On one chain the
     /// chain leaves the comparison, so the address table's key (chain,
     /// address, time) or the node's history index serves the page as one
     /// backward range; across chains the history index does, with the chain
     /// in the comparison.
     pub(crate) fn bound(&self, statement: &mut Statement, table: &str) {
-        let order = match self.chain {
+        match self.chain {
             Some(chain) => {
                 statement
                     .push(format!(" AND {table}.chain_id = "))
                     .push_bind(chain);
-                if let Some(before) = self.before {
-                    statement
-                        .push(format!(
-                            " AND ({table}.block_time, {table}.block_number, \
-                             {table}.log_index) < ("
-                        ))
-                        .push_bind(before.block_time)
-                        .push(", ")
-                        .push_bind(before.block_number)
-                        .push(", ")
-                        .push_bind(before.log_index)
-                        .push(")");
-                }
-                format!(
-                    " ORDER BY {table}.block_time DESC, {table}.block_number DESC, \
-                     {table}.log_index DESC LIMIT "
-                )
+                self.on_one_chain(statement, table);
             }
-            None => {
-                if let Some(before) = self.before {
-                    statement
-                        .push(format!(
-                            " AND ({table}.block_time, {table}.chain_id, \
-                             {table}.block_number, {table}.log_index) < ("
-                        ))
-                        .push_bind(before.block_time)
-                        .push(", ")
-                        .push_bind(before.chain_id)
-                        .push(", ")
-                        .push_bind(before.block_number)
-                        .push(", ")
-                        .push_bind(before.log_index)
-                        .push(")");
-                }
-                format!(
-                    " ORDER BY {table}.block_time DESC, {table}.chain_id DESC, \
-                     {table}.block_number DESC, {table}.log_index DESC LIMIT "
-                )
-            }
-        };
-        statement.push(order).push_bind(self.fetch());
+            None => self.across_chains(statement, table),
+        }
+    }
+
+    /// The cursor, the order and the fetch limit of a page across every
+    /// chain: the chain joins the comparison and the order.
+    fn across_chains(&self, statement: &mut Statement, table: &str) {
+        if let Some(before) = self.before {
+            statement
+                .push(format!(
+                    " AND ({table}.block_time, {table}.chain_id, \
+                     {table}.block_number, {table}.log_index) < ("
+                ))
+                .push_bind(before.block_time)
+                .push(", ")
+                .push_bind(before.chain_id)
+                .push(", ")
+                .push_bind(before.block_number)
+                .push(", ")
+                .push_bind(before.log_index)
+                .push(")");
+        }
+        statement
+            .push(format!(
+                " ORDER BY {table}.block_time DESC, {table}.chain_id DESC, \
+                 {table}.block_number DESC, {table}.log_index DESC LIMIT "
+            ))
+            .push_bind(self.fetch());
+    }
+
+    /// The cursor, the order and the fetch limit of a page whose statement
+    /// already holds its one chain.
+    fn on_one_chain(&self, statement: &mut Statement, table: &str) {
+        if let Some(before) = self.before {
+            statement
+                .push(format!(
+                    " AND ({table}.block_time, {table}.block_number, \
+                     {table}.log_index) < ("
+                ))
+                .push_bind(before.block_time)
+                .push(", ")
+                .push_bind(before.block_number)
+                .push(", ")
+                .push_bind(before.log_index)
+                .push(")");
+        }
+        statement
+            .push(format!(
+                " ORDER BY {table}.block_time DESC, {table}.block_number DESC, \
+                 {table}.log_index DESC LIMIT "
+            ))
+            .push_bind(self.fetch());
     }
 }
 
+/// A page of a chain's events as the store read it.
+pub struct ChainEventsPage {
+    /// When it was read, in unix seconds by the database's clock.
+    pub taken_at: i64,
+    /// The events, and the cursor of the next page.
+    pub rows: Rows<HistoryRow, HistoryCursor>,
+}
+
 impl Store {
+    /// A chain's events, newest first, as `events` narrows them, and when
+    /// they were read.
+    pub async fn chain_history(
+        &self,
+        events: ChainEvents,
+        page: Page<HistoryCursor>,
+    ) -> Result<ChainEventsPage, sqlx::Error> {
+        let mut tx = self.pool.begin_with(sql::STATS_SNAPSHOT).await?;
+        let taken_at = sqlx::query_scalar(sql::STATS_TAKEN_AT)
+            .fetch_one(&mut *tx)
+            .await?;
+        let rows = page
+            .chain_lookup("", events)
+            .build_query_as()
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(ChainEventsPage {
+            taken_at,
+            rows: page.split(rows),
+        })
+    }
+
     /// The events an address took part in, newest first.
     pub async fn address_history(
         &self,
@@ -499,6 +587,95 @@ pub(crate) mod plans {
                 ),
             ] {
                 plans.push(Plan::of(self, name, Some(seeks), statement).await);
+            }
+
+            let on_chain = ChainEvents {
+                chain_id: 1,
+                day: None,
+                kind: None,
+                token: None,
+            };
+            let day = Some(0);
+            let deposits = Some(EventKind::Deposited);
+            let token = Some(Address::repeat_byte(5));
+            let time: &[&str] = &["events_chain_time_idx"];
+            let kind: &[&str] = &["events_chain_kind_time_idx"];
+            let in_token: &[&str] = &["events_chain_token_time_idx"];
+            let token_kind: &[&str] = &["events_chain_token_kind_time_idx"];
+            for (name, past, seeks, events) in [
+                (
+                    "chain history",
+                    "chain history, past a cursor",
+                    time,
+                    on_chain,
+                ),
+                (
+                    "chain history, one day",
+                    "chain history, one day, past a cursor",
+                    time,
+                    ChainEvents { day, ..on_chain },
+                ),
+                (
+                    "chain history, one kind",
+                    "chain history, one kind, past a cursor",
+                    kind,
+                    ChainEvents {
+                        kind: deposits,
+                        ..on_chain
+                    },
+                ),
+                (
+                    "chain history, one day, one kind",
+                    "chain history, one day, one kind, past a cursor",
+                    kind,
+                    ChainEvents {
+                        day,
+                        kind: deposits,
+                        ..on_chain
+                    },
+                ),
+                (
+                    "chain history, one token",
+                    "chain history, one token, past a cursor",
+                    in_token,
+                    ChainEvents { token, ..on_chain },
+                ),
+                (
+                    "chain history, one day, one token",
+                    "chain history, one day, one token, past a cursor",
+                    in_token,
+                    ChainEvents {
+                        day,
+                        token,
+                        ..on_chain
+                    },
+                ),
+                (
+                    "chain history, one kind, one token",
+                    "chain history, one kind, one token, past a cursor",
+                    token_kind,
+                    ChainEvents {
+                        kind: deposits,
+                        token,
+                        ..on_chain
+                    },
+                ),
+                (
+                    "chain history, one day, one kind, one token",
+                    "chain history, one day, one kind, one token, past a cursor",
+                    token_kind,
+                    ChainEvents {
+                        day,
+                        kind: deposits,
+                        token,
+                        ..on_chain
+                    },
+                ),
+            ] {
+                for (name, before) in [(name, None), (past, cursor)] {
+                    let statement = page(None, before).chain_lookup("EXPLAIN ", events);
+                    plans.push(Plan::of(self, name, Some(seeks), statement).await);
+                }
             }
 
             let reads = [

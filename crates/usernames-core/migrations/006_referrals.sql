@@ -4,7 +4,7 @@
 -- Every statement here takes the journal's exclusive lock only for a catalog
 -- change, which is waited for 5 s at most: a migration that does not get it
 -- fails, and the indexer's next start tries again. The new kind's check is
--- added NOT VALID, so no row is read under the lock; 006 validates it.
+-- added NOT VALID, so no row is read under the lock; 007 validates it.
 SET LOCAL lock_timeout = '5s';
 
 -- The ReferralSplitter the chain's indexer watches, beside its escrow, and
