@@ -14,6 +14,7 @@ use alloy::{
         Address,
         B256,
         U256,
+        U512,
     },
     providers::{
         ext::AnvilApi,
@@ -27,6 +28,7 @@ use usernames_core::{
         AddressAmounts,
         AddressHistory,
         AddressReferrals,
+        AddressTotals,
         Delivery,
         EscrowAmount,
         HandleAmounts,
@@ -38,6 +40,7 @@ use usernames_core::{
     chain::{
         self,
         Contracts,
+        NATIVE_COIN,
     },
     db::{
         self,
@@ -227,6 +230,24 @@ impl Pages<'_> {
     /// The profile: what binding its handles elsewhere makes claimable.
     async fn awaiting(&self) -> AddressAmounts {
         self.amounts("awaiting").await
+    }
+
+    /// The profile: the holder's totals per chain, claimable and awaiting,
+    /// in each chain's coin as (chain, claimable, awaiting).
+    async fn totals(&self) -> Vec<(i64, U512, U512)> {
+        let path = format!("/v1/escrow/totals/{}", self.holder);
+        let answer: AddressTotals = self.pool.get(&path).await.answer();
+        answer
+            .chains
+            .iter()
+            .filter(|c| self.chains.contains(&c.chain_id))
+            .flat_map(|c| {
+                c.tokens.iter().map(|t| {
+                    assert_eq!(t.token, NATIVE_COIN, "only the coin is named");
+                    (c.chain_id, t.claimable.amount, t.awaiting.amount)
+                })
+            })
+            .collect()
     }
 
     async fn amounts(&self, list: &str) -> AddressAmounts {
@@ -517,6 +538,11 @@ async fn a_referral_across_two_chains_reads_on_both_pages() {
     assert_eq!(awaiting.priced_at, None);
     assert_eq!(awaiting.amounts[0].priced, TokenValue::default());
     assert_eq!(pages.claimable().await.slots(), []);
+    assert_eq!(
+        pages.totals().await,
+        [(on_b, U512::ZERO, share().to())],
+        "the share awaits on B"
+    );
 
     // B2 binds on A naming it: the splitter forwards the share to R.
     let before = a.libid.balance(r).await;
@@ -543,6 +569,11 @@ async fn a_referral_across_two_chains_reads_on_both_pages() {
         [(on_b, node, share(), Some(r))]
     );
     assert_eq!(pages.awaiting().await.slots(), []);
+    assert_eq!(
+        pages.totals().await,
+        [(on_b, share().to(), U512::ZERO)],
+        "the share is claimable on B"
+    );
 
     // R claims on B: the share reads claimed, nothing waits on either page,
     // and R's history shows the forward on A and the claim on B.
@@ -558,6 +589,7 @@ async fn a_referral_across_two_chains_reads_on_both_pages() {
     );
     assert_eq!(pages.claimable().await.slots(), []);
     assert_eq!(pages.awaiting().await.slots(), []);
+    assert_eq!(pages.totals().await, [], "nothing is left to claim");
     let splitter = *a.libid.splitter.address();
     let paid: Vec<_> = pages
         .history()

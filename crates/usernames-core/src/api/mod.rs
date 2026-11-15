@@ -15,6 +15,7 @@ mod prices;
 mod referral;
 mod referrals;
 mod stats;
+mod totals;
 
 use std::{
     sync::Arc,
@@ -181,6 +182,7 @@ impl AppState {
             .route("/v1/escrow/handle/{platform}/{handle}", get(escrow::handle))
             .route("/v1/escrow/node/{node}", get(escrow::node))
             .route("/v1/escrow/unclaimed", get(escrow::unclaimed))
+            .route("/v1/escrow/totals/{address}", get(totals::totals))
             .route("/v1/stats", get(stats::stats))
             .route("/v1/stats/days", get(stats::days))
             .route("/v1/referral/code/{code}", get(referral::code))

@@ -297,7 +297,7 @@ impl fmt::Display for ListedAddress {
 
 impl ListedAddress {
     /// `listed` as the two arrays a statement unnests into pairs.
-    fn columns(listed: &[Self]) -> (Vec<i64>, Vec<Vec<u8>>) {
+    pub(crate) fn columns(listed: &[Self]) -> (Vec<i64>, Vec<Vec<u8>>) {
         listed
             .iter()
             .map(|listed| (listed.chain_id, listed.address.to_vec()))

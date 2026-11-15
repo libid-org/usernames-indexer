@@ -16,6 +16,7 @@ use super::{
     referral::plans::ReferralPlans,
     referrals::plans::ReferralHistoryPlans,
     stats::plans::StatsPlans,
+    totals::plans::TotalsPlans,
     *,
 };
 
@@ -29,7 +30,8 @@ const VACUUM: &str = include_str!("../../sql/plan_vacuum.sql");
 /// seeks exactly, `None` where only the row count decides between them.
 /// `index:a,b` asks more: every scan of `index` has columns `a` and `b` in
 /// its index condition, so a scan that walks the index, or binds a later
-/// column without the leading one, cannot pass for a seek.
+/// column without the leading one, cannot pass for a seek; `x|y:a,b` asks
+/// it of whichever of them the plan scans.
 pub(crate) struct Plan {
     pub(crate) name: &'static str,
     pub(crate) seeks: Option<&'static [&'static str]>,
@@ -88,10 +90,17 @@ impl Plan {
         }
         for index in seeks.unwrap_or_default() {
             match index.split_once(':') {
-                Some((index, columns)) => assert!(
-                    self.bounds(index, columns),
-                    "{name} scans {index} without {columns} in its index condition:\n{text}"
-                ),
+                Some((index, columns)) => {
+                    let scanned: Vec<&str> = index
+                        .split('|')
+                        .filter(|index| !self.scans(index).is_empty())
+                        .collect();
+                    assert!(
+                        !scanned.is_empty()
+                            && scanned.iter().all(|index| self.bounds(index, columns)),
+                        "{name} scans {index} without {columns} in its index condition:\n{text}"
+                    )
+                }
                 None => assert!(
                     index.split('|').any(|index| text.contains(index)),
                     "{name} does not seek {index}:\n{text}"
@@ -120,16 +129,24 @@ impl Plan {
         }
     }
 
+    /// The lines of the plan that scan `index`: `Index Scan using <index>
+    /// on`, or `Bitmap Index Scan on <index>`.
+    fn scans(&self, index: &str) -> Vec<usize> {
+        let names = [format!("using {index} "), format!("Index Scan on {index} ")];
+        self.text
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| names.iter().any(|name| line.contains(name)))
+            .map(|(at, _)| at)
+            .collect()
+    }
+
     /// Whether the plan scans `index` and every scan of it names each of the
     /// comma-separated `columns` in its `Index Cond`: the lines under a
     /// scan, up to the next node.
     fn bounds(&self, index: &str, columns: &str) -> bool {
-        // `Index Scan using <index> on`, or `Bitmap Index Scan on <index>`.
-        let names = [format!("using {index} "), format!("Index Scan on {index} ")];
         let lines: Vec<&str> = self.text.lines().collect();
-        let scans: Vec<usize> = (0..lines.len())
-            .filter(|&at| names.iter().any(|name| lines[at].contains(name)))
-            .collect();
+        let scans = self.scans(index);
         !scans.is_empty()
             && scans.iter().all(|&at| {
                 lines[at + 1..]
@@ -356,6 +373,7 @@ async fn every_read_over_the_big_tables_seeks_its_index() {
     all.extend(conn.referral_plans().await);
     all.extend(conn.referral_history_plans().await);
     all.extend(conn.awaiting_plans().await);
+    all.extend(conn.totals_plans().await);
     for plan in all {
         plan.check();
     }
