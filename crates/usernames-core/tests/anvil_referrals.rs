@@ -33,6 +33,7 @@ use usernames_core::{
         HistoryEvent,
         Outcome,
         Status,
+        TokenValue,
     },
     chain::{
         self,
@@ -510,10 +511,11 @@ async fn a_referral_across_two_chains_reads_on_both_pages() {
         pages.referrals().await.on_chains(),
         [(on_b, b1, Outcome::Paid, Some(Delivery::Held))]
     );
-    assert_eq!(
-        pages.awaiting().await.slots(),
-        [(on_b, node, share(), None)]
-    );
+    let awaiting = pages.awaiting().await;
+    assert_eq!(awaiting.slots(), [(on_b, node, share(), None)]);
+    // No price source prices an anvil chain: the share answers raw units.
+    assert_eq!(awaiting.priced_at, None);
+    assert_eq!(awaiting.amounts[0].priced, TokenValue::default());
     assert_eq!(pages.claimable().await.slots(), []);
 
     // B2 binds on A naming it: the splitter forwards the share to R.
