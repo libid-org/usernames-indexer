@@ -52,6 +52,9 @@ use usernames_core::{
     api::{
         model::{
             AddressAmounts,
+            AddressTotals,
+            Amount,
+            ChainTotals,
             DayActivity,
             HandleAmounts,
             OtherTokens,
@@ -59,7 +62,9 @@ use usernames_core::{
             StatsDays,
             TokenFlow,
             TokenFlows,
+            TokenTotals,
             TokenValue,
+            Totals,
             Usd,
         },
         AppState,
@@ -667,6 +672,85 @@ async fn escrow_amounts_are_valued_at_the_served_prices() {
         .await;
     assert_eq!(claimable.priced_at, Some(oldest));
     assert_eq!(claimable.priced(), held.priced());
+    suite.store().forget().await;
+    suite.done();
+}
+
+/// An address's totals value each named token at the served prices, the
+/// chain's coin first, and sum its USD per chain and across chains; a token
+/// nobody prices is not summed.
+#[tokio::test]
+async fn totals_are_valued_at_the_served_prices() {
+    let suite = Suite::open(&SUITE, CHAIN).await;
+    let mock = MockSource::start().await;
+    let ether_price = Coin {
+        timestamp: now() - 100,
+        ..Coin::priced(2000.5, 18, "ETH")
+    };
+    let oldest = ether_price.timestamp;
+    mock.price(NATIVE, ether_price);
+    mock.price(USDC, Coin::priced(0.9998, 6, "USDC"));
+    let deposits = vec![
+        NamesEvent::deposited(NATIVE, SENDER, ether(15)),
+        NamesEvent::deposited(USDC, PAYER, U256::from(1_234_567u64)),
+        NamesEvent::deposited(JUNK, SENDER, U256::from(5u64)),
+    ];
+    suite.apply_tx(10, deposits).await;
+    suite
+        .apply_tx(
+            11,
+            NamesEvent::bind(HOLDER, KnownPlatform::X, "901", "dave", 5_000, false),
+        )
+        .await;
+
+    let totals: AddressTotals = AppState::new(Store::new(suite.pool.clone()))
+        .pricing(mock.source())
+        .router()
+        .answer(&format!("/v1/escrow/totals/{HOLDER}"))
+        .await;
+    let held = |amount: U512, value: &str, usd_value: &str| Amount {
+        amount,
+        value: Some(value.to_string()),
+        usd: Some(usd(usd_value)),
+    };
+    let token =
+        |token, (symbol, decimals): (&str, u8), claimable, awaiting| TokenTotals {
+            token,
+            symbol: Some(symbol.to_string()),
+            decimals: Some(decimals),
+            claimable,
+            awaiting,
+        };
+    let chain_usd = Totals {
+        claimable: usd("3001.98"),
+        awaiting: usd("0.00"),
+    };
+    assert_eq!(
+        totals,
+        AddressTotals {
+            address: HOLDER,
+            priced_at: Some(oldest),
+            chains: vec![ChainTotals {
+                chain_id: CHAIN,
+                tokens: vec![
+                    token(
+                        NATIVE,
+                        ("ETH", 18),
+                        held(ether(15).to(), "1.5", "3000.75"),
+                        held(U512::ZERO, "0", "0.00"),
+                    ),
+                    token(
+                        USDC,
+                        ("USDC", 6),
+                        held(U512::from(1_234_567u64), "1.234567", "1.23"),
+                        held(U512::ZERO, "0", "0.00"),
+                    ),
+                ],
+                usd: chain_usd.clone(),
+            }],
+            usd: chain_usd,
+        }
+    );
     suite.store().forget().await;
     suite.done();
 }

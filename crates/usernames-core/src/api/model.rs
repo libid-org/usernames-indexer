@@ -23,7 +23,9 @@ use serde::{
 };
 use serde_with::{
     serde_as,
+    DeserializeFromStr,
     DisplayFromStr,
+    SerializeDisplay,
 };
 
 pub use crate::events::{
@@ -806,6 +808,81 @@ pub struct Unclaimed {
     pub next: Option<String>,
 }
 
+/// `GET /v1/escrow/totals/{address}`: what the address may claim now and
+/// what binding its handles elsewhere makes claimable, per chain and token,
+/// in each chain's coin and the tokens `/v1/stats` prices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddressTotals {
+    /// The address asked about.
+    pub address: Address,
+    /// Unix seconds of the oldest price the totals are valued at: the
+    /// `/v1/stats` answer being served prices the tokens, and its
+    /// `pricedAt` is this; absent when it uses none.
+    pub priced_at: Option<i64>,
+    /// By chain id; a chain where nothing is held is absent.
+    pub chains: Vec<ChainTotals>,
+    /// Across chains, the priced tokens only.
+    pub usd: Totals<Usd>,
+}
+
+/// One chain's totals for an address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainTotals {
+    /// The chain the escrow holds them on.
+    pub chain_id: i64,
+    /// The chain's coin first, then by token; a token where nothing is held
+    /// is absent.
+    pub tokens: Vec<TokenTotals>,
+    /// The priced tokens only.
+    pub usd: Totals<Usd>,
+}
+
+/// One token's totals on one chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenTotals {
+    /// The token; EIP-7528 `0xEeee…EEeE` is the chain's own coin.
+    pub token: Address,
+    /// The token's symbol, as its creator wrote it: text to show, never
+    /// markup. Absent when unpriced or not plain.
+    pub symbol: Option<String>,
+    /// The token's decimals; absent when unpriced.
+    pub decimals: Option<u8>,
+    /// Held for the handles the address holds on this chain, which `claim`
+    /// pays it.
+    pub claimable: Amount,
+    /// Held for its handles' nodes on this chain, where nobody holds them:
+    /// binding the handle here makes it claimable.
+    pub awaiting: Amount,
+}
+
+/// A sum of token units, and its worth when the token is priced.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Amount {
+    /// Token units, as a decimal string. A sum, so it may pass a `uint256`.
+    #[serde_as(as = "DisplayFromStr")]
+    pub amount: U512,
+    /// `amount` after the decimals, as a decimal string; absent when
+    /// unpriced.
+    pub value: Option<String>,
+    /// `amount` in USD, truncated to the cent; absent when unpriced.
+    pub usd: Option<Usd>,
+}
+
+/// What may be claimed now, and what waits for a bind.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Totals<T> {
+    /// Claimable now.
+    pub claimable: T,
+    /// Awaiting a bind.
+    pub awaiting: T,
+}
+
 /// One bind that named a handle as its referrer, and what became of the
 /// referrer's share of the fee.
 #[serde_as]
@@ -909,7 +986,18 @@ pub struct Payments {
 }
 
 /// A USD amount in cents, served with two places: `1234.05`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    SerializeDisplay,
+    DeserializeFromStr,
+)]
 pub struct Usd(U512);
 
 /// Why a USD amount does not parse.
