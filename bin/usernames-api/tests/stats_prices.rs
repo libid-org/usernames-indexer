@@ -628,9 +628,8 @@ async fn a_failed_chain_list_keeps_the_last_one() {
     suite.done();
 }
 
-/// A chain the source's list leaves out is not priced: nothing of it is
-/// asked, its coin is named without a price, and its other tokens count
-/// under `other`.
+/// A chain the source's list stops naming is not priced: nothing of it is
+/// asked, and its coin and tokens priced before read unpriced.
 #[tokio::test]
 async fn a_chain_the_list_leaves_out_is_not_priced() {
     let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
@@ -640,22 +639,30 @@ async fn a_chain_the_list_leaves_out_is_not_priced() {
     let mock = MockSource::start().await;
     mock.price(NATIVE, Coin::priced(2000.0, 18, "ETH"));
     mock.price(USDC, Coin::priced(1.0, 6, "USDC"));
-    mock.unlist();
+    let source = mock.source();
+    let api = || {
+        AppState::new(Store::new(suite.pool.clone()))
+            .pricing(Arc::clone(&source))
+            .router()
+    };
     let deposits = vec![
         NamesEvent::deposited(NATIVE, SENDER, ether(10)),
-        NamesEvent::deposited(USDC, PAYER, U256::from(1_000u64)),
+        NamesEvent::deposited(USDC, PAYER, U256::from(1_000_000u64)),
     ];
     suite.apply_tx(10, deposits).await;
-
-    let stats = AppState::new(Store::new(suite.pool.clone()))
-        .pricing(mock.source())
-        .router()
-        .stats()
-        .await;
-    assert_eq!(mock.asked(), Vec::<String>::new());
-    assert_eq!(stats.priced_at, None);
+    let listed = api().stats().await;
     assert_eq!(
-        stats.chain(CHAIN).total.escrow.deposits,
+        listed.chain(CHAIN).total.escrow.deposits.usd,
+        usd("2001.00")
+    );
+
+    mock.unlist();
+    mock.asked();
+    let unlisted = api().stats().await;
+    assert_eq!(mock.asked(), Vec::<String>::new());
+    assert_eq!(unlisted.priced_at, None);
+    assert_eq!(
+        unlisted.chain(CHAIN).total.escrow.deposits,
         TokenFlows {
             tokens: vec![TokenFlow::unpriced(NATIVE, ether(10).to())],
             usd: Usd::default(),

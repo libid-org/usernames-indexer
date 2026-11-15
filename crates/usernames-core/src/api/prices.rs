@@ -126,6 +126,18 @@ impl fmt::Display for PriceSource {
 }
 
 impl PriceSource {
+    /// Where a server on `base` answering as this source does answers.
+    #[cfg(feature = "test-helpers")]
+    fn endpoints_under(self, base: &Url) -> Endpoints {
+        let base = base.as_str().trim_end_matches('/');
+        match self {
+            Self::DefiLlama => Endpoints {
+                prices: base.to_string(),
+                chains: format!("{base}/v2/chains"),
+            },
+        }
+    }
+
     /// Where the source answers.
     fn endpoints(self) -> Endpoints {
         match self {
@@ -136,16 +148,73 @@ impl PriceSource {
         }
     }
 
-    /// The chains a list the source served names, by chain id.
-    fn chains(self, listed: Vec<ListedChain>) -> ChainNames {
+    /// The chains the source lists at `endpoint`, named as it names them
+    /// in coin ids.
+    async fn chain_names(
+        self,
+        client: &reqwest::Client,
+        endpoint: &str,
+    ) -> Result<ChainNames, PriceFetchError> {
+        let url = Url::parse(endpoint)?;
         match self {
-            Self::DefiLlama => ChainNames::of(listed),
+            Self::DefiLlama => Ok(ListedChain::names(client.fetch(url).await?)),
+        }
+    }
+
+    /// The source's id of `coin` among `chains`: `<chain>:0x…`, the
+    /// chain's own coin as the zero address; `None` on a chain the source
+    /// does not name.
+    fn coin_id(self, chains: &ChainNames, coin: &ListedAddress) -> Option<String> {
+        match self {
+            Self::DefiLlama => {
+                let chain = chains.name(coin.chain_id)?;
+                let token = if coin.address == NATIVE_COIN {
+                    SOURCE_COIN
+                } else {
+                    coin.address
+                };
+                Some(format!("{chain}:{token:#x}"))
+            }
+        }
+    }
+
+    /// The request under `endpoint` for one batch of coin ids.
+    fn price_url(self, endpoint: &str, ids: &[&String]) -> Result<Url, PriceFetchError> {
+        let ids: Vec<&str> = ids.iter().map(|id| id.as_str()).collect();
+        let mut url = Url::parse(endpoint)?;
+        match self {
+            Self::DefiLlama => {
+                url.path_segments_mut()
+                    .map_err(|()| PriceFetchError::Base(endpoint.to_string()))?
+                    .pop_if_empty()
+                    .extend(["prices", "current", &ids.join(",")]);
+            }
+        }
+        Ok(url)
+    }
+
+    /// What the source answers at `url`, by coin id: each coin's quote,
+    /// or `None` where the answer is not confident or does not hold.
+    async fn prices(
+        self,
+        client: reqwest::Client,
+        url: Url,
+    ) -> Result<HashMap<String, Option<Quote>>, PriceFetchError> {
+        match self {
+            Self::DefiLlama => {
+                let answer: Answer = client.fetch(url).await?;
+                Ok(answer
+                    .coins
+                    .into_iter()
+                    .map(|(id, priced)| (id, priced.quote()))
+                    .collect())
+            }
         }
     }
 }
 
-/// The two requests a source answers: prices under `prices`, as
-/// `<prices>/prices/current/<coins>`, and its chain list at `chains`.
+/// Where a source answers: its prices under `prices`, its chain list at
+/// `chains`.
 #[derive(Clone, Debug)]
 struct Endpoints {
     prices: String,
@@ -179,26 +248,30 @@ struct ListedChain {
     name: String,
 }
 
+impl ListedChain {
+    /// Each listed chain with an id, named by its entry's `name`,
+    /// lowercased.
+    fn names(listed: Vec<Self>) -> ChainNames {
+        ChainNames::of(listed.into_iter().filter_map(|entry| {
+            let chain_id = entry.chain_id.as_ref().and_then(ListedChainId::chain_id)?;
+            Some((chain_id, entry.name.to_lowercase()))
+        }))
+    }
+}
+
 /// The name the source gives each chain it prices, by chain id. A chain
 /// missing here, a testnet, is never priced.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ChainNames(BTreeMap<i64, String>);
 
 impl ChainNames {
-    /// Each listed chain with an id, named by its entry's `name`,
-    /// lowercased. Names go into the price request's path, so a name is
-    /// ASCII letters, digits, spaces, `-`, `_` and `.`. Where entries share
-    /// an id (56 is `BSC` and `Binance`), the least name is kept, so a
-    /// reordered list names the chain the same way.
-    fn of(listed: Vec<ListedChain>) -> Self {
+    /// The `named` chains whose names fit a price request's path: ASCII
+    /// letters, digits, spaces, `-`, `_` and `.`. Where names share an id
+    /// (56 is `bsc` and `binance`), the least is kept, so a reordered list
+    /// names the chain the same way.
+    fn of(named: impl IntoIterator<Item = (i64, String)>) -> Self {
         let mut chains: BTreeMap<i64, String> = BTreeMap::new();
-        for entry in listed {
-            let Some(chain_id) =
-                entry.chain_id.as_ref().and_then(ListedChainId::chain_id)
-            else {
-                continue;
-            };
-            let name = entry.name.to_lowercase();
+        for (chain_id, name) in named {
             let usable = !name.is_empty()
                 && name.bytes().all(|b| {
                     b.is_ascii_alphanumeric() || matches!(b, b' ' | b'-' | b'_' | b'.')
@@ -221,18 +294,6 @@ impl ChainNames {
     /// The source's name for `chain_id`.
     fn name(&self, chain_id: i64) -> Option<&str> {
         self.0.get(&chain_id).map(String::as_str)
-    }
-
-    /// The source's id of `coin`: `<chain>:0x…`, the chain's own coin as
-    /// the zero address; `None` on a chain the source does not name.
-    fn coin_id(&self, coin: &ListedAddress) -> Option<String> {
-        let chain = self.name(coin.chain_id)?;
-        let token = if coin.address == NATIVE_COIN {
-            SOURCE_COIN
-        } else {
-            coin.address
-        };
-        Some(format!("{chain}:{token:#x}"))
     }
 }
 
@@ -423,8 +484,8 @@ impl Book {
     /// What the source answered for `coin`: a confident quote replaces the
     /// last one, and any other answer leaves it unable to value the coin
     /// while keeping the coin known.
-    fn learn(&mut self, coin: ListedAddress, priced: &Priced) {
-        match priced.quote() {
+    fn learn(&mut self, coin: ListedAddress, quote: Option<Quote>) {
+        match quote {
             Some(quote) => {
                 self.0.insert(
                     coin,
@@ -446,7 +507,7 @@ impl Book {
     /// known `candidates` ranked by whether they value now, then by the USD
     /// they moved at their last confident quote, ties by token; forget the
     /// rest. A coin that lost its price never outranks one that has one.
-    fn keep(&mut self, candidates: &[Candidate]) {
+    fn keep<'a>(&mut self, candidates: impl IntoIterator<Item = &'a Candidate>) {
         let oldest = Self::oldest();
         let mut chains: HashMap<i64, Vec<(bool, U512, ListedAddress)>> = HashMap::new();
         let mut kept = HashMap::new();
@@ -516,18 +577,10 @@ impl Prices {
         Self::at(source, source.endpoints())
     }
 
-    /// Prices from a server on `base` that answers as `source` does:
-    /// prices under `base` and the chain list at `<base>/v2/chains`.
+    /// Prices from a server on `base` that answers as `source` does.
     #[cfg(feature = "test-helpers")]
     pub fn mock(source: PriceSource, base: &Url) -> Self {
-        let base = base.as_str().trim_end_matches('/');
-        Self::at(
-            source,
-            Endpoints {
-                prices: base.to_string(),
-                chains: format!("{base}/v2/chains"),
-            },
-        )
+        Self::at(source, source.endpoints_under(base))
     }
 
     fn at(source: PriceSource, endpoints: Endpoints) -> Self {
@@ -553,13 +606,13 @@ impl Prices {
     /// The chains the source lists now; when the list fails, the last list
     /// it gave, and before any, none.
     async fn chains(&self) -> ChainNames {
-        let listed = match Url::parse(&self.endpoints.chains) {
-            Ok(url) => self.client.fetch::<Vec<ListedChain>>(url).await,
-            Err(error) => Err(error.into()),
-        };
+        let listed = self
+            .source
+            .chain_names(&self.client, &self.endpoints.chains)
+            .await;
         let mut chains = self.held_chains();
         match listed {
-            Ok(listed) => *chains = self.source.chains(listed),
+            Ok(listed) => *chains = listed,
             Err(error) => {
                 tracing::warn!(%error, "the chain list failed; the last one names the chains")
             }
@@ -573,28 +626,32 @@ impl Prices {
     /// A coin the source prices with confidence takes the new quote, and
     /// one it answers otherwise is not valued until it is again; a request
     /// that fails keeps the quotes of its coins. A quote older than a day
-    /// values nothing. Each chain keeps the [`KEPT_PER_CHAIN`] priced coins
-    /// that moved the most USD; the rest are forgotten and not valued.
+    /// values nothing. Each listed chain keeps the [`KEPT_PER_CHAIN`] priced
+    /// coins that moved the most USD; the rest, and every coin of a chain
+    /// the list no longer names, are forgotten and not valued.
     pub(crate) async fn quotes(&self, candidates: &[Candidate]) -> Quotes {
         let chains = self.chains().await;
         let ids: HashMap<String, ListedAddress> = candidates
             .iter()
             .filter_map(|candidate| {
-                Some((chains.coin_id(&candidate.coin)?, candidate.coin))
+                Some((
+                    self.source.coin_id(&chains, &candidate.coin)?,
+                    candidate.coin,
+                ))
             })
             .collect();
         let mut asked: Vec<&String> = ids.keys().collect();
         asked.sort();
         let mut requests = JoinSet::new();
         for batch in asked.chunks(BATCH) {
-            let url = self.url(batch);
-            let client = self.client.clone();
-            requests.spawn(async move { client.fetch::<Answer>(url?).await });
+            let url = self.source.price_url(&self.endpoints.prices, batch);
+            let (source, client) = (self.source, self.client.clone());
+            requests.spawn(async move { source.prices(client, url?).await });
         }
         let mut fresh = HashMap::new();
         while let Some(answer) = requests.join_next().await {
             match answer {
-                Ok(Ok(answer)) => fresh.extend(answer.coins),
+                Ok(Ok(answer)) => fresh.extend(answer),
                 Ok(Err(error)) => {
                     tracing::warn!(%error, "a price request failed; its coins keep their last prices")
                 }
@@ -604,26 +661,19 @@ impl Prices {
             }
         }
         let mut book = self.book();
-        for (id, priced) in &fresh {
-            if let Some(coin) = ids.get(id) {
-                book.learn(*coin, priced);
+        for (id, quote) in fresh {
+            if let Some(coin) = ids.get(&id) {
+                book.learn(*coin, quote);
             }
         }
-        book.keep(candidates);
+        book.keep(
+            candidates
+                .iter()
+                .filter(|candidate| chains.name(candidate.coin.chain_id).is_some()),
+        );
         let quotes = book.quotes();
         drop(book);
         quotes
-    }
-
-    /// The request for one batch of coin ids.
-    fn url(&self, batch: &[&String]) -> Result<Url, PriceFetchError> {
-        let ids: Vec<&str> = batch.iter().map(|id| id.as_str()).collect();
-        let mut url = Url::parse(&self.endpoints.prices)?;
-        url.path_segments_mut()
-            .map_err(|()| PriceFetchError::Base(self.endpoints.prices.clone()))?
-            .pop_if_empty()
-            .extend(["prices", "current", &ids.join(",")]);
-        Ok(url)
     }
 
     fn held_chains(&self) -> MutexGuard<'_, ChainNames> {
@@ -730,7 +780,7 @@ mod tests {
         let listed: Vec<ListedChain> =
             serde_json::from_str(include_str!("fixtures/llama_chains.json"))
                 .expect("the list");
-        PriceSource::DefiLlama.chains(listed)
+        ListedChain::names(listed)
     }
 
     #[test]
@@ -761,7 +811,7 @@ mod tests {
             address: Address::repeat_byte(0xAB),
         };
         assert_eq!(
-            chains.coin_id(&usdc).as_deref(),
+            PriceSource::DefiLlama.coin_id(&chains, &usdc).as_deref(),
             Some("base:0xabababababababababababababababababababab")
         );
         let coin = ListedAddress {
@@ -769,14 +819,14 @@ mod tests {
             address: NATIVE_COIN,
         };
         assert_eq!(
-            chains.coin_id(&coin).as_deref(),
+            PriceSource::DefiLlama.coin_id(&chains, &coin).as_deref(),
             Some("ethereum:0x0000000000000000000000000000000000000000")
         );
         let testnet = ListedAddress {
             chain_id: 84532,
             address: NATIVE_COIN,
         };
-        assert_eq!(chains.coin_id(&testnet), None);
+        assert_eq!(PriceSource::DefiLlama.coin_id(&chains, &testnet), None);
     }
 
     #[test]
