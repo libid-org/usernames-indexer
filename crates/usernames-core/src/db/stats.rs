@@ -5,6 +5,7 @@
 
 use std::{
     fmt,
+    future::Future,
     iter,
     num::ParseIntError,
     str::FromStr,
@@ -238,7 +239,9 @@ impl Keys {
 /// `other`.
 #[derive(Debug, Clone, Default)]
 pub struct Listing {
-    /// Tokens, beside each chain's own coin.
+    /// Tokens, beside each chain's own coin: those priced, for a read of
+    /// the rollups, and those priced before, kept among the tokens asked a
+    /// price for.
     pub tokens: Vec<ListedAddress>,
     /// Registration fee receivers.
     pub fee_receivers: Vec<ListedAddress>,
@@ -246,7 +249,7 @@ pub struct Listing {
 
 /// An address `/v1/stats` names on one chain, a token or a fee receiver,
 /// written `<chain id>:<address>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, sqlx::FromRow)]
 pub struct ListedAddress {
     /// The chain.
     pub chain_id: i64,
@@ -292,6 +295,44 @@ impl fmt::Display for ListedAddress {
     }
 }
 
+impl ListedAddress {
+    /// `listed` as the two arrays a statement unnests into pairs.
+    fn columns(listed: &[Self]) -> (Vec<i64>, Vec<Vec<u8>>) {
+        listed
+            .iter()
+            .map(|listed| (listed.chain_id, listed.address.to_vec()))
+            .unzip()
+    }
+}
+
+/// A token worth a price, and what its deposits and forwards moved.
+#[derive(Debug, sqlx::FromRow)]
+pub struct Candidate {
+    /// The token.
+    #[sqlx(flatten)]
+    pub coin: ListedAddress,
+    /// The sum of its deposits and forwards, as Postgres prints a
+    /// `numeric`.
+    pub moved: String,
+}
+
+impl Candidate {
+    /// The sum as a number, under [`CountRow::amount`]'s rule.
+    pub fn moved(&self) -> Option<U512> {
+        self.moved.parse().ok()
+    }
+}
+
+/// The tokens a computation names, once it has their prices.
+pub trait NamedTokens {
+    /// The tokens named beside each chain's coin.
+    fn named(&self) -> Vec<ListedAddress>;
+}
+
+/// The tokens per chain asked a price for beyond its coin and those priced
+/// before, the most moved first.
+pub const CANDIDATES_PER_CHAIN: i64 = 40;
+
 /// An escrow flow the rollups count: one kind of movement, or the claims
 /// that brought their holder in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,17 +374,26 @@ impl Flow {
 
 impl Store {
     /// Every number `/v1/stats` serves, read in one snapshot so they agree
-    /// with each other. Token flows name each chain's coin and the listed
-    /// tokens, fees the listed receivers, and both every key together. The
-    /// live handles count the handles table, so a caller runs this once per
-    /// period, not per request. The statements share `budget`: the database
-    /// stops the one running when it is spent.
-    pub async fn stats(
+    /// with each other. The snapshot first reads the tokens worth a price:
+    /// each chain's coin, `listing`'s tokens and the most moved others, up
+    /// to [`CANDIDATES_PER_CHAIN`]. `price` values them while the snapshot
+    /// counts the live handles. Token flows then name each chain's coin and
+    /// the tokens `price` named, fees `listing`'s receivers, and both every
+    /// key together. The live handles count the handles table, so a caller
+    /// runs this once per period, not per request. The statements share
+    /// `budget`: the database stops the one running when it is spent.
+    pub async fn stats<F, P>(
         &self,
         listing: &Listing,
         budget: Duration,
-    ) -> Result<StatsSnapshot, sqlx::Error> {
+        price: impl FnOnce(Vec<Candidate>) -> F,
+    ) -> Result<(StatsSnapshot, P), sqlx::Error>
+    where
+        F: Future<Output = P>,
+        P: NamedTokens,
+    {
         let deadline = Deadline::after(budget);
+        let (kept_chains, kept_tokens) = ListedAddress::columns(&listing.tokens);
         let mut tx = self.pool.begin_with(sql::STATS_SNAPSHOT).await?;
         let taken_at = sqlx::query_scalar(sql::STATS_TAKEN_AT)
             .fetch_one(deadline.bound(&mut tx).await?)
@@ -351,10 +401,24 @@ impl Store {
         let chains: Vec<i64> = sqlx::query_scalar(sql::CHAINS)
             .fetch_all(deadline.bound(&mut tx).await?)
             .await?;
-        let handles = sqlx::query_as(sql::STATS_HANDLES)
+        let candidates = sqlx::query_as(sql::STATS_CANDIDATES)
+            .bind(NATIVE_COIN.to_vec())
+            .bind(&kept_chains)
+            .bind(&kept_tokens)
+            .bind(CANDIDATES_PER_CHAIN)
             .fetch_all(deadline.bound(&mut tx).await?)
             .await?;
-        let keys = Keys::of(&chains, Measure::ALL, listing);
+        let (prices, handles) = tokio::join!(price(candidates), async {
+            sqlx::query_as(sql::STATS_HANDLES)
+                .fetch_all(deadline.bound(&mut tx).await?)
+                .await
+        });
+        let handles = handles?;
+        let named = Listing {
+            tokens: prices.named(),
+            fee_receivers: listing.fee_receivers.clone(),
+        };
+        let keys = Keys::of(&chains, Measure::ALL, &named);
         let counts = sqlx::query_as(sql::STATS_TOTALS)
             .bind(&keys.every)
             .bind(&keys.chains)
@@ -363,12 +427,13 @@ impl Store {
             .fetch_all(deadline.bound(&mut tx).await?)
             .await?;
         tx.commit().await?;
-        Ok(StatsSnapshot {
+        let snapshot = StatsSnapshot {
             taken_at,
             chains,
             handles,
             counts,
-        })
+        };
+        Ok((snapshot, prices))
     }
 
     /// A page of days, newest first: on one chain with everything the chain
@@ -575,12 +640,23 @@ pub(crate) mod plans {
                 ),
                 (
                     "the totals",
-                    &["stats_totals_pkey"][..],
+                    &["stats_totals_pkey:chain_id,measure"][..],
                     sqlx::query_scalar(&explain(sql::STATS_TOTALS))
                         .bind(&every.every)
                         .bind(&every.chains)
                         .bind(&every.measures)
                         .bind(&every.keys)
+                        .fetch_all(&mut *self)
+                        .await,
+                ),
+                (
+                    "the price candidates",
+                    &["stats_totals_pkey:chain_id,measure"][..],
+                    sqlx::query_scalar(&explain(sql::STATS_CANDIDATES))
+                        .bind(NATIVE_COIN.to_vec())
+                        .bind(&[1i64][..])
+                        .bind(vec![Address::repeat_byte(0xEE).to_vec()])
+                        .bind(CANDIDATES_PER_CHAIN)
                         .fetch_all(&mut *self)
                         .await,
                 ),
