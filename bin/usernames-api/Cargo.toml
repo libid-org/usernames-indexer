@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Serves resolution, search, address and handle histories, escrow balances, and the ENS gateway over the indexed read model."
+description = "Serves resolution, search, address and handle histories, escrow balances, statistics valued in USD, and the ENS gateway over the indexed read model."
 publish = false
 
 [dependencies]
