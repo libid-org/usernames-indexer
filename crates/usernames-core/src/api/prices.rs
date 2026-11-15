@@ -37,7 +37,7 @@ use crate::{
     chain::NATIVE_COIN,
     db::{
         Candidate,
-        ChainToken,
+        ListedAddress,
         NamedTokens,
     },
 };
@@ -284,11 +284,16 @@ impl Priced {
 
 /// The prices one computation values its tokens at, by coin.
 #[derive(Debug, Default)]
-pub(crate) struct Quotes(pub(crate) HashMap<ChainToken, Quote>);
+pub(crate) struct Quotes(pub(crate) HashMap<ListedAddress, Quote>);
 
 impl NamedTokens for Quotes {
-    fn named(&self) -> Vec<ChainToken> {
-        self.0.keys().copied().collect()
+    /// The priced tokens; each chain's coin is named whether priced or not.
+    fn named(&self) -> Vec<ListedAddress> {
+        self.0
+            .keys()
+            .filter(|coin| coin.address != NATIVE_COIN)
+            .copied()
+            .collect()
     }
 }
 
@@ -318,13 +323,13 @@ impl Known {
 /// The coins a source priced with confidence, by coin: the tokens each
 /// computation asks again, and the quotes it may value them at.
 #[derive(Debug, Default)]
-struct Book(HashMap<ChainToken, Known>);
+struct Book(HashMap<ListedAddress, Known>);
 
 impl Book {
     /// What the source answered for `coin`: a confident quote replaces the
     /// last one, and any other answer leaves it unable to value the coin
     /// while keeping the coin known.
-    fn learn(&mut self, coin: ChainToken, priced: &Priced) {
+    fn learn(&mut self, coin: ListedAddress, priced: &Priced) {
         match priced.quote() {
             Some(quote) => {
                 self.0.insert(
@@ -349,13 +354,13 @@ impl Book {
     /// rest. A coin that lost its price never outranks one that has one.
     fn keep(&mut self, candidates: &[Candidate]) {
         let oldest = Self::oldest();
-        let mut chains: HashMap<i64, Vec<(bool, U512, ChainToken)>> = HashMap::new();
+        let mut chains: HashMap<i64, Vec<(bool, U512, ListedAddress)>> = HashMap::new();
         let mut kept = HashMap::new();
         for candidate in candidates {
             let Some(known) = self.0.get(&candidate.coin) else {
                 continue;
             };
-            if candidate.coin.token == NATIVE_COIN {
+            if candidate.coin.address == NATIVE_COIN {
                 kept.insert(candidate.coin, known.clone());
                 continue;
             }
@@ -367,7 +372,10 @@ impl Book {
         }
         for mut ranked in chains.into_values() {
             ranked.sort_by(|(now_a, a, x), (now_b, b, y)| {
-                now_b.cmp(now_a).then(b.cmp(a)).then(x.token.cmp(&y.token))
+                now_b
+                    .cmp(now_a)
+                    .then(b.cmp(a))
+                    .then(x.address.cmp(&y.address))
             });
             for (_, _, coin) in ranked.into_iter().take(KEPT_PER_CHAIN) {
                 if let Some(known) = self.0.get(&coin) {
@@ -419,12 +427,12 @@ impl PriceSource {
 
     /// The source's id of `coin`: `<chain>:0x…`, the chain's own coin as
     /// the zero address; `None` on a chain the source does not name.
-    fn coin_id(&self, coin: &ChainToken) -> Option<String> {
+    fn coin_id(&self, coin: &ListedAddress) -> Option<String> {
         let chain = self.chains.name(coin.chain_id)?;
-        let token = if coin.token == NATIVE_COIN {
+        let token = if coin.address == NATIVE_COIN {
             SOURCE_COIN
         } else {
-            coin.token
+            coin.address
         };
         Some(format!("{chain}:{token:#x}"))
     }
@@ -432,7 +440,7 @@ impl PriceSource {
     /// The coins priced with confidence before and kept, which stay among
     /// those asked whatever their latest answer: a token anybody wrote
     /// cannot push them out.
-    pub(crate) fn priced_before(&self) -> Vec<ChainToken> {
+    pub(crate) fn priced_before(&self) -> Vec<ListedAddress> {
         let book = self.book();
         let coins = book.0.keys().copied().collect();
         drop(book);
@@ -446,7 +454,7 @@ impl PriceSource {
     /// [`KEPT_PER_CHAIN`] priced coins that moved the most USD; the rest are
     /// forgotten and not valued.
     pub(crate) async fn quotes(&self, candidates: &[Candidate]) -> Quotes {
-        let ids: HashMap<String, ChainToken> = candidates
+        let ids: HashMap<String, ListedAddress> = candidates
             .iter()
             .filter_map(|candidate| {
                 Some((self.coin_id(&candidate.coin)?, candidate.coin))
@@ -597,25 +605,25 @@ mod tests {
             DEFILLAMA.parse().expect("a URL"),
             DEFILLAMA_CHAINS.parse().expect("chains"),
         );
-        let usdc = ChainToken {
+        let usdc = ListedAddress {
             chain_id: 8453,
-            token: Address::repeat_byte(0xAB),
+            address: Address::repeat_byte(0xAB),
         };
         assert_eq!(
             source.coin_id(&usdc).as_deref(),
             Some("base:0xabababababababababababababababababababab")
         );
-        let coin = ChainToken {
+        let coin = ListedAddress {
             chain_id: 1,
-            token: NATIVE_COIN,
+            address: NATIVE_COIN,
         };
         assert_eq!(
             source.coin_id(&coin).as_deref(),
             Some("ethereum:0x0000000000000000000000000000000000000000")
         );
-        let testnet = ChainToken {
+        let testnet = ListedAddress {
             chain_id: 84532,
-            token: NATIVE_COIN,
+            address: NATIVE_COIN,
         };
         assert_eq!(source.coin_id(&testnet), None);
     }
@@ -648,8 +656,11 @@ mod tests {
         dollars: u64,
         at: i64,
         current: bool,
-    ) -> (ChainToken, Known) {
-        let coin = ChainToken { chain_id: 1, token };
+    ) -> (ListedAddress, Known) {
+        let coin = ListedAddress {
+            chain_id: 1,
+            address: token,
+        };
         let quote = Quote {
             symbol: None,
             decimals: 18,
@@ -665,7 +676,7 @@ mod tests {
         let real = Address::repeat_byte(0x05);
         let mut book = Book::default();
         let mut candidates = Vec::new();
-        let mut add = |(coin, known): (ChainToken, Known), moved: &str| {
+        let mut add = |(coin, known): (ListedAddress, Known), moved: &str| {
             book.0.insert(coin, known);
             candidates.push(Candidate {
                 coin,

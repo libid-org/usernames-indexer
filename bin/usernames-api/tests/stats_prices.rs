@@ -350,10 +350,7 @@ async fn priced_tokens_are_valued_in_usd() {
                 TokenFlow::unpriced(NATIVE, ether(15).to()).valued(eth, "1.5", "3000.75"),
             ],
             usd: usd("3001.98"),
-            other: Some(OtherTokens {
-                count: 1,
-                wallets: 1,
-            }),
+            other: Some(OtherTokens { count: 1 }),
         }
     );
     assert_eq!(
@@ -377,8 +374,9 @@ async fn priced_tokens_are_valued_in_usd() {
     suite.done();
 }
 
-/// `GET /v1/stats/days` values each day's tokens at the prices of the
-/// computation `/v1/stats` serves, and gives its `pricedAt`.
+/// `GET /v1/stats/days` names and values each day's tokens as the
+/// `/v1/stats` answer being served does, at its prices, and gives its
+/// `pricedAt`; asked first, it computes that answer.
 #[tokio::test]
 async fn days_are_valued_at_the_answers_prices() {
     let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
@@ -387,24 +385,34 @@ async fn days_are_valued_at_the_answers_prices() {
     };
     let mock = MockSource::start().await;
     mock.price(NATIVE, Coin::priced(2000.5, 18, "ETH"));
+    mock.price(USDC, Coin::priced(0.9998, 6, "USDC"));
     let api = AppState::new(Store::new(suite.pool.clone()))
         .pricing(mock.source())
         .router();
-    suite
-        .apply(10, NamesEvent::deposited(NATIVE, SENDER, ether(15)))
-        .await;
+    let deposits = vec![
+        NamesEvent::deposited(NATIVE, SENDER, ether(15)),
+        NamesEvent::deposited(USDC, PAYER, U256::from(1_234_567u64)),
+    ];
+    suite.apply_tx(10, deposits).await;
 
-    let stats = api.stats().await;
     let days: Vec<DayActivity> = api.days(Some(CHAIN)).await;
     let page: StatsDays<DayActivity> =
         api.answer(&format!("/v1/stats/days?chain={CHAIN}")).await;
+    let stats = api.stats().await;
     let deposits = TokenFlows {
-        tokens: vec![TokenFlow::unpriced(NATIVE, ether(15).to()).valued(
-            ("ETH", 18),
-            "1.5",
-            "3000.75",
-        )],
-        usd: usd("3000.75"),
+        tokens: vec![
+            TokenFlow::unpriced(USDC, U512::from(1_234_567u64)).valued(
+                ("USDC", 6),
+                "1.234567",
+                "1.23",
+            ),
+            TokenFlow::unpriced(NATIVE, ether(15).to()).valued(
+                ("ETH", 18),
+                "1.5",
+                "3000.75",
+            ),
+        ],
+        usd: usd("3001.98"),
         other: None,
     };
     assert_eq!(stats.clone().chain(CHAIN).total.escrow.deposits, deposits);
@@ -412,7 +420,7 @@ async fn days_are_valued_at_the_answers_prices() {
         panic!("one day recorded: {days:?}");
     };
     assert_eq!(day.activity.escrow.deposits, deposits);
-    assert_eq!(page.computed_at, stats.computed_at);
+    assert!(stats.priced_at.is_some());
     assert_eq!(page.priced_at, stats.priced_at);
     suite.store().forget().await;
     suite.done();
@@ -453,10 +461,7 @@ async fn a_token_without_a_confident_price_counts_under_other() {
         TokenFlows {
             tokens: Vec::new(),
             usd: Usd::default(),
-            other: Some(OtherTokens {
-                count: 2,
-                wallets: 2,
-            }),
+            other: Some(OtherTokens { count: 2 }),
         }
     );
     assert_eq!(stats.priced_at, None);
@@ -531,10 +536,7 @@ async fn a_failed_first_request_prices_nothing() {
         TokenFlows {
             tokens: vec![TokenFlow::unpriced(NATIVE, ether(10).to())],
             usd: Usd::default(),
-            other: Some(OtherTokens {
-                count: 1,
-                wallets: 1,
-            }),
+            other: Some(OtherTokens { count: 1 }),
         }
     );
     suite.store().forget().await;
@@ -663,10 +665,7 @@ async fn a_value_past_the_arithmetic_leaves_its_token_unpriced() {
         TokenFlows {
             tokens: Vec::new(),
             usd: Usd::default(),
-            other: Some(OtherTokens {
-                count: 2,
-                wallets: 2,
-            }),
+            other: Some(OtherTokens { count: 2 }),
         }
     );
     suite.store().forget().await;

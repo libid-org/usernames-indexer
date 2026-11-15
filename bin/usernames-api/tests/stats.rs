@@ -1,8 +1,11 @@
-//! `GET /v1/stats` and `GET /v1/stats/days` over a journal written through
-//! the indexer's apply path: users, links, fees and escrow movements counted
-//! per chain, in total and per UTC day, users counted once across chains,
-//! tokens without a price counted together, and one answer served until it
-//! expires. Nothing here is priced: `stats_prices.rs` values tokens.
+//! `GET /v1/stats`, `GET /v1/stats/days` and `GET /v1/history/chain/{chain}`
+//! over a journal written through the indexer's apply path: users, links,
+//! fees and escrow movements counted per chain, in total and per UTC day,
+//! the same whether folded window by window or whole, users counted once
+//! across chains in whatever order the chains fold, tokens without a price
+//! and fee receivers nobody listed counted together, 30 days to a page, one
+//! answer served until it expires, and one day's events listed page by
+//! page. Nothing here is priced: `stats_prices.rs` values tokens.
 //!
 //! Skips without `DATABASE_URL`, unless `CI` is set: there its absence
 //! fails. The suite's chain is its own; the answer lists every chain the
@@ -20,6 +23,7 @@ use alloy::primitives::{
     U512,
 };
 use axum::Router;
+use sqlx::PgPool;
 use tokio::{
     sync::Mutex,
     task::JoinSet,
@@ -29,14 +33,18 @@ use usernames_core::{
         model::{
             Activity,
             AllChainsDay,
+            ChainHistory,
             ChainStats,
             DayActivity,
             EscrowActivity,
             FeesPaid,
+            OtherFees,
             OtherTokens,
             PlatformHandles,
             PlatformLinks,
+            RegistrationFees,
             Stats,
+            StatsDays,
             TokenFlow,
             TokenFlows,
             Usd,
@@ -45,6 +53,7 @@ use usernames_core::{
     },
     db::{
         ChainStore,
+        ListedAddress,
         Store,
     },
     events::{
@@ -56,6 +65,7 @@ use usernames_core::{
 use usernames_fixtures::{
     ChainEntry,
     Events,
+    LockWaits,
     Seed,
     StatsRoute,
     Suite,
@@ -84,8 +94,9 @@ const GRACE: Address = Address::repeat_byte(0x6A);
 const SENDER: Address = Address::repeat_byte(0x51);
 const PAYER: Address = Address::repeat_byte(0x52);
 const SAFE: Address = Address::repeat_byte(0xFE);
-/// A wallet on both of the suite's chains, and on no other suite's.
+/// Wallets on both of the suite's chains, and on no other suite's.
 const ROAMER: Address = Address::repeat_byte(0x7C);
+const NOMAD: Address = Address::repeat_byte(0x7D);
 
 const ETHER: u64 = 1_000_000_000_000_000_000;
 const FEE: u64 = 3_700_000_000_000_000;
@@ -169,11 +180,23 @@ fn flow(token: Address, count: i64, amount: u128, wallets: i64) -> TokenFlow {
     }
 }
 
-fn fees(count: i64) -> Vec<FeesPaid> {
-    vec![FeesPaid {
-        receiver: SAFE,
-        count,
-        amount: U512::from(FEE) * U512::from(count),
+/// `count` fees paid to the listed receiver, none to any other.
+fn fees(count: i64) -> RegistrationFees {
+    RegistrationFees {
+        receivers: vec![FeesPaid {
+            receiver: SAFE,
+            count,
+            amount: U512::from(FEE) * U512::from(count),
+        }],
+        other: None,
+    }
+}
+
+/// The suite's listed fee receiver: the fee Safe on its chain.
+fn fee_receivers() -> Vec<ListedAddress> {
+    vec![ListedAddress {
+        chain_id: CHAIN,
+        address: SAFE,
     }]
 }
 
@@ -199,7 +222,7 @@ impl ByPlatform for Vec<PlatformHandles> {
 /// Flows of unpriced tokens: named ones, and those under `other`.
 trait Named {
     fn named(self) -> TokenFlows;
-    fn and_other(self, count: i64, wallets: i64) -> TokenFlows;
+    fn and_other(self, count: i64) -> TokenFlows;
 }
 
 impl Named for Vec<TokenFlow> {
@@ -211,9 +234,9 @@ impl Named for Vec<TokenFlow> {
         }
     }
 
-    fn and_other(self, count: i64, wallets: i64) -> TokenFlows {
+    fn and_other(self, count: i64) -> TokenFlows {
         TokenFlows {
-            other: Some(OtherTokens { count, wallets }),
+            other: Some(OtherTokens { count }),
             ..self.named()
         }
     }
@@ -225,7 +248,7 @@ trait AllChainsEntry {
     fn on(&self, day: i64) -> AllChainsDay;
 }
 
-impl AllChainsEntry for Vec<AllChainsDay> {
+impl AllChainsEntry for [AllChainsDay] {
     fn on(&self, day: i64) -> AllChainsDay {
         self.iter()
             .find(|entry| entry.day == day)
@@ -238,16 +261,39 @@ impl AllChainsEntry for Vec<AllChainsDay> {
     }
 }
 
-/// An API over the suite's database, with its own cache.
-fn api(suite: &Suite) -> Router {
-    AppState::new(Store::new(suite.pool.clone())).router()
+/// Where each entry of a chain history sits: block and log index.
+trait Positions {
+    fn positions(&self) -> Vec<(i64, i64)>;
+}
+
+impl Positions for ChainHistory {
+    fn positions(&self) -> Vec<(i64, i64)> {
+        self.entries
+            .iter()
+            .map(|entry| (entry.block_number, entry.log_index))
+            .collect()
+    }
+}
+
+/// A suite's API.
+trait Serves {
+    /// An API over the suite's database, with its own cache.
+    fn api(&self) -> Router;
+}
+
+impl Serves for Suite {
+    fn api(&self) -> Router {
+        AppState::new(Store::new(self.pool.clone())).router()
+    }
 }
 
 /// Users, links, live handles, fees and every escrow movement add up per
 /// chain, over the whole journal and per UTC day: the chain's coin by name,
 /// a token without a price under `other`. A deposit to a handle nobody held, claimed by the holder who bound
 /// it after, is an onboarding claim; a claim of deposits made before the
-/// index's first block is not.
+/// index's first block is not. A journal written before the rollups adds up
+/// the same once its indexer folds it, also when the fold stopped after its
+/// first page and a restart folded the rest.
 #[tokio::test]
 async fn the_journal_adds_up_per_chain_and_day() {
     let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
@@ -310,7 +356,9 @@ async fn the_journal_adds_up_per_chain_and_day() {
         .apply(IN_B + 6, NamesEvent::claimed("eve", NATIVE, EVE, 7))
         .await;
 
-    let api = api(&suite);
+    let api = AppState::new(Store::new(suite.pool.clone()))
+        .fee_receivers(fee_receivers())
+        .router();
     let stats = api.stats().await;
     let days: Vec<DayActivity> = api.days(Some(CHAIN)).await;
     let ether = u128::from(ETHER);
@@ -336,10 +384,10 @@ async fn the_journal_adds_up_per_chain_and_day() {
             links: vec![links(X, 4, 4), links(GITHUB, 1, 1)].by_platform(),
             registration_fees: fees(2),
             escrow: EscrowActivity {
-                deposits: vec![flow(NATIVE, 2, 3 * ether, 2)].and_other(1, 1),
+                deposits: vec![flow(NATIVE, 2, 3 * ether, 2)].and_other(1),
                 forwards: vec![flow(NATIVE, 1, 5, 1)].named(),
                 claims: vec![flow(NATIVE, 2, 3 * ether + 7, 2)].named(),
-                refunds: Vec::new().and_other(1, 1),
+                refunds: Vec::new().and_other(1),
             },
             onboarding_claims: vec![flow(NATIVE, 1, 3 * ether, 1)].named(),
         },
@@ -356,7 +404,7 @@ async fn the_journal_adds_up_per_chain_and_day() {
                     links: vec![links(X, 2, 2)],
                     registration_fees: fees(1),
                     escrow: EscrowActivity {
-                        deposits: vec![flow(NATIVE, 2, 3 * ether, 2)].and_other(1, 1),
+                        deposits: vec![flow(NATIVE, 2, 3 * ether, 2)].and_other(1),
                         ..EscrowActivity::default()
                     },
                     onboarding_claims: TokenFlows::default(),
@@ -373,13 +421,32 @@ async fn the_journal_adds_up_per_chain_and_day() {
                         deposits: TokenFlows::default(),
                         forwards: vec![flow(NATIVE, 1, 5, 1)].named(),
                         claims: vec![flow(NATIVE, 2, 3 * ether + 7, 2)].named(),
-                        refunds: Vec::new().and_other(1, 1),
+                        refunds: Vec::new().and_other(1),
                     },
                     onboarding_claims: vec![flow(NATIVE, 1, 3 * ether, 1)].named(),
                 },
             },
         ]
     );
+
+    let folded = || {
+        AppState::new(Store::new(suite.pool.clone()))
+            .fee_receivers(fee_receivers())
+            .router()
+    };
+    suite.store().unfold().await;
+    suite.store().fold_one_page(5).await;
+    let one_page = folded().stats().await.chain(CHAIN);
+    assert_eq!(
+        (one_page.total.users, one_page.total.escrow.deposits),
+        (4, vec![flow(NATIVE, 2, 3 * ether, 2)].named()),
+        "five rows: alice's paid bind, bob's bind and two coin deposits"
+    );
+    suite.store().writer().await;
+    let restarted = folded();
+    assert_eq!(restarted.stats().await.chain(CHAIN), expected);
+    let days_restarted: Vec<DayActivity> = restarted.days(Some(CHAIN)).await;
+    assert_eq!(days_restarted, days);
     suite.store().forget().await;
     suite.done();
 }
@@ -424,7 +491,7 @@ async fn a_freed_handle_onboards_its_next_holder() {
         )
         .await;
 
-    let api = api(&suite);
+    let api = suite.api();
     let chain = api.stats().await.chain(CHAIN);
     let days: Vec<DayActivity> = api.days(Some(CHAIN)).await;
     let grace = || vec![flow(NATIVE, 1, 3 * u128::from(ETHER), 1)].named();
@@ -462,7 +529,7 @@ async fn unpriced_tokens_count_together() {
     suite.apply_tx(IN_A, day_a).await;
     suite.apply_tx(IN_B, junk(500..1_000)).await;
 
-    let api = api(&suite);
+    let api = suite.api();
     let chain = api.stats().await.chain(CHAIN);
     let days: Vec<DayActivity> = api.days(Some(CHAIN)).await;
     let deposits_on = |day: i64| {
@@ -472,17 +539,108 @@ async fn unpriced_tokens_count_together() {
             .unwrap_or_else(|| panic!("day {day} listed"))
     };
     let coin = || vec![flow(NATIVE, 1, u128::from(ETHER), 1)];
-    assert_eq!(chain.total.escrow.deposits, coin().and_other(1_001, 2));
-    assert_eq!(deposits_on(DAY_A), coin().and_other(501, 2));
-    assert_eq!(deposits_on(DAY_B), Vec::new().and_other(500, 1));
+    let other = |count| Some(OtherTokens { count });
+    assert_eq!(
+        chain.total.escrow.deposits,
+        TokenFlows {
+            tokens: coin(),
+            usd: Usd::default(),
+            other: other(1_001),
+        }
+    );
+    assert_eq!(
+        deposits_on(DAY_A),
+        TokenFlows {
+            tokens: coin(),
+            usd: Usd::default(),
+            other: other(501),
+        }
+    );
+    assert_eq!(
+        deposits_on(DAY_B),
+        TokenFlows {
+            tokens: Vec::new(),
+            usd: Usd::default(),
+            other: other(500),
+        }
+    );
+    suite.store().forget().await;
+    suite.done();
+}
+
+/// A bind may name any fee receiver. A thousand of them count together
+/// under one `other` per day and in total, with their amount, beside the
+/// receiver the deployment listed, so the answer does not grow with them.
+#[tokio::test]
+async fn unlisted_fee_receivers_count_together() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let paid = |receivers: Range<u64>| -> Vec<NamesEvent> {
+        receivers
+            .map(|i| NamesEvent::BindFeePaid {
+                authorization_digest: U256::from(i).into(),
+                receiver: Address::from_word(U256::from(i + 1).into()),
+                amount: U256::from(1u64),
+            })
+            .collect()
+    };
+    suite
+        .apply_tx(IN_A, NamesEvent::paid_bind(ALICE, "1", "alice"))
+        .await;
+    suite.apply_tx(IN_A + 1, paid(0..500)).await;
+    suite.apply_tx(IN_B, paid(500..1_000)).await;
+
+    let api = AppState::new(Store::new(suite.pool.clone()))
+        .fee_receivers(fee_receivers())
+        .router();
+    let chain = api.stats().await.chain(CHAIN);
+    let days: Vec<DayActivity> = api.days(Some(CHAIN)).await;
+    let fees_on = |day: i64| {
+        days.iter()
+            .find(|entry| entry.day == day)
+            .map(|entry| entry.activity.registration_fees.clone())
+            .unwrap_or_else(|| panic!("day {day} listed"))
+    };
+    let other = |count: i64| {
+        Some(OtherFees {
+            count,
+            amount: U512::from(count),
+        })
+    };
+    assert_eq!(
+        chain.total.registration_fees,
+        RegistrationFees {
+            other: other(1_000),
+            ..fees(1)
+        }
+    );
+    assert_eq!(
+        fees_on(DAY_A),
+        RegistrationFees {
+            other: other(500),
+            ..fees(1)
+        }
+    );
+    assert_eq!(
+        fees_on(DAY_B),
+        RegistrationFees {
+            receivers: Vec::new(),
+            other: other(500),
+        }
+    );
     suite.store().forget().await;
     suite.done();
 }
 
 /// A wallet that used two chains counts once across them: in the total, and
-/// as new only on the first day it used either. Each chain still counts it
-/// as new on its own first day there. The numbers across chains span every
-/// chain the database holds, so the test counts what its writes add.
+/// as new only on the first day it used either, also when the chain that
+/// saw it first is folded last. Each chain still counts it as new on its
+/// own first day there. Forgetting the chain that saw both first leaves
+/// them counted from the other chain's journal, new on its day. The numbers
+/// across chains span every chain the database holds, so the test counts
+/// what its writes add.
 #[tokio::test]
 async fn a_wallet_on_two_chains_counts_once_across_them() {
     let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
@@ -492,23 +650,30 @@ async fn a_wallet_on_two_chains_counts_once_across_them() {
     let other = ChainStore::new(suite.pool.clone(), OTHER_CHAIN);
     other.forget().await;
     let other = other.writer().await;
-    let then = api(&suite);
+    let then = suite.api();
     let before = then.stats().await;
     let days_before: Vec<AllChainsDay> = then.days(None).await;
 
+    // Roamer is folded in day order, nomad's later day first.
     other
         .apply_tx(IN_A, NamesEvent::bind(ROAMER, X, "6", "roamer", 1, false))
         .await;
     suite
         .apply_tx(IN_B, NamesEvent::bind(ROAMER, X, "6", "roamer", 1, false))
         .await;
-    let now = api(&suite);
+    suite
+        .apply_tx(IN_B + 1, NamesEvent::bind(NOMAD, X, "9", "nomad", 1, false))
+        .await;
+    other
+        .apply_tx(IN_A + 1, NamesEvent::bind(NOMAD, X, "9", "nomad", 1, false))
+        .await;
+    let now = suite.api();
     let after = now.stats().await;
     let days_after: Vec<AllChainsDay> = now.days(None).await;
 
-    assert_eq!(after.total.users - before.total.users, 1);
-    let added = |day: i64| {
-        let (added, had) = (days_after.on(day), days_before.on(day));
+    assert_eq!(after.total.users - before.total.users, 2);
+    let added = |days: &[AllChainsDay], day: i64| {
+        let (added, had) = (days.on(day), days_before.on(day));
         AllChainsDay {
             day,
             users: added.users - had.users,
@@ -516,32 +681,168 @@ async fn a_wallet_on_two_chains_counts_once_across_them() {
         }
     };
     assert_eq!(
-        added(DAY_A),
+        added(&days_after, DAY_A),
         AllChainsDay {
             day: DAY_A,
-            users: 1,
-            new_users: 1,
+            users: 2,
+            new_users: 2,
         }
     );
     assert_eq!(
-        added(DAY_B),
+        added(&days_after, DAY_B),
         AllChainsDay {
             day: DAY_B,
-            users: 1,
+            users: 2,
             new_users: 0,
         }
     );
     let chain = after.chain(CHAIN);
-    assert_eq!(chain.total.users, 1);
+    assert_eq!(chain.total.users, 2);
     let chain_days: Vec<DayActivity> = now.days(Some(CHAIN)).await;
     let day_b = chain_days
         .iter()
         .find(|entry| entry.day == DAY_B)
         .expect("day B listed");
-    assert_eq!(day_b.new_users, 1);
+    assert_eq!(day_b.new_users, 2);
+
     ChainStore::new(suite.pool.clone(), OTHER_CHAIN)
         .forget()
         .await;
+    let cleared = suite.api();
+    assert_eq!(cleared.stats().await.total.users - before.total.users, 2);
+    let days_cleared: Vec<AllChainsDay> = cleared.days(None).await;
+    assert_eq!(
+        [added(&days_cleared, DAY_A), added(&days_cleared, DAY_B)],
+        [
+            AllChainsDay {
+                day: DAY_A,
+                users: 0,
+                new_users: 0,
+            },
+            AllChainsDay {
+                day: DAY_B,
+                users: 2,
+                new_users: 2,
+            },
+        ]
+    );
+    suite.store().forget().await;
+    suite.done();
+}
+
+/// Two chains' windows that bring the same new wallets fold at once: the
+/// second waits on the rows the first wrote across chains, then both
+/// commit, and each wallet counts once across chains, new on the first
+/// chain's day. The numbers across chains span every chain the database
+/// holds, so the test counts what its writes add.
+#[tokio::test]
+async fn two_chains_fold_the_same_new_wallets_at_once() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    // Each chain writes on sessions of its own name, so a wait below is that
+    // chain's wait and no other session's.
+    const FIRST: &str = "stats: the first chain's window";
+    const SECOND: &str = "stats: the second chain's window";
+    let named = |name: &str| {
+        PgPool::connect_with(
+            (*suite.pool.connect_options())
+                .clone()
+                .application_name(name),
+        )
+    };
+    let first = ChainStore::new(named(FIRST).await.expect("a pool"), CHAIN)
+        .writer()
+        .await;
+    let other = ChainStore::new(named(SECOND).await.expect("a pool"), OTHER_CHAIN);
+    other.forget().await;
+    let second = other.writer().await;
+    first
+        .apply_tx(IN_A, NamesEvent::bind(ALICE, X, "1", "alice", 1, false))
+        .await;
+    let then = suite.api();
+    let before = then.stats().await;
+    let days_before: Vec<AllChainsDay> = then.days(None).await;
+    let both = || {
+        let mut binds = NamesEvent::bind(ROAMER, X, "6", "roamer", 1, false);
+        binds.extend(NamesEvent::bind(NOMAD, X, "9", "nomad", 1, false));
+        binds
+    };
+
+    // The first window stops at the chain's users total, which the test
+    // holds, after it wrote the wallets across chains; the second waits on
+    // those.
+    let mut hold = suite.pool.begin().await.expect("a transaction");
+    sqlx::query(include_str!("sql/hold_chain_users.sql"))
+        .bind(CHAIN)
+        .fetch_one(&mut *hold)
+        .await
+        .expect("the chain's users total is held");
+    let first = tokio::spawn(async move { first.apply_tx(IN_B, both()).await });
+    suite.pool.waits_on_a_lock(FIRST).await;
+    let second = tokio::spawn(async move { second.apply_tx(IN_B, both()).await });
+    suite.pool.waits_on_a_lock(SECOND).await;
+    hold.rollback().await.expect("the hold ends");
+    first.await.expect("the first window commits");
+    second.await.expect("the second window commits");
+
+    let now = suite.api();
+    let after = now.stats().await;
+    let days_after: Vec<AllChainsDay> = now.days(None).await;
+    assert_eq!(after.total.users - before.total.users, 2);
+    let (added, had) = (days_after.on(DAY_B), days_before.on(DAY_B));
+    assert_eq!(
+        AllChainsDay {
+            day: DAY_B,
+            users: added.users - had.users,
+            new_users: added.new_users - had.new_users,
+        },
+        AllChainsDay {
+            day: DAY_B,
+            users: 2,
+            new_users: 2,
+        }
+    );
+    assert_eq!(after.clone().chain(CHAIN).total.users, 3);
+    assert_eq!(after.chain(OTHER_CHAIN).total.users, 2);
+    ChainStore::new(suite.pool.clone(), OTHER_CHAIN)
+        .forget()
+        .await;
+    suite.store().forget().await;
+    suite.done();
+}
+
+/// A page of days holds the last 30 unless asked for more, newest first,
+/// and hands out where the next one starts while older days remain.
+#[tokio::test]
+async fn days_come_thirty_to_a_page() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    // One bind a day for 31 days from day A, each by its own account.
+    let starts: Vec<i64> = (0..31).map(|day| DAY_A + day * 86_400).collect();
+    for day in 0..31u64 {
+        let (id, handle) = ((100 + day).to_string(), format!("alice{day}"));
+        let bind = NamesEvent::bind(ALICE, X, &id, &handle, 1, false);
+        suite.apply_tx(IN_A + day * 86_400, bind).await;
+    }
+
+    let api = suite.api();
+    let first: StatsDays<DayActivity> =
+        api.answer(&format!("/v1/stats/days?chain={CHAIN}")).await;
+    let served = |page: &StatsDays<DayActivity>| -> Vec<i64> {
+        page.days.iter().map(|entry| entry.day).collect()
+    };
+    let newest: Vec<i64> = starts.iter().rev().take(30).copied().collect();
+    assert_eq!(served(&first), newest);
+    let next = first.next.clone().expect("an older day remains");
+    let last: StatsDays<DayActivity> = api
+        .answer(&format!("/v1/stats/days?chain={CHAIN}&before={next}"))
+        .await;
+    assert_eq!(served(&last), [DAY_A]);
+    assert_eq!(last.next, None);
     suite.store().forget().await;
     suite.done();
 }
@@ -557,7 +858,7 @@ async fn an_answer_is_served_again_until_it_expires() {
     suite
         .apply_tx(IN_A, NamesEvent::bind(ALICE, X, "1", "alice", 1, false))
         .await;
-    let api = api(&suite);
+    let api = suite.api();
     let first = api.stats().await;
     assert_eq!(first.clone().chain(CHAIN).total.links, [links(X, 1, 1)]);
 
@@ -575,6 +876,83 @@ async fn an_answer_is_served_again_until_it_expires() {
 
     let restarted: Stats = suite.get("/v1/stats").await.answer();
     assert_eq!(restarted.chain(CHAIN).total.links, [links(X, 2, 2)]);
+    suite.store().forget().await;
+    suite.done();
+}
+
+/// A day's events come newest first, a page at a time, narrowed to a kind, a
+/// token or both; the journal's other days and a day with nothing stay out.
+#[tokio::test]
+async fn a_day_lists_its_events_page_by_page() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let mut day_a = Vec::new();
+    let bind = NamesEvent::paid_bind(ALICE, "1", "alice");
+    day_a.extend((0..bind.len()).map(|log| (IN_A, log)));
+    suite.apply_tx(IN_A, bind).await;
+    for (block, token) in [(IN_A + 1, NATIVE), (IN_A + 2, USDC)] {
+        suite
+            .apply(block, NamesEvent::deposited("dave", token, SENDER, 1_000))
+            .await;
+        day_a.push((block, 0));
+    }
+    suite
+        .apply_tx(IN_B, NamesEvent::paid_bind(DAVE, "4", "dave"))
+        .await;
+    suite
+        .apply(IN_B + 1, NamesEvent::claimed("dave", NATIVE, DAVE, 1_000))
+        .await;
+    let newest_first = |positions: &[(u64, usize)]| -> Vec<(i64, i64)> {
+        positions
+            .iter()
+            .rev()
+            .map(|&(block, log)| (block as i64, log as i64))
+            .collect()
+    };
+
+    let api = suite.api();
+    let history = |query: String| {
+        let api = api.clone();
+        async move {
+            let page: ChainHistory = api
+                .answer(&format!("/v1/history/chain/{CHAIN}?{query}"))
+                .await;
+            page
+        }
+    };
+    let whole = history(format!("day={DAY_A}&limit=100")).await;
+    assert_eq!(whole.chain_id, CHAIN);
+    assert_eq!(whole.day, Some(DAY_A));
+    assert_eq!(whole.positions(), newest_first(&day_a));
+    assert_eq!(whole.next, None);
+
+    let mut paged = Vec::new();
+    let mut before = String::new();
+    loop {
+        let page = history(format!("day={DAY_A}&limit=2{before}")).await;
+        assert!(page.entries.len() <= 2);
+        paged.extend(page.positions());
+        match page.next {
+            Some(next) => before = format!("&before={next}"),
+            None => break,
+        }
+    }
+    assert_eq!(paged, whole.positions());
+
+    let deposits = history(format!("day={DAY_A}&kind=deposited")).await;
+    assert_eq!(
+        deposits.positions(),
+        newest_first(&[(IN_A + 1, 0), (IN_A + 2, 0)])
+    );
+    let usdc = history(format!("token={USDC}")).await;
+    assert_eq!(usdc.positions(), newest_first(&[(IN_A + 2, 0)]));
+    let claims = history(format!("day={DAY_B}&kind=claimed&token={NATIVE}")).await;
+    assert_eq!(claims.positions(), newest_first(&[(IN_B + 1, 0)]));
+    let quiet = history(format!("day={}", DAY_A + 86_400)).await;
+    assert_eq!(quiet.positions(), []);
+    assert_eq!(quiet.next, None);
     suite.store().forget().await;
     suite.done();
 }

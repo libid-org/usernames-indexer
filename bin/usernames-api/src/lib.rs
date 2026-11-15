@@ -54,6 +54,7 @@ use usernames_core::{
     },
     db::{
         self,
+        ListedAddress,
         Store,
     },
     ens::{
@@ -147,6 +148,14 @@ pub struct Config {
     /// it; past it the computation fails and the next request tries again.
     #[arg(long, env = "STATS_DEADLINE", default_value_t = STATS_DEADLINE.into())]
     pub stats_deadline: humantime::Duration,
+
+    /// The registration fee receivers `/v1/stats` names by address,
+    /// comma-separated `<chain id>:<address>` pairs. Every other receiver's
+    /// fees count together under `other`, with their amount: a bind may
+    /// name any receiver, and naming each would let anybody grow every
+    /// answer.
+    #[arg(long, env = "STATS_FEE_RECEIVERS", value_delimiter = ',')]
+    pub stats_fee_receivers: Vec<ListedAddress>,
 }
 
 /// The API serving as a task, and the token that stops it.
@@ -263,6 +272,7 @@ impl Config {
                     self.price_source,
                     self.price_chains,
                 )))
+                .fee_receivers(self.stats_fee_receivers)
                 .stats_timing(self.stats_ttl.into(), self.stats_deadline.into()),
             gateway,
         }
