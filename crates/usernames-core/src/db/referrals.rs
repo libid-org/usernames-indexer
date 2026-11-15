@@ -212,21 +212,26 @@ impl Page<HistoryCursor> {
     /// `holder`'s referrals: a page's worth per node of the handles it
     /// holds, then the page across them, newest first.
     pub(crate) fn referrals_lookup(&self, prefix: &str, holder: Address) -> Statement {
+        let newest =
+            " ORDER BY r.block_time DESC, r.chain_id DESC, r.block_number DESC, \
+                      r.log_index DESC";
         let mut statement = holder_nodes(prefix, holder, None);
         statement.push(sql::REFERRALS_BY_NODE);
         self.bound(&mut statement, "r");
+        // The page is cut before the joins, which then run once per row it
+        // serves rather than once per row each node returned.
         statement
-            .push(") r\n")
+            .push(") r")
+            .push(newest)
+            .push(" LIMIT ")
+            .push_bind(self.fetch())
+            .push(")\n")
+            .push(sql::REFERRALS_HOLDER)
             .push(HandleText {
-                node: "h.handle_node",
+                node: "r.referrer_node",
                 alias: "rv",
             })
-            .push(sql::REFERRALS_HOLDER)
-            .push(
-                " ORDER BY r.block_time DESC, r.chain_id DESC, r.block_number DESC, \
-                 r.log_index DESC LIMIT ",
-            )
-            .push_bind(self.fetch());
+            .push(newest);
         statement
     }
 }
@@ -320,7 +325,7 @@ pub(crate) mod plans {
                 };
                 let statement = page.referrals_lookup("EXPLAIN ", holder);
                 let plan = Plan::of(self, name, Some(seeks), statement).await;
-                plans.push(plan.reading_once(holder));
+                plans.push(plan.reading_once(holder).cut_before("events_pkey"));
             }
 
             let name = "a claim settling its round's held referrals";
