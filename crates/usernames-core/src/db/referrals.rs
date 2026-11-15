@@ -155,6 +155,8 @@ pub struct ReferralRow {
     pub block_number: i64,
     /// Its log's index in the block.
     pub log_index: i64,
+    /// The transaction that bound.
+    pub tx_hash: B256,
     /// Its block's time, in unix seconds.
     pub block_time: i64,
     /// The referrer's handle node, which the share is for.
@@ -276,8 +278,11 @@ pub(crate) mod plans {
             });
             // The holder's handles drive the page through the owner index,
             // and each node's referrals are read backwards from its index.
-            let seeks: &[&str] =
-                &["handles_owner_chain_node_idx", "referrals_referrer_idx"];
+            let seeks: &[&str] = &[
+                "handles_owner_chain_node_idx",
+                "referrals_referrer_idx",
+                "events_pkey",
+            ];
             let mut plans = Vec::new();
             for (name, holder, chain, before) in [
                 ("referrals", holder, None, None),

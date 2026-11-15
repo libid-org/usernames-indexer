@@ -1,7 +1,11 @@
--- The rest of a referral history: the referrer handle's disclosed text on
--- the chain `h` takes its node from, and each binder's published handle on
--- the referral's chain as it stands now. The caller orders and caps the
--- page.
+-- The rest of a referral history: the transaction of each bind, from the
+-- journal row under the referral's own key; the referrer handle's disclosed
+-- text on the chain `h` takes its node from; and each binder's published
+-- handle on the referral's chain as it stands now. The caller orders and
+-- caps the page.
+JOIN names.events e
+  ON e.chain_id = r.chain_id AND e.block_number = r.block_number
+ AND e.log_index = r.log_index
 LEFT JOIN names.handle_nodes rv
   ON rv.chain_id = h.chain_id AND rv.handle_node = h.handle_node
 LEFT JOIN names.published p

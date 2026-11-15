@@ -49,6 +49,7 @@ impl Referral {
             chain_id: row.chain_id,
             block_number: row.block_number,
             log_index: row.log_index,
+            tx_hash: row.tx_hash,
             block_time: row.block_time,
             referrer: HandleRef::of(
                 Some(row.referrer_platform),

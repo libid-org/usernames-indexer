@@ -798,6 +798,8 @@ pub struct Referral {
     pub block_number: i64,
     /// Its log's index in the block.
     pub log_index: i64,
+    /// The transaction that bound.
+    pub tx_hash: B256,
     /// Its block's time, in unix seconds.
     pub block_time: i64,
     /// The address's handle the bind named as its referrer.

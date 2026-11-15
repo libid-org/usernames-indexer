@@ -100,6 +100,9 @@ trait OnChains {
     /// Chain, binder, outcome and delivery of each, by chain: binds on two
     /// chains in the same second list by chain, not by when they happened.
     fn on_chains(&self) -> Vec<(i64, Address, Outcome, Option<Delivery>)>;
+
+    /// Chain and transaction of each, by chain, as [`OnChains::on_chains`].
+    fn transactions(&self) -> Vec<(i64, B256)>;
 }
 
 impl OnChains for AddressReferrals {
@@ -110,6 +113,16 @@ impl OnChains for AddressReferrals {
             .map(|r| (r.chain_id, r.binder, r.outcome, r.delivery))
             .collect();
         rows.sort_by_key(|&(chain, ..)| chain);
+        rows
+    }
+
+    fn transactions(&self) -> Vec<(i64, B256)> {
+        let mut rows: Vec<_> = self
+            .referrals
+            .iter()
+            .map(|r| (r.chain_id, r.tx_hash))
+            .collect();
+        rows.sort_by_key(|&(chain, _)| chain);
         rows
     }
 }
@@ -501,9 +514,11 @@ async fn a_referral_across_two_chains_reads_on_both_pages() {
 
     // B1 binds on B naming it: nobody holds it there, so the escrow holds
     // R's share, awaiting R's bind on B.
-    b.libid
-        .bind_referred(b1, proof(Handle(x, "binder_b1"), "801"), referrer, fee)
+    let bind = b
+        .libid
+        .referred(b1, proof(Handle(x, "binder_b1"), "801"), referrer, fee)
         .await;
+    let bound_b1 = b.node.provider.mined(bind).await.transaction_hash;
     b.index(&pool).await;
     assert_eq!(b.libid.escrowed(referrer).await, share());
     assert_eq!(
@@ -518,11 +533,18 @@ async fn a_referral_across_two_chains_reads_on_both_pages() {
 
     // B2 binds on A naming it: the splitter forwards the share to R.
     let before = a.libid.balance(r).await;
-    a.libid
-        .bind_referred(b2, proof(Handle(x, "binder_b2"), "802"), referrer, fee)
+    let bind = a
+        .libid
+        .referred(b2, proof(Handle(x, "binder_b2"), "802"), referrer, fee)
         .await;
+    let bound_b2 = a.node.provider.mined(bind).await.transaction_hash;
     a.index(&pool).await;
     assert_eq!(a.libid.balance(r).await - before, share());
+    // Each referral names the transaction that bound, for an explorer link.
+    assert_eq!(
+        pages.referrals().await.transactions(),
+        [(on_a, bound_b2), (on_b, bound_b1)]
+    );
     assert_eq!(
         pages.referrals().await.on_chains(),
         [

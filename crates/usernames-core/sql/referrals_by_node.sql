@@ -4,7 +4,7 @@
 -- per node, as the claimable slots are: Postgres estimates a row comparison led by block time as matching
 -- almost nothing, and would walk the whole table past a cursor. The
 -- referrer's platform is the one `h` holds its node on.
-SELECT r.chain_id, r.block_number, r.log_index, r.block_time, r.referrer_node,
+SELECT r.chain_id, r.block_number, r.log_index, e.tx_hash, r.block_time, r.referrer_node,
        h.platform_id AS referrer_platform, r.binder, r.platform_id, r.handle_node, r.fee,
        r.share, r.outcome, r.delivery, rv.handle AS referrer_handle,
        v.handle AS binder_handle
