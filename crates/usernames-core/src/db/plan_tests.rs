@@ -10,6 +10,7 @@ use super::{
         Scope,
         Search,
     },
+    stats::plans::StatsPlans,
     *,
 };
 
@@ -42,6 +43,50 @@ impl Plan {
             .unwrap_or_else(|e| panic!("{name}: {e}"))
             .join("\n");
         Self { name, seeks, text }
+    }
+
+    /// Panics unless the plan seeks every index it names, scans none of the
+    /// big tables, and reads no table it writes.
+    fn check(&self) {
+        let Self { name, seeks, text } = self;
+        for written in text
+            .lines()
+            .filter_map(|line| line.split("Insert on ").nth(1)?.split_whitespace().next())
+        {
+            assert!(
+                !text.lines().any(|line| line.contains("Scan")
+                    && line
+                        .split(" on ")
+                        .skip(1)
+                        .any(|rest| rest.split_whitespace().next() == Some(written))),
+                "{name} reads {written}, which it writes:\n{text}"
+            );
+        }
+        for index in seeks.unwrap_or_default() {
+            assert!(
+                index.split('|').any(|index| text.contains(index)),
+                "{name} does not seek {index}:\n{text}"
+            );
+        }
+        for table in [
+            "handles",
+            "ids",
+            "published",
+            "events",
+            "escrow_held",
+            "escrow_refundable",
+            "address_events",
+            "handle_nodes",
+            "stats_counts",
+            "stats_totals",
+            "stats_wallet_days",
+            "stats_firsts",
+        ] {
+            assert!(
+                !text.contains(&format!("Seq Scan on {table}")),
+                "{name} scans {table}:\n{text}"
+            );
+        }
     }
 }
 
@@ -261,29 +306,9 @@ async fn every_read_over_the_big_tables_seeks_its_index() {
     let mut all = conn.store_plans().await;
     all.extend(conn.history_plans().await);
     all.extend(conn.escrow_plans().await);
+    all.extend(conn.stats_plans().await);
     for plan in all {
-        let Plan { name, seeks, text } = plan;
-        for index in seeks.unwrap_or_default() {
-            assert!(
-                index.split('|').any(|index| text.contains(index)),
-                "{name} does not seek {index}:\n{text}"
-            );
-        }
-        for table in [
-            "handles",
-            "ids",
-            "published",
-            "events",
-            "escrow_held",
-            "escrow_refundable",
-            "address_events",
-            "handle_nodes",
-        ] {
-            assert!(
-                !text.contains(&format!("Seq Scan on {table}")),
-                "{name} scans {table}:\n{text}"
-            );
-        }
+        plan.check();
     }
     conn.rollback().await.expect("rollback")
 }

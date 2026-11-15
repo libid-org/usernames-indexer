@@ -18,9 +18,16 @@ use super::{
 };
 use crate::{
     db::{
+        ChainEvents,
+        HistoryCursor,
         InvalidCursor,
         Page,
         Rows,
+        SECONDS_PER_DAY,
+    },
+    events::{
+        EventKind,
+        UnknownKind,
     },
     nodes::{
         KnownPlatform,
@@ -28,10 +35,25 @@ use crate::{
     },
 };
 
-/// A list page holds this many entries when the request names no `limit`.
-const PAGE_DEFAULT_LIMIT: i64 = 20;
-/// The most entries one list page holds.
-const PAGE_MAX_LIMIT: i64 = 100;
+/// How many entries a page holds: when the request names no `limit`, and
+/// at most.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Limits {
+    default: i64,
+    max: i64,
+}
+
+/// A list page: 20 entries, at most 100.
+pub(crate) const LIST_PAGE: Limits = Limits {
+    default: 20,
+    max: 100,
+};
+
+/// A page of days: the last 30, at most a year's 366.
+pub(crate) const DAYS_PAGE: Limits = Limits {
+    default: 30,
+    max: 366,
+};
 
 /// `?chain=8453&before=<next>&limit=20`: one page of a list, the cursor the
 /// one the previous page handed out.
@@ -46,6 +68,14 @@ impl PageParams {
     pub(crate) fn page<C: FromStr<Err = InvalidCursor>>(
         self,
     ) -> Result<Page<C>, ApiError> {
+        self.page_within(LIST_PAGE)
+    }
+
+    /// The page, its size within `limits`.
+    pub(crate) fn page_within<C: FromStr<Err = InvalidCursor>>(
+        self,
+        limits: Limits,
+    ) -> Result<Page<C>, ApiError> {
         Ok(Page {
             chain: ChainFilter { chain: self.chain }.chain_id()?,
             before: self.before.as_deref().map(str::parse).transpose()?,
@@ -54,8 +84,8 @@ impl PageParams {
                 .as_deref()
                 .map(|limit| limit.parse_count("limit"))
                 .transpose()?
-                .unwrap_or(PAGE_DEFAULT_LIMIT)
-                .clamp(1, PAGE_MAX_LIMIT),
+                .unwrap_or(limits.default)
+                .clamp(1, limits.max),
         })
     }
 }
@@ -69,6 +99,49 @@ impl<R, C: Display> Rows<R, C> {
     ) -> Result<(Vec<T>, Option<String>), ApiError> {
         let served = self.rows.into_iter().map(of).collect::<Result<_, _>>()?;
         Ok((served, self.next.map(|next| next.to_string())))
+    }
+}
+
+/// `?day=<unix second>&kind=deposited&token=0x…&before=<next>&limit=20`: one
+/// page of a chain's history, narrowed to a UTC day, a kind and a token.
+#[derive(Deserialize)]
+pub(crate) struct ChainHistoryParams {
+    day: Option<String>,
+    kind: Option<String>,
+    token: Option<String>,
+    before: Option<String>,
+    limit: Option<String>,
+}
+
+impl ChainHistoryParams {
+    /// The events asked for on `chain`, and the page.
+    pub(crate) fn on(
+        self,
+        chain: &str,
+    ) -> Result<(ChainEvents, Page<HistoryCursor>), ApiError> {
+        let Self {
+            day,
+            kind,
+            token,
+            before,
+            limit,
+        } = self;
+        let chain = ChainFilter {
+            chain: Some(chain.to_owned()),
+        };
+        let page = PageParams {
+            chain: chain.chain,
+            before,
+            limit,
+        }
+        .page()?;
+        let events = ChainEvents {
+            chain_id: page.chain.unwrap_or_default(),
+            day: day.as_deref().map(str::parse_day).transpose()?,
+            kind: kind.as_deref().map(str::parse_kind).transpose()?,
+            token: token.as_deref().map(str::parse_address).transpose()?,
+        };
+        Ok((events, page))
     }
 }
 
@@ -142,6 +215,10 @@ pub(crate) trait Param {
     /// A count from the query string named `name`: typed as a number in the
     /// extractor, `limit=ten` would get axum's plain-text 400.
     fn parse_count(&self, name: &str) -> Result<i64, ApiError>;
+    /// A UTC day by its first second, in unix seconds.
+    fn parse_day(&self) -> Result<i64, ApiError>;
+    /// A journal event kind by its wire name (`deposited`).
+    fn parse_kind(&self) -> Result<EventKind, ApiError>;
     /// Refused when it holds a NUL byte: Postgres cannot compare TEXT holding
     /// one, and no stored value ever does.
     fn refuse_nul(&self, what: &str) -> Result<(), ApiError>;
@@ -186,6 +263,23 @@ impl Param for str {
                 ErrorCode::InvalidArgument,
                 format!("{name} must be an integer, not {self:?}"),
             )
+        })
+    }
+
+    fn parse_day(&self) -> Result<i64, ApiError> {
+        let day = self.parse_count("day")?;
+        if day.rem_euclid(SECONDS_PER_DAY) != 0 {
+            return Err(ApiError::bad_request(
+                ErrorCode::InvalidArgument,
+                format!("day must be a UTC day's first second, not {day}"),
+            ));
+        }
+        Ok(day)
+    }
+
+    fn parse_kind(&self) -> Result<EventKind, ApiError> {
+        self.parse().map_err(|e: UnknownKind| {
+            ApiError::bad_request(ErrorCode::InvalidArgument, e.to_string())
         })
     }
 

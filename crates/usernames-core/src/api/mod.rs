@@ -1,14 +1,18 @@
 //! The read API. Resolution answers exactly what the contract's resolvers
-//! answer, from the projections; search, the histories and the escrow's
-//! waiting amounts are what the chain cannot list. The answers' shapes live
-//! in [`model`]; the handlers here and in the history and escrow modules only
-//! translate HTTP to store calls and rows to those shapes.
+//! answer, from the projections; search, the histories, the escrow's
+//! waiting amounts and the statistics are what the chain cannot list. The
+//! answers' shapes live in [`model`]; the handlers here and in the history,
+//! escrow and stats modules only translate HTTP to store calls and rows to
+//! those shapes.
 
 mod error;
 mod escrow;
 mod history;
 pub mod model;
 mod params;
+mod stats;
+
+use std::sync::Arc;
 
 use alloy::primitives::B256;
 use axum::{
@@ -41,16 +45,19 @@ use self::{
     },
     params::{
         ChainFilter,
+        ChainHistoryParams,
         HandleKey,
         PageParams,
         Param,
     },
+    stats::StatsCache,
 };
 use crate::{
     db::{
         self,
         ChainStatusRow,
         HandleNodeRow,
+        Listing,
         Search,
         Store,
     },
@@ -59,15 +66,33 @@ use crate::{
 
 /// What every handler needs: the store. Which chains it holds, and which
 /// contract each was indexed from, is read from what the indexers wrote.
+/// Beside it, the tokens and fee receivers `/v1/stats` names and its latest
+/// answer, shared by every clone.
 #[derive(Clone)]
 pub struct AppState {
     store: Store,
+    listing: Arc<Listing>,
+    stats: StatsCache,
 }
 
 impl AppState {
-    /// State over one database, however many chains it holds.
+    /// State over one database, however many chains it holds. `/v1/stats`
+    /// names each chain's own coin, and no other token and no fee receiver.
     pub fn new(store: Store) -> Self {
-        Self { store }
+        Self {
+            store,
+            listing: Arc::default(),
+            stats: StatsCache::default(),
+        }
+    }
+
+    /// The same state, with `/v1/stats` also naming the tokens and fee
+    /// receivers `listing` lists.
+    pub fn listing(self, listing: Listing) -> Self {
+        Self {
+            listing: listing.into(),
+            ..self
+        }
     }
 
     /// The chains a request reads from — the one `?chain=` names, or all —
@@ -110,11 +135,14 @@ impl AppState {
                 get(history::handle),
             )
             .route("/v1/history/node/{node}", get(history::node))
+            .route("/v1/history/chain/{chain}", get(history::chain))
             .route("/v1/escrow/claimable/{address}", get(escrow::claimable))
             .route("/v1/escrow/refundable/{address}", get(escrow::refundable))
             .route("/v1/escrow/handle/{platform}/{handle}", get(escrow::handle))
             .route("/v1/escrow/node/{node}", get(escrow::node))
             .route("/v1/escrow/unclaimed", get(escrow::unclaimed))
+            .route("/v1/stats", get(stats::stats))
+            .route("/v1/stats/days", get(stats::days))
             .with_state(self)
     }
 
@@ -544,6 +572,42 @@ mod tests {
             ),
             (
                 "/v1/escrow/unclaimed?before=nope".to_string(),
+                bad(ErrorCode::InvalidCursor),
+            ),
+            (
+                "/v1/stats/days?before=yesterday".to_string(),
+                bad(ErrorCode::InvalidCursor),
+            ),
+            (
+                "/v1/stats/days?chain=base".to_string(),
+                bad(ErrorCode::InvalidChain),
+            ),
+            (
+                "/v1/stats/days?limit=ten".to_string(),
+                bad(ErrorCode::InvalidArgument),
+            ),
+            (
+                "/v1/history/chain/base".to_string(),
+                bad(ErrorCode::InvalidChain),
+            ),
+            (
+                "/v1/history/chain/1?day=1700000001".to_string(),
+                bad(ErrorCode::InvalidArgument),
+            ),
+            (
+                "/v1/history/chain/1?day=today".to_string(),
+                bad(ErrorCode::InvalidArgument),
+            ),
+            (
+                "/v1/history/chain/1?kind=minted".to_string(),
+                bad(ErrorCode::InvalidArgument),
+            ),
+            (
+                "/v1/history/chain/1?token=usdc".to_string(),
+                bad(ErrorCode::InvalidAddress),
+            ),
+            (
+                "/v1/history/chain/1?before=yesterday".to_string(),
                 bad(ErrorCode::InvalidCursor),
             ),
             (

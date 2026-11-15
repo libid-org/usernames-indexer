@@ -45,6 +45,8 @@ use usernames_core::{
     api,
     db::{
         self,
+        ListedAddress,
+        Listing,
         Store,
     },
     ens::{
@@ -116,6 +118,21 @@ pub struct Config {
     /// index has not earned the right to say that.
     #[arg(long, env = "ENS_MAX_LAG_BLOCKS", default_value_t = 32)]
     pub ens_max_lag_blocks: u64,
+
+    /// The tokens `/v1/stats` names by address beside each chain's own coin,
+    /// comma-separated `<chain id>:<address>` pairs: `8453:0x8335…`. Every
+    /// other token counts under `other`, without an amount: anybody can
+    /// write a token, and naming each would let them grow every answer.
+    #[arg(long, env = "STATS_TOKENS", value_delimiter = ',')]
+    pub stats_tokens: Vec<ListedAddress>,
+
+    /// The registration fee receivers `/v1/stats` names by address,
+    /// comma-separated `<chain id>:<address>` pairs. Every other receiver's
+    /// fees count together under `other`, with their amount: a bind may
+    /// name any receiver, and naming each would let anybody grow every
+    /// answer.
+    #[arg(long, env = "STATS_FEE_RECEIVERS", value_delimiter = ',')]
+    pub stats_fee_receivers: Vec<ListedAddress>,
 }
 
 /// The API serving as a task, and the token that stops it.
@@ -227,7 +244,10 @@ impl Config {
             }
         }
         let app = Service {
-            api: api::AppState::new(store),
+            api: api::AppState::new(store).listing(Listing {
+                tokens: self.stats_tokens,
+                fee_receivers: self.stats_fee_receivers,
+            }),
             gateway,
         }
         .router();

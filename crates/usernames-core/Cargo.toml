@@ -24,6 +24,7 @@ libid-contracts.workspace = true
 libid-identity.workspace = true
 reqwest.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 serde_with.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
@@ -38,6 +39,5 @@ usernames-core = { workspace = true, features = ["test-helpers"] }
 usernames-fixtures.workspace = true
 libid-profiles.workspace = true
 http-body-util.workspace = true
-serde_json.workspace = true
 tower = { workspace = true, features = ["util"] }
 tracing-subscriber.workspace = true
