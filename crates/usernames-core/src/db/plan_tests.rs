@@ -9,6 +9,7 @@ use super::{
     awaiting::plans::AwaitingPlans,
     escrow::plans::EscrowPlans,
     history::plans::HistoryPlans,
+    links::plans::ReferralLinkPlans,
     reads::{
         Scope,
         Search,
@@ -65,6 +66,28 @@ impl Plan {
         assert_eq!(
             reads, 1,
             "{name} reads the holder's handles {reads} times:\n{text}"
+        );
+        self
+    }
+
+    /// Panics unless the plan cuts the page before it seeks `index`: no scan
+    /// of it sits under the outermost `Limit`, so the join runs once per row
+    /// served rather than once per row the page was cut from.
+    pub(crate) fn cut_before(self, index: &str) -> Self {
+        let Self { name, text, .. } = &self;
+        let depth = |line: &str| line.len() - line.trim_start().len();
+        let lines: Vec<&str> = text.lines().collect();
+        let limit = (0..lines.len())
+            .filter(|&at| lines[at].contains("Limit"))
+            .min_by_key(|&at| depth(lines[at]))
+            .unwrap_or_else(|| panic!("{name} has no Limit:\n{text}"));
+        let under = lines[limit + 1..]
+            .iter()
+            .take_while(|line| depth(line) > depth(lines[limit]))
+            .any(|line| line.contains(index));
+        assert!(
+            !under,
+            "{name} seeks {index} before it cuts the page:\n{text}"
         );
         self
     }
@@ -356,6 +379,7 @@ async fn every_read_over_the_big_tables_seeks_its_index() {
     all.extend(conn.referral_plans().await);
     all.extend(conn.referral_history_plans().await);
     all.extend(conn.awaiting_plans().await);
+    all.extend(conn.referral_link_plans().await);
     for plan in all {
         plan.check();
     }

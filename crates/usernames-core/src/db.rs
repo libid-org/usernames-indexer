@@ -49,6 +49,7 @@ mod escrow;
 mod fold;
 mod history;
 mod journal;
+mod links;
 mod page;
 #[cfg(test)]
 mod plan_tests;
@@ -81,6 +82,10 @@ pub use self::{
     journal::{
         EventColumns,
         JournalError,
+    },
+    links::{
+        ReferralLinkRow,
+        ReferralLinks,
     },
     page::{
         Cursor,
