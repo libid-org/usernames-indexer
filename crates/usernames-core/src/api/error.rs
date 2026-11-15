@@ -95,6 +95,17 @@ impl ApiError {
         }
     }
 
+    /// The stats computation failed moments ago and is not run again yet.
+    pub(crate) fn stats_backing_off() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ErrorCode::Internal,
+            message: "the stats computation failed moments ago and runs again shortly"
+                .into(),
+            source: None,
+        }
+    }
+
     pub(crate) fn not_synced(chain: Option<i64>) -> Self {
         let message = match chain {
             Some(chain) => {

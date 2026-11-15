@@ -19,6 +19,7 @@ use std::{
     },
     time::{
         Duration,
+        Instant,
         SystemTime,
         UNIX_EPOCH,
     },
@@ -64,6 +65,7 @@ use usernames_core::{
         PriceSource,
         Prices,
         KEPT_PER_CHAIN,
+        STATS_TTL,
     },
     db::{
         Store,
@@ -672,6 +674,43 @@ async fn a_failed_stats_computation_leaves_escrow_amounts_unpriced() {
     assert_eq!(
         held.priced(),
         BTreeMap::from([(NATIVE, TokenValue::default())])
+    );
+    suite.store().forget().await;
+    suite.done();
+}
+
+/// While the `/v1/stats` computation fails, a burst of escrow requests
+/// waits on one computation, not one each: the requests after it answer
+/// unpriced at once.
+#[tokio::test]
+async fn escrow_requests_wait_on_one_failing_computation() {
+    let suite = Suite::open(&SUITE, CHAIN).await;
+    let mock = MockSource::start().await;
+    mock.price(NATIVE, Coin::priced(2000.5, 18, "ETH"));
+    suite
+        .apply(10, NamesEvent::deposited(NATIVE, SENDER, ether(15)))
+        .await;
+    let mut lock = suite.pool.begin().await.expect("a transaction");
+    sqlx::query("LOCK TABLE names.stats_totals IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .expect("the stats rollups locked");
+    let deadline = Duration::from_secs(1);
+    let api = AppState::new(Store::new(suite.pool.clone()))
+        .pricing(mock.source())
+        .stats_timing(STATS_TTL, deadline)
+        .router();
+
+    let started = Instant::now();
+    let path = format!("/v1/escrow/handle/x/dave?chain={CHAIN}");
+    let (first, second): (HandleAmounts, HandleAmounts) =
+        tokio::join!(api.answer(&path), api.answer(&path));
+    let waited = started.elapsed();
+    lock.rollback().await.expect("the lock released");
+    assert_eq!((first.priced_at, second.priced_at), (None, None));
+    assert!(
+        waited >= deadline && waited < 2 * deadline,
+        "two requests waited {waited:?}"
     );
     suite.store().forget().await;
     suite.done();
