@@ -209,8 +209,8 @@ impl Chain {
 }
 
 /// The two pages a referrer reads, read across every chain the store holds
-/// and kept to the journey's chains: other suites' anvils run the same
-/// accounts on chains of their own.
+/// a full page at a time and kept to the journey's chains: other suites'
+/// anvils run the same accounts on chains of their own.
 struct Pages<'a> {
     pool: &'a PgPool,
     holder: Address,
@@ -220,7 +220,7 @@ struct Pages<'a> {
 impl Pages<'_> {
     /// The referral history: the binds that named the holder's handles.
     async fn referrals(&self) -> AddressReferrals {
-        let path = format!("/v1/referrals/address/{}", self.holder);
+        let path = format!("/v1/referrals/address/{}?limit=100", self.holder);
         let mut answer: AddressReferrals = self.pool.get(&path).await.answer();
         answer
             .referrals
@@ -230,7 +230,7 @@ impl Pages<'_> {
 
     /// The referral history: every event the holder took part in.
     async fn history(&self) -> AddressHistory {
-        let path = format!("/v1/history/address/{}", self.holder);
+        let path = format!("/v1/history/address/{}?limit=100", self.holder);
         let mut answer: AddressHistory = self.pool.get(&path).await.answer();
         answer.entries.retain(|e| self.chains.contains(&e.chain_id));
         answer
@@ -248,7 +248,7 @@ impl Pages<'_> {
 
     /// One of the profile's lists, kept to the journey's chains.
     async fn amounts(&self, list: &str) -> AddressAmounts {
-        let path = format!("/v1/escrow/{list}/{}", self.holder);
+        let path = format!("/v1/escrow/{list}/{}?limit=100", self.holder);
         let mut answer: AddressAmounts = self.pool.get(&path).await.answer();
         answer.amounts.retain(|a| self.chains.contains(&a.chain_id));
         answer
@@ -481,8 +481,10 @@ async fn a_referral_across_two_chains_reads_on_both_pages() {
         .expect("database");
     let mut a = Chain::start(&pool, CHAIN_A).await;
     let mut b = Chain::start(&pool, CHAIN_B).await;
-    let &[_, r, b1, b2, ..] = a.node.accounts() else {
-        panic!("anvil has fewer than four accounts");
+    // Accounts no other test here binds with, so their pages hold the
+    // journey's rows and the leftovers of other binaries' chains alone.
+    let &[r, b1, b2] = &a.node.accounts()[7..] else {
+        panic!("anvil runs ten accounts");
     };
     let (on_a, on_b) = (CHAIN_A as i64, CHAIN_B as i64);
     let x = KnownPlatform::X;
