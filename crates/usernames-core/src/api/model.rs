@@ -70,6 +70,9 @@ pub enum ErrorCode {
     HandleImpossible,
     /// No indexer has committed a first window for the chains in scope.
     NotSynced,
+    /// The stats computation failed moments ago; it runs again once
+    /// `STATS_DEADLINE` has passed, so a retry shortly after can succeed.
+    StatsBackingOff,
     /// Neither a known platform key nor a 0x-hex platform id.
     InvalidPlatform,
     /// Not an address.
