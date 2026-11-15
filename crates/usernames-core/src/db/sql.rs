@@ -127,3 +127,8 @@ pub const STATS_FOLDED: &str = include_str!("../../sql/stats_folded.sql");
 /// whose journals count those users again.
 pub const STATS_CLEAR: &str = include_str!("../../sql/stats_clear.sql");
 pub const STATS_REFOLDS: &str = include_str!("../../sql/stats_refolds.sql");
+/// The bound handle nodes; the caller bounds them by a referral code's prefix
+/// and takes two.
+pub const REFERRAL_CODE_OWNER: &str = include_str!("../../sql/referral_code_owner.sql");
+pub const REFERRAL_CODE_REFERRER: &str =
+    include_str!("../../sql/referral_code_referrer.sql");

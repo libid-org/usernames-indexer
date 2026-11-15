@@ -5681,6 +5681,7 @@ dependencies = [
  "alloy-primitives",
  "anyhow",
  "axum",
+ "bs58",
  "chrono",
  "futures-util",
  "http-body-util",

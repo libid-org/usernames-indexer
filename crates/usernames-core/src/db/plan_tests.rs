@@ -11,6 +11,7 @@ use super::{
         Scope,
         Search,
     },
+    referral::plans::ReferralPlans,
     stats::plans::StatsPlans,
     *,
 };
@@ -332,6 +333,7 @@ async fn every_read_over_the_big_tables_seeks_its_index() {
     all.extend(conn.history_plans().await);
     all.extend(conn.escrow_plans().await);
     all.extend(conn.stats_plans().await);
+    all.extend(conn.referral_plans().await);
     for plan in all {
         plan.check();
     }

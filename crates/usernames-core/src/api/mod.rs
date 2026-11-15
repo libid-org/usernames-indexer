@@ -1,9 +1,9 @@
 //! The read API. Resolution answers exactly what the contract's resolvers
 //! answer, from the projections; search, the histories, the escrow's
-//! waiting amounts and the statistics are what the chain cannot list. The
-//! answers' shapes live in [`model`]; the handlers here and in the history,
-//! escrow and stats modules only translate HTTP to store calls and rows to
-//! those shapes.
+//! waiting amounts, the statistics and referral codes are what the chain
+//! cannot list. The answers' shapes live in [`model`]; the handlers here
+//! and in the history, escrow, stats and referral modules only translate
+//! HTTP to store calls and rows to those shapes.
 
 mod error;
 mod escrow;
@@ -11,6 +11,7 @@ mod history;
 pub mod model;
 mod params;
 mod prices;
+mod referral;
 mod stats;
 
 use std::{
@@ -179,6 +180,8 @@ impl AppState {
             .route("/v1/escrow/unclaimed", get(escrow::unclaimed))
             .route("/v1/stats", get(stats::stats))
             .route("/v1/stats/days", get(stats::days))
+            .route("/v1/referral/code/{code}", get(referral::code))
+            .route("/v1/referral/node/{node}/code", get(referral::node_code))
             .with_state(self)
     }
 
@@ -681,6 +684,22 @@ mod tests {
             (
                 format!("/v1/escrow/claimable/{address}?chain=1&chain=2"),
                 bad(ErrorCode::InvalidQuery),
+            ),
+            (
+                "/v1/referral/code/0OIl0OIl0OIl".to_string(),
+                bad(ErrorCode::InvalidCode),
+            ),
+            (
+                "/v1/referral/code/2g".to_string(),
+                bad(ErrorCode::InvalidCode),
+            ),
+            (
+                format!("/v1/referral/code/{}", "z".repeat(45)),
+                bad(ErrorCode::InvalidCode),
+            ),
+            (
+                "/v1/referral/node/0x1234/code".to_string(),
+                bad(ErrorCode::InvalidNode),
             ),
         ];
         for (path, expected) in cases {
