@@ -222,6 +222,18 @@ impl ChainNames {
     fn name(&self, chain_id: i64) -> Option<&str> {
         self.0.get(&chain_id).map(String::as_str)
     }
+
+    /// The source's id of `coin`: `<chain>:0x…`, the chain's own coin as
+    /// the zero address; `None` on a chain the source does not name.
+    fn coin_id(&self, coin: &ListedAddress) -> Option<String> {
+        let chain = self.name(coin.chain_id)?;
+        let token = if coin.address == NATIVE_COIN {
+            SOURCE_COIN
+        } else {
+            coin.address
+        };
+        Some(format!("{chain}:{token:#x}"))
+    }
 }
 
 /// A price in units of 10^-18 USD.
@@ -528,19 +540,6 @@ impl Prices {
         }
     }
 
-    /// The source's id of `coin` among `chains`: `<chain>:0x…`, the chain's
-    /// own coin as the zero address; `None` on a chain the source does not
-    /// name.
-    fn coin_id(chains: &ChainNames, coin: &ListedAddress) -> Option<String> {
-        let chain = chains.name(coin.chain_id)?;
-        let token = if coin.address == NATIVE_COIN {
-            SOURCE_COIN
-        } else {
-            coin.address
-        };
-        Some(format!("{chain}:{token:#x}"))
-    }
-
     /// The coins priced with confidence before and kept, which stay among
     /// those asked whatever their latest answer: a token anybody wrote
     /// cannot push them out.
@@ -581,7 +580,7 @@ impl Prices {
         let ids: HashMap<String, ListedAddress> = candidates
             .iter()
             .filter_map(|candidate| {
-                Some((Self::coin_id(&chains, &candidate.coin)?, candidate.coin))
+                Some((chains.coin_id(&candidate.coin)?, candidate.coin))
             })
             .collect();
         let mut asked: Vec<&String> = ids.keys().collect();
@@ -762,7 +761,7 @@ mod tests {
             address: Address::repeat_byte(0xAB),
         };
         assert_eq!(
-            Prices::coin_id(&chains, &usdc).as_deref(),
+            chains.coin_id(&usdc).as_deref(),
             Some("base:0xabababababababababababababababababababab")
         );
         let coin = ListedAddress {
@@ -770,14 +769,14 @@ mod tests {
             address: NATIVE_COIN,
         };
         assert_eq!(
-            Prices::coin_id(&chains, &coin).as_deref(),
+            chains.coin_id(&coin).as_deref(),
             Some("ethereum:0x0000000000000000000000000000000000000000")
         );
         let testnet = ListedAddress {
             chain_id: 84532,
             address: NATIVE_COIN,
         };
-        assert_eq!(Prices::coin_id(&chains, &testnet), None);
+        assert_eq!(chains.coin_id(&testnet), None);
     }
 
     #[test]
