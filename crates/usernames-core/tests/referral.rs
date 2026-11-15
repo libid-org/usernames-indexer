@@ -1,9 +1,9 @@
 //! Referral codes, end to end: binds go through the apply path the indexer
 //! uses, and every assertion goes through the axum handlers a caller hits.
 //!
-//! Skips, saying so, when `DATABASE_URL` is unset; everything past that check
-//! panics on failure. The suite's chains are its own; its nodes start with
-//! bytes no other suite's handles do.
+//! Runs against the Postgres at `DATABASE_URL`, and fails without it.
+//! The suite's chains are its own; its nodes start with bytes no other
+//! suite's handles do.
 
 use alloy::primitives::{
     Address,
@@ -57,12 +57,12 @@ struct Referrals {
 }
 
 impl Referrals {
-    async fn open() -> Option<Self> {
-        let suite = Suite::open(&SUITE, CHAIN).await?;
+    async fn open() -> Self {
+        let suite = Suite::open(&SUITE, CHAIN).await;
         let other = ChainStore::new(suite.pool.clone(), OTHER_CHAIN);
         other.forget().await;
         let other = other.writer().await;
-        Some(Self { suite, other })
+        Self { suite, other }
     }
 
     /// The chain's writer: the suite's own, or the other chain's.
@@ -117,9 +117,7 @@ impl Referrals {
 
 #[tokio::test]
 async fn a_published_handle_goes_by_an_8_byte_code_that_shows_its_text() {
-    let Some(referrals) = Referrals::open().await else {
-        return;
-    };
+    let referrals = Referrals::open().await;
     let node = X.handle_node("referrer_alice").unwrap();
     referrals
         .suite
@@ -148,9 +146,7 @@ async fn a_published_handle_goes_by_an_8_byte_code_that_shows_its_text() {
 
 #[tokio::test]
 async fn a_handle_nobody_published_as_a_name_keeps_its_text_hidden() {
-    let Some(referrals) = Referrals::open().await else {
-        return;
-    };
+    let referrals = Referrals::open().await;
     let private = X.handle_node("referrer_private").unwrap();
     let revealed = X.handle_node("referrer_revealed").unwrap();
     referrals
@@ -175,9 +171,7 @@ async fn a_handle_nobody_published_as_a_name_keeps_its_text_hidden() {
 
 #[tokio::test]
 async fn a_code_two_bound_nodes_start_names_neither_and_each_takes_a_longer_one() {
-    let Some(referrals) = Referrals::open().await else {
-        return;
-    };
+    let referrals = Referrals::open().await;
     let head = [0x5e, 0xf3, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
     let first = crafted(&head, 0x22);
     let later = crafted(&head, 0x11);
@@ -211,9 +205,7 @@ async fn a_code_two_bound_nodes_start_names_neither_and_each_takes_a_longer_one(
 
 #[tokio::test]
 async fn a_lagging_chains_earlier_bind_takes_no_code_already_named() {
-    let Some(referrals) = Referrals::open().await else {
-        return;
-    };
+    let referrals = Referrals::open().await;
     let head = [0x5e, 0xf3, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f];
     let earlier = crafted(&head, 0x66);
     let later = crafted(&head, 0x55);
@@ -236,9 +228,7 @@ async fn a_lagging_chains_earlier_bind_takes_no_code_already_named() {
 
 #[tokio::test]
 async fn a_node_bound_on_two_chains_lists_both_and_a_retired_one_keeps_its_code() {
-    let Some(referrals) = Referrals::open().await else {
-        return;
-    };
+    let referrals = Referrals::open().await;
     let node = X.handle_node("referrer_twice").unwrap();
     referrals.bind(CHAIN, 1, node, HOLDER).await;
     referrals.bind(OTHER_CHAIN, 2, node, HOLDER).await;
@@ -260,9 +250,7 @@ async fn a_node_bound_on_two_chains_lists_both_and_a_retired_one_keeps_its_code(
 
 #[tokio::test]
 async fn a_prefix_of_all_0xff_and_one_of_leading_zeros_name_their_nodes() {
-    let Some(referrals) = Referrals::open().await else {
-        return;
-    };
+    let referrals = Referrals::open().await;
     let top = crafted(&[0xff; 8], 0x5e);
     let zeros = crafted(&[0, 0, 0, 0x5e, 0xf3, 0x5e, 0xf3, 0x5e], 0x5e);
     referrals.bind(CHAIN, 1, top, HOLDER).await;
@@ -285,9 +273,7 @@ async fn a_prefix_of_all_0xff_and_one_of_leading_zeros_name_their_nodes() {
 
 #[tokio::test]
 async fn a_code_or_node_nobody_bound_is_refused() {
-    let Some(referrals) = Referrals::open().await else {
-        return;
-    };
+    let referrals = Referrals::open().await;
     let bound = crafted(&[0x5e, 0xf3, 0xee], 0x55);
     let above = crafted(&[0x5e, 0xf3, 0xf0], 0x55);
     referrals.bind(CHAIN, 1, bound, HOLDER).await;
