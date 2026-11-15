@@ -114,18 +114,23 @@ impl OnChains for AddressReferrals {
     }
 }
 
-/// What the journey compares of a profile's amounts.
+/// What the suite compares of the escrow's amounts.
 trait Slots {
     /// Chain, node, amount and holder of each, in the order served.
     fn slots(&self) -> Vec<(i64, B256, U256, Option<Address>)>;
 }
 
-impl Slots for AddressAmounts {
+impl Slots for [EscrowAmount] {
     fn slots(&self) -> Vec<(i64, B256, U256, Option<Address>)> {
-        self.amounts
-            .iter()
+        self.iter()
             .map(|a| (a.chain_id, a.handle.handle_node, a.amount, a.holder))
             .collect()
+    }
+}
+
+impl Slots for AddressAmounts {
+    fn slots(&self) -> Vec<(i64, B256, U256, Option<Address>)> {
+        self.amounts.slots()
     }
 }
 
@@ -228,6 +233,7 @@ impl Pages<'_> {
         self.amounts("awaiting").await
     }
 
+    /// One of the profile's lists, kept to the journey's chains.
     async fn amounts(&self, list: &str) -> AddressAmounts {
         let path = format!("/v1/escrow/{list}/{}", self.holder);
         let mut answer: AddressAmounts = self.pool.get(&path).await.answer();
@@ -363,16 +369,10 @@ async fn indexes_the_splitters_referrals_and_reconciles_them() {
         .answer();
     let escrowed = libid.escrowed(nobody_r).await;
     assert_eq!(escrowed, share());
-    let slots = |amounts: &[EscrowAmount]| {
-        amounts
-            .iter()
-            .map(|a| (a.chain_id, a.handle.handle_node, a.amount))
-            .collect::<Vec<_>>()
-    };
     let nobody_node = libid.node(nobody_r).await;
     assert_eq!(
-        slots(&awaiting.amounts),
-        [(chain_id as i64, nobody_node, escrowed)]
+        awaiting.slots(),
+        [(chain_id as i64, nobody_node, escrowed, None)]
     );
     // The holder's handle names the platform the node alone does not.
     assert_eq!(awaiting.amounts[0].handle.platform, Some(x));
@@ -380,7 +380,7 @@ async fn indexes_the_splitters_referrals_and_reconciles_them() {
         .get_on(chain_id as i64, &format!("/v1/escrow/node/{nobody_node}"))
         .await
         .answer();
-    assert_eq!(slots(&held.amounts), slots(&awaiting.amounts));
+    assert_eq!(held.amounts.slots(), awaiting.slots());
 
     // The money reconciles: the treasury took every fee less the two shares
     // the escrow took, and the splitter keeps nothing.
