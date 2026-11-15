@@ -982,7 +982,6 @@ pub struct AllChains {
 #[serde(rename_all = "camelCase")]
 pub struct Payments {
     /// The priced tokens' payments, in USD.
-    #[serde_as(as = "DisplayFromStr")]
     pub usd: Usd,
     /// Payments in tokens without a price, not in `usd`.
     pub unpriced: i64,
@@ -1215,7 +1214,6 @@ pub struct TokenFlows {
     pub tokens: Vec<TokenFlow>,
     /// The priced tokens' movements in USD, each truncated to the cent
     /// before the sum.
-    #[serde_as(as = "DisplayFromStr")]
     pub usd: Usd,
     /// Every other token's movements, together; absent when there were
     /// none.
@@ -1257,7 +1255,6 @@ pub struct TokenValue {
     /// The amount after the decimals, as a decimal string.
     pub value: Option<String>,
     /// The amount in USD, truncated to the cent.
-    #[serde_as(as = "Option<DisplayFromStr>")]
     pub usd: Option<Usd>,
 }
 
