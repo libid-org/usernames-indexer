@@ -51,6 +51,7 @@ use url::Url;
 use usernames_core::{
     api::{
         model::{
+            AddressAmounts,
             DayActivity,
             HandleAmounts,
             OtherTokens,
@@ -79,6 +80,7 @@ use usernames_core::{
 };
 use usernames_fixtures::{
     ChainEntry,
+    Events,
     StatsRoute,
     Suite,
 };
@@ -378,6 +380,15 @@ impl PricedAmounts for HandleAmounts {
     }
 }
 
+impl PricedAmounts for AddressAmounts {
+    fn priced(&self) -> BTreeMap<Address, TokenValue> {
+        self.amounts
+            .iter()
+            .map(|amount| (amount.token, amount.priced.clone()))
+            .collect()
+    }
+}
+
 fn ether(tenths: u64) -> U256 {
     U256::from(ETHER / 10 * tenths)
 }
@@ -629,9 +640,10 @@ async fn escrow_amounts_are_valued_at_the_served_prices() {
     ];
     suite.apply_tx(10, deposits).await;
 
-    let held: HandleAmounts = AppState::new(Store::new(suite.pool.clone()))
+    let api = AppState::new(Store::new(suite.pool.clone()))
         .pricing(mock.source())
-        .router()
+        .router();
+    let held: HandleAmounts = api
         .answer(&format!("/v1/escrow/handle/x/dave?chain={CHAIN}"))
         .await;
     assert_eq!(held.priced_at, Some(oldest));
@@ -643,6 +655,18 @@ async fn escrow_amounts_are_valued_at_the_served_prices() {
             (JUNK, TokenValue::default()),
         ])
     );
+    // Bound, the same slots are the holder's claim, valued the same way.
+    suite
+        .apply_tx(
+            11,
+            NamesEvent::bind(HOLDER, KnownPlatform::X, "901", "dave", 5_000, false),
+        )
+        .await;
+    let claimable: AddressAmounts = api
+        .answer(&format!("/v1/escrow/claimable/{HOLDER}?chain={CHAIN}"))
+        .await;
+    assert_eq!(claimable.priced_at, Some(oldest));
+    assert_eq!(claimable.priced(), held.priced());
     suite.store().forget().await;
     suite.done();
 }

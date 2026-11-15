@@ -136,9 +136,11 @@ unclaimed list) of a token `/v1/stats` prices also carries its `symbol`,
 `decimals`, `value` (the amount after decimals, a decimal string) and `usd`,
 at the prices of the `/v1/stats` answer being served; the answer's
 `pricedAt` is that answer's `pricedAt`. Any other token answers raw units
-alone. A request never asks the price source: when no fresh `/v1/stats`
-answer is held, it waits for that one computation, and when the computation
-fails the amounts answer unpriced with no `pricedAt`.
+alone. The price source is asked at most once per `STATS_TTL`, by the
+`/v1/stats` computation every request shares: the request that finds the
+answer stale runs it, each call to the source bounded by 5 s, and requests
+meanwhile wait for it. When the computation fails the amounts answer
+unpriced with no `pricedAt`, at once for `STATS_DEADLINE` after the failure.
 
 A `deposit` names a handle by its node alone: the store knows no platform
 for it (`platformId` is absent) until a bind, a `HandleRevealed`, a
