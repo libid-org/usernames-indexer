@@ -837,9 +837,7 @@ async fn days_come_thirty_to_a_page() {
 /// the bind's own fee counts once, as `BindFeePaid`.
 #[tokio::test]
 async fn the_referral_splitter_is_no_user() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let before = suite.api().stats().await;
     suite
         .apply_tx(

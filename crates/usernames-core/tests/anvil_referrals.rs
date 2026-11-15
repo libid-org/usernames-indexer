@@ -4,8 +4,8 @@
 //! API answers. Every number the API serves is reconciled against the
 //! contracts' own balances and views.
 //!
-//! Skips without `DATABASE_URL` or `anvil`, unless `CI` is set: there a
-//! missing one fails. Everything past those checks panics on failure.
+//! Runs against the Postgres at `DATABASE_URL` and `anvil` on PATH, and
+//! fails without either.
 
 use std::time::Duration;
 
@@ -42,7 +42,6 @@ use usernames_core::{
     nodes::KnownPlatform,
 };
 use usernames_fixtures::{
-    anvil_available,
     database_url,
     libid::{
         Disclose,
@@ -90,14 +89,7 @@ impl Outcomes for AddressReferrals {
 #[tokio::test]
 async fn indexes_the_splitters_referrals_and_reconciles_them() {
     let chain_id = CHAIN;
-    let Some(url) = database_url() else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
-    if !anvil_available() {
-        eprintln!("skipping: anvil not on PATH");
-        return;
-    }
+    let url = database_url();
 
     let pool = db::connect_and_migrate(&url).await.expect("database");
     let store = ChainStore::new(pool.clone(), chain_id as i64);
@@ -288,10 +280,6 @@ async fn indexes_the_splitters_referrals_and_reconciles_them() {
 /// registry the indexer follows.
 #[tokio::test]
 async fn a_splitter_of_other_contracts_or_without_an_escrow_is_refused() {
-    if !anvil_available() {
-        eprintln!("skipping: anvil not on PATH");
-        return;
-    }
     let node = Node::spawn(CHAIN);
     let (provider, owner) = (&node.provider, node.accounts()[0]);
     let libid = Libid::deploy(provider, owner).await;

@@ -2,8 +2,8 @@
 //! through the apply path the indexer uses, and every assertion goes through
 //! the axum handlers a caller hits.
 //!
-//! Skips, saying so, when `DATABASE_URL` is unset; everything past that check
-//! panics on failure. The suite's chains and handles are its own.
+//! Runs against the Postgres at `DATABASE_URL`, and fails without it.
+//! The suite's chains and handles are its own.
 
 use alloy::primitives::{
     address,
@@ -140,12 +140,12 @@ struct Referrals {
 }
 
 impl Referrals {
-    async fn open() -> Option<Self> {
-        let suite = Suite::open(&SUITE, CHAIN).await?;
+    async fn open() -> Self {
+        let suite = Suite::open(&SUITE, CHAIN).await;
         let other = ChainStore::new(suite.pool.clone(), OTHER_CHAIN);
         other.forget().await;
         let other = other.writer().await;
-        Some(Self { suite, other })
+        Self { suite, other }
     }
 
     /// The chain's writer: the suite's own, or the other chain's.
@@ -321,9 +321,7 @@ impl Shape for [Referral] {
 
 #[tokio::test]
 async fn a_paid_share_is_listed_as_forwarded_or_held_where_it_went() {
-    let Some(suite) = Referrals::open().await else {
-        return;
-    };
+    let suite = Referrals::open().await;
     suite.bind(CHAIN, 1, "alice_r", ALICE).await;
     // On this chain Alice holds her handle, so her share is forwarded; on
     // the other nobody does, so it is held for whoever binds it there.
@@ -394,9 +392,7 @@ async fn a_paid_share_is_listed_as_forwarded_or_held_where_it_went() {
 
 #[tokio::test]
 async fn a_self_referral_and_a_refused_share_are_listed_without_a_delivery() {
-    let Some(suite) = Referrals::open().await else {
-        return;
-    };
+    let suite = Referrals::open().await;
     suite.bind(CHAIN, 1, "alice_s", ALICE).await;
     let own = Referred::unpaid(ALICE, "alice_s2", "alice_s", Outcome::SelfReferral);
     suite.referred(CHAIN, 2, own).await;
@@ -417,9 +413,7 @@ async fn a_self_referral_and_a_refused_share_are_listed_without_a_delivery() {
 /// platform its `Referred` names.
 #[tokio::test]
 async fn a_referral_shows_the_platform_its_referrers_node_is_bound_on() {
-    let Some(suite) = Referrals::open().await else {
-        return;
-    };
+    let suite = Referrals::open().await;
     suite.bind(CHAIN, 1, "alice_p", ALICE).await;
     let mut events =
         Referred::paid(BOB, "bob_p", "alice_p", Delivery::Forwarded).events();
@@ -447,9 +441,7 @@ async fn a_referral_shows_the_platform_its_referrers_node_is_bound_on() {
 /// holder claims it. A claim in another token, or a refund, leaves it held.
 #[tokio::test]
 async fn a_held_share_reads_claimed_once_its_holder_claims_the_round() {
-    let Some(suite) = Referrals::open().await else {
-        return;
-    };
+    let suite = Referrals::open().await;
     suite.bind(CHAIN, 1, "alice_w", ALICE).await;
     suite.bind(CHAIN, 2, "erin_w", ERIN).await;
     // Nobody holds either handle on the other chain, so both shares are held.
@@ -489,9 +481,7 @@ async fn a_held_share_reads_claimed_once_its_holder_claims_the_round() {
 /// splitter's deposit just before it, for its own referrer.
 #[tokio::test]
 async fn two_referred_binds_in_one_transaction_pair_each_with_its_own_deposit() {
-    let Some(suite) = Referrals::open().await else {
-        return;
-    };
+    let suite = Referrals::open().await;
     suite.bind(CHAIN, 1, "alice_t", ALICE).await;
     suite.bind(OTHER_CHAIN, 2, "dave_t", DAVE).await;
     let (forwarded, held) = (Delivery::Forwarded, Delivery::Held);
@@ -515,9 +505,7 @@ async fn two_referred_binds_in_one_transaction_pair_each_with_its_own_deposit() 
 /// nothing of it is written.
 #[tokio::test]
 async fn a_paid_share_without_the_splitters_deposit_fails_the_window() {
-    let Some(suite) = Referrals::open().await else {
-        return;
-    };
+    let suite = Referrals::open().await;
     suite.bind(CHAIN, 1, "alice_u", ALICE).await;
     let at = |block: u64, log_index: u64, tx: u8| LogPosition {
         block_number: block,
@@ -568,9 +556,7 @@ async fn a_paid_share_without_the_splitters_deposit_fails_the_window() {
 /// someone binds it there, the slot is that holder's claim.
 #[tokio::test]
 async fn a_slot_awaits_the_holder_only_where_nobody_holds_its_handle() {
-    let Some(suite) = Referrals::open().await else {
-        return;
-    };
+    let suite = Referrals::open().await;
     let payer = Address::repeat_byte(0xF0);
     suite.bind(CHAIN, 1, "alice_w", ALICE).await;
     suite
@@ -608,9 +594,7 @@ async fn a_slot_awaits_the_holder_only_where_nobody_holds_its_handle() {
 /// every page of one row follows the full list's order.
 #[tokio::test]
 async fn referrals_are_listed_once_per_node_and_page_in_order() {
-    let Some(suite) = Referrals::open().await else {
-        return;
-    };
+    let suite = Referrals::open().await;
     suite.bind(CHAIN, 1, "alice_p", ALICE).await;
     suite.bind(OTHER_CHAIN, 2, "alice_p", ALICE).await;
     suite.bind(CHAIN, 3, "alice_p2", ALICE).await;
