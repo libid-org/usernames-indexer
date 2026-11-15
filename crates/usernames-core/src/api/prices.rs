@@ -1,7 +1,7 @@
-//! USD prices for `/v1/stats`, from a source that answers DefiLlama's
-//! `prices/current/<coins>`: each coin's price, decimals, symbol, confidence
-//! and the time it was priced. The store keeps token units; these prices
-//! value them when the answer is computed.
+//! USD prices for `/v1/stats`, from a [`PriceSource`]: each coin's price,
+//! decimals, symbol, confidence and the time it was priced, and the chains
+//! the source names. The store keeps token units; these prices value them
+//! when the answer is computed.
 
 use std::{
     collections::{
@@ -27,7 +27,13 @@ use alloy::primitives::{
     Address,
     U512,
 };
-use serde::Deserialize;
+use serde::{
+    de::{
+        DeserializeOwned,
+        IgnoredAny,
+    },
+    Deserialize,
+};
 use serde_json::value::RawValue;
 use tokio::task::JoinSet;
 use url::Url;
@@ -41,13 +47,6 @@ use crate::{
         NamedTokens,
     },
 };
-
-/// The source DefiLlama runs, with no key.
-pub const DEFILLAMA: &str = "https://coins.llama.fi";
-
-/// The chains DefiLlama names among those the indexer serves, as
-/// [`PriceChains`] parses them.
-pub const DEFILLAMA_CHAINS: &str = "1=ethereum,56=bsc,714=eden,8453=base,42161=arbitrum";
 
 /// How the source names a chain's own coin.
 const SOURCE_COIN: Address = Address::ZERO;
@@ -92,53 +91,136 @@ const HIDDEN: [RangeInclusive<char>; 3] = [
     '\u{2066}'..='\u{2069}',
 ];
 
-/// The name the source gives each chain it prices, by chain id:
-/// `1=ethereum,8453=base`. A chain missing here, a testnet, is never priced.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PriceChains(BTreeMap<i64, String>);
+/// Where `/v1/stats` reads USD prices and the chains they are for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PriceSource {
+    /// DefiLlama, with no key: prices from `coins.llama.fi`, chains from
+    /// `api.llama.fi/v2/chains`, each named by its entry's `name`,
+    /// lowercased.
+    #[default]
+    DefiLlama,
+}
 
-/// Why a list of chains does not parse.
+/// Why a price source does not parse.
 #[derive(Debug, thiserror::Error)]
-#[error("not `<chain id>=<source name>`, comma-separated, each chain once: {0:?}")]
-pub struct PriceChainsError(String);
+#[error("not a price source; the one known is `defillama`: {0:?}")]
+pub struct PriceSourceError(String);
 
-impl PriceChains {
+impl FromStr for PriceSource {
+    type Err = PriceSourceError;
+
+    fn from_str(text: &str) -> Result<Self, PriceSourceError> {
+        match text {
+            "defillama" => Ok(Self::DefiLlama),
+            _ => Err(PriceSourceError(text.to_string())),
+        }
+    }
+}
+
+impl fmt::Display for PriceSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DefiLlama => f.write_str("defillama"),
+        }
+    }
+}
+
+impl PriceSource {
+    /// Where the source answers.
+    fn endpoints(self) -> Endpoints {
+        match self {
+            Self::DefiLlama => Endpoints {
+                prices: "https://coins.llama.fi".to_string(),
+                chains: "https://api.llama.fi/v2/chains".to_string(),
+            },
+        }
+    }
+
+    /// The chains a list the source served names, by chain id.
+    fn chains(self, listed: Vec<ListedChain>) -> ChainNames {
+        match self {
+            Self::DefiLlama => ChainNames::of(listed),
+        }
+    }
+}
+
+/// The two requests a source answers: prices under `prices`, as
+/// `<prices>/prices/current/<coins>`, and its chain list at `chains`.
+#[derive(Clone, Debug)]
+struct Endpoints {
+    prices: String,
+    chains: String,
+}
+
+/// A chain id as a source lists it: a number, a decimal string, or none.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ListedChainId {
+    Number(i64),
+    Text(String),
+    Other(IgnoredAny),
+}
+
+impl ListedChainId {
+    fn chain_id(&self) -> Option<i64> {
+        match self {
+            Self::Number(chain_id) => Some(*chain_id),
+            Self::Text(text) => text.parse().ok(),
+            Self::Other(_) => None,
+        }
+    }
+}
+
+/// One entry of DefiLlama's chain list.
+#[derive(Deserialize)]
+struct ListedChain {
+    #[serde(rename = "chainId")]
+    chain_id: Option<ListedChainId>,
+    name: String,
+}
+
+/// The name the source gives each chain it prices, by chain id. A chain
+/// missing here, a testnet, is never priced.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ChainNames(BTreeMap<i64, String>);
+
+impl ChainNames {
+    /// Each listed chain with an id, named by its entry's `name`,
+    /// lowercased. Names go into the price request's path, so a name is
+    /// ASCII letters, digits, spaces, `-`, `_` and `.`. Where entries share
+    /// an id (56 is `BSC` and `Binance`), the least name is kept, so a
+    /// reordered list names the chain the same way.
+    fn of(listed: Vec<ListedChain>) -> Self {
+        let mut chains: BTreeMap<i64, String> = BTreeMap::new();
+        for entry in listed {
+            let Some(chain_id) =
+                entry.chain_id.as_ref().and_then(ListedChainId::chain_id)
+            else {
+                continue;
+            };
+            let name = entry.name.to_lowercase();
+            let usable = !name.is_empty()
+                && name.bytes().all(|b| {
+                    b.is_ascii_alphanumeric() || matches!(b, b' ' | b'-' | b'_' | b'.')
+                });
+            if !usable {
+                continue;
+            }
+            chains
+                .entry(chain_id)
+                .and_modify(|held| {
+                    if name < *held {
+                        held.clone_from(&name);
+                    }
+                })
+                .or_insert(name);
+        }
+        Self(chains)
+    }
+
     /// The source's name for `chain_id`.
     fn name(&self, chain_id: i64) -> Option<&str> {
         self.0.get(&chain_id).map(String::as_str)
-    }
-}
-
-impl FromStr for PriceChains {
-    type Err = PriceChainsError;
-
-    /// Names go into the source's URL path, so each is ASCII letters,
-    /// digits, `-` and `_`. An empty list prices no chain.
-    fn from_str(text: &str) -> Result<Self, PriceChainsError> {
-        let mut chains = BTreeMap::new();
-        for entry in text.split(',').filter(|entry| !entry.is_empty()) {
-            let refused = || PriceChainsError(entry.to_string());
-            let (chain_id, name) = entry.split_once('=').ok_or_else(refused)?;
-            let chain_id = chain_id.parse::<i64>().map_err(|_| refused())?;
-            let named = !name.is_empty()
-                && name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
-            if !named || chains.insert(chain_id, name.to_string()).is_some() {
-                return Err(refused());
-            }
-        }
-        Ok(Self(chains))
-    }
-}
-
-impl fmt::Display for PriceChains {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, (chain_id, name)) in self.0.iter().enumerate() {
-            let comma = if i == 0 { "" } else { "," };
-            write!(f, "{comma}{chain_id}={name}")?;
-        }
-        Ok(())
     }
 }
 
@@ -405,30 +487,52 @@ impl Book {
     }
 }
 
-/// A price source and the coins it priced with confidence. The one stats
-/// computation running at a time asks it, so it has one writer.
-pub struct PriceSource {
-    base: Url,
-    chains: PriceChains,
+/// A price source, the chains it last listed, and the coins it priced with
+/// confidence. The one stats computation running at a time asks it, so it
+/// has one writer.
+pub struct Prices {
+    source: PriceSource,
+    endpoints: Endpoints,
     client: reqwest::Client,
+    chains: Mutex<ChainNames>,
     book: Mutex<Book>,
 }
-impl PriceSource {
-    /// The source at `base`, DefiLlama's [`DEFILLAMA`] or one that answers
-    /// the same way, pricing the `chains` it names.
-    pub fn new(base: Url, chains: PriceChains) -> Self {
+
+impl Prices {
+    /// Prices from `source`, at its own endpoints.
+    pub fn new(source: PriceSource) -> Self {
+        Self::at(source, source.endpoints())
+    }
+
+    /// Prices from a server on `base` that answers as `source` does:
+    /// prices under `base` and the chain list at `<base>/v2/chains`.
+    #[cfg(feature = "test-helpers")]
+    pub fn mock(source: PriceSource, base: &Url) -> Self {
+        let base = base.as_str().trim_end_matches('/');
+        Self::at(
+            source,
+            Endpoints {
+                prices: base.to_string(),
+                chains: format!("{base}/v2/chains"),
+            },
+        )
+    }
+
+    fn at(source: PriceSource, endpoints: Endpoints) -> Self {
         Self {
-            base,
-            chains,
+            source,
+            endpoints,
             client: reqwest::Client::new(),
+            chains: Mutex::default(),
             book: Mutex::default(),
         }
     }
 
-    /// The source's id of `coin`: `<chain>:0x…`, the chain's own coin as
-    /// the zero address; `None` on a chain the source does not name.
-    fn coin_id(&self, coin: &ListedAddress) -> Option<String> {
-        let chain = self.chains.name(coin.chain_id)?;
+    /// The source's id of `coin` among `chains`: `<chain>:0x…`, the chain's
+    /// own coin as the zero address; `None` on a chain the source does not
+    /// name.
+    fn coin_id(chains: &ChainNames, coin: &ListedAddress) -> Option<String> {
+        let chain = chains.name(coin.chain_id)?;
         let token = if coin.address == NATIVE_COIN {
             SOURCE_COIN
         } else {
@@ -447,17 +551,37 @@ impl PriceSource {
         coins
     }
 
-    /// Prices for `candidates`, asked now. A coin the source prices with
-    /// confidence takes the new quote, and one it answers otherwise is not
-    /// valued until it is again; a request that fails keeps the quotes of its
-    /// coins. A quote older than a day values nothing. Each chain keeps the
-    /// [`KEPT_PER_CHAIN`] priced coins that moved the most USD; the rest are
-    /// forgotten and not valued.
+    /// The chains the source lists now; when the list fails, the last list
+    /// it gave, and before any, none.
+    async fn chains(&self) -> ChainNames {
+        let listed = match Url::parse(&self.endpoints.chains) {
+            Ok(url) => self.client.fetch::<Vec<ListedChain>>(url).await,
+            Err(error) => Err(error.into()),
+        };
+        let mut chains = self.held_chains();
+        match listed {
+            Ok(listed) => *chains = self.source.chains(listed),
+            Err(error) => {
+                tracing::warn!(%error, "the chain list failed; the last one names the chains")
+            }
+        }
+        let names = chains.clone();
+        drop(chains);
+        names
+    }
+
+    /// Prices for `candidates`, asked now on the chains the source lists.
+    /// A coin the source prices with confidence takes the new quote, and
+    /// one it answers otherwise is not valued until it is again; a request
+    /// that fails keeps the quotes of its coins. A quote older than a day
+    /// values nothing. Each chain keeps the [`KEPT_PER_CHAIN`] priced coins
+    /// that moved the most USD; the rest are forgotten and not valued.
     pub(crate) async fn quotes(&self, candidates: &[Candidate]) -> Quotes {
+        let chains = self.chains().await;
         let ids: HashMap<String, ListedAddress> = candidates
             .iter()
             .filter_map(|candidate| {
-                Some((self.coin_id(&candidate.coin)?, candidate.coin))
+                Some((Self::coin_id(&chains, &candidate.coin)?, candidate.coin))
             })
             .collect();
         let mut asked: Vec<&String> = ids.keys().collect();
@@ -466,7 +590,7 @@ impl PriceSource {
         for batch in asked.chunks(BATCH) {
             let url = self.url(batch);
             let client = self.client.clone();
-            requests.spawn(async move { client.ask_prices(url?).await });
+            requests.spawn(async move { client.fetch::<Answer>(url?).await });
         }
         let mut fresh = HashMap::new();
         while let Some(answer) = requests.join_next().await {
@@ -495,12 +619,18 @@ impl PriceSource {
     /// The request for one batch of coin ids.
     fn url(&self, batch: &[&String]) -> Result<Url, PriceFetchError> {
         let ids: Vec<&str> = batch.iter().map(|id| id.as_str()).collect();
-        let mut url = self.base.clone();
+        let mut url = Url::parse(&self.endpoints.prices)?;
         url.path_segments_mut()
-            .map_err(|()| PriceFetchError::Base(self.base.clone()))?
+            .map_err(|()| PriceFetchError::Base(self.endpoints.prices.clone()))?
             .pop_if_empty()
             .extend(["prices", "current", &ids.join(",")]);
         Ok(url)
+    }
+
+    fn held_chains(&self) -> MutexGuard<'_, ChainNames> {
+        self.chains
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn book(&self) -> MutexGuard<'_, Book> {
@@ -511,16 +641,16 @@ impl PriceSource {
 }
 
 /// A client asking a price source.
-trait AskPrices {
-    /// One request, its answer read up to [`MAX_BODY`].
-    fn ask_prices(
+trait Fetch {
+    /// One request, its answer read up to [`MAX_BODY`] and parsed.
+    fn fetch<T: DeserializeOwned>(
         &self,
         url: Url,
-    ) -> impl Future<Output = Result<Answer, PriceFetchError>> + Send;
+    ) -> impl Future<Output = Result<T, PriceFetchError>> + Send;
 }
 
-impl AskPrices for reqwest::Client {
-    async fn ask_prices(&self, url: Url) -> Result<Answer, PriceFetchError> {
+impl Fetch for reqwest::Client {
+    async fn fetch<T: DeserializeOwned>(&self, url: Url) -> Result<T, PriceFetchError> {
         let mut response = self
             .get(url)
             .timeout(TIMEOUT)
@@ -538,11 +668,13 @@ impl AskPrices for reqwest::Client {
     }
 }
 
-/// Why a price request gave nothing.
+/// Why a request to the price source gave nothing.
 #[derive(Debug, thiserror::Error)]
 enum PriceFetchError {
+    #[error("an endpoint is not a URL: {0}")]
+    Url(#[from] url::ParseError),
     #[error("{0} cannot hold a path")]
-    Base(Url),
+    Base(String),
     #[error(transparent)]
     Http(#[from] reqwest::Error),
     #[error("the answer is past {MAX_BODY} bytes")]
@@ -585,32 +717,52 @@ mod tests {
     }
 
     #[test]
-    fn price_chains_parse_back_from_their_display() {
-        let chains: PriceChains = DEFILLAMA_CHAINS.parse().expect("chains");
-        assert_eq!(chains.name(8453), Some("base"));
-        assert_eq!(chains.name(11155111), None);
-        assert_eq!(chains.to_string(), DEFILLAMA_CHAINS);
-        assert_eq!(
-            "".parse::<PriceChains>().expect("none"),
-            PriceChains::default()
-        );
-        for refused in ["1", "1=", "x=ethereum", "1=eth/x", "1=a,1=b", "1=a:b"] {
-            assert!(refused.parse::<PriceChains>().is_err(), "{refused}");
+    fn a_price_source_parses_back_from_its_display() {
+        let source: PriceSource = "defillama".parse().expect("a source");
+        assert_eq!(source, PriceSource::default());
+        assert_eq!(source.to_string(), "defillama");
+        for refused in ["", "DefiLlama", "https://coins.llama.fi"] {
+            assert!(refused.parse::<PriceSource>().is_err(), "{refused}");
         }
+    }
+
+    /// Entries of DefiLlama's `/v2/chains` as served on 2026-11-15.
+    fn listed_chains() -> ChainNames {
+        let listed: Vec<ListedChain> =
+            serde_json::from_str(include_str!("fixtures/llama_chains.json"))
+                .expect("the list");
+        PriceSource::DefiLlama.chains(listed)
+    }
+
+    #[test]
+    fn listed_chains_are_named_lowercased_by_chain_id() {
+        let chains = listed_chains();
+        assert_eq!(chains.name(1), Some("ethereum"));
+        assert_eq!(chains.name(8453), Some("base"));
+        assert_eq!(
+            chains.name(56),
+            Some("binance"),
+            "the least of BSC and Binance"
+        );
+        assert_eq!(
+            chains.name(10),
+            Some("op mainnet"),
+            "the least of OP Mainnet and Optimism"
+        );
+        assert_eq!(chains.name(11235), Some("haqq"), "an id listed as a string");
+        assert_eq!(chains.name(84532), None, "a testnet");
+        assert_eq!(chains.0.len(), 5, "entries without an id name nothing");
     }
 
     #[test]
     fn a_coin_id_names_the_chain_and_the_source_coin() {
-        let source = PriceSource::new(
-            DEFILLAMA.parse().expect("a URL"),
-            DEFILLAMA_CHAINS.parse().expect("chains"),
-        );
+        let chains = listed_chains();
         let usdc = ListedAddress {
             chain_id: 8453,
             address: Address::repeat_byte(0xAB),
         };
         assert_eq!(
-            source.coin_id(&usdc).as_deref(),
+            Prices::coin_id(&chains, &usdc).as_deref(),
             Some("base:0xabababababababababababababababababababab")
         );
         let coin = ListedAddress {
@@ -618,14 +770,14 @@ mod tests {
             address: NATIVE_COIN,
         };
         assert_eq!(
-            source.coin_id(&coin).as_deref(),
+            Prices::coin_id(&chains, &coin).as_deref(),
             Some("ethereum:0x0000000000000000000000000000000000000000")
         );
         let testnet = ListedAddress {
             chain_id: 84532,
             address: NATIVE_COIN,
         };
-        assert_eq!(source.coin_id(&testnet), None);
+        assert_eq!(Prices::coin_id(&chains, &testnet), None);
     }
 
     #[test]

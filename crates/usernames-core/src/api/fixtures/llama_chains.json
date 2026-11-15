@@ -1,0 +1,83 @@
+[
+  {
+    "gecko_id": "ethereum",
+    "gasTokenGeckoId": "ethereum",
+    "tvl": 37776808597.1809,
+    "tokenSymbol": "ETH",
+    "cmcId": "1027",
+    "name": "Ethereum",
+    "chainId": 1
+  },
+  {
+    "gecko_id": "optimism",
+    "gasTokenGeckoId": "ethereum",
+    "tvl": 375963488.6247681,
+    "tokenSymbol": "OP",
+    "cmcId": "11840",
+    "name": "OP Mainnet",
+    "chainId": 10
+  },
+  {
+    "gecko_id": null,
+    "gasTokenGeckoId": "ethereum",
+    "tvl": 5166439793.2950535,
+    "tokenSymbol": null,
+    "cmcId": null,
+    "name": "Base",
+    "chainId": 8453
+  },
+  {
+    "gecko_id": "binancecoin",
+    "gasTokenGeckoId": "binancecoin",
+    "tvl": 4535019243.84519,
+    "tokenSymbol": "BNB",
+    "cmcId": "1839",
+    "name": "BSC",
+    "chainId": 56
+  },
+  {
+    "gecko_id": "islamic-coin",
+    "gasTokenGeckoId": "islamic-coin",
+    "tvl": 0.18347524160720535,
+    "tokenSymbol": "ISLM",
+    "cmcId": "26220",
+    "name": "HAQQ",
+    "chainId": "11235"
+  },
+  {
+    "gecko_id": "solana",
+    "gasTokenGeckoId": "solana",
+    "tvl": 4697365909.837765,
+    "tokenSymbol": "SOL",
+    "cmcId": "5426",
+    "name": "Solana",
+    "chainId": null
+  },
+  {
+    "gecko_id": "bitcoin",
+    "gasTokenGeckoId": "bitcoin",
+    "tvl": 3411224438.528948,
+    "tokenSymbol": "BTC",
+    "cmcId": "1",
+    "name": "Bitcoin",
+    "chainId": null
+  },
+  {
+    "gecko_id": "binancecoin",
+    "gasTokenGeckoId": "binancecoin",
+    "tvl": 0,
+    "tokenSymbol": "BNB",
+    "cmcId": "1839",
+    "name": "Binance",
+    "chainId": 56
+  },
+  {
+    "gecko_id": "optimism",
+    "gasTokenGeckoId": "ethereum",
+    "tvl": 0,
+    "tokenSymbol": "OP",
+    "cmcId": "11840",
+    "name": "Optimism",
+    "chainId": 10
+  }
+]

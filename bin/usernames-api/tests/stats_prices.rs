@@ -1,12 +1,14 @@
 //! `GET /v1/stats` valued in USD, against a price source on this machine
-//! that answers DefiLlama's `prices/current/<coins>`: a token priced with
-//! confidence is named and valued, every other one counts under `other`,
-//! each day valued at the same prices, a failed request keeps the last
-//! prices, and a token priced once keeps its place among the coins asked.
+//! that answers as DefiLlama does, `prices/current/<coins>` and
+//! `v2/chains`: a token priced with confidence is named and valued, every
+//! other one counts under `other`, each day valued at the same prices, a
+//! failed request keeps the last prices and chain list, a chain the list
+//! leaves out is not priced, and a token priced once keeps its place among
+//! the coins asked.
 //!
 //! Skips without `DATABASE_URL`, unless `CI` is set: there its absence
-//! fails. The suite's chain is its own, named to the source as
-//! `testchain`; each test forgets it when it ends.
+//! fails. The suite's chain is its own, listed by the source as
+//! `TestChain`; each test forgets it when it ends.
 
 use std::{
     collections::BTreeMap,
@@ -56,6 +58,7 @@ use usernames_core::{
         },
         AppState,
         PriceSource,
+        Prices,
         KEPT_PER_CHAIN,
     },
     db::{
@@ -75,7 +78,10 @@ use usernames_fixtures::{
 };
 
 const CHAIN: i64 = 31353;
-/// The suite chain's name to the source.
+/// The suite chain's entry in the source's chain list.
+const LISTED_NAME: &str = "TestChain";
+/// The suite chain's name in the source's coin ids: the listed name,
+/// lowercased.
 const CHAIN_NAME: &str = "testchain";
 
 static SUITE: Mutex<()> = Mutex::const_new(());
@@ -129,12 +135,22 @@ struct Answer {
     coins: BTreeMap<String, Coin>,
 }
 
-/// What the source prices and whether it answers, and the coin ids it was
-/// asked for.
+/// An entry of the source's chain list.
+#[derive(Clone, Serialize)]
+struct ListedChain {
+    #[serde(rename = "chainId")]
+    chain_id: i64,
+    name: String,
+}
+
+/// What the source prices and lists and whether it answers, and the coin
+/// ids it was asked for.
 #[derive(Default)]
 struct Book {
     coins: BTreeMap<String, Coin>,
+    chains: Vec<ListedChain>,
     failing: bool,
+    chains_failing: bool,
     asked: Vec<String>,
 }
 
@@ -166,6 +182,17 @@ async fn answer(
     answer.map(Json).ok_or(StatusCode::SERVICE_UNAVAILABLE)
 }
 
+/// `GET /v2/chains`: the chains the book lists, or a 503 while the list
+/// fails.
+async fn chains(
+    State(book): State<Arc<StdMutex<Book>>>,
+) -> Result<Json<Vec<ListedChain>>, StatusCode> {
+    let book = book.lock().expect("the book");
+    let chains = (!book.chains_failing).then(|| book.chains.clone());
+    drop(book);
+    chains.map(Json).ok_or(StatusCode::SERVICE_UNAVAILABLE)
+}
+
 /// A price source serving on a port of its own until dropped.
 struct MockSource {
     base: Url,
@@ -174,13 +201,21 @@ struct MockSource {
 }
 
 impl MockSource {
+    /// A source listing the suite's chain.
     async fn start() -> Self {
-        let book = Arc::<StdMutex<Book>>::default();
+        let book = Arc::new(StdMutex::new(Book {
+            chains: vec![ListedChain {
+                chain_id: CHAIN,
+                name: LISTED_NAME.to_string(),
+            }],
+            ..Book::default()
+        }));
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
         let addr = listener.local_addr().expect("its address");
         let base = format!("http://{addr}").parse().expect("a URL");
         let app = Router::new()
             .route("/prices/current/{coins}", get(answer))
+            .route("/v2/chains", get(chains))
             .with_state(Arc::clone(&book));
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serving");
@@ -202,6 +237,20 @@ impl MockSource {
         drop(book);
     }
 
+    /// The chain list answers 503 from now on.
+    fn fail_chains(&self) {
+        let mut book = self.book.lock().expect("the book");
+        book.chains_failing = true;
+        drop(book);
+    }
+
+    /// The chain list leaves the suite's chain out from now on.
+    fn unlist(&self) {
+        let mut book = self.book.lock().expect("the book");
+        book.chains.clear();
+        drop(book);
+    }
+
     /// The coin ids asked since the last call.
     fn asked(&self) -> Vec<String> {
         let mut book = self.book.lock().expect("the book");
@@ -210,10 +259,9 @@ impl MockSource {
         asked
     }
 
-    /// A price source over this one, naming the suite's chain.
-    fn source(&self) -> Arc<PriceSource> {
-        let chains = format!("{CHAIN}={CHAIN_NAME}").parse().expect("chains");
-        Arc::new(PriceSource::new(self.base.clone(), chains))
+    /// Prices from this source.
+    fn source(&self) -> Arc<Prices> {
+        Arc::new(Prices::mock(PriceSource::DefiLlama, &self.base))
     }
 }
 
@@ -543,6 +591,81 @@ async fn a_failed_first_request_prices_nothing() {
     suite.done();
 }
 
+/// A chain list that fails after a good one keeps the chains it named:
+/// the chain's tokens are still asked and valued.
+#[tokio::test]
+async fn a_failed_chain_list_keeps_the_last_one() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let mock = MockSource::start().await;
+    mock.price(NATIVE, Coin::priced(2000.0, 18, "ETH"));
+    let source = mock.source();
+    let api = || {
+        AppState::new(Store::new(suite.pool.clone()))
+            .pricing(Arc::clone(&source))
+            .router()
+    };
+    suite
+        .apply(10, NamesEvent::deposited(NATIVE, SENDER, ether(10)))
+        .await;
+    let first = api().stats().await;
+    assert_eq!(first.chain(CHAIN).total.escrow.deposits.usd, usd("2000.00"));
+
+    mock.fail_chains();
+    mock.asked();
+    suite
+        .apply(11, NamesEvent::deposited(NATIVE, PAYER, ether(10)))
+        .await;
+    let second = api().stats().await;
+    assert_eq!(mock.asked(), vec![coin_id(NATIVE)]);
+    assert_eq!(
+        second.chain(CHAIN).total.escrow.deposits.usd,
+        usd("4000.00")
+    );
+    suite.store().forget().await;
+    suite.done();
+}
+
+/// A chain the source's list leaves out is not priced: nothing of it is
+/// asked, its coin is named without a price, and its other tokens count
+/// under `other`.
+#[tokio::test]
+async fn a_chain_the_list_leaves_out_is_not_priced() {
+    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
+        eprintln!("skipping: DATABASE_URL not set");
+        return;
+    };
+    let mock = MockSource::start().await;
+    mock.price(NATIVE, Coin::priced(2000.0, 18, "ETH"));
+    mock.price(USDC, Coin::priced(1.0, 6, "USDC"));
+    mock.unlist();
+    let deposits = vec![
+        NamesEvent::deposited(NATIVE, SENDER, ether(10)),
+        NamesEvent::deposited(USDC, PAYER, U256::from(1_000u64)),
+    ];
+    suite.apply_tx(10, deposits).await;
+
+    let stats = AppState::new(Store::new(suite.pool.clone()))
+        .pricing(mock.source())
+        .router()
+        .stats()
+        .await;
+    assert_eq!(mock.asked(), Vec::<String>::new());
+    assert_eq!(stats.priced_at, None);
+    assert_eq!(
+        stats.chain(CHAIN).total.escrow.deposits,
+        TokenFlows {
+            tokens: vec![TokenFlow::unpriced(NATIVE, ether(10).to())],
+            usd: Usd::default(),
+            other: Some(OtherTokens { count: 1 }),
+        }
+    );
+    suite.store().forget().await;
+    suite.done();
+}
+
 /// A price older than a day values nothing: the token reads unpriced
 /// rather than stale.
 #[tokio::test]
@@ -590,7 +713,7 @@ async fn a_token_priced_before_keeps_its_place() {
     let mock = MockSource::start().await;
     mock.price(USDC, Coin::priced(1.0, 6, "USDC"));
     let source = mock.source();
-    let api = |source: &Arc<PriceSource>| {
+    let api = |source: &Arc<Prices>| {
         AppState::new(Store::new(suite.pool.clone()))
             .pricing(Arc::clone(source))
             .router()

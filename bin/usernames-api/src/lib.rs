@@ -41,14 +41,11 @@ use tower_http::cors::{
     Any,
     CorsLayer,
 };
-use url::Url;
 use usernames_core::{
     api::{
         self,
-        PriceChains,
         PriceSource,
-        DEFILLAMA,
-        DEFILLAMA_CHAINS,
+        Prices,
         STATS_DEADLINE,
         STATS_TTL,
     },
@@ -127,17 +124,12 @@ pub struct Config {
     #[arg(long, env = "ENS_MAX_LAG_BLOCKS", default_value_t = 32)]
     pub ens_max_lag_blocks: u64,
 
-    /// The source `/v1/stats` prices tokens from, answering DefiLlama's
-    /// `prices/current/<coins>`. A token it prices with confidence is named
-    /// and valued in USD; every other one counts under `other`.
-    #[arg(long, env = "PRICE_SOURCE", default_value = DEFILLAMA)]
-    pub price_source: Url,
-
-    /// The name the price source gives each chain it prices, by chain id:
-    /// `1=ethereum,8453=base`. A chain missing here counts its tokens
-    /// under `other`.
-    #[arg(long, env = "PRICE_CHAINS", default_value = DEFILLAMA_CHAINS)]
-    pub price_chains: PriceChains,
+    /// The source `/v1/stats` prices tokens from: `defillama`. A token it
+    /// prices with confidence is named and valued in USD; every other one,
+    /// and every token of a chain the source does not list, counts under
+    /// `other`.
+    #[arg(long, env = "PRICE_SOURCE", default_value_t = PriceSource::default())]
+    pub price_source: PriceSource,
 
     /// How long `/v1/stats` serves one computation. Each computation reads
     /// whole tables; a longer time spares a large database.
@@ -268,10 +260,7 @@ impl Config {
         }
         let app = Service {
             api: api::AppState::new(store)
-                .pricing(Arc::new(PriceSource::new(
-                    self.price_source,
-                    self.price_chains,
-                )))
+                .pricing(Arc::new(Prices::new(self.price_source)))
                 .fee_receivers(self.stats_fee_receivers)
                 .stats_timing(self.stats_ttl.into(), self.stats_deadline.into()),
             gateway,

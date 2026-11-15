@@ -58,11 +58,9 @@ use self::{
 };
 pub use self::{
     prices::{
-        PriceChains,
-        PriceChainsError,
         PriceSource,
-        DEFILLAMA,
-        DEFILLAMA_CHAINS,
+        PriceSourceError,
+        Prices,
         KEPT_PER_CHAIN,
     },
     stats::{
@@ -89,7 +87,7 @@ use crate::{
 #[derive(Clone)]
 pub struct AppState {
     store: Store,
-    prices: Option<Arc<PriceSource>>,
+    prices: Option<Arc<Prices>>,
     fee_receivers: Arc<[ListedAddress]>,
     stats: StatsCache,
 }
@@ -107,11 +105,11 @@ impl AppState {
         }
     }
 
-    /// The same state, with `/v1/stats` valuing tokens at the prices of
-    /// `source` and naming each token it prices.
-    pub fn pricing(self, source: Arc<PriceSource>) -> Self {
+    /// The same state, with `/v1/stats` valuing tokens at `prices` and
+    /// naming each token they price.
+    pub fn pricing(self, prices: Arc<Prices>) -> Self {
         Self {
-            prices: Some(source),
+            prices: Some(prices),
             ..self
         }
     }

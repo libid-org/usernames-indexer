@@ -59,7 +59,7 @@ use super::{
         DAYS_PAGE,
     },
     prices::{
-        PriceSource,
+        Prices,
         Quote,
         Quotes,
     },
@@ -158,7 +158,7 @@ impl AppState {
                 let listing = Listing {
                     tokens: prices
                         .as_deref()
-                        .map(PriceSource::priced_before)
+                        .map(Prices::priced_before)
                         .unwrap_or_default(),
                     fee_receivers: fee_receivers.to_vec(),
                 };
