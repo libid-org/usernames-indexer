@@ -30,6 +30,8 @@ use usernames_core::{
         Delivery,
         EscrowAmount,
         HandleAmounts,
+        HandleHistory,
+        HistoryEntry,
         HistoryEvent,
         Outcome,
         Status,
@@ -100,6 +102,12 @@ trait OnChains {
     /// Chain, binder, outcome and delivery of each, by chain: binds on two
     /// chains in the same second list by chain, not by when they happened.
     fn on_chains(&self) -> Vec<(i64, Address, Outcome, Option<Delivery>)>;
+
+    /// Chain and transaction of each, by chain, as [`OnChains::on_chains`].
+    fn transactions(&self) -> Vec<(i64, B256)>;
+
+    /// The `Referred`'s log index of the referral on `chain`.
+    fn logged_on(&self, chain: i64) -> i64;
 }
 
 impl OnChains for AddressReferrals {
@@ -108,6 +116,50 @@ impl OnChains for AddressReferrals {
             .referrals
             .iter()
             .map(|r| (r.chain_id, r.binder, r.outcome, r.delivery))
+            .collect();
+        rows.sort_by_key(|&(chain, ..)| chain);
+        rows
+    }
+
+    fn transactions(&self) -> Vec<(i64, B256)> {
+        let mut rows: Vec<_> = self
+            .referrals
+            .iter()
+            .map(|r| (r.chain_id, r.tx_hash))
+            .collect();
+        rows.sort_by_key(|&(chain, _)| chain);
+        rows
+    }
+
+    fn logged_on(&self, chain: i64) -> i64 {
+        self.referrals
+            .iter()
+            .find(|r| r.chain_id == chain)
+            .map(|r| r.log_index)
+            .unwrap_or_else(|| panic!("no referral on chain {chain}"))
+    }
+}
+
+/// What the journey compares of a history's referral links.
+trait Links {
+    /// Chain, the `Referred`'s log index, binder and referrer text of each
+    /// entry that links to a referral, by chain.
+    fn links(&self) -> Vec<(i64, i64, Address, Option<String>)>;
+}
+
+impl Links for [HistoryEntry] {
+    fn links(&self) -> Vec<(i64, i64, Address, Option<String>)> {
+        let mut rows: Vec<_> = self
+            .iter()
+            .filter_map(|entry| {
+                let link = entry.referral.as_ref()?;
+                Some((
+                    entry.chain_id,
+                    link.log_index,
+                    link.binder,
+                    link.referrer.handle.clone(),
+                ))
+            })
             .collect();
         rows.sort_by_key(|&(chain, ..)| chain);
         rows
@@ -195,9 +247,10 @@ impl Chain {
     }
 }
 
-/// The two pages a referrer reads, read across every chain the store holds
-/// a full page at a time and kept to the journey's chains: other suites'
+/// The pages a referrer reads, read across every chain the store holds a
+/// full page at a time and kept to the journey's chains: other suites'
 /// anvils run the same accounts on chains of their own.
+#[derive(Clone, Copy)]
 struct Pages<'a> {
     pool: &'a PgPool,
     holder: Address,
@@ -219,6 +272,14 @@ impl Pages<'_> {
     async fn history(&self) -> AddressHistory {
         let path = format!("/v1/history/address/{}?limit=100", self.holder);
         let mut answer: AddressHistory = self.pool.get(&path).await.answer();
+        answer.entries.retain(|e| self.chains.contains(&e.chain_id));
+        answer
+    }
+
+    /// What happened to the handle `node`.
+    async fn handle_history(&self, node: B256) -> HandleHistory {
+        let path = format!("/v1/history/node/{node}?limit=100");
+        let mut answer: HandleHistory = self.pool.get(&path).await.answer();
         answer.entries.retain(|e| self.chains.contains(&e.chain_id));
         answer
     }
@@ -503,28 +564,56 @@ async fn a_referral_across_two_chains_reads_on_both_pages() {
 
     // B1 binds on B naming it: nobody holds it there, so the escrow holds
     // R's share, awaiting R's bind on B.
-    b.libid
-        .bind_referred(b1, proof(Handle(x, "binder_b1"), "801"), referrer, fee)
+    let bind = b
+        .libid
+        .referred(b1, proof(Handle(x, "binder_b1"), "801"), referrer, fee)
         .await;
+    let bound_b1 = b.node.provider.mined(bind).await.transaction_hash;
     b.index(&pool).await;
     assert_eq!(b.libid.escrowed(referrer).await, share());
     assert_eq!(
         pages.referrals().await.on_chains(),
         [(on_b, b1, Outcome::Paid, Some(Delivery::Held))]
     );
+    let awaiting = pages.awaiting().await;
+    assert_eq!(awaiting.slots(), [(on_b, node, share(), None)]);
+    // The share names the handle by the text A disclosed: B disclosed none.
     assert_eq!(
-        pages.awaiting().await.slots(),
-        [(on_b, node, share(), None)]
+        awaiting.amounts[0].handle.handle.as_deref(),
+        Some("referrer_r")
     );
     assert_eq!(pages.claimable().await.slots(), []);
+    // B1's `referred` entry is its own referral, and the splitter's deposit
+    // on B links to the same one.
+    let held_at = pages.referrals().await.logged_on(on_b);
+    let named = || Some("referrer_r".to_owned());
+    let b1s = Pages {
+        holder: b1,
+        ..pages
+    };
+    assert_eq!(
+        b1s.history().await.entries.links(),
+        [(on_b, held_at, b1, named())]
+    );
+    assert_eq!(
+        pages.handle_history(node).await.entries.links(),
+        [(on_b, held_at, b1, named())]
+    );
 
     // B2 binds on A naming it: the splitter forwards the share to R.
     let before = a.libid.balance(r).await;
-    a.libid
-        .bind_referred(b2, proof(Handle(x, "binder_b2"), "802"), referrer, fee)
+    let bind = a
+        .libid
+        .referred(b2, proof(Handle(x, "binder_b2"), "802"), referrer, fee)
         .await;
+    let bound_b2 = a.node.provider.mined(bind).await.transaction_hash;
     a.index(&pool).await;
     assert_eq!(a.libid.balance(r).await - before, share());
+    // Each referral names the transaction that bound, for an explorer link.
+    assert_eq!(
+        pages.referrals().await.transactions(),
+        [(on_a, bound_b2), (on_b, bound_b1)]
+    );
     assert_eq!(
         pages.referrals().await.on_chains(),
         [
@@ -584,5 +673,19 @@ async fn a_referral_across_two_chains_reads_on_both_pages() {
         paid,
         [(on_b, r, r, share()), (on_a, splitter, r, share())],
         "newest first: the claim on B, then the forward on A"
+    );
+    // The forward on A links to B2's referral; the claim, which settles any
+    // number of shares, to none.
+    let forwarded_at = pages.referrals().await.logged_on(on_a);
+    assert_eq!(
+        pages.history().await.entries.links(),
+        [(on_a, forwarded_at, b2, named())]
+    );
+    assert_eq!(
+        pages.handle_history(node).await.entries.links(),
+        [
+            (on_a, forwarded_at, b2, named()),
+            (on_b, held_at, b1, named()),
+        ]
     );
 }

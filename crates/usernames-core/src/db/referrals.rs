@@ -3,6 +3,7 @@
 
 use super::{
     holder_nodes,
+    reads::HandleText,
     sql,
     ApplyError,
     Cursor,
@@ -155,6 +156,8 @@ pub struct ReferralRow {
     pub block_number: i64,
     /// Its log's index in the block.
     pub log_index: i64,
+    /// The transaction that bound.
+    pub tx_hash: B256,
     /// Its block's time, in unix seconds.
     pub block_time: i64,
     /// The referrer's handle node, which the share is for.
@@ -209,17 +212,26 @@ impl Page<HistoryCursor> {
     /// `holder`'s referrals: a page's worth per node of the handles it
     /// holds, then the page across them, newest first.
     pub(crate) fn referrals_lookup(&self, prefix: &str, holder: Address) -> Statement {
+        let newest =
+            " ORDER BY r.block_time DESC, r.chain_id DESC, r.block_number DESC, \
+                      r.log_index DESC";
         let mut statement = holder_nodes(prefix, holder, None);
         statement.push(sql::REFERRALS_BY_NODE);
         self.bound(&mut statement, "r");
+        // The page is cut before the joins, which then run once per row it
+        // serves rather than once per row each node returned.
         statement
-            .push(") r\n")
+            .push(") r")
+            .push(newest)
+            .push(" LIMIT ")
+            .push_bind(self.fetch())
+            .push(")\n")
             .push(sql::REFERRALS_HOLDER)
-            .push(
-                " ORDER BY r.block_time DESC, r.chain_id DESC, r.block_number DESC, \
-                 r.log_index DESC LIMIT ",
-            )
-            .push_bind(self.fetch());
+            .push(HandleText {
+                node: "r.referrer_node",
+                alias: "rv",
+            })
+            .push(newest);
         statement
     }
 }
@@ -276,8 +288,12 @@ pub(crate) mod plans {
             });
             // The holder's handles drive the page through the owner index,
             // and each node's referrals are read backwards from its index.
-            let seeks: &[&str] =
-                &["handles_owner_chain_node_idx", "referrals_referrer_idx"];
+            let seeks: &[&str] = &[
+                "handles_owner_chain_node_idx",
+                "referrals_referrer_idx",
+                "events_pkey",
+                "handle_nodes_node_chain_idx",
+            ];
             let mut plans = Vec::new();
             for (name, holder, chain, before) in [
                 ("referrals", holder, None, None),
@@ -309,7 +325,7 @@ pub(crate) mod plans {
                 };
                 let statement = page.referrals_lookup("EXPLAIN ", holder);
                 let plan = Plan::of(self, name, Some(seeks), statement).await;
-                plans.push(plan.reading_once(holder));
+                plans.push(plan.reading_once(holder).cut_before("events_pkey"));
             }
 
             let name = "a claim settling its round's held referrals";

@@ -15,8 +15,10 @@ use tokio::sync::Mutex;
 use usernames_core::{
     api::model::{
         AddressAmounts,
+        AddressHistory,
         AddressReferrals,
         Delivery,
+        HistoryEvent,
         Outcome,
         Referral,
         Status,
@@ -215,6 +217,9 @@ trait SplitterEvents {
     /// An escrow deposit to `handle` by `sender`.
     fn deposit_by(handle: &str, sender: Address, amount: u64) -> Self;
 
+    /// `sender`'s share-sized deposit to `handle`, forwarded to Alice.
+    fn forwarded_by(handle: &str, sender: Address) -> Self;
+
     /// Alice's claim of what `handle`'s round 0 holds in `token`.
     fn claimed(handle: &str, token: Address) -> Self;
 
@@ -228,19 +233,23 @@ trait SplitterEvents {
 impl SplitterEvents for NamesEvent {
     fn splitter_deposit(referrer: &str, delivery: Delivery) -> Self {
         match delivery {
-            Delivery::Forwarded => Self::Escrow(EscrowEvent::Forwarded {
-                handle_node: node(referrer),
-                token: NATIVE,
-                sender: SPLITTER,
-                holder: ALICE,
-                amount: U256::from(SHARE),
-                received: U256::from(SHARE),
-            }),
+            Delivery::Forwarded => Self::forwarded_by(referrer, SPLITTER),
             Delivery::Held => Self::deposit_by(referrer, SPLITTER, SHARE),
             Delivery::Claimed => {
                 unreachable!("the escrow answers a deposit by forwarding or holding it")
             }
         }
+    }
+
+    fn forwarded_by(handle: &str, sender: Address) -> Self {
+        Self::Escrow(EscrowEvent::Forwarded {
+            handle_node: node(handle),
+            token: NATIVE,
+            sender,
+            holder: ALICE,
+            amount: U256::from(SHARE),
+            received: U256::from(SHARE),
+        })
     }
 
     fn claimed(handle: &str, token: Address) -> Self {
@@ -497,6 +506,37 @@ async fn two_referred_binds_in_one_transaction_pair_each_with_its_own_deposit() 
         suite.referrals(DAVE).await.referrals.shape(),
         [(CHAIN, CAROL, Some("carol_t"), Outcome::Paid, Some(held))]
     );
+    suite.done();
+}
+
+/// In a holder's history, the splitter's payment links to the bind it paid
+/// for; another sender's payment to the same handle, earlier in the same
+/// transaction, links to none.
+#[tokio::test]
+async fn only_the_splitters_payment_links_to_the_referral_after_it() {
+    let suite = Referrals::open().await;
+    suite.bind(CHAIN, 1, "alice_l", ALICE).await;
+    let mut events = vec![NamesEvent::forwarded_by("alice_l", ERIN)];
+    events.extend(Referred::paid(BOB, "bob_l", "alice_l", Delivery::Forwarded).events());
+    suite.suite.apply_tx(2, events).await;
+
+    let history: AddressHistory = suite
+        .suite
+        .pool
+        .get(&format!("/v1/history/address/{ALICE}"))
+        .await
+        .answer();
+    let payments: Vec<_> = history
+        .entries
+        .iter()
+        .filter_map(|entry| match entry.event {
+            HistoryEvent::Forwarded { sender, .. } => {
+                Some((sender, entry.referral.as_ref().map(|link| link.binder)))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(payments, [(SPLITTER, Some(BOB)), (ERIN, None)]);
     suite.done();
 }
 

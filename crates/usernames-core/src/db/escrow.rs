@@ -22,6 +22,7 @@ use super::{
         Page,
         Rows,
     },
+    reads::HandleText,
     sql,
     ApplyError,
     InvalidCursor,
@@ -388,6 +389,10 @@ impl Page<SlotCursor> {
             .push(" ORDER BY e.token DESC LIMIT ")
             .push_bind(self.fetch())
             .push(") e\n")
+            .push(HandleText {
+                node: "e.handle_node",
+                alias: "v",
+            })
             .push(sql::CLAIMABLE_HOLDER)
             .push_bind(holder);
         if let Some(chain) = self.chain {
@@ -590,10 +595,12 @@ pub(crate) mod plans {
                 handle_node: high,
             });
             // The holder's handles drive the page through the owner index, and
-            // each one's slots are looked up by its node.
+            // each one's slots are looked up by its node, and each slot's text
+            // by node on any chain.
             let claimable: &[&str] = &[
                 "handles_owner_chain_node_idx",
                 "escrow_held_node_idx|escrow_held_pkey",
+                "handle_nodes_node_chain_idx",
                 "handle_node = h.handle_node",
             ];
             let refundable: &[&str] = &["escrow_refundable_pkey"];
