@@ -729,8 +729,9 @@ pub struct EscrowAmount {
 pub struct AddressAmounts {
     /// The address asked about.
     pub address: Address,
-    /// The unix second of the oldest price the amounts are valued at;
-    /// absent when none is.
+    /// Unix seconds of the oldest price the amounts are valued at: the
+    /// `/v1/stats` answer being served prices the tokens, and its
+    /// `pricedAt` is this; absent when it uses none.
     pub priced_at: Option<i64>,
     /// Claimable by chain, node and token; awaiting by node, chain and
     /// token; descending.
@@ -760,8 +761,9 @@ pub struct Contribution {
 pub struct AddressContributions {
     /// The address asked about.
     pub address: Address,
-    /// The unix second of the oldest price the amounts are valued at;
-    /// absent when none is.
+    /// Unix seconds of the oldest price the amounts are valued at: the
+    /// `/v1/stats` answer being served prices the tokens, and its
+    /// `pricedAt` is this; absent when it uses none.
     pub priced_at: Option<i64>,
     /// By chain, node and token, descending.
     pub amounts: Vec<Contribution>,
@@ -776,8 +778,9 @@ pub struct AddressContributions {
 pub struct HandleAmounts {
     /// The handle, as far as the store knows it.
     pub handle: HandleRef,
-    /// The unix second of the oldest price the amounts are valued at;
-    /// absent when none is.
+    /// Unix seconds of the oldest price the amounts are valued at: the
+    /// `/v1/stats` answer being served prices the tokens, and its
+    /// `pricedAt` is this; absent when it uses none.
     pub priced_at: Option<i64>,
     /// One per chain and token still holding something, descending.
     pub amounts: Vec<EscrowAmount>,
@@ -791,8 +794,9 @@ pub struct HandleAmounts {
 pub struct Unclaimed {
     /// The token the list was narrowed to, when one was asked for.
     pub token: Option<Address>,
-    /// The unix second of the oldest price the amounts are valued at;
-    /// absent when none is.
+    /// Unix seconds of the oldest price the amounts are valued at: the
+    /// `/v1/stats` answer being served prices the tokens, and its
+    /// `pricedAt` is this; absent when it uses none.
     pub priced_at: Option<i64>,
     /// The page size served.
     pub limit: i64,
