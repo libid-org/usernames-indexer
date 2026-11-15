@@ -26,6 +26,9 @@ const VACUUM: &str = include_str!("../../sql/plan_vacuum.sql");
 
 /// One statement's plan, and the indexes it must seek: `a|b` where either
 /// seeks exactly, `None` where only the row count decides between them.
+/// `index:a,b` asks more: every scan of `index` has columns `a` and `b` in
+/// its index condition, so a scan that walks the index, or binds a later
+/// column without the leading one, cannot pass for a seek.
 pub(crate) struct Plan {
     pub(crate) name: &'static str,
     pub(crate) seeks: Option<&'static [&'static str]>,
@@ -83,10 +86,16 @@ impl Plan {
             );
         }
         for index in seeks.unwrap_or_default() {
-            assert!(
-                index.split('|').any(|index| text.contains(index)),
-                "{name} does not seek {index}:\n{text}"
-            );
+            match index.split_once(':') {
+                Some((index, columns)) => assert!(
+                    self.bounds(index, columns),
+                    "{name} scans {index} without {columns} in its index condition:\n{text}"
+                ),
+                None => assert!(
+                    index.split('|').any(|index| text.contains(index)),
+                    "{name} does not seek {index}:\n{text}"
+                ),
+            }
         }
         for table in [
             "handles",
@@ -108,6 +117,28 @@ impl Plan {
                 "{name} scans {table}:\n{text}"
             );
         }
+    }
+
+    /// Whether the plan scans `index` and every scan of it names each of the
+    /// comma-separated `columns` in its `Index Cond`: the lines under a
+    /// scan, up to the next node.
+    fn bounds(&self, index: &str, columns: &str) -> bool {
+        // `Index Scan using <index> on`, or `Bitmap Index Scan on <index>`.
+        let names = [format!("using {index} "), format!("Index Scan on {index} ")];
+        let lines: Vec<&str> = self.text.lines().collect();
+        let scans: Vec<usize> = (0..lines.len())
+            .filter(|&at| names.iter().any(|name| lines[at].contains(name)))
+            .collect();
+        !scans.is_empty()
+            && scans.iter().all(|&at| {
+                lines[at + 1..]
+                    .iter()
+                    .take_while(|line| !line.contains("->"))
+                    .any(|line| {
+                        line.contains("Index Cond:")
+                            && columns.split(',').all(|column| line.contains(column))
+                    })
+            })
     }
 }
 

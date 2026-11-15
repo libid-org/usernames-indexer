@@ -102,6 +102,7 @@ pub use self::{
     },
     referrals::ReferralRow,
     stats::{
+        Candidate,
         CountRow,
         Flow,
         HandlesRow,
@@ -109,10 +110,12 @@ pub use self::{
         ListedAddressError,
         Listing,
         Measure,
+        NamedTokens,
         StatsDay,
         StatsDays,
         StatsSnapshot,
         UnknownMeasure,
+        CANDIDATES_PER_CHAIN,
     },
 };
 

@@ -117,6 +117,8 @@ pub const STATS_TAKEN_AT: &str = include_str!("../../sql/stats_taken_at.sql");
 pub const STATS_HANDLES: &str = include_str!("../../sql/stats_handles.sql");
 /// Every chain's totals, by measure and key.
 pub const STATS_TOTALS: &str = include_str!("../../sql/stats_totals.sql");
+/// The tokens worth a price, each with what it moved.
+pub const STATS_CANDIDATES: &str = include_str!("../../sql/stats_candidates.sql");
 /// A page of one chain's days, and of the days across every chain.
 pub const STATS_CHAIN_DAYS: &str = include_str!("../../sql/stats_chain_days.sql");
 pub const STATS_ALL_DAYS: &str = include_str!("../../sql/stats_all_days.sql");
