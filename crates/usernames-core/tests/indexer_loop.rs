@@ -3,8 +3,8 @@
 //! logs' block times, so each test checks what the indexer committed and what
 //! the RPC was asked for it.
 //!
-//! Skips without `DATABASE_URL` or `anvil`, unless `CI` is set: there a
-//! missing one fails. Everything past those checks panics on failure.
+//! Runs against the Postgres at `DATABASE_URL` and `anvil` on PATH, and
+//! fails without either.
 
 use std::{
     collections::BTreeSet,
@@ -53,7 +53,6 @@ use usernames_core::{
 mod relay;
 use relay::Relay;
 use usernames_fixtures::{
-    anvil_available,
     database_url,
     libid::{
         Disclose,
@@ -99,17 +98,9 @@ fn x_proof(handle: &'static str) -> Proof {
 }
 
 impl Chain {
-    /// A fresh chain with id `chain_id` and its rows cleared, or `None` where
-    /// the suite skips.
-    async fn start(chain_id: u64) -> Option<Self> {
-        let Some(url) = database_url() else {
-            eprintln!("skipping: DATABASE_URL not set");
-            return None;
-        };
-        if !anvil_available() {
-            eprintln!("skipping: anvil not on PATH");
-            return None;
-        }
+    /// A fresh chain with id `chain_id` and its rows cleared.
+    async fn start(chain_id: u64) -> Self {
+        let url = database_url();
 
         let pool = db::connect_and_migrate(&url).await.expect("database");
         ChainStore::new(pool.clone(), chain_id as i64)
@@ -137,14 +128,14 @@ impl Chain {
             .prepare(&mut lease, libid.contracts())
             .await
             .expect("prepare");
-        Some(Self {
+        Self {
             node,
             libid,
             relay,
             pool,
             writer,
             lease,
-        })
+        }
     }
 
     /// The name of the sessions the indexer of chain `chain_id` writes on.
@@ -257,9 +248,7 @@ fn spaced(times: &[Instant], interval: Duration) {
 /// no logs.
 #[tokio::test]
 async fn an_idle_chain_is_polled_once_an_interval_without_logs() {
-    let Some(chain) = Chain::start(43151).await else {
-        return;
-    };
+    let chain = Chain::start(43151).await;
     let interval = Duration::from_millis(200);
     let running = chain.run(IndexerConfig {
         poll_interval: interval,
@@ -294,9 +283,7 @@ async fn an_idle_chain_is_polled_once_an_interval_without_logs() {
 /// in a tight loop.
 #[tokio::test]
 async fn a_refusing_endpoint_is_retried_once_an_interval() {
-    let Some(chain) = Chain::start(43152).await else {
-        return;
-    };
+    let chain = Chain::start(43152).await;
     let interval = Duration::from_millis(200);
     let running = chain.run(IndexerConfig {
         poll_interval: interval,
@@ -327,9 +314,7 @@ async fn a_refusing_endpoint_is_retried_once_an_interval() {
 /// again the next session catches up from the cursor.
 #[tokio::test]
 async fn a_deaf_endpoint_is_left_and_the_next_session_catches_up() {
-    let Some(mut chain) = Chain::start(43141).await else {
-        return;
-    };
+    let mut chain = Chain::start(43141).await;
     // A block a second, as a live chain makes them, so the head stays
     // younger than the report while the endpoint is deaf.
     chain
@@ -370,9 +355,7 @@ async fn a_deaf_endpoint_is_left_and_the_next_session_catches_up() {
 /// refuses the chain; a head that moves again brings the report back.
 #[tokio::test]
 async fn a_head_older_than_the_report_lets_the_report_expire() {
-    let Some(chain) = Chain::start(43171).await else {
-        return;
-    };
+    let chain = Chain::start(43171).await;
     chain.mine(1).await;
     let running = chain.run(IndexerConfig {
         stale_after: Duration::from_secs(2),
@@ -431,9 +414,7 @@ async fn a_head_older_than_the_report_lets_the_report_expire() {
 /// rather than retrying a chain that is no longer its to write.
 #[tokio::test]
 async fn an_indexer_whose_chain_was_taken_stops() {
-    let Some(chain) = Chain::start(43127).await else {
-        return;
-    };
+    let chain = Chain::start(43127).await;
     let running = chain.run(chain.config(1));
     chain.wait_for_index(chain.head().await - 1).await;
 
@@ -464,9 +445,7 @@ async fn an_indexer_whose_chain_was_taken_stops() {
 #[tokio::test]
 async fn a_window_aborted_in_its_fold_is_retried_and_counts_once() {
     const CHAIN_ID: u64 = 43181;
-    let Some(mut chain) = Chain::start(CHAIN_ID).await else {
-        return;
-    };
+    let mut chain = Chain::start(CHAIN_ID).await;
     let (alice, bob) = (chain.accounts()[0], chain.accounts()[1]);
     let first = chain.bind("alice", alice).await;
     let running = chain.run(chain.config(0));
@@ -515,9 +494,7 @@ async fn a_window_aborted_in_its_fold_is_retried_and_counts_once() {
 /// has every event indexed, at its block's time.
 #[tokio::test]
 async fn logs_without_block_times_take_their_blocks_time() {
-    let Some(mut chain) = Chain::start(43131).await else {
-        return;
-    };
+    let mut chain = Chain::start(43131).await;
     chain.relay.strip_block_times(true);
     let running = chain.run(chain.config(1));
     let holder = chain.accounts()[0];
