@@ -56,6 +56,7 @@ use usernames_core::{
             Amount,
             ChainTotals,
             DayActivity,
+            ErrorCode,
             HandleAmounts,
             OtherTokens,
             Stats,
@@ -820,6 +821,15 @@ async fn escrow_requests_wait_on_one_failing_computation() {
         waited >= deadline && waited < 2 * deadline,
         "two requests waited {waited:?}"
     );
+    // `/v1/stats` and its days read the same backoff, with a code a client
+    // retries on.
+    for path in ["/v1/stats", "/v1/stats/days"] {
+        assert_eq!(
+            api.refusal(path).await,
+            (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::StatsBackingOff),
+            "{path}"
+        );
+    }
     suite.store().forget().await;
     suite.done();
 }

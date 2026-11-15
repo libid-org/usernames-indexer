@@ -99,7 +99,7 @@ impl ApiError {
     pub(crate) fn stats_backing_off() -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
-            code: ErrorCode::Internal,
+            code: ErrorCode::StatsBackingOff,
             message: "the stats computation failed moments ago and runs again shortly"
                 .into(),
             source: None,
