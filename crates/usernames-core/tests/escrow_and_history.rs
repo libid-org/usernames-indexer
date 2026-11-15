@@ -584,8 +584,6 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
     suite.done();
 }
 
-/// Each deposit moves its own sender's refund date for the sender's whole
-/// contribution to the slot, and nobody else's.
 /// An address's totals sum, per chain, what it may claim in each chain's
 /// coin, as its claimable list holds it. A handle another address holds
 /// is not its own, and a token `/v1/stats` does not price is not summed:
@@ -663,6 +661,8 @@ async fn the_totals_sum_the_claimable_coin_and_leave_out_unnamed_tokens() {
     suite.done();
 }
 
+/// Each deposit moves its own sender's refund date for the sender's whole
+/// contribution to the slot, and nobody else's.
 #[tokio::test]
 async fn a_top_up_moves_only_its_senders_refund_date() {
     let suite = Suite::open(&SUITE, CHAIN).await;
