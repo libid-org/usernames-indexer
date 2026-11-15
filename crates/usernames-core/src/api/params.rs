@@ -95,7 +95,7 @@ impl<R, C: Display> Rows<R, C> {
     /// next one.
     pub(crate) fn served<T>(
         self,
-        of: impl Fn(R) -> Result<T, ApiError>,
+        of: impl FnMut(R) -> Result<T, ApiError>,
     ) -> Result<(Vec<T>, Option<String>), ApiError> {
         let served = self.rows.into_iter().map(of).collect::<Result<_, _>>()?;
         Ok((served, self.next.map(|next| next.to_string())))

@@ -3,6 +3,7 @@
 
 use super::{
     holder_nodes,
+    reads::HandleText,
     sql,
     ApplyError,
     Cursor,
@@ -216,6 +217,10 @@ impl Page<HistoryCursor> {
         self.bound(&mut statement, "r");
         statement
             .push(") r\n")
+            .push(HandleText {
+                node: "h.handle_node",
+                alias: "rv",
+            })
             .push(sql::REFERRALS_HOLDER)
             .push(
                 " ORDER BY r.block_time DESC, r.chain_id DESC, r.block_number DESC, \
@@ -282,6 +287,7 @@ pub(crate) mod plans {
                 "handles_owner_chain_node_idx",
                 "referrals_referrer_idx",
                 "events_pkey",
+                "handle_nodes_node_chain_idx",
             ];
             let mut plans = Vec::new();
             for (name, holder, chain, before) in [

@@ -2,6 +2,8 @@
 //! caller names, each row saying which chain it came from; and the ENS
 //! gateway's answer on one chain.
 
+use std::fmt;
+
 use alloy::primitives::{
     Address,
     B256,
@@ -271,6 +273,26 @@ impl Scoped for Statement {
         if let Some(chain) = chain {
             self.push(" AND ").push(column).push(" = ").push_bind(chain);
         }
+    }
+}
+
+/// A handle node's text from the first chain that disclosed it, joined
+/// laterally as `alias.handle`: the [`sql::HANDLE_TEXT`] fragment, written
+/// for one read's node column.
+pub(crate) struct HandleText {
+    /// The column holding the node.
+    pub(crate) node: &'static str,
+    /// The name the read gives the join.
+    pub(crate) alias: &'static str,
+}
+
+impl fmt::Display for HandleText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(
+            &sql::HANDLE_TEXT
+                .replace("{node}", self.node)
+                .replace("{alias}", self.alias),
+        )
     }
 }
 
