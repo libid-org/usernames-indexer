@@ -20,8 +20,8 @@
 //! preimage that drifted, and a chain the gateway answered for when it should
 //! have stepped aside.
 //!
-//! Skips without `DATABASE_URL`, unless `CI` is set: there its absence
-//! fails. Needs `anvil` on PATH.
+//! Runs against the Postgres at `DATABASE_URL` and `anvil` on PATH, and
+//! fails without either.
 
 use std::{
     sync::Arc,
@@ -149,13 +149,12 @@ impl AskGateway for Router {
 #[tokio::test]
 async fn a_wallet_resolves_a_name_through_the_real_resolver() {
     match WhoSigns::TheTrustedKey.walk().await {
-        Some(Ok(address)) => assert_eq!(
+        Ok(address) => assert_eq!(
             address,
             Address::from([0xbe; 20]),
             "the address the chain returned is not the one the read model holds"
         ),
-        Some(Err(e)) => panic!("the resolver refused what the gateway signed: {e}"),
-        None => {}
+        Err(e) => panic!("the resolver refused what the gateway signed: {e}"),
     }
 }
 
@@ -168,8 +167,8 @@ async fn a_wallet_resolves_a_name_through_the_real_resolver() {
 #[tokio::test]
 async fn the_chain_refuses_a_blob_signed_by_a_key_it_does_not_know() {
     match WhoSigns::AnImpostor.walk().await {
-        Some(Ok(address)) => panic!("an untrusted signer resolved to {address}"),
-        Some(Err(e)) => {
+        Ok(address) => panic!("an untrusted signer resolved to {address}"),
+        Err(e) => {
             // Decoded, not matched on prose: the selector is the contract's
             // own, so this asserts the refusal came from the resolver rather
             // than from anywhere in this process.
@@ -182,7 +181,6 @@ async fn the_chain_refuses_a_blob_signed_by_a_key_it_does_not_know() {
                 "the resolver recovered a signer other than the one that signed"
             );
         }
-        None => {}
     }
 }
 
@@ -192,10 +190,10 @@ enum WhoSigns {
 }
 
 impl WhoSigns {
-    /// The four protocol steps, end to end. `None` means the suite skipped.
-    async fn walk(self) -> Option<Result<Address, contract::Error>> {
+    /// The four protocol steps, end to end.
+    async fn walk(self) -> Result<Address, contract::Error> {
         let guard = DB_LOCK.lock().await;
-        let url = database_url()?;
+        let url = database_url();
 
         // ── the read model the gateway answers from ──────────────────────
         let pool = sqlx::PgPool::connect(&url).await.expect("connect");
@@ -275,18 +273,16 @@ impl WhoSigns {
         drop(guard);
 
         // ── 4. and the chain turns it into an address, or refuses ────────
-        Some(
-            resolver
-                .resolveWithProof(response, lookup.extraData)
-                .call()
-                .await
-                .map(|returned| {
-                    // ENSIP-11 `addr` returns `bytes`; a wallet reads an address
-                    // out of them.
-                    let decoded = <Bytes as SolValue>::abi_decode(&returned)
-                        .expect("the record decodes as bytes");
-                    Address::from_slice(&decoded)
-                }),
-        )
+        resolver
+            .resolveWithProof(response, lookup.extraData)
+            .call()
+            .await
+            .map(|returned| {
+                // ENSIP-11 `addr` returns `bytes`; a wallet reads an address
+                // out of them.
+                let decoded = <Bytes as SolValue>::abi_decode(&returned)
+                    .expect("the record decodes as bytes");
+                Address::from_slice(&decoded)
+            })
     }
 }

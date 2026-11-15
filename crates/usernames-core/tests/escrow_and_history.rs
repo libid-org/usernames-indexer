@@ -2,8 +2,8 @@
 //! through the apply path the indexer uses, and every assertion goes through
 //! the axum handlers a caller hits.
 //!
-//! Skips, saying so, when `DATABASE_URL` is unset; everything past that check
-//! panics on failure. The suite's chain and handles are its own.
+//! Runs against the Postgres at `DATABASE_URL`, and fails without it.
+//! The suite's chain and handles are its own.
 
 use std::{
     collections::BTreeMap,
@@ -311,10 +311,7 @@ impl EscrowSuite for Suite {
 
 #[tokio::test]
 async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let (bob, carol, dave, dave_wallet) = (
         Address::repeat_byte(0xB0),
         Address::repeat_byte(0xC0),
@@ -585,10 +582,7 @@ async fn a_handle_collects_before_its_bind_and_its_holder_claims_after() {
 /// contribution to the slot, and nobody else's.
 #[tokio::test]
 async fn a_top_up_moves_only_its_senders_refund_date() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let (carol, dave) = (Address::repeat_byte(0xC0), Address::repeat_byte(0xD0));
     let (first, later) = (REFUNDABLE_AT, REFUNDABLE_AT + 600);
     suite
@@ -627,10 +621,7 @@ async fn a_top_up_moves_only_its_senders_refund_date() {
 
 #[tokio::test]
 async fn the_unclaimed_list_runs_by_token_then_by_amount() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     suite.six_unclaimed_slots().await;
 
     // Token by token, descending, each token's largest amount first: the
@@ -653,10 +644,7 @@ async fn the_unclaimed_list_runs_by_token_then_by_amount() {
 
 #[tokio::test]
 async fn the_unclaimed_list_narrows_to_one_token() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     suite.six_unclaimed_slots().await;
 
     let usdc: Unclaimed = suite
@@ -673,10 +661,7 @@ async fn the_unclaimed_list_narrows_to_one_token() {
 
 #[tokio::test]
 async fn every_escrow_list_pages_by_cursor_without_gaps_or_repeats() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let (bob, carol) = (Address::repeat_byte(0xB0), Address::repeat_byte(0xC0));
     // Two handles Bob will hold and one nobody does, three tokens each.
     for (block, handle) in (1u64..).step_by(3).zip(["p1", "p2", "p3"]) {
@@ -731,10 +716,7 @@ async fn every_escrow_list_pages_by_cursor_without_gaps_or_repeats() {
 
 #[tokio::test]
 async fn a_history_pages_by_cursor_without_gaps_or_repeats() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let payer = Address::repeat_byte(0xC0);
     // Two events in one transaction and three alone: five entries, two of
     // them sharing a block.
@@ -775,10 +757,7 @@ async fn a_history_pages_by_cursor_without_gaps_or_repeats() {
 
 #[tokio::test]
 async fn a_bind_names_what_it_took_and_from_whom() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let (alice, bob, carol, dave) = (
         Address::repeat_byte(0xA1),
         Address::repeat_byte(0xB2),
@@ -835,10 +814,7 @@ async fn a_bind_names_what_it_took_and_from_whom() {
 /// the event names, whoever's bind retired it.
 #[tokio::test]
 async fn a_retired_handle_is_in_the_history_of_the_address_that_held_it() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let (alice, bob) = (Address::repeat_byte(0xA1), Address::repeat_byte(0xB2));
 
     // Alice binds @kim1, disclosing it, then renames to @kim2: her bind
@@ -903,10 +879,7 @@ async fn a_retired_handle_is_in_the_history_of_the_address_that_held_it() {
 /// a retire, which names it.
 #[tokio::test]
 async fn a_retire_names_the_platform_of_a_node_whose_bind_was_missed() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     suite
         .apply_tx(
             1,
@@ -924,10 +897,7 @@ async fn a_retire_names_the_platform_of_a_node_whose_bind_was_missed() {
 
 #[tokio::test]
 async fn a_bind_fee_is_in_the_payers_history_under_the_handle_it_bought() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let (alice, app) = (Address::repeat_byte(0xA1), Address::repeat_byte(0xFE));
     let digest = B256::repeat_byte(0xD1);
     // One bind's transaction: the binding, its ceremony, its fee.
@@ -979,10 +949,7 @@ async fn a_bind_fee_is_in_the_payers_history_under_the_handle_it_bought() {
 
 #[tokio::test]
 async fn an_unpublish_concerns_the_handle_it_withdrew() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let alice = Address::repeat_byte(0xA1);
     suite
         .apply_tx(1, NamesEvent::bind(alice, X, "111", "ann_1", 1_000, true))
@@ -1011,10 +978,7 @@ async fn an_unpublish_concerns_the_handle_it_withdrew() {
 
 #[tokio::test]
 async fn an_unpublish_with_nothing_published_concerns_no_handle() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let alice = Address::repeat_byte(0xA1);
     suite
         .apply_tx(1, NamesEvent::bind(alice, X, "111", "ann_1", 1_000, false))
@@ -1038,10 +1002,7 @@ async fn an_unpublish_with_nothing_published_concerns_no_handle() {
 
 #[tokio::test]
 async fn an_escrow_list_before_the_first_window_is_not_synced() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let refusal = suite
         .get::<Unclaimed>("/v1/escrow/unclaimed")
         .await
@@ -1055,10 +1016,7 @@ async fn an_escrow_list_before_the_first_window_is_not_synced() {
 
 #[tokio::test]
 async fn a_handle_nothing_was_sent_to_holds_nothing() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     suite
         .apply_tx(
             1,
@@ -1078,10 +1036,7 @@ async fn a_handle_nothing_was_sent_to_holds_nothing() {
 /// page past its events.
 #[tokio::test]
 async fn an_empty_page_still_names_the_handle_it_is_about() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     suite
         .apply_tx(
             1,
@@ -1114,10 +1069,7 @@ async fn an_empty_page_still_names_the_handle_it_is_about() {
 /// it and its text is not stored.
 #[tokio::test]
 async fn text_finds_a_deposit_the_way_the_chain_hashed_it() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let carol = Address::repeat_byte(0xC0);
     let (_, quoted) = X.folded_handle_node("Bo\"b");
     assert!(X.handle_node("Bo\"b").is_err(), "no circuit hashes a quote");
@@ -1149,10 +1101,7 @@ async fn text_finds_a_deposit_the_way_the_chain_hashed_it() {
 
 #[tokio::test]
 async fn the_status_names_the_escrow_the_chain_was_indexed_from() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let (registry, escrow) = (Address::repeat_byte(0x11), Address::repeat_byte(0x22));
     let mut lease = suite.store().acquire_writer().await.expect("lease");
     suite
@@ -1182,10 +1131,7 @@ async fn the_status_names_the_escrow_the_chain_was_indexed_from() {
 
 #[tokio::test]
 async fn another_escrow_replays_the_chain_and_the_same_one_keeps_it() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let registry = Address::repeat_byte(0x11);
     let (escrow, other_escrow) = (Address::repeat_byte(0x22), Address::repeat_byte(0x33));
     let mut lease = suite.store().acquire_writer().await.expect("lease");
@@ -1252,10 +1198,7 @@ async fn another_escrow_replays_the_chain_and_the_same_one_keeps_it() {
 /// they concern no handle and charge no holder.
 #[tokio::test]
 async fn a_ceremony_and_a_fee_take_only_their_own_transactions_bind() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let alice = Address::repeat_byte(0xA1);
     let at = |log_index, tx: u8| LogPosition {
         block_number: 1,
@@ -1326,10 +1269,7 @@ async fn a_ceremony_and_a_fee_take_only_their_own_transactions_bind() {
 /// its own sender.
 #[tokio::test]
 async fn a_claim_opens_the_next_round() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let (bob, carol, dave) = (
         Address::repeat_byte(0xB0),
         Address::repeat_byte(0xC0),
@@ -1395,10 +1335,7 @@ async fn a_claim_opens_the_next_round() {
 /// round: the slot keeps the round its first deposit names.
 #[tokio::test]
 async fn a_late_start_keeps_the_round_its_first_deposit_names() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let late = NamesEvent::Escrow(EscrowEvent::Deposited {
         handle_node: node("late"),
         token: NATIVE,
@@ -1420,10 +1357,7 @@ async fn a_late_start_keeps_the_round_its_first_deposit_names() {
 /// and the slot keeps exactly what the other senders put in, as on chain.
 #[tokio::test]
 async fn a_refund_takes_back_only_what_the_index_booked_for_its_sender() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let (carol, dave) = (Address::repeat_byte(0xC0), Address::repeat_byte(0xD0));
     suite
         .apply(1, NamesEvent::deposited("early", NATIVE, carol, 50))
@@ -1448,10 +1382,7 @@ async fn a_refund_takes_back_only_what_the_index_booked_for_its_sender() {
 /// the contract never makes: the window fails rather than hide it.
 #[tokio::test]
 async fn a_refund_releasing_less_than_was_booked_fails_the_window() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let dave = Address::repeat_byte(0xD0);
     suite
         .apply(1, NamesEvent::deposited("short", NATIVE, dave, 10))

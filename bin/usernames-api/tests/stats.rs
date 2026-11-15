@@ -7,8 +7,8 @@
 //! answer served until it expires, and one day's events listed page by
 //! page. Nothing here is priced: `stats_prices.rs` values tokens.
 //!
-//! Skips without `DATABASE_URL`, unless `CI` is set: there its absence
-//! fails. The suite's chain is its own; the answer lists every chain the
+//! Runs against the Postgres at `DATABASE_URL`, and fails without it.
+//! The suite's chain is its own; the answer lists every chain the
 //! database holds, so it reads only its own. Each test forgets its chain
 //! when it ends: the index-plan test plans over what the database holds,
 //! and escrow rows left here can tip its plans.
@@ -301,9 +301,7 @@ impl Serves for Suite {
 /// first page and a restart folded the rest.
 #[tokio::test]
 async fn the_journal_adds_up_per_chain_and_day() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     // Day A: a paid link and a free one, then three deposits for dave, who has none.
     suite
         .apply_tx(IN_A, NamesEvent::paid_bind(ALICE, "1", "alice"))
@@ -460,9 +458,7 @@ async fn the_journal_adds_up_per_chain_and_day() {
 /// deposit counts for nothing, the one after it brought the holder in.
 #[tokio::test]
 async fn a_freed_handle_onboards_its_next_holder() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     // Day A: frank links "frank", then moves his account to another handle,
     // which frees it; two deposits follow.
     suite
@@ -516,9 +512,7 @@ async fn a_freed_handle_onboards_its_next_holder() {
 /// without an amount, so the answer does not grow with them.
 #[tokio::test]
 async fn unpriced_tokens_count_together() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let junk = |tokens: Range<u64>| -> Vec<NamesEvent> {
         tokens
             .map(|i| Address::from_word(U256::from(i + 1).into()))
@@ -575,10 +569,7 @@ async fn unpriced_tokens_count_together() {
 /// receiver the deployment listed, so the answer does not grow with them.
 #[tokio::test]
 async fn unlisted_fee_receivers_count_together() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let paid = |receivers: Range<u64>| -> Vec<NamesEvent> {
         receivers
             .map(|i| NamesEvent::BindFeePaid {
@@ -645,9 +636,7 @@ async fn unlisted_fee_receivers_count_together() {
 /// what its writes add.
 #[tokio::test]
 async fn a_wallet_on_two_chains_counts_once_across_them() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let other = ChainStore::new(suite.pool.clone(), OTHER_CHAIN);
     other.forget().await;
     let other = other.writer().await;
@@ -738,10 +727,7 @@ async fn a_wallet_on_two_chains_counts_once_across_them() {
 /// holds, so the test counts what its writes add.
 #[tokio::test]
 async fn two_chains_fold_the_same_new_wallets_at_once() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     // Each chain writes on sessions of its own name, so a wait below is that
     // chain's wait and no other session's.
     const FIRST: &str = "stats: the first chain's window";
@@ -818,10 +804,7 @@ async fn two_chains_fold_the_same_new_wallets_at_once() {
 /// and hands out where the next one starts while older days remain.
 #[tokio::test]
 async fn days_come_thirty_to_a_page() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     // One bind a day for 31 days from day A, each by its own account.
     let starts: Vec<i64> = (0..31).map(|day| DAY_A + day * 86_400).collect();
     for day in 0..31u64 {
@@ -918,9 +901,7 @@ async fn the_referral_splitter_is_no_user() {
 /// too, while one started after the journal changed counts the change.
 #[tokio::test]
 async fn an_answer_is_served_again_until_it_expires() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     suite
         .apply_tx(IN_A, NamesEvent::bind(ALICE, X, "1", "alice", 1, false))
         .await;
@@ -950,10 +931,7 @@ async fn an_answer_is_served_again_until_it_expires() {
 /// token or both; the journal's other days and a day with nothing stay out.
 #[tokio::test]
 async fn a_day_lists_its_events_page_by_page() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let mut day_a = Vec::new();
     let bind = NamesEvent::paid_bind(ALICE, "1", "alice");
     day_a.extend((0..bind.len()).map(|log| (IN_A, log)));

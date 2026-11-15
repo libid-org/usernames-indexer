@@ -789,10 +789,7 @@ mod tests {
     /// what the first left, and the database stops it there.
     #[tokio::test]
     async fn the_statements_share_one_deadline() {
-        let Some(url) = database_url() else {
-            eprintln!("skipping: DATABASE_URL not set");
-            return;
-        };
+        let url = database_url();
         let pool = PgPool::connect(&url).await.expect("connect");
         let mut tx = pool.begin().await.expect("transaction");
         let deadline = Deadline::after(Duration::from_secs(1));

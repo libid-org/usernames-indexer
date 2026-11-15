@@ -3,9 +3,8 @@
 //! indexes them; the read API answers; and no plaintext the chain did not
 //! disclose is left anywhere in the store.
 //!
-//! Skips without `DATABASE_URL`, or without `anvil` on PATH, unless `CI` is
-//! set: there a missing one fails. Everything past those checks panics on
-//! failure.
+//! Runs against the Postgres at `DATABASE_URL` and `anvil` on PATH, and
+//! fails without either.
 
 use std::{
     fmt::Debug,
@@ -42,7 +41,6 @@ use usernames_core::{
     nodes::KnownPlatform,
 };
 use usernames_fixtures::{
-    anvil_available,
     database_url,
     libid::{
         Disclose,
@@ -80,16 +78,9 @@ struct Harness {
 }
 
 impl Harness {
-    /// A fresh `chain`, indexed; `None` when the suite skips.
-    async fn open(chain: u64) -> Option<Self> {
-        let Some(url) = database_url() else {
-            eprintln!("skipping: DATABASE_URL not set");
-            return None;
-        };
-        if !anvil_available() {
-            eprintln!("skipping: anvil not on PATH");
-            return None;
-        }
+    /// A fresh `chain`, indexed.
+    async fn open(chain: u64) -> Self {
+        let url = database_url();
         let pool = db::connect_and_migrate(&url).await.expect("database");
         ChainStore::new(pool.clone(), chain as i64).forget().await;
         let store = ChainStore::new(pool.clone(), chain as i64);
@@ -118,7 +109,7 @@ impl Harness {
             .run(cancel.clone()),
         );
 
-        Some(Self {
+        Self {
             chain,
             pool,
             store,
@@ -127,7 +118,7 @@ impl Harness {
             cancel,
             indexer,
             lease,
-        })
+        }
     }
 
     /// Stop the loop and release the lease.
@@ -203,9 +194,7 @@ fn x_proof(id: &'static str, handle: &'static str, observed_at: u64) -> Proof {
 
 #[tokio::test]
 async fn unlisted_binds_show_no_text_and_disclosures_stay_shown() {
-    let Some(mut h) = Harness::open(CHAIN).await else {
-        return;
-    };
+    let mut h = Harness::open(CHAIN).await;
     let &[alice, bob, dave, payer, ..] = h.accounts() else {
         panic!("anvil has fewer than five accounts");
     };

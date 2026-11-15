@@ -6,8 +6,8 @@
 //! leaves out is not priced, and a token priced once keeps its place among
 //! the coins asked.
 //!
-//! Skips without `DATABASE_URL`, unless `CI` is set: there its absence
-//! fails. The suite's chain is its own, listed by the source as
+//! Runs against the Postgres at `DATABASE_URL`, and fails without it.
+//! The suite's chain is its own, listed by the source as
 //! `TestChain`; each test forgets it when it ends.
 
 use std::{
@@ -356,10 +356,7 @@ fn ether(tenths: u64) -> U256 {
 /// forwards. `pricedAt` is the oldest price used.
 #[tokio::test]
 async fn priced_tokens_are_valued_in_usd() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let mock = MockSource::start().await;
     let ether_price = Coin {
         timestamp: now() - 100,
@@ -427,10 +424,7 @@ async fn priced_tokens_are_valued_in_usd() {
 /// `pricedAt`; asked first, it computes that answer.
 #[tokio::test]
 async fn days_are_valued_at_the_answers_prices() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let mock = MockSource::start().await;
     mock.price(NATIVE, Coin::priced(2000.5, 18, "ETH"));
     mock.price(USDC, Coin::priced(0.9998, 6, "USDC"));
@@ -478,10 +472,7 @@ async fn days_are_valued_at_the_answers_prices() {
 /// under 0.9, count under `other`; both were asked.
 #[tokio::test]
 async fn a_token_without_a_confident_price_counts_under_other() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let mock = MockSource::start().await;
     mock.price(
         USDC,
@@ -521,10 +512,7 @@ async fn a_token_without_a_confident_price_counts_under_other() {
 /// `pricedAt` stays their time.
 #[tokio::test]
 async fn a_failed_request_keeps_the_last_prices() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let mock = MockSource::start().await;
     let ether_price = Coin::priced(2000.0, 18, "ETH");
     let priced_at = ether_price.timestamp;
@@ -560,10 +548,7 @@ async fn a_failed_request_keeps_the_last_prices() {
 /// is still served.
 #[tokio::test]
 async fn a_failed_first_request_prices_nothing() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let mock = MockSource::start().await;
     mock.price(USDC, Coin::priced(1.0, 6, "USDC"));
     mock.fail();
@@ -595,10 +580,7 @@ async fn a_failed_first_request_prices_nothing() {
 /// the chain's tokens are still asked and valued.
 #[tokio::test]
 async fn a_failed_chain_list_keeps_the_last_one() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let mock = MockSource::start().await;
     mock.price(NATIVE, Coin::priced(2000.0, 18, "ETH"));
     let source = mock.source();
@@ -632,10 +614,7 @@ async fn a_failed_chain_list_keeps_the_last_one() {
 /// asked, and its coin and tokens priced before read unpriced.
 #[tokio::test]
 async fn a_chain_the_list_leaves_out_is_not_priced() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let mock = MockSource::start().await;
     mock.price(NATIVE, Coin::priced(2000.0, 18, "ETH"));
     mock.price(USDC, Coin::priced(1.0, 6, "USDC"));
@@ -677,10 +656,7 @@ async fn a_chain_the_list_leaves_out_is_not_priced() {
 /// rather than stale.
 #[tokio::test]
 async fn a_price_older_than_a_day_is_not_used() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let mock = MockSource::start().await;
     mock.price(
         NATIVE,
@@ -713,10 +689,7 @@ async fn a_price_older_than_a_day_is_not_used() {
 /// out.
 #[tokio::test]
 async fn a_token_priced_before_keeps_its_place() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let mock = MockSource::start().await;
     mock.price(USDC, Coin::priced(1.0, 6, "USDC"));
     let source = mock.source();
@@ -772,10 +745,7 @@ async fn a_token_priced_before_keeps_its_place() {
 /// source chooses a price and decimals.
 #[tokio::test]
 async fn a_value_past_the_arithmetic_leaves_its_token_unpriced() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let mock = MockSource::start().await;
     mock.price(USDC, Coin::priced(1e60, 0, "HUGE"));
     mock.price(JUNK, Coin::priced(1.0, 255, "WIDE"));
@@ -806,10 +776,7 @@ async fn a_value_past_the_arithmetic_leaves_its_token_unpriced() {
 /// and the token is still valued.
 #[tokio::test]
 async fn a_long_symbol_is_not_served() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let mock = MockSource::start().await;
     mock.price(USDC, Coin::priced(1.0, 6, &"U".repeat(33)));
     suite
@@ -850,10 +817,7 @@ fn junk(from: u64, count: u64) -> Vec<NamesEvent> {
 /// stop growing at the kept and the new.
 #[tokio::test]
 async fn priced_dust_cannot_grow_the_tokens_asked() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let mock = MockSource::start().await;
     mock.price(USDC, Coin::priced(1.0, 6, "USDC"));
     let dust = 2_000..2_000 + 3 * CANDIDATES_PER_CHAIN as u64 + 30;
@@ -911,10 +875,7 @@ async fn priced_dust_cannot_grow_the_tokens_asked() {
 /// round, stays asked, and is valued again once the source is confident.
 #[tokio::test]
 async fn a_confidence_dip_keeps_a_token_asked() {
-    let Some(suite) = Suite::open(&SUITE, CHAIN).await else {
-        eprintln!("skipping: DATABASE_URL not set");
-        return;
-    };
+    let suite = Suite::open(&SUITE, CHAIN).await;
     let mock = MockSource::start().await;
     mock.price(USDC, Coin::priced(1.0, 6, "USDC"));
     let source = mock.source();
