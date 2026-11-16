@@ -121,18 +121,24 @@ impl Indexer {
                         applied += 1;
                     }
                 }
-                Ok(None) => {
-                    // A topic this build does not know. The contracts are
-                    // upgradeable, so this is survivable — but it is not
-                    // silent, because a new event type usually means the read
-                    // model is due for a version bump.
-                    tracing::warn!(
+                Ok(None) => match self.config.contracts.declared(log) {
+                    Some(event) => tracing::debug!(
+                        emitter = %log.address(),
+                        event,
+                        block = log.block_number,
+                        "event the index does not read; skipped"
+                    ),
+                    // A topic no watched contract declares. The contracts are
+                    // upgradeable, so this is survivable, but it is not
+                    // silent: a new event type usually means the read model
+                    // is due for a version bump.
+                    None => tracing::warn!(
                         emitter = %log.address(),
                         topic0 = ?log.topic0(),
                         block = log.block_number,
                         "unknown event topic from a watched contract; skipped"
-                    );
-                }
+                    ),
+                },
                 Err(e) => {
                     anyhow::bail!("undecodable log at block {:?}: {e}", log.block_number)
                 }

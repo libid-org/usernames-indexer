@@ -98,6 +98,24 @@ impl Contracts {
         }
     }
 
+    /// The name of the event `log`'s topic is in its emitter's ABI, for a
+    /// log [`Self::decode`] skips: the proxy's upgrades, initialization and
+    /// ownership, the splitter's share and treasury. `None` is a topic its
+    /// emitter does not declare: a contract changed under the indexer.
+    pub fn declared(&self, log: &Log) -> Option<&'static str> {
+        let topic0 = log.topic0()?.0;
+        let emitter = log.address();
+        if emitter == self.registry {
+            IdentityRegistry::IdentityRegistryEvents::name_by_selector(topic0)
+        } else if Some(emitter) == self.escrow {
+            HandleEscrow::HandleEscrowEvents::name_by_selector(topic0)
+        } else if Some(emitter) == self.referral_splitter {
+            ReferralSplitter::ReferralSplitterEvents::name_by_selector(topic0)
+        } else {
+            None
+        }
+    }
+
     /// Binary search for the block at which the registry was deployed: the
     /// first block where `eth_getCode` returns non-empty bytecode. `Ok(None)`
     /// means the contract has no code at `latest_block` — absence is an
