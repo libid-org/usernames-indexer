@@ -88,17 +88,16 @@ fn a_referral_is_read_only_from_the_configured_splitter() {
     assert!(unwatched.decode(&referred_by(SPLITTER)).unwrap().is_none());
 }
 
-/// An event the emitter's ABI declares and the indexer does not index is
-/// named, from the contract that declares it only; a topic no watched
-/// contract declares is not.
+/// An event a watched contract declares and the index does not read is
+/// named, from that contract only; any other topic is not.
 #[test]
-fn an_unindexed_event_is_named_by_the_contract_that_declares_it() {
+fn an_unread_event_is_named_by_the_contract_that_declares_it() {
     let upgraded = IdentityRegistry::Upgraded {
         implementation: Address::repeat_byte(0x1A),
     }
     .encode_log_data();
     let initialized = HandleEscrow::Initialized { version: 1 }.encode_log_data();
-    let transferred = HandleEscrow::OwnershipTransferred {
+    let transferred = ReferralSplitter::OwnershipTransferred {
         previousOwner: Address::ZERO,
         newOwner: Address::repeat_byte(0x0E),
     }
@@ -106,25 +105,60 @@ fn an_unindexed_event_is_named_by_the_contract_that_declares_it() {
     let share_set = ReferralSplitter::ShareSet { shareBps: 3000 }.encode_log_data();
 
     assert_eq!(
-        CONTRACTS.declared(&mined(REGISTRY, upgraded.clone())),
-        Some("Upgraded")
+        CONTRACTS.unread(&mined(REGISTRY, upgraded.clone())),
+        Some("Upgraded(address)")
     );
     assert_eq!(
-        CONTRACTS.declared(&mined(ESCROW, initialized)),
-        Some("Initialized")
+        CONTRACTS.unread(&mined(ESCROW, initialized)),
+        Some("Initialized(uint64)")
     );
     assert_eq!(
-        CONTRACTS.declared(&mined(SPLITTER, transferred)),
-        Some("OwnershipTransferred")
+        CONTRACTS.unread(&mined(SPLITTER, transferred)),
+        Some("OwnershipTransferred(address,address)")
     );
     assert_eq!(
-        CONTRACTS.declared(&mined(SPLITTER, share_set.clone())),
-        Some("ShareSet")
+        CONTRACTS.unread(&mined(SPLITTER, share_set.clone())),
+        Some("ShareSet(uint16)")
     );
 
-    assert_eq!(CONTRACTS.declared(&mined(REGISTRY, share_set)), None);
-    assert_eq!(CONTRACTS.declared(&mined(SPLITTER, upgraded)), None);
+    assert_eq!(CONTRACTS.unread(&mined(REGISTRY, share_set)), None);
+    assert_eq!(CONTRACTS.unread(&mined(SPLITTER, upgraded)), None);
     let undeclared =
         LogData::new_unchecked(vec![B256::repeat_byte(0x7E)], Default::default());
-    assert_eq!(CONTRACTS.declared(&mined(REGISTRY, undeclared)), None);
+    assert_eq!(CONTRACTS.unread(&mined(REGISTRY, undeclared)), None);
+}
+
+/// Every event a watched contract's bindings declare is either read by
+/// `decode` or named as unread, never both: a bindings bump that adds an
+/// event fails here until the index reads it or lists it. A read event's
+/// empty payload fails to decode, so `Ok(None)` marks exactly the skipped
+/// topics.
+#[test]
+fn every_declared_event_is_read_or_named_unread() {
+    let watched = [
+        (
+            REGISTRY,
+            IdentityRegistry::IdentityRegistryEvents::SELECTORS,
+        ),
+        (ESCROW, HandleEscrow::HandleEscrowEvents::SELECTORS),
+        (
+            SPLITTER,
+            ReferralSplitter::ReferralSplitterEvents::SELECTORS,
+        ),
+    ];
+    for (emitter, selectors) in watched {
+        for selector in selectors {
+            let topic = B256::from(*selector);
+            let log = mined(
+                emitter,
+                LogData::new_unchecked(vec![topic], Default::default()),
+            );
+            let skipped = matches!(CONTRACTS.decode(&log), Ok(None));
+            let named = CONTRACTS.unread(&log).is_some();
+            assert_eq!(
+                skipped, named,
+                "{emitter} {topic}: skipped by decode {skipped}, named unread {named}"
+            );
+        }
+    }
 }

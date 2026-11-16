@@ -121,14 +121,14 @@ impl Indexer {
                         applied += 1;
                     }
                 }
-                Ok(None) => match self.config.contracts.declared(log) {
+                Ok(None) => match self.config.contracts.unread(log) {
                     Some(event) => tracing::debug!(
                         emitter = %log.address(),
                         event,
                         block = log.block_number,
                         "event the index does not read; skipped"
                     ),
-                    // A topic no watched contract declares. The contracts are
+                    // A topic this build does not read. The contracts are
                     // upgradeable, so this is survivable, but it is not
                     // silent: a new event type usually means the read model
                     // is due for a version bump.
