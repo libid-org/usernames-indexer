@@ -1,5 +1,5 @@
 -- Rows in the shape production holds them, for the index-plan test in
--- db.rs, on the chain every probe names: 5000 per table over 1000 addresses
+-- tests/plans/main.rs, on the chain every probe names: 5000 per table over 1000 addresses
 -- and three platforms, the probes' platform among them and the probes'
 -- address, node and handle nowhere; the escrow's slots also on four more
 -- chains. The journal holds a bind and a fee per handle beside the 5000
