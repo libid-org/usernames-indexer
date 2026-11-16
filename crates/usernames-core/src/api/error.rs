@@ -37,7 +37,7 @@ use crate::{
 };
 /// A refusal: its status, and the code and prose of the [`ErrorBody`] it
 /// renders as.
-pub(crate) struct ApiError {
+pub struct ApiError {
     status: StatusCode,
     code: ErrorCode,
     message: String,
@@ -67,7 +67,7 @@ impl ApiError {
 
     /// A stored value this build cannot read back. Logged with `what` where
     /// it is found; the client gets the same opaque 500 as a database error.
-    pub(crate) fn internal(what: impl fmt::Display) -> Self {
+    pub fn internal(what: impl fmt::Display) -> Self {
         tracing::error!(%what, "unreadable stored value");
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -95,6 +95,17 @@ impl ApiError {
         }
     }
 
+    /// The stats computation failed moments ago and is not run again yet.
+    pub(crate) fn stats_backing_off() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: ErrorCode::StatsBackingOff,
+            message: "the stats computation failed moments ago and runs again shortly"
+                .into(),
+            source: None,
+        }
+    }
+
     pub(crate) fn not_synced(chain: Option<i64>) -> Self {
         let message = match chain {
             Some(chain) => {
@@ -107,6 +118,17 @@ impl ApiError {
             code: ErrorCode::NotSynced,
             message,
             source: None,
+        }
+    }
+}
+
+impl fmt::Display for ApiError {
+    /// The status and message, and the database's cause when there is one.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}", self.status, self.message)?;
+        match &self.source {
+            Some(source) => write!(f, ": {source}"),
+            None => Ok(()),
         }
     }
 }
@@ -183,7 +205,7 @@ impl IntoResponse for ApiError {
 }
 
 /// `Path`, refused in the API's envelope instead of axum's plain text.
-pub(crate) struct ApiPath<T>(pub(crate) T);
+pub struct ApiPath<T>(pub T);
 
 impl<T, S> FromRequestParts<S> for ApiPath<T>
 where
@@ -199,7 +221,7 @@ where
 }
 
 /// `Query`, refused in the API's envelope instead of axum's plain text.
-pub(crate) struct ApiQuery<T>(pub(crate) T);
+pub struct ApiQuery<T>(pub T);
 
 impl<T, S> FromRequestParts<S> for ApiQuery<T>
 where

@@ -1,5 +1,6 @@
-//! The indexer: one process per chain, mirroring `IdentityRegistry` and
-//! `HandleEscrow` events into Postgres under that chain's writer lease.
+//! The indexer: one process per chain, mirroring `IdentityRegistry`,
+//! `HandleEscrow` and `ReferralSplitter` events into Postgres under that
+//! chain's writer lease.
 //!
 //! It exposes no port. An indexer that stops advancing exits, and the
 //! supervisor notices; the read API is a separate binary over the same
@@ -61,6 +62,13 @@ pub struct Config {
     #[arg(long, env = "HANDLE_ESCROW_ADDRESS")]
     pub handle_escrow_address: Option<Address>,
 
+    /// The ReferralSplitter, when the chain has one. It needs
+    /// `HANDLE_ESCROW_ADDRESS`, and its `REGISTRY()` and `ESCROW()` must be
+    /// the two configured: a paid referral is read beside the escrow's
+    /// deposit. Setting it, changing it or unsetting it replays the chain.
+    #[arg(long, env = "REFERRAL_SPLITTER_ADDRESS")]
+    pub referral_splitter_address: Option<Address>,
+
     /// Refuse to start unless the RPC reports this chain id. Optional, but a
     /// deployment that sets it cannot silently index the wrong chain.
     #[arg(long, env = "CHAIN_ID")]
@@ -107,13 +115,14 @@ impl Config {
         Contracts {
             registry: self.identity_registry_address,
             escrow: self.handle_escrow_address,
+            referral_splitter: self.referral_splitter_address,
         }
     }
 
     /// The indexer this configuration describes, under its chain's writer
-    /// lease: endpoints checked, the schema migrated, the chain prepared and
-    /// its names declared.
-    async fn start(self) -> anyhow::Result<(WriterLease, Indexer)> {
+    /// lease: endpoints checked, the schema migrated, the chain prepared and its
+    /// names declared.
+    pub async fn start(self) -> anyhow::Result<(WriterLease, Indexer)> {
         let contracts = self.contracts();
         // Pure configuration, checked before anything is touched: `prepare`
         // below may wipe the chain's rows on a version bump, and a refusal has
@@ -133,8 +142,8 @@ impl Config {
             .await
             .map_err(|e| anyhow::anyhow!(self.rpc_url.redact(&e)))?;
 
-        // The indexer migrates because the indexer writes. The read API connects
-        // to whatever schema it finds.
+        // The indexer migrates because the indexer writes. The read API only
+        // connects.
         let pool = db::connect_and_migrate(&self.database_url).await?;
         let store = ChainStore::new(pool, chain_id);
         // The writer lease outlives the indexer: as long as this process may
@@ -154,6 +163,7 @@ impl Config {
             chain_id,
             contract = %contracts.registry,
             escrow = ?contracts.escrow,
+            referral_splitter = ?contracts.referral_splitter,
             "indexing"
         );
         Ok((lease, indexer))
@@ -187,13 +197,17 @@ impl Config {
             .check_escrow(provider)
             .await
             .context("HANDLE_ESCROW_ADDRESS")?;
+        contracts
+            .check_referrals(provider)
+            .await
+            .context("REFERRAL_SPLITTER_ADDRESS")?;
         Ok(chain_id)
     }
 
     /// How long the loop waits between polls and before a retry:
     /// `POLL_INTERVAL`, refused at zero, which would poll and retry back to
     /// back.
-    fn poll_interval(&self) -> anyhow::Result<Duration> {
+    pub fn poll_interval(&self) -> anyhow::Result<Duration> {
         anyhow::ensure!(
             !self.poll_interval.is_zero(),
             "POLL_INTERVAL must be above zero, or the loop polls and retries \
@@ -206,7 +220,7 @@ impl Config {
     /// intervals plus a minute. Refused unless it outlasts a poll interval,
     /// or every idle cycle would expire the report before the next one
     /// renews it, and unless it stays between a second and a year.
-    fn report_validity(&self) -> anyhow::Result<Duration> {
+    pub fn report_validity(&self) -> anyhow::Result<Duration> {
         let validity = self.stale_after.unwrap_or(
             self.poll_interval
                 .saturating_mul(4)
@@ -286,14 +300,16 @@ impl Config {
 const LEASE_CHECK: Duration = Duration::from_secs(5);
 
 /// The indexer loop running as a task, and the token that stops it.
-struct Indexing {
-    cancel: CancellationToken,
-    task: JoinHandle<Result<(), Superseded>>,
+pub struct Indexing {
+    /// The token that stops it.
+    pub cancel: CancellationToken,
+    /// The loop task.
+    pub task: JoinHandle<Result<(), Superseded>>,
 }
 
 impl Indexing {
     /// Run `indexer` until it is stopped.
-    fn start(indexer: Indexer) -> Self {
+    pub fn start(indexer: Indexer) -> Self {
         let cancel = CancellationToken::new();
         let task = tokio::spawn(indexer.run(cancel.clone()));
         Self { cancel, task }
@@ -303,204 +319,11 @@ impl Indexing {
     /// stuck in a write to a silent database is aborted: its transaction
     /// commits whole or not at all, before any later writer's prepare, and
     /// the writer generation keeps anything after from landing.
-    async fn stop(&mut self, within: Duration) {
+    pub async fn stop(&mut self, within: Duration) {
         self.cancel.cancel();
         if tokio::time::timeout(within, &mut self.task).await.is_err() {
             tracing::warn!(?within, "the indexer did not stop in time; aborting it");
             self.task.abort();
         }
-    }
-}
-
-#[cfg(test)]
-mod help_tests {
-    use std::time::Duration;
-
-    use clap::{
-        CommandFactory,
-        Parser,
-    };
-
-    use super::Config;
-
-    /// clap renders `[env: NAME=value]` in `--help` for every argument bound
-    /// to a variable, and `.env` is read before parsing, so without
-    /// `hide_env_values` a secret is one `--help` away from a CI log.
-    #[test]
-    fn help_never_prints_a_secret() {
-        let command = Config::command();
-        for secret in ["database_url", "rpc_url"] {
-            let arg = command
-                .get_arguments()
-                .find(|a| a.get_id() == secret)
-                .unwrap_or_else(|| panic!("{secret} is an argument"));
-            assert!(
-                arg.is_hide_env_values_set(),
-                "{secret} shows its value in --help"
-            );
-        }
-    }
-
-    /// The chain names are parsed by clap into their type, so a platform key
-    /// or a malformed label stops the process before anything connects.
-    #[test]
-    fn chain_names_are_refused_at_parse() {
-        let args = |names: &str| {
-            Config::try_parse_from([
-                "usernames-indexer",
-                "--database-url",
-                "postgres://localhost/usernames",
-                "--rpc-url",
-                "http://127.0.0.1:8545",
-                "--identity-registry-address",
-                "0x0000000000000000000000000000000000000001",
-                "--chain-names",
-                names,
-            ])
-        };
-        let names: Vec<String> = args("eden,base")
-            .expect("two labels")
-            .chain_names
-            .iter()
-            .map(|name| name.as_str().to_string())
-            .collect();
-        assert_eq!(names, ["eden", "base"]);
-        for bad in ["eden,x", "Eden", "eden,"] {
-            assert!(args(bad).is_err(), "{bad:?}");
-        }
-    }
-
-    /// The configuration of `rpc` and `poll_interval`, as clap reads it.
-    fn polling(rpc: &str, poll_interval: &str) -> Result<Config, clap::Error> {
-        Config::try_parse_from([
-            "usernames-indexer",
-            "--database-url",
-            "postgres://localhost/usernames",
-            "--rpc-url",
-            rpc,
-            "--identity-registry-address",
-            "0x0000000000000000000000000000000000000001",
-            "--chain-names",
-            "eden",
-            "--poll-interval",
-            poll_interval,
-        ])
-    }
-
-    /// The loop polls over HTTP, so a WebSocket URL is a usage error before
-    /// anything connects.
-    #[test]
-    fn a_websocket_rpc_url_is_refused_at_parse() {
-        assert!(polling("https://node.example/rpc", "5s").is_ok());
-        for rpc in ["wss://node.example/rpc", "ws://127.0.0.1:8546"] {
-            let refused = polling(rpc, "5s").expect_err(rpc);
-            assert_eq!(
-                refused.kind(),
-                clap::error::ErrorKind::ValueValidation,
-                "{rpc}"
-            );
-        }
-    }
-
-    /// The store keeps report times in whole seconds, so a sub-second
-    /// report would expire as it is written.
-    #[test]
-    fn a_sub_second_stale_after_is_refused() {
-        let config = |stale_after| {
-            Config::try_parse_from([
-                "usernames-indexer",
-                "--database-url",
-                "postgres://localhost/usernames",
-                "--rpc-url",
-                "http://127.0.0.1:8545",
-                "--identity-registry-address",
-                "0x0000000000000000000000000000000000000001",
-                "--chain-names",
-                "eden",
-                "--poll-interval",
-                "100ms",
-                "--stale-after",
-                stale_after,
-            ])
-            .expect("parses")
-        };
-        assert!(config("500ms").report_validity().is_err());
-        assert_eq!(
-            config("1s").report_validity().ok(),
-            Some(Duration::from_secs(1))
-        );
-    }
-
-    /// A zero interval would poll and retry back to back.
-    #[test]
-    fn a_zero_poll_interval_is_refused() {
-        let config =
-            |interval| polling("http://127.0.0.1:8545", interval).expect("parses");
-        assert!(config("0s").poll_interval().is_err());
-        assert_eq!(
-            config("1s").poll_interval().ok(),
-            Some(Duration::from_secs(1))
-        );
-    }
-}
-
-#[cfg(test)]
-mod indexing_tests {
-    use std::time::Duration;
-
-    use tokio_util::sync::CancellationToken;
-
-    use super::Indexing;
-
-    /// A loop that never reaches its next cancellation check is aborted
-    /// once its time is up, so the process can exit.
-    #[tokio::test]
-    async fn a_loop_that_does_not_stop_is_aborted() {
-        let mut indexing = Indexing {
-            cancel: CancellationToken::new(),
-            task: tokio::spawn(std::future::pending()),
-        };
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            indexing.stop(Duration::from_millis(50)),
-        )
-        .await
-        .expect("stop returns");
-        let ended = tokio::time::timeout(Duration::from_secs(1), indexing.task)
-            .await
-            .expect("the loop ended");
-        assert!(ended.unwrap_err().is_cancelled());
-    }
-}
-
-#[cfg(test)]
-mod startup_tests {
-    use clap::Parser;
-
-    use super::Config;
-
-    /// An endpoint's URL often holds its API key, and an HTTP client's error
-    /// names the URL it called: a startup that fails on its endpoint names
-    /// the endpoint by its setting.
-    #[tokio::test]
-    async fn a_failed_startup_names_the_endpoint_by_its_setting() {
-        let config = Config::try_parse_from([
-            "usernames-indexer",
-            "--database-url",
-            "postgres://localhost/usernames",
-            "--rpc-url",
-            "http://127.0.0.1:1/v2/api-key-marker",
-            "--identity-registry-address",
-            "0x0000000000000000000000000000000000000001",
-            "--chain-names",
-            "eden",
-        ])
-        .expect("parses");
-        let Err(refused) = config.start().await else {
-            panic!("nothing answers on port 1");
-        };
-        let shown = format!("{refused:#}");
-        assert!(!shown.contains("api-key-marker"), "{shown}");
-        assert!(shown.contains("<RPC_URL>"), "{shown}");
     }
 }

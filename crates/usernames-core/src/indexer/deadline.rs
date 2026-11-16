@@ -28,16 +28,16 @@ use tower::{
 
 /// The client layer that fails a call left unanswered past its limit.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Deadline(pub(crate) Duration);
+pub struct Deadline(pub Duration);
 
 /// The error of a call the endpoint left unanswered past the limit.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 #[error("no answer within {0:?}")]
-pub(crate) struct Unanswered(pub(crate) Duration);
+pub struct Unanswered(pub Duration);
 
 /// A transport whose calls fail once they go unanswered past `limit`.
 #[derive(Clone, Debug)]
-pub(crate) struct Bounded<S> {
+pub struct Bounded<S> {
     inner: S,
     limit: Duration,
 }

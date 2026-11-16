@@ -60,9 +60,9 @@ use usernames_fixtures::{
     database_url,
     Events,
     IdNode,
-    LockWaits,
     Reads,
     Seed,
+    Sessions,
     Writes,
 };
 
@@ -95,7 +95,7 @@ impl Chains {
             .connect(&url)
             .await
             .expect("DATABASE_URL is set but connecting failed");
-        db::MIGRATOR.run(&pool).await.expect("migrations failed");
+        db::MIGRATOR.run(&pool).await.expect("migrations");
         for chain in [CHAIN, OTHER_CHAIN] {
             ChainStore::new(pool.clone(), chain).forget().await;
         }
@@ -1338,6 +1338,7 @@ async fn preparing_an_unchanged_chain_keeps_everything() {
             Contracts {
                 registry: a_contract(),
                 escrow: None,
+                referral_splitter: None,
             },
         )
         .await
@@ -1352,6 +1353,7 @@ async fn preparing_an_unchanged_chain_keeps_everything() {
             Contracts {
                 registry: a_contract(),
                 escrow: None,
+                referral_splitter: None,
             },
         )
         .await
@@ -1387,6 +1389,7 @@ async fn watching_another_contract_clears_the_chain() {
             Contracts {
                 registry: a_contract(),
                 escrow: None,
+                referral_splitter: None,
             },
         )
         .await
@@ -1407,6 +1410,7 @@ async fn watching_another_contract_clears_the_chain() {
             Contracts {
                 registry: OTHER_CONTRACT,
                 escrow: Some(OTHER_ESCROW),
+                referral_splitter: None,
             },
         )
         .await
@@ -1424,6 +1428,7 @@ async fn watching_another_contract_clears_the_chain() {
             indexer_version: Some(db::INDEXER_VERSION.to_string()),
             contract: Some(OTHER_CONTRACT),
             escrow: Some(OTHER_ESCROW),
+            referral_splitter: None,
             ..ChainState::default()
         }
     );
@@ -1455,6 +1460,7 @@ async fn the_deployment_block_survives_a_replay_of_the_same_registry() {
             Contracts {
                 registry: a_contract(),
                 escrow: None,
+                referral_splitter: None,
             },
         )
         .await
@@ -1470,6 +1476,7 @@ async fn the_deployment_block_survives_a_replay_of_the_same_registry() {
             Contracts {
                 registry: a_contract(),
                 escrow: Some(escrow),
+                referral_splitter: None,
             },
         )
         .await
@@ -1490,6 +1497,7 @@ async fn the_deployment_block_survives_a_replay_of_the_same_registry() {
             Contracts {
                 registry: OTHER_CONTRACT,
                 escrow: Some(escrow),
+                referral_splitter: None,
             },
         )
         .await
@@ -1645,7 +1653,12 @@ async fn a_writer_from_before_its_chain_row_was_deleted_writes_nothing() {
 #[tokio::test]
 async fn a_replay_waits_for_the_window_in_flight_and_clears_it() {
     let chains = Chains::open(3).await;
-    let stale = chains.store.writer().await;
+    // The window in flight and the replay write on sessions of their own
+    // names, so the wait below is the replay's on the window.
+    const WINDOW: &str = "window in flight under test";
+    let stale = ChainStore::new(chains.pool.named(WINDOW).await, CHAIN)
+        .writer()
+        .await;
     let mut window = stale.begin_window().await.expect("a window");
     let events = NamesEvent::bind(
         Address::repeat_byte(1),
@@ -1665,19 +1678,8 @@ async fn a_replay_waits_for_the_window_in_flight_and_clears_it() {
         window.apply(event, &at).await.expect("apply");
     }
 
-    // The replay runs on a lease of its own name, so the wait below is its
-    // wait and no other session's.
     const REPLAY: &str = "replay under test";
-    let replaying = ChainStore::new(
-        PgPool::connect_with(
-            (*chains.pool.connect_options())
-                .clone()
-                .application_name(REPLAY),
-        )
-        .await
-        .expect("the replay's pool"),
-        CHAIN,
-    );
+    let replaying = ChainStore::new(chains.pool.named(REPLAY).await, CHAIN);
     let mut lease = replaying.acquire_writer().await.expect("lease");
     let replay = tokio::spawn(async move {
         replaying
@@ -1686,13 +1688,14 @@ async fn a_replay_waits_for_the_window_in_flight_and_clears_it() {
                 Contracts {
                     registry: OTHER_CONTRACT,
                     escrow: None,
+                    referral_splitter: None,
                 },
             )
             .await
             .expect("the replay is prepared");
         lease
     });
-    chains.pool.waits_on_a_lock(REPLAY).await;
+    chains.pool.waits_on(REPLAY, WINDOW).await;
     window
         .commit(1)
         .await
@@ -1724,7 +1727,12 @@ async fn a_replay_waits_for_the_window_in_flight_and_clears_it() {
 #[tokio::test]
 async fn a_prepare_whose_lease_ended_while_it_waited_clears_nothing() {
     let chains = Chains::open(3).await;
-    let stale = chains.store.writer().await;
+    // The window in flight and the replay write on sessions of their own
+    // names, so the wait below is the replay's on the window.
+    const WINDOW: &str = "window in flight of the ended replay";
+    let stale = ChainStore::new(chains.pool.named(WINDOW).await, CHAIN)
+        .writer()
+        .await;
     let mut window = stale.begin_window().await.expect("a window");
     let events = NamesEvent::bind(
         Address::repeat_byte(1),
@@ -1744,19 +1752,8 @@ async fn a_prepare_whose_lease_ended_while_it_waited_clears_nothing() {
         window.apply(event, &at).await.expect("apply");
     }
 
-    // The replay runs on a lease of its own name, so the wait below is its
-    // wait and no other session's.
     const REPLAY: &str = "ended replay under test";
-    let replaying = ChainStore::new(
-        PgPool::connect_with(
-            (*chains.pool.connect_options())
-                .clone()
-                .application_name(REPLAY),
-        )
-        .await
-        .expect("the replay's pool"),
-        CHAIN,
-    );
+    let replaying = ChainStore::new(chains.pool.named(REPLAY).await, CHAIN);
     let mut lease = replaying.acquire_writer().await.expect("lease");
     let replay = tokio::spawn(async move {
         replaying
@@ -1765,11 +1762,12 @@ async fn a_prepare_whose_lease_ended_while_it_waited_clears_nothing() {
                 Contracts {
                     registry: OTHER_CONTRACT,
                     escrow: None,
+                    referral_splitter: None,
                 },
             )
             .await
     });
-    chains.pool.waits_on_a_lock(REPLAY).await;
+    chains.pool.waits_on(REPLAY, WINDOW).await;
     sqlx::query(include_str!("sql/end_writer_session.sql"))
         .bind(CHAIN)
         .execute(&chains.pool)
@@ -1876,6 +1874,7 @@ async fn a_chain_declares_its_names_and_no_two_chains_share_one() {
             Contracts {
                 registry: a_contract(),
                 escrow: None,
+                referral_splitter: None,
             },
         )
         .await

@@ -23,7 +23,6 @@ use alloy::primitives::{
     U512,
 };
 use axum::Router;
-use sqlx::PgPool;
 use tokio::{
     sync::Mutex,
     task::JoinSet,
@@ -47,6 +46,7 @@ use usernames_core::{
             StatsDays,
             TokenFlow,
             TokenFlows,
+            TokenValue,
             Usd,
         },
         AppState,
@@ -59,17 +59,19 @@ use usernames_core::{
     events::{
         EscrowEvent,
         NamesEvent,
+        Outcome,
     },
     nodes::KnownPlatform,
 };
 use usernames_fixtures::{
     ChainEntry,
     Events,
-    LockWaits,
     Seed,
+    Sessions,
     StatsRoute,
     Suite,
     Writes,
+    SPLITTER,
 };
 
 const CHAIN: i64 = 31351;
@@ -97,6 +99,9 @@ const SAFE: Address = Address::repeat_byte(0xFE);
 /// Wallets on both of the suite's chains, and on no other suite's.
 const ROAMER: Address = Address::repeat_byte(0x7C);
 const NOMAD: Address = Address::repeat_byte(0x7D);
+/// A wallet on no other suite's chains: the users across chains count it
+/// once, whatever other suites left behind.
+const REFERRER: Address = Address::repeat_byte(0x7B);
 
 const ETHER: u64 = 1_000_000_000_000_000_000;
 const FEE: u64 = 3_700_000_000_000_000;
@@ -173,10 +178,7 @@ fn flow(token: Address, count: i64, amount: u128, wallets: i64) -> TokenFlow {
         count,
         amount: U512::from(amount),
         wallets,
-        symbol: None,
-        decimals: None,
-        value: None,
-        usd: None,
+        priced: TokenValue::default(),
     }
 }
 
@@ -508,17 +510,17 @@ async fn a_freed_handle_onboards_its_next_holder() {
 #[tokio::test]
 async fn unpriced_tokens_count_together() {
     let suite = Suite::open(&SUITE, CHAIN).await;
-    let junk = |tokens: Range<u64>| -> Vec<NamesEvent> {
+    let spam = |tokens: Range<u64>| -> Vec<NamesEvent> {
         tokens
             .map(|i| Address::from_word(U256::from(i + 1).into()))
             .map(|token| NamesEvent::deposited("dave", token, SENDER, 1))
             .collect()
     };
-    let mut day_a = junk(0..500);
+    let mut day_a = spam(0..500);
     day_a.push(NamesEvent::deposited("dave", USDC, PAYER, 1_000));
     day_a.push(NamesEvent::deposited("dave", NATIVE, PAYER, ETHER));
     suite.apply_tx(IN_A, day_a).await;
-    suite.apply_tx(IN_B, junk(500..1_000)).await;
+    suite.apply_tx(IN_B, spam(500..1_000)).await;
 
     let api = suite.api();
     let chain = api.stats().await.chain(CHAIN);
@@ -727,17 +729,11 @@ async fn two_chains_fold_the_same_new_wallets_at_once() {
     // chain's wait and no other session's.
     const FIRST: &str = "stats: the first chain's window";
     const SECOND: &str = "stats: the second chain's window";
-    let named = |name: &str| {
-        PgPool::connect_with(
-            (*suite.pool.connect_options())
-                .clone()
-                .application_name(name),
-        )
-    };
-    let first = ChainStore::new(named(FIRST).await.expect("a pool"), CHAIN)
+    const HOLD: &str = "stats: the hold of the first chain's users total";
+    let first = ChainStore::new(suite.pool.named(FIRST).await, CHAIN)
         .writer()
         .await;
-    let other = ChainStore::new(named(SECOND).await.expect("a pool"), OTHER_CHAIN);
+    let other = ChainStore::new(suite.pool.named(SECOND).await, OTHER_CHAIN);
     other.forget().await;
     let second = other.writer().await;
     first
@@ -755,16 +751,17 @@ async fn two_chains_fold_the_same_new_wallets_at_once() {
     // The first window stops at the chain's users total, which the test
     // holds, after it wrote the wallets across chains; the second waits on
     // those.
-    let mut hold = suite.pool.begin().await.expect("a transaction");
+    let holding = suite.pool.named(HOLD).await;
+    let mut hold = holding.begin().await.expect("a transaction");
     sqlx::query(include_str!("sql/hold_chain_users.sql"))
         .bind(CHAIN)
         .fetch_one(&mut *hold)
         .await
         .expect("the chain's users total is held");
     let first = tokio::spawn(async move { first.apply_tx(IN_B, both()).await });
-    suite.pool.waits_on_a_lock(FIRST).await;
+    suite.pool.waits_on(FIRST, HOLD).await;
     let second = tokio::spawn(async move { second.apply_tx(IN_B, both()).await });
-    suite.pool.waits_on_a_lock(SECOND).await;
+    suite.pool.waits_on(SECOND, FIRST).await;
     hold.rollback().await.expect("the hold ends");
     first.await.expect("the first window commits");
     second.await.expect("the second window commits");
@@ -822,6 +819,70 @@ async fn days_come_thirty_to_a_page() {
         .await;
     assert_eq!(served(&last), [DAY_A]);
     assert_eq!(last.next, None);
+    suite.store().forget().await;
+    suite.done();
+}
+
+/// The referral splitter sends every paid share through the escrow: its
+/// deposits and forwards count as such, and it counts as no user and among
+/// no movement's wallets. A referral and a bind fee's setting count nowhere:
+/// the bind's own fee counts once, as `BindFeePaid`.
+#[tokio::test]
+async fn the_referral_splitter_is_no_user() {
+    let suite = Suite::open(&SUITE, CHAIN).await;
+    let before = suite.api().stats().await;
+    suite
+        .apply_tx(
+            IN_A,
+            NamesEvent::bind(REFERRER, X, "9", "referrer", 1, false),
+        )
+        .await;
+    let forward = NamesEvent::Escrow(EscrowEvent::Forwarded {
+        handle_node: node("referrer"),
+        token: NATIVE,
+        sender: SPLITTER,
+        holder: REFERRER,
+        amount: U256::from(5u64),
+        received: U256::from(5u64),
+    });
+    suite.apply(IN_A + 1, forward).await;
+    let held = NamesEvent::deposited("dave", NATIVE, SPLITTER, 7);
+    suite.apply(IN_A + 2, held).await;
+    let own = NamesEvent::Referred {
+        referrer_node: node("referrer"),
+        binder: REFERRER,
+        session_id: B256::repeat_byte(0x5E),
+        referrer_platform_id: X.id(),
+        platform_id: X.id(),
+        handle_node: node("referrer"),
+        fee: U256::from(FEE),
+        share: U256::from(3u64),
+        outcome: Outcome::SelfReferral,
+    };
+    suite.apply(IN_B, own).await;
+    let price = NamesEvent::BindFeeSet {
+        fee: U256::from(FEE),
+    };
+    suite.apply(IN_B + 1, price).await;
+    let api = suite.api();
+    let after = api.stats().await;
+    let days: Vec<DayActivity> = api.days(Some(CHAIN)).await;
+
+    assert_eq!(after.total.users - before.total.users, 1);
+    let chain = after.chain(CHAIN);
+    assert_eq!(chain.total.users, 1);
+    assert_eq!(
+        chain.total.escrow.deposits,
+        vec![flow(NATIVE, 1, 7, 0)].named()
+    );
+    assert_eq!(
+        chain.total.escrow.forwards,
+        vec![flow(NATIVE, 1, 5, 0)].named()
+    );
+    let [day] = days.as_slice() else {
+        panic!("one day listed, not {days:?}");
+    };
+    assert_eq!((day.day, day.activity.users, day.new_users), (DAY_A, 1, 1));
     suite.store().forget().await;
     suite.done();
 }

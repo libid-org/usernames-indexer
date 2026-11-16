@@ -6,10 +6,10 @@
 //! of resuming inside one, and the journal's conflict gates every write, so
 //! the replay converges.
 
-mod deadline;
-mod head;
-mod retry;
-mod rpc;
+pub mod deadline;
+pub mod head;
+pub mod retry;
+pub mod rpc;
 
 use std::time::Duration;
 
@@ -178,7 +178,7 @@ impl Indexer {
 }
 
 /// An error and its causes as one line.
-trait OneLine {
+pub trait OneLine {
     /// Each cause once: a cause is left out when the line already ends with
     /// it as a whole part, as it does after an error that prints its cause
     /// in its own message and also returns it as its source.
@@ -370,26 +370,5 @@ impl<'a> Session<'a> {
                 Ok(0)
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// An error that prints its cause in its own message and returns it as
-    /// its source, as sqlx's and alloy's do.
-    #[derive(Debug, thiserror::Error)]
-    #[error("answer lost: {0}")]
-    struct Repeats(#[source] std::io::Error);
-
-    #[test]
-    fn a_stored_error_names_each_cause_once() {
-        let error = anyhow::Error::new(Repeats(std::io::Error::other("socket closed")))
-            .context("eth_blockNumber");
-        assert_eq!(
-            error.one_line(),
-            "eth_blockNumber: answer lost: socket closed"
-        );
     }
 }

@@ -48,11 +48,11 @@ const BACKOFF: [Duration; 5] = [
 /// The client layer that sends a call to `rpc` again after a transient error,
 /// waiting the entry of [`BACKOFF`] for each try.
 #[derive(Clone, Debug)]
-pub(crate) struct Retry(pub(crate) RpcUrl);
+pub struct Retry(pub RpcUrl);
 
 /// A transport whose calls are sent again after a transient error.
 #[derive(Clone, Debug)]
-pub(crate) struct Retrying<S> {
+pub struct Retrying<S> {
     inner: S,
     rpc: RpcUrl,
 }

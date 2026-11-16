@@ -17,6 +17,8 @@ use serde::de::DeserializeOwned;
 use tower::ServiceExt;
 use usernames_core::api::model::{
     ChainStats,
+    ErrorBody,
+    ErrorCode,
     Stats,
     StatsDays,
 };
@@ -33,6 +35,9 @@ pub trait StatsRoute {
     ) -> impl Future<Output = Vec<D>> + Send;
     /// One GET answered 200, in its type.
     fn answer<T: DeserializeOwned>(&self, path: &str) -> impl Future<Output = T> + Send;
+    /// The status and code of one GET refused.
+    fn refusal(&self, path: &str)
+        -> impl Future<Output = (StatusCode, ErrorCode)> + Send;
 }
 
 impl StatsRoute for Router {
@@ -66,6 +71,16 @@ impl StatsRoute for Router {
         assert_eq!(response.status(), StatusCode::OK, "{path}");
         let body = response.into_body().collect().await.expect("body");
         serde_json::from_slice(&body.to_bytes()).expect("the answer's shape")
+    }
+
+    async fn refusal(&self, path: &str) -> (StatusCode, ErrorCode) {
+        let request = Request::get(path).body(Body::empty()).expect("a request");
+        let response = self.clone().oneshot(request).await.expect("request");
+        let status = response.status();
+        let body = response.into_body().collect().await.expect("body");
+        let refused: ErrorBody =
+            serde_json::from_slice(&body.to_bytes()).expect("the refusal's shape");
+        (status, refused.error.code)
     }
 }
 

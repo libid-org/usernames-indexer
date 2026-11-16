@@ -22,6 +22,7 @@ use super::{
         Page,
         Rows,
     },
+    reads::HandleText,
     sql,
     ApplyError,
     InvalidCursor,
@@ -313,11 +314,7 @@ impl Page<UnclaimedCursor> {
     /// Every slot still holding something, or every one in `token`. Across
     /// chains the unclaimed index serves the page; on one chain, its chain
     /// twin, with the chain out of the comparison.
-    pub(crate) fn unclaimed_lookup(
-        &self,
-        prefix: &str,
-        token: Option<Address>,
-    ) -> Statement {
+    pub fn unclaimed_lookup(&self, prefix: &str, token: Option<Address>) -> Statement {
         let mut statement =
             QueryBuilder::new(format!("{prefix}{}", sql::ESCROW_SLOT_PROJECTION));
         if let Some(token) = token {
@@ -363,7 +360,7 @@ impl Page<UnclaimedCursor> {
 impl Page<SlotCursor> {
     /// What `holder` may claim: the slots of the handles it holds, walked in
     /// the order of its handles and their tokens.
-    pub(crate) fn claimable_lookup(&self, prefix: &str, holder: Address) -> Statement {
+    pub fn claimable_lookup(&self, prefix: &str, holder: Address) -> Statement {
         let mut statement =
             QueryBuilder::new(format!("{prefix}{}", sql::CLAIMABLE_SLOTS));
         if let Some(before) = self.before {
@@ -388,6 +385,10 @@ impl Page<SlotCursor> {
             .push(" ORDER BY e.token DESC LIMIT ")
             .push_bind(self.fetch())
             .push(") e\n")
+            .push(HandleText {
+                node: "e.handle_node",
+                alias: "v",
+            })
             .push(sql::CLAIMABLE_HOLDER)
             .push_bind(holder);
         if let Some(chain) = self.chain {
@@ -413,7 +414,7 @@ impl Page<SlotCursor> {
     }
 
     /// One handle node's slots, token by token.
-    pub(crate) fn slots_lookup(&self, prefix: &str, handle_node: B256) -> Statement {
+    pub fn slots_lookup(&self, prefix: &str, handle_node: B256) -> Statement {
         let mut statement = QueryBuilder::new(format!(
             "{prefix}{} AND e.handle_node = ",
             sql::ESCROW_SLOT_PROJECTION
@@ -449,7 +450,7 @@ impl Page<SlotCursor> {
 
     /// What `sender` may take back: its contributions, in the order of the
     /// table's key.
-    pub(crate) fn refundable_lookup(&self, prefix: &str, sender: Address) -> Statement {
+    pub fn refundable_lookup(&self, prefix: &str, sender: Address) -> Statement {
         let mut statement = QueryBuilder::new(format!(
             "{prefix}{} WHERE r.sender = ",
             sql::REFUNDABLE_PROJECTION
@@ -546,234 +547,5 @@ impl Store {
             .fetch_all(&self.pool)
             .await?;
         Ok(page.split(rows))
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod plans {
-    use sqlx::PgConnection;
-
-    use super::*;
-    use crate::db::plan_tests::{
-        explain,
-        Plan,
-    };
-
-    fn page<C>(chain: Option<i64>, before: Option<C>) -> Page<C> {
-        Page {
-            chain,
-            before,
-            limit: 20,
-        }
-    }
-    /// The escrow's reads, planned.
-    pub(crate) trait EscrowPlans {
-        /// The escrow's lists and the books' writes, in every shape they are asked in.
-        async fn escrow_plans(&mut self) -> Vec<Plan>;
-    }
-
-    impl EscrowPlans for PgConnection {
-        async fn escrow_plans(&mut self) -> Vec<Plan> {
-            let (address, node) = (Address::repeat_byte(2), B256::repeat_byte(1));
-            // A cursor high in the node, token and amount ranges, where a list
-            // read backwards has most of its rows still ahead of it.
-            let (high, token) = (B256::repeat_byte(0xEE), Address::repeat_byte(0xEE));
-            let slot = Some(SlotCursor {
-                chain_id: 1,
-                handle_node: high,
-                token,
-            });
-            let unclaimed = Some(UnclaimedCursor {
-                token,
-                held: U256::from(4000u64),
-                chain_id: 1,
-                handle_node: high,
-            });
-            // The holder's handles drive the page through the owner index, and
-            // each one's slots are looked up by its node.
-            let claimable: &[&str] = &[
-                "handles_owner_chain_node_idx",
-                "escrow_held_node_idx|escrow_held_pkey",
-                "handle_node = h.handle_node",
-            ];
-            let refundable: &[&str] = &["escrow_refundable_pkey"];
-            let slots: &[&str] = &["escrow_held_node_idx"];
-            // One chain and one node: the key seeks the page exactly as well.
-            let slots_on_one: &[&str] = &["escrow_held_node_idx|escrow_held_pkey"];
-            let across: &[&str] = &["escrow_held_unclaimed_idx"];
-            let one: &[&str] = &["escrow_held_chain_unclaimed_idx"];
-            let mut plans = Vec::new();
-            for (name, seeks, statement) in [
-                (
-                    "claimable",
-                    claimable,
-                    page(None, None).claimable_lookup("EXPLAIN ", address),
-                ),
-                (
-                    "claimable, past a cursor",
-                    claimable,
-                    page(None, slot).claimable_lookup("EXPLAIN ", address),
-                ),
-                (
-                    "claimable, one chain, past a cursor",
-                    claimable,
-                    page(Some(1), slot).claimable_lookup("EXPLAIN ", address),
-                ),
-                (
-                    "refundable",
-                    refundable,
-                    page(None, None).refundable_lookup("EXPLAIN ", address),
-                ),
-                (
-                    "refundable, past a cursor",
-                    refundable,
-                    page(None, slot).refundable_lookup("EXPLAIN ", address),
-                ),
-                (
-                    "refundable, one chain, past a cursor",
-                    refundable,
-                    page(Some(1), slot).refundable_lookup("EXPLAIN ", address),
-                ),
-                (
-                    "a node's slots",
-                    slots,
-                    page(None, None).slots_lookup("EXPLAIN ", node),
-                ),
-                (
-                    "a node's slots, past a cursor",
-                    slots,
-                    page(None, slot).slots_lookup("EXPLAIN ", node),
-                ),
-                (
-                    "a node's slots, one chain, past a cursor",
-                    slots_on_one,
-                    page(Some(1), slot).slots_lookup("EXPLAIN ", node),
-                ),
-                (
-                    "unclaimed",
-                    across,
-                    page(None, None).unclaimed_lookup("EXPLAIN ", None),
-                ),
-                (
-                    "unclaimed, past a cursor",
-                    across,
-                    page(None, unclaimed).unclaimed_lookup("EXPLAIN ", None),
-                ),
-                (
-                    "unclaimed in one token",
-                    across,
-                    page(None, unclaimed).unclaimed_lookup("EXPLAIN ", Some(token)),
-                ),
-                (
-                    "unclaimed, one chain",
-                    one,
-                    page(Some(1), None).unclaimed_lookup("EXPLAIN ", None),
-                ),
-                (
-                    "unclaimed, one chain, past a cursor",
-                    one,
-                    page(Some(1), unclaimed).unclaimed_lookup("EXPLAIN ", None),
-                ),
-                (
-                    "unclaimed in one token, one chain",
-                    one,
-                    page(Some(1), unclaimed).unclaimed_lookup("EXPLAIN ", Some(token)),
-                ),
-            ] {
-                plans.push(Plan::of(self, name, Some(seeks), statement).await);
-            }
-
-            let writes = [
-                (
-                    "a claim",
-                    &["escrow_held_pkey"][..],
-                    sqlx::query_scalar::<_, String>(&explain(sql::ESCROW_CLAIM))
-                        .bind(1i64)
-                        .bind(node)
-                        .bind(token)
-                        .bind("0")
-                        .fetch_all(&mut *self)
-                        .await,
-                ),
-                (
-                    "a claim closing its round",
-                    &["escrow_refundable_slot_idx"][..],
-                    sqlx::query_scalar(&explain(sql::ESCROW_CLOSE_ROUND))
-                        .bind(1i64)
-                        .bind(node)
-                        .bind(token)
-                        .fetch_all(&mut *self)
-                        .await,
-                ),
-                (
-                    "a refund",
-                    &["escrow_held_pkey"][..],
-                    sqlx::query_scalar(&explain(sql::ESCROW_REFUND))
-                        .bind(1i64)
-                        .bind(node)
-                        .bind(token)
-                        .bind("1")
-                        .fetch_all(&mut *self)
-                        .await,
-                ),
-                (
-                    "a refund taking its contribution",
-                    &["escrow_refundable_pkey|escrow_refundable_slot_idx"][..],
-                    sqlx::query_scalar(&explain(sql::ESCROW_TAKE_REFUNDABLE))
-                        .bind(1i64)
-                        .bind(node)
-                        .bind(token)
-                        .bind(address)
-                        .fetch_all(&mut *self)
-                        .await,
-                ),
-            ];
-            for (name, seeks, text) in writes {
-                let text: Vec<String> = text.unwrap_or_else(|e| panic!("{name}: {e}"));
-                plans.push(Plan {
-                    name,
-                    seeks: Some(seeks),
-                    text: text.join("\n"),
-                });
-            }
-            plans
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use alloy::primitives::{
-        Address,
-        B256,
-        U256,
-    };
-
-    use super::{
-        SlotCursor,
-        UnclaimedCursor,
-    };
-
-    #[test]
-    fn every_cursor_reads_back_what_it_wrote_and_nothing_else() {
-        let (token, node) = (Address::repeat_byte(0xEE), B256::repeat_byte(0x0D));
-        let unclaimed = UnclaimedCursor {
-            token,
-            held: U256::MAX,
-            chain_id: 3_735_928_814,
-            handle_node: node,
-        };
-        assert_eq!(unclaimed.to_string().parse().ok(), Some(unclaimed));
-        let slot = SlotCursor {
-            chain_id: 1,
-            handle_node: node,
-            token,
-        };
-        assert_eq!(slot.to_string().parse().ok(), Some(slot));
-        let slot = slot.to_string();
-        for garbage in ["", "1-0x0d", &format!("{slot}-1"), &format!("x{slot}")] {
-            assert!(garbage.parse::<SlotCursor>().is_err(), "{garbage:?}");
-        }
-        assert!("1-2-3-4".parse::<UnclaimedCursor>().is_err());
     }
 }

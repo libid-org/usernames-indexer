@@ -53,6 +53,7 @@ use super::{
         StatsDays,
         TokenFlow,
         TokenFlows,
+        TokenValue,
     },
     params::{
         PageParams,
@@ -70,7 +71,6 @@ use crate::{
         CountRow,
         Flow,
         HandlesRow,
-        ListedAddress,
         Listing,
         Measure,
         NamedTokens,
@@ -144,6 +144,19 @@ pub(crate) async fn days(
 }
 
 impl AppState {
+    /// The prices the served totals hold, to value amounts on a request
+    /// path without asking the source: none, with a warning, when the
+    /// totals cannot be computed, so an amount list never fails on them.
+    pub(crate) async fn quotes(&self) -> Arc<Quotes> {
+        match self.clone().served_stats().await {
+            Ok(served) => served.quotes,
+            Err(error) => {
+                tracing::warn!(%error, "amounts served unpriced: the stats computation failed");
+                Arc::default()
+            }
+        }
+    }
+
     /// The latest totals, computed when none are fresh.
     async fn served_stats(self) -> Result<Served, ApiError> {
         let AppState {
@@ -181,12 +194,21 @@ impl AppState {
 }
 
 /// The latest totals, serialized once and shared by every request, served
-/// for `ttl`; a computation may take `deadline`.
+/// for `ttl`; a computation may take `deadline`, and one that failed is not
+/// run again for as long.
 #[derive(Clone)]
-pub(crate) struct StatsCache {
-    latest: Arc<Mutex<Option<Computed>>>,
+pub struct StatsCache {
+    latest: Arc<Mutex<Latest>>,
     ttl: Duration,
     deadline: Duration,
+}
+
+/// What the cache holds: the last answer computed, and when the last
+/// computation failed, if it was the latest.
+#[derive(Default)]
+struct Latest {
+    computed: Option<Computed>,
+    failed: Option<Instant>,
 }
 
 impl Default for StatsCache {
@@ -196,22 +218,26 @@ impl Default for StatsCache {
 }
 
 /// One computation's totals and the prices that valued them.
-pub(crate) struct Valued {
-    stats: Stats,
-    quotes: Quotes,
+pub struct Valued {
+    /// The totals.
+    pub stats: Stats,
+    /// The prices that valued them.
+    pub quotes: Quotes,
 }
 
 /// The numbers a snapshot holds, as the stats routes serve them: the totals,
 /// and the days, oldest first.
-pub(crate) struct Report {
-    stats: Stats,
-    history: History,
+pub struct Report {
+    /// The totals.
+    pub stats: Stats,
+    /// The days, oldest first.
+    pub history: History,
 }
 
 /// The days of a snapshot, oldest first; a day with nothing recorded is
 /// absent.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct History {
+pub struct History {
     /// Across every chain.
     days: Vec<AllChainsDay>,
     /// Per chain, by chain id.
@@ -221,15 +247,19 @@ struct History {
 /// The totals as served: serialized once, with the prices that valued
 /// them, which name and value the tokens of a page of days too.
 #[derive(Clone)]
-pub(crate) struct Served {
-    body: Bytes,
-    quotes: Arc<Quotes>,
+pub struct Served {
+    /// The totals, serialized.
+    pub body: Bytes,
+    /// The prices that valued them.
+    pub quotes: Arc<Quotes>,
 }
 
 /// One computation's answer as served, and when it finished.
-struct Computed {
-    at: Instant,
-    served: Served,
+pub struct Computed {
+    /// When the computation finished.
+    pub at: Instant,
+    /// Its answer.
+    pub served: Served,
 }
 
 impl Computed {
@@ -247,7 +277,7 @@ impl Computed {
 
     /// Whether the answer may still be served at `now`, for `ttl` after it
     /// was computed.
-    fn fresh(&self, now: Instant, ttl: Duration) -> bool {
+    pub fn fresh(&self, now: Instant, ttl: Duration) -> bool {
         now.saturating_duration_since(self.at) < ttl
     }
 }
@@ -255,7 +285,7 @@ impl Computed {
 impl StatsCache {
     /// An empty cache serving each answer for `ttl`, each computation
     /// given `deadline`.
-    pub(crate) fn new(ttl: Duration, deadline: Duration) -> Self {
+    pub fn new(ttl: Duration, deadline: Duration) -> Self {
         Self {
             latest: Arc::default(),
             ttl,
@@ -265,31 +295,44 @@ impl StatsCache {
 
     /// The answer, from `compute` when none younger than the cache's `ttl`
     /// is held. The lock is held through the computation, so requests arriving
-    /// meanwhile wait for its answer instead of computing again; after a
-    /// failure the next of them computes. The computation runs in a task of
-    /// its own: a request whose client goes away leaves it running.
-    pub(crate) async fn get<F>(
-        &self,
-        compute: impl FnOnce() -> F,
-    ) -> Result<Served, ApiError>
+    /// meanwhile wait for its answer instead of computing again. A failure is
+    /// answered at once for `deadline` after it, so a burst against a failing
+    /// computation waits on none; the first request after that computes. The
+    /// computation runs in a task of its own: a request whose client goes
+    /// away leaves it running.
+    pub async fn get<F>(&self, compute: impl FnOnce() -> F) -> Result<Served, ApiError>
     where
         F: Future<Output = Result<Valued, ApiError>> + Send + 'static,
     {
         let mut latest = Arc::clone(&self.latest).lock_owned().await;
+        let now = Instant::now();
         let held = latest
+            .computed
             .as_ref()
-            .filter(|computed| computed.fresh(Instant::now(), self.ttl))
+            .filter(|computed| computed.fresh(now, self.ttl))
             .map(|computed| computed.served.clone());
         if let Some(served) = held {
             drop(latest);
             return Ok(served);
         }
+        if let Some(failed) = latest.failed {
+            if now.saturating_duration_since(failed) < self.deadline {
+                drop(latest);
+                return Err(ApiError::stats_backing_off());
+            }
+        }
         let computation = compute();
         tokio::spawn(async move {
-            let answer = computation
-                .await
-                .and_then(Computed::of)
-                .map(|computed| latest.insert(computed).served.clone());
+            let answer = match computation.await.and_then(Computed::of) {
+                Ok(computed) => {
+                    latest.failed = None;
+                    Ok(latest.computed.insert(computed).served.clone())
+                }
+                Err(error) => {
+                    latest.failed = Some(Instant::now());
+                    Err(error)
+                }
+            };
             drop(latest);
             answer
         })
@@ -303,7 +346,7 @@ impl StatsCache {
 impl Report {
     /// The answer from the store's rollups, its tokens valued at `quotes`:
     /// every chain the snapshot read, each with its totals and its days.
-    fn of(snapshot: StatsSnapshot, quotes: &Quotes) -> Result<Self, ApiError> {
+    pub fn of(snapshot: StatsSnapshot, quotes: &Quotes) -> Result<Self, ApiError> {
         let mut chains = Tallies(
             snapshot
                 .chains
@@ -562,7 +605,7 @@ impl Payments {
     /// Count the payments of `flows`, once every row is in.
     fn add(&mut self, flows: &TokenFlows) {
         for flow in &flows.tokens {
-            match flow.usd.and_then(|usd| self.usd.checked_add(usd)) {
+            match flow.priced.usd.and_then(|usd| self.usd.checked_add(usd)) {
                 Some(usd) => self.usd = usd,
                 None => self.unpriced += flow.count,
             }
@@ -580,12 +623,8 @@ impl TokenFlows {
             true => row.count,
             false => {
                 let token: Address = row.key_as()?;
-                let coin = ListedAddress {
-                    chain_id: row.chain_id,
-                    address: token,
-                };
-                let mut flow = TokenFlow::of(token, row, quotes.0.get(&coin))?;
-                match flow.usd.map(|usd| self.usd.checked_add(usd)) {
+                let mut flow = TokenFlow::of(token, row, quotes.of(row.chain_id, token))?;
+                match flow.priced.usd.map(|usd| self.usd.checked_add(usd)) {
                     Some(Some(usd)) => self.usd = usd,
                     Some(None) => flow.unprice(),
                     None => {}
@@ -608,207 +647,17 @@ impl TokenFlow {
         quote: Option<&Quote>,
     ) -> Result<Self, ApiError> {
         let amount = row.amount_of()?;
-        let usd = quote.and_then(|quote| quote.usd(amount));
-        let quote = quote.filter(|_| usd.is_some());
         Ok(Self {
             token,
             count: row.count,
             amount,
             wallets: row.wallets,
-            symbol: quote.and_then(|quote| quote.symbol.clone()),
-            decimals: quote.map(|quote| quote.decimals),
-            value: quote.map(|quote| quote.value(amount)),
-            usd,
+            priced: TokenValue::of(amount, quote),
         })
     }
 
     /// The flow without a price, as when its sum would overflow.
     fn unprice(&mut self) {
-        self.symbol = None;
-        self.decimals = None;
-        self.value = None;
-        self.usd = None;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::atomic::{
-        AtomicI64,
-        Ordering,
-    };
-
-    use futures_util::future::join_all;
-    use sqlx::PgPool;
-    use tokio::sync::oneshot;
-    use usernames_fixtures::database_url;
-
-    use super::*;
-    use crate::db::{
-        Store,
-        MIGRATOR,
-    };
-
-    fn stats(computed_at: i64) -> Stats {
-        Stats {
-            computed_at,
-            priced_at: None,
-            total: AllChains::default(),
-            chains: Vec::new(),
-        }
-    }
-
-    /// A computation's answer with nothing priced.
-    fn answer(computed_at: i64) -> Valued {
-        Valued {
-            stats: stats(computed_at),
-            quotes: Quotes::default(),
-        }
-    }
-
-    /// The store's answer with nothing priced.
-    trait Unpriced {
-        async fn unpriced(&self, budget: Duration) -> Result<Valued, ApiError>;
-    }
-
-    impl Unpriced for Store {
-        async fn unpriced(&self, budget: Duration) -> Result<Valued, ApiError> {
-            let (snapshot, quotes) = self
-                .stats(&Listing::default(), budget, |_| async { Quotes::default() })
-                .await?;
-            let stats = Report::of(snapshot, &quotes)?.stats;
-            Ok(Valued { stats, quotes })
-        }
-    }
-
-    /// The totals a cached answer serves.
-    trait Totals {
-        fn served(self) -> Stats;
-    }
-
-    impl Totals for Result<Served, ApiError> {
-        fn served(self) -> Stats {
-            let served = self.ok().expect("an answer");
-            serde_json::from_slice(&served.body).expect("a stats answer")
-        }
-    }
-
-    /// Ten requests that arrive together run one computation, and each gets
-    /// its answer.
-    #[tokio::test]
-    async fn requests_arriving_together_share_one_computation() {
-        let cache = StatsCache::default();
-        let computations = Arc::new(AtomicI64::new(0));
-        let answers = join_all((0..10).map(|_| {
-            let computations = Arc::clone(&computations);
-            cache.get(|| async move {
-                let computation = computations.fetch_add(1, Ordering::SeqCst);
-                // The other requests are polled while this one computes.
-                tokio::task::yield_now().await;
-                Ok(answer(computation))
-            })
-        }))
-        .await;
-        assert_eq!(computations.load(Ordering::SeqCst), 1);
-        for body in answers {
-            assert_eq!(body.served(), stats(0));
-        }
-    }
-
-    /// A request whose client goes away mid-computation leaves the
-    /// computation running, and the request behind it gets its answer.
-    #[tokio::test]
-    async fn a_dropped_request_leaves_its_computation_running() {
-        let cache = StatsCache::default();
-        let (started, has_started) = oneshot::channel();
-        let (finish, finishes) = oneshot::channel();
-        let first = cache.get(|| async move {
-            started.send(()).expect("the test waits for the start");
-            finishes.await.expect("the test lets it finish");
-            Ok(answer(0))
-        });
-        // axum drops a request's future when its client disconnects.
-        tokio::select! {
-            _ = first => panic!("the computation finished before it was let go"),
-            started = has_started => started.expect("the computation started"),
-        }
-        let second = cache.get(|| async { Ok(answer(1)) });
-        finish.send(()).expect("the computation still runs");
-        assert_eq!(second.await.served(), stats(0));
-    }
-
-    /// A failed computation is not served: the next request computes.
-    #[tokio::test]
-    async fn a_failed_computation_is_computed_again() {
-        let cache = StatsCache::default();
-        let failed = cache
-            .get(|| async { Err(ApiError::internal("the database is down")) })
-            .await;
-        assert!(failed.is_err());
-        let body = cache.get(|| async { Ok(answer(1)) }).await;
-        assert_eq!(body.served(), stats(1));
-    }
-
-    /// A computation past its deadline fails on the database and is not
-    /// served: once the journal is free, the next request computes again.
-    #[tokio::test]
-    async fn a_computation_past_its_deadline_is_not_served() {
-        let url = database_url();
-        let pool = PgPool::connect(&url).await.expect("connect");
-        MIGRATOR.run(&pool).await.expect("migrations");
-        let store = Store::new(pool.clone());
-        let budget = Duration::from_secs(1);
-        // Another session holds the users' rollup the totals read, so the
-        // computation waits on it until its deadline.
-        let mut holder = pool.begin().await.expect("transaction");
-        sqlx::query("LOCK TABLE names.stats_totals IN ACCESS EXCLUSIVE MODE")
-            .execute(&mut *holder)
-            .await
-            .expect("the rollup locked");
-        let cache = StatsCache::default();
-        let waiting = store.clone();
-        let started = Instant::now();
-        let failed = cache
-            .get(|| async move { waiting.unpriced(budget).await })
-            .await;
-        let waited = started.elapsed();
-        assert!(failed.is_err(), "the computation outlasted its deadline");
-        assert!(
-            waited >= budget && waited < 2 * budget,
-            "stopped after {waited:?}"
-        );
-        holder.rollback().await.expect("the rollup free");
-        let served = cache
-            .get(|| async move { store.unpriced(budget).await })
-            .await;
-        assert!(served.is_ok(), "the next request computes again");
-    }
-
-    /// An answer is served for its time to live after its computation.
-    #[test]
-    fn an_answer_is_served_for_its_time_to_live() {
-        let at = Instant::now();
-        let computed = Computed {
-            at,
-            served: Served {
-                body: Bytes::new(),
-                quotes: Arc::default(),
-            },
-        };
-        let ttl = Duration::from_secs(90);
-        assert!(computed.fresh(at, ttl));
-        assert!(computed.fresh(at + ttl - Duration::from_secs(1), ttl));
-        assert!(!computed.fresh(at + ttl, ttl));
-    }
-
-    /// A cache serves for the time to live it was given: with none, every
-    /// request computes.
-    #[tokio::test]
-    async fn a_cache_serves_for_the_time_to_live_it_was_given() {
-        let cache = StatsCache::new(Duration::ZERO, STATS_DEADLINE);
-        let first = cache.get(|| async { Ok(answer(0)) }).await;
-        assert_eq!(first.served(), stats(0));
-        let next = cache.get(|| async { Ok(answer(1)) }).await;
-        assert_eq!(next.served(), stats(1));
+        self.priced = TokenValue::default();
     }
 }

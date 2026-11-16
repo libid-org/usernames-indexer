@@ -1,32 +1,59 @@
 //! The plan test: every read over the big tables, planned over
 //! production-shaped volume.
 
-use sqlx::PgConnection;
+mod awaiting;
+mod escrow;
+mod history;
+mod links;
+mod referral;
+mod referrals;
+mod stats;
+mod totals;
+
+use alloy::{
+    hex,
+    primitives::{
+        Address,
+        B256,
+    },
+};
+use sqlx::{
+    PgConnection,
+    PgPool,
+};
 use usernames_fixtures::database_url;
 
-use super::{
-    escrow::plans::EscrowPlans,
-    history::plans::HistoryPlans,
+use usernames_core::db::{
     reads::{
         Scope,
         Search,
     },
-    referral::plans::ReferralPlans,
-    stats::plans::StatsPlans,
     *,
+};
+
+use crate::{
+    awaiting::AwaitingPlans,
+    escrow::EscrowPlans,
+    history::HistoryPlans,
+    links::ReferralLinkPlans,
+    referral::ReferralPlans,
+    referrals::ReferralHistoryPlans,
+    stats::StatsPlans,
+    totals::TotalsPlans,
 };
 
 /// Rows in the shape production holds them, on the chain every probe
 /// names; the file says how they are shaped.
-const VOLUME: &str = include_str!("../../sql/plan_volume.sql");
+const VOLUME: &str = include_str!("../sql/plan_volume.sql");
 /// The same tables, cleared of what earlier loads left behind.
-const VACUUM: &str = include_str!("../../sql/plan_vacuum.sql");
+const VACUUM: &str = include_str!("../sql/plan_vacuum.sql");
 
 /// One statement's plan, and the indexes it must seek: `a|b` where either
 /// seeks exactly, `None` where only the row count decides between them.
 /// `index:a,b` asks more: every scan of `index` has columns `a` and `b` in
 /// its index condition, so a scan that walks the index, or binds a later
-/// column without the leading one, cannot pass for a seek.
+/// column without the leading one, cannot pass for a seek; `x|y:a,b` asks
+/// it of whichever of them the plan scans.
 pub(crate) struct Plan {
     pub(crate) name: &'static str,
     pub(crate) seeks: Option<&'static [&'static str]>,
@@ -50,6 +77,44 @@ impl Plan {
         Self { name, seeks, text }
     }
 
+    /// Panics unless the plan seeks `holder`'s handles once: a second read
+    /// of them joins each with every other, quadratic in their count.
+    pub(crate) fn reading_once(self, holder: Address) -> Self {
+        let Self { name, text, .. } = &self;
+        let owner = format!("owner = '\\x{}'", hex::encode(holder));
+        let reads = text
+            .lines()
+            .filter(|line| line.contains("Index Cond") && line.contains(&owner))
+            .count();
+        assert_eq!(
+            reads, 1,
+            "{name} reads the holder's handles {reads} times:\n{text}"
+        );
+        self
+    }
+
+    /// Panics unless the plan cuts the page before it seeks `index`: no scan
+    /// of it sits under the outermost `Limit`, so the join runs once per row
+    /// served rather than once per row the page was cut from.
+    pub(crate) fn cut_before(self, index: &str) -> Self {
+        let Self { name, text, .. } = &self;
+        let depth = |line: &str| line.len() - line.trim_start().len();
+        let lines: Vec<&str> = text.lines().collect();
+        let limit = (0..lines.len())
+            .filter(|&at| lines[at].contains("Limit"))
+            .min_by_key(|&at| depth(lines[at]))
+            .unwrap_or_else(|| panic!("{name} has no Limit:\n{text}"));
+        let under = lines[limit + 1..]
+            .iter()
+            .take_while(|line| depth(line) > depth(lines[limit]))
+            .any(|line| line.contains(index));
+        assert!(
+            !under,
+            "{name} seeks {index} before it cuts the page:\n{text}"
+        );
+        self
+    }
+
     /// Panics unless the plan seeks every index it names, scans none of the
     /// big tables, and reads no table it writes.
     fn check(&self) {
@@ -69,10 +134,17 @@ impl Plan {
         }
         for index in seeks.unwrap_or_default() {
             match index.split_once(':') {
-                Some((index, columns)) => assert!(
-                    self.bounds(index, columns),
-                    "{name} scans {index} without {columns} in its index condition:\n{text}"
-                ),
+                Some((index, columns)) => {
+                    let scanned: Vec<&str> = index
+                        .split('|')
+                        .filter(|index| !self.scans(index).is_empty())
+                        .collect();
+                    assert!(
+                        !scanned.is_empty()
+                            && scanned.iter().all(|index| self.bounds(index, columns)),
+                        "{name} scans {index} without {columns} in its index condition:\n{text}"
+                    )
+                }
                 None => assert!(
                     index.split('|').any(|index| text.contains(index)),
                     "{name} does not seek {index}:\n{text}"
@@ -92,6 +164,7 @@ impl Plan {
             "stats_totals",
             "stats_wallet_days",
             "stats_firsts",
+            "referrals",
         ] {
             assert!(
                 !text.contains(&format!("Seq Scan on {table}")),
@@ -100,16 +173,24 @@ impl Plan {
         }
     }
 
+    /// The lines of the plan that scan `index`: `Index Scan using <index>
+    /// on`, or `Bitmap Index Scan on <index>`.
+    fn scans(&self, index: &str) -> Vec<usize> {
+        let names = [format!("using {index} "), format!("Index Scan on {index} ")];
+        self.text
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| names.iter().any(|name| line.contains(name)))
+            .map(|(at, _)| at)
+            .collect()
+    }
+
     /// Whether the plan scans `index` and every scan of it names each of the
     /// comma-separated `columns` in its `Index Cond`: the lines under a
     /// scan, up to the next node.
     fn bounds(&self, index: &str, columns: &str) -> bool {
-        // `Index Scan using <index> on`, or `Bitmap Index Scan on <index>`.
-        let names = [format!("using {index} "), format!("Index Scan on {index} ")];
         let lines: Vec<&str> = self.text.lines().collect();
-        let scans: Vec<usize> = (0..lines.len())
-            .filter(|&at| names.iter().any(|name| lines[at].contains(name)))
-            .collect();
+        let scans = self.scans(index);
         !scans.is_empty()
             && scans.iter().all(|&at| {
                 lines[at + 1..]
@@ -334,6 +415,10 @@ async fn every_read_over_the_big_tables_seeks_its_index() {
     all.extend(conn.escrow_plans().await);
     all.extend(conn.stats_plans().await);
     all.extend(conn.referral_plans().await);
+    all.extend(conn.referral_history_plans().await);
+    all.extend(conn.awaiting_plans().await);
+    all.extend(conn.referral_link_plans().await);
+    all.extend(conn.totals_plans().await);
     for plan in all {
         plan.check();
     }

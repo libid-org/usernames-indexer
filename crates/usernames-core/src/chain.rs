@@ -35,6 +35,7 @@ use futures_util::{
 use libid_contracts::bindings::{
     escrow::HandleEscrow,
     identity::IdentityRegistry,
+    referral::ReferralSplitter,
 };
 
 use crate::events::{
@@ -51,20 +52,27 @@ const HEADERS_AT_ONCE: usize = 8;
 pub const NATIVE_COIN: Address = address!("EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
 
 /// The libid contracts one indexer follows on its chain: the registry, and
-/// the escrow when it watches one. Each is the ERC1967 proxy, the address
-/// that emits; the implementation behind it changes on upgrade.
+/// the escrow and the referral splitter when it watches them. The registry
+/// and the escrow are ERC1967 proxies, the addresses that emit; the
+/// implementation behind each changes on upgrade. The splitter is no proxy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Contracts {
     /// The IdentityRegistry.
     pub registry: Address,
     /// The HandleEscrow, when the indexer watches one.
     pub escrow: Option<Address>,
+    /// The ReferralSplitter, when the indexer watches one. It deposits
+    /// through the escrow, so it is watched only beside one.
+    pub referral_splitter: Option<Address>,
 }
 
 impl Contracts {
     /// Every contract whose logs the indexer reads.
     pub fn watched(&self) -> Vec<Address> {
-        std::iter::once(self.registry).chain(self.escrow).collect()
+        std::iter::once(self.registry)
+            .chain(self.escrow)
+            .chain(self.referral_splitter)
+            .collect()
     }
 
     /// Decode a log by the contract that emitted it: each contract's topics
@@ -79,6 +87,8 @@ impl Contracts {
             NamesEvent::from_registry(log)
         } else if Some(emitter) == self.escrow {
             NamesEvent::from_escrow(log)
+        } else if Some(emitter) == self.referral_splitter {
+            NamesEvent::from_splitter(log)
         } else {
             tracing::warn!(
                 %emitter,
@@ -227,6 +237,73 @@ impl Contracts {
             })
         }
     }
+
+    /// Refuse a splitter that is not wired to the registry and the escrow
+    /// this indexer follows; without a splitter there is nothing to refuse.
+    /// A paid referral is read from the escrow's event before it, so a
+    /// splitter that pays through another escrow, or with none watched,
+    /// would leave every paid referral unpaired. Both addresses are
+    /// immutable in the splitter, so an indexer checks once, at startup.
+    pub async fn check_referrals(
+        &self,
+        provider: &impl Provider,
+    ) -> Result<(), ReferralsRefused> {
+        let Some(splitter) = self.referral_splitter else {
+            return Ok(());
+        };
+        let Some(escrow) = self.escrow else {
+            return Err(ReferralsRefused::NoEscrow { splitter });
+        };
+        let instance = ReferralSplitter::new(splitter, provider);
+        let unread = |source| ReferralsRefused::Unread { splitter, source };
+        let (registry, escrow_call) = (instance.REGISTRY(), instance.ESCROW());
+        let (registry, pays_through) =
+            tokio::try_join!(registry.call(), escrow_call.call()).map_err(unread)?;
+        if registry != self.registry || pays_through != escrow {
+            return Err(ReferralsRefused::OtherContracts {
+                splitter,
+                registry,
+                escrow: pays_through,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Why a referral splitter is refused beside the contracts an indexer follows.
+#[derive(Debug, thiserror::Error)]
+pub enum ReferralsRefused {
+    /// A splitter configured with no escrow to read its deposits from.
+    #[error(
+        "splitter {splitter} needs HANDLE_ESCROW_ADDRESS: it pays through the escrow"
+    )]
+    NoEscrow {
+        /// The splitter configured.
+        splitter: Address,
+    },
+    /// The splitter's `REGISTRY()` or `ESCROW()` could not be read.
+    #[error("splitter {splitter}: REGISTRY() or ESCROW() could not be read")]
+    Unread {
+        /// The splitter asked.
+        splitter: Address,
+        /// The call's failure.
+        #[source]
+        source: contract::Error,
+    },
+    /// The splitter is paid by another registry or pays through another
+    /// escrow.
+    #[error(
+        "splitter {splitter} serves registry {registry} through escrow {escrow}, \
+         not the ones indexed"
+    )]
+    OtherContracts {
+        /// The splitter asked.
+        splitter: Address,
+        /// The registry it takes fees from.
+        registry: Address,
+        /// The escrow it pays through.
+        escrow: Address,
+    },
 }
 
 /// Why a registry is refused.

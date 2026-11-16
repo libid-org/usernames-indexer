@@ -14,6 +14,7 @@ pub const SET_CURSOR: &str = include_str!("../../sql/set_cursor.sql");
 pub const SET_CHAIN_HEAD: &str = include_str!("../../sql/set_chain_head.sql");
 pub const SET_DEPLOY_BLOCK: &str = include_str!("../../sql/set_deploy_block.sql");
 pub const SET_PROOF_VERIFIER: &str = include_str!("../../sql/set_proof_verifier.sql");
+pub const SET_BIND_FEE: &str = include_str!("../../sql/set_bind_fee.sql");
 pub const SET_WINDOW_ERROR: &str = include_str!("../../sql/set_window_error.sql");
 #[cfg(feature = "test-helpers")]
 pub const SET_VALID_UNTIL: &str = include_str!("../../sql/set_valid_until.sql");
@@ -29,6 +30,30 @@ pub const WRITER_UNLOCK: &str = include_str!("../../sql/writer_unlock.sql");
 pub const WRITER_ALIVE: &str = include_str!("../../sql/writer_alive.sql");
 pub const SET_CHAIN_TARGET: &str = include_str!("../../sql/set_chain_target.sql");
 pub const TOUCH_CHAIN_TARGET: &str = include_str!("../../sql/touch_chain_target.sql");
+pub const RECORD_REFERRAL: &str = include_str!("../../sql/record_referral.sql");
+/// The held shares of a slot's round, marked claimed.
+pub const SETTLE_REFERRALS: &str = include_str!("../../sql/settle_referrals.sql");
+/// The nodes a holder holds, once each, opening its referral and awaiting
+/// reads; the caller names the holder and closes the set.
+pub const HOLDER_NODES: &str = include_str!("../../sql/holder_nodes.sql");
+/// A holder's referrals, read per node after [`HOLDER_NODES`]; the caller
+/// narrows and caps them, caps the page, then appends [`REFERRALS_HOLDER`]
+/// and the referrer's [`HANDLE_TEXT`].
+pub const REFERRALS_BY_NODE: &str = include_str!("../../sql/referrals_by_node.sql");
+pub const REFERRALS_HOLDER: &str = include_str!("../../sql/referrals_holder.sql");
+/// What waits for a holder where nobody holds its handles, read per node
+/// after [`HOLDER_NODES`]; the caller narrows and caps the slots, then appends
+/// each slot's [`HANDLE_TEXT`].
+pub const ESCROW_AWAITING_SLOTS: &str =
+    include_str!("../../sql/escrow_awaiting_slots.sql");
+/// The text any chain disclosed for a handle node, read from the lowest chain
+/// id that disclosed it, as a lateral join; `HandleText` names its node and
+/// alias.
+pub const HANDLE_TEXT: &str = include_str!("../../sql/handle_text.sql");
+/// The referrals behind a history page's entries, by their keys; the caller
+/// appends the referrer's [`HANDLE_TEXT`].
+pub const HISTORY_REFERRAL_LINKS: &str =
+    include_str!("../../sql/history_referral_links.sql");
 pub const JOURNAL_EVENT: &str = include_str!("../../sql/journal_event.sql");
 pub const UPSERT_ID: &str = include_str!("../../sql/upsert_id.sql");
 pub const UPSERT_HANDLE: &str = include_str!("../../sql/upsert_handle.sql");
@@ -84,8 +109,8 @@ pub const ESCROW_SLOT_PROJECTION: &str =
 /// The slots a holder may claim, read per handle; the caller narrows
 /// and caps them.
 pub const CLAIMABLE_SLOTS: &str = include_str!("../../sql/claimable_slots.sql");
-/// The holder whose handles a claimable read walks; the caller narrows
-/// the chain and the cursor.
+/// The holder whose handles a claimable read walks, after each slot's
+/// [`HANDLE_TEXT`]; the caller narrows the chain and the cursor.
 pub const CLAIMABLE_HOLDER: &str = include_str!("../../sql/claimable_holder.sql");
 /// One sender's contributions in the same shape, with their refund dates.
 pub const REFUNDABLE_PROJECTION: &str =
@@ -132,3 +157,5 @@ pub const STATS_REFOLDS: &str = include_str!("../../sql/stats_refolds.sql");
 pub const REFERRAL_CODE_OWNER: &str = include_str!("../../sql/referral_code_owner.sql");
 pub const REFERRAL_CODE_REFERRER: &str =
     include_str!("../../sql/referral_code_referrer.sql");
+/// An address's unclaimed totals per chain and named token.
+pub const ESCROW_TOTALS: &str = include_str!("../../sql/escrow_totals.sql");

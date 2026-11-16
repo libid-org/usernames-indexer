@@ -15,7 +15,8 @@
 //! - [`Seed`]: a chain's store seeded the way its indexer writes it — the
 //!   right to write it, and one binding with the chain marked synced.
 //! - [`IdNode`]: a user id's node, as the chain keys it.
-//! - [`LockWaits`]: a session of the database caught waiting on a lock.
+//! - [`Sessions`]: pools of named sessions, and a session caught waiting on a
+//!   lock another named session holds.
 //!
 //! `gateway.rs` drives the router in process with these; `end_to_end.rs`
 //! deploys the real `HandleResolver` on anvil and walks the protocol with
@@ -167,6 +168,13 @@ pub use suite::{
 /// The registry a chain these fixtures write is prepared for.
 const REGISTRY: Address = Address::repeat_byte(0x1D);
 
+/// The escrow a chain these fixtures write is prepared for.
+pub const ESCROW: Address = Address::repeat_byte(0xE5);
+
+/// The referral splitter a chain these fixtures write is prepared for: the
+/// escrow deposits it sends pair with its referrals.
+pub const SPLITTER: Address = Address::repeat_byte(0x5B);
+
 /// A user id's node on a platform.
 pub trait IdNode {
     /// The node `id` is bound under, as libid-identity derives it.
@@ -181,19 +189,35 @@ impl IdNode for KnownPlatform {
     }
 }
 
-/// The sessions of a database, as the suites watch them.
-pub trait LockWaits {
-    /// Return once a session of this database named `application` waits on
-    /// a lock. Postgres announces no lock wait, so this reads
-    /// `pg_stat_activity` every few milliseconds, for at most five seconds.
-    fn waits_on_a_lock(&self, application: &str) -> impl Future<Output = ()> + Send;
+/// The sessions of a database, told apart by name, as the suites watch them.
+pub trait Sessions {
+    /// A new pool on the same database whose sessions are named
+    /// `application`.
+    fn named(&self, application: &str) -> impl Future<Output = PgPool> + Send;
+
+    /// Return once a session of this database named `waiting` waits on a lock
+    /// a session named `blocker` holds. Postgres announces no lock wait, so
+    /// this reads `pg_stat_activity` every few milliseconds, for at most five
+    /// seconds.
+    fn waits_on(&self, waiting: &str, blocker: &str) -> impl Future<Output = ()> + Send;
 }
 
-impl LockWaits for PgPool {
-    async fn waits_on_a_lock(&self, application: &str) {
-        let waiting = async {
-            while !sqlx::query_scalar::<_, bool>(include_str!("waiting_on_a_lock.sql"))
-                .bind(application)
+impl Sessions for PgPool {
+    async fn named(&self, application: &str) -> PgPool {
+        PgPool::connect_with(
+            (*self.connect_options())
+                .clone()
+                .application_name(application),
+        )
+        .await
+        .expect("a pool of named sessions")
+    }
+
+    async fn waits_on(&self, waiting: &str, blocker: &str) {
+        let wait = async {
+            while !sqlx::query_scalar::<_, bool>(include_str!("waiting_on.sql"))
+                .bind(waiting)
+                .bind(blocker)
                 .fetch_one(self)
                 .await
                 .expect("the sessions")
@@ -201,9 +225,9 @@ impl LockWaits for PgPool {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
-        tokio::time::timeout(Duration::from_secs(5), waiting)
+        tokio::time::timeout(Duration::from_secs(5), wait)
             .await
-            .unwrap_or_else(|_| panic!("{application} never waited on a lock"));
+            .unwrap_or_else(|_| panic!("{waiting} never waited on {blocker}"));
     }
 }
 
@@ -218,6 +242,14 @@ pub trait Seed {
     /// One disclosing X binding: its `IdentityBound`, `HandleRevealed` and
     /// `HandlePublished`, in one transaction, with the chain marked synced.
     fn bind(&self, handle: &str, holder: Address) -> impl Future<Output = ()> + Send;
+
+    /// [`Seed::bind`] on `platform`.
+    fn bind_on(
+        &self,
+        platform: KnownPlatform,
+        handle: &str,
+        holder: Address,
+    ) -> impl Future<Output = ()> + Send;
 
     /// [`Seed::bind`] without the `HandleRevealed` and `HandlePublished`:
     /// an unlisted binding.
@@ -236,7 +268,8 @@ impl Seed for ChainStore {
                 &mut lease,
                 Contracts {
                     registry: REGISTRY,
-                    escrow: None,
+                    escrow: Some(ESCROW),
+                    referral_splitter: Some(SPLITTER),
                 },
             )
             .await
@@ -246,42 +279,65 @@ impl Seed for ChainStore {
     }
 
     async fn bind(&self, handle: &str, holder: Address) {
-        self.writer().await.seed(handle, holder, true).await;
+        self.bind_on(KnownPlatform::X, handle, holder).await;
+    }
+
+    async fn bind_on(&self, platform: KnownPlatform, handle: &str, holder: Address) {
+        self.writer()
+            .await
+            .seed(platform, handle, holder, true)
+            .await;
     }
 
     async fn bind_private(&self, handle: &str, holder: Address) {
-        self.writer().await.seed(handle, holder, false).await;
+        self.writer()
+            .await
+            .seed(KnownPlatform::X, handle, holder, false)
+            .await;
     }
 }
 
 /// A binding written the way the indexer writes one.
 trait Binding {
-    /// An X binding of `handle` to `holder` at block 1, disclosed or not,
-    /// and the chain's head and target there.
-    async fn seed(&self, handle: &str, holder: Address, disclosed: bool);
+    /// A binding of `handle` on `platform` to `holder` at block 1, disclosed
+    /// or not, and the chain's head and target there.
+    async fn seed(
+        &self,
+        platform: KnownPlatform,
+        handle: &str,
+        holder: Address,
+        disclosed: bool,
+    );
 }
 
 impl Binding for ChainWriter {
-    async fn seed(&self, handle: &str, holder: Address, disclosed: bool) {
-        let x = KnownPlatform::X;
-        let handle_node = x.handle_node(handle).expect("an X handle");
+    async fn seed(
+        &self,
+        platform: KnownPlatform,
+        handle: &str,
+        holder: Address,
+        disclosed: bool,
+    ) {
+        let handle_node = platform
+            .handle_node(handle)
+            .expect("a handle of the platform");
         let mut events = vec![NamesEvent::IdentityBound {
             holder,
-            id_node: x.id_node("42"),
+            id_node: platform.id_node("42"),
             handle_node,
-            platform_id: x.id(),
+            platform_id: platform.id(),
             observed_at: 1_700_000_000,
             ceremony_version: 1,
         }];
         if disclosed {
             events.push(NamesEvent::HandleRevealed {
-                platform_id: x.id(),
+                platform_id: platform.id(),
                 handle_node,
-                handle: DisclosedHandle::verify(x, handle_node, handle),
+                handle: DisclosedHandle::verify(platform, handle_node, handle),
             });
             events.push(NamesEvent::HandlePublished {
                 holder,
-                platform_id: x.id(),
+                platform_id: platform.id(),
                 handle_node,
             });
         }

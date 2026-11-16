@@ -195,16 +195,20 @@ impl TryFrom<String> for Measure {
 /// What a read takes: every key of some measures, and of the others the
 /// keys each chain names, as chain, measure and key, pairwise.
 #[derive(Default)]
-struct Keys {
+pub struct Keys {
     /// The measures read under every key.
-    every: Vec<&'static str>,
-    chains: Vec<i64>,
-    measures: Vec<&'static str>,
-    keys: Vec<Vec<u8>>,
+    pub every: Vec<&'static str>,
+    /// The chain of each pair.
+    pub chains: Vec<i64>,
+    /// The measure of each pair.
+    pub measures: Vec<&'static str>,
+    /// The key of each pair.
+    pub keys: Vec<Vec<u8>>,
 }
 
 impl Keys {
-    fn of(
+    /// The keys a read of `measures` on `chains` takes under `listing`.
+    pub fn of(
         chains: &[i64],
         measures: impl IntoIterator<Item = Measure>,
         listing: &Listing,
@@ -297,7 +301,7 @@ impl fmt::Display for ListedAddress {
 
 impl ListedAddress {
     /// `listed` as the two arrays a statement unnests into pairs.
-    fn columns(listed: &[Self]) -> (Vec<i64>, Vec<Vec<u8>>) {
+    pub fn columns(listed: &[Self]) -> (Vec<i64>, Vec<Vec<u8>>) {
         listed
             .iter()
             .map(|listed| (listed.chain_id, listed.address.to_vec()))
@@ -536,11 +540,11 @@ impl fmt::Display for StatsDay {
 /// When a computation's time runs out. Its statements share the time: each
 /// may run only for what the ones before it left, and the database stops
 /// it there, so the work ends on the server too.
-struct Deadline(Instant);
+pub struct Deadline(Instant);
 
 impl Deadline {
     /// The deadline `budget` from now.
-    fn after(budget: Duration) -> Self {
+    pub fn after(budget: Duration) -> Self {
         Self(Instant::now() + budget)
     }
 
@@ -548,7 +552,7 @@ impl Deadline {
     /// milliseconds rounded up, so the database never stops it before the
     /// deadline. A millisecond at least: Postgres reads a timeout of zero as
     /// none.
-    async fn bound<'c>(
+    pub async fn bound<'c>(
         &self,
         conn: &'c mut PgConnection,
     ) -> Result<&'c mut PgConnection, sqlx::Error> {
@@ -561,265 +565,5 @@ impl Deadline {
             .execute(&mut *conn)
             .await?;
         Ok(conn)
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod plans {
-    use sqlx::PgConnection;
-
-    use super::*;
-    use crate::db::{
-        fold::{
-            Fold,
-            JournalPosition,
-        },
-        plan_tests::{
-            explain,
-            Plan,
-        },
-    };
-
-    /// The stats reads and the rollups' writes, planned.
-    pub(crate) trait StatsPlans {
-        /// The totals, every shape of a day page, and the folds of a
-        /// window's rows and of a journal's page, with the indexes they
-        /// seek.
-        async fn stats_plans(&mut self) -> Vec<Plan>;
-    }
-
-    impl StatsPlans for PgConnection {
-        async fn stats_plans(&mut self) -> Vec<Plan> {
-            // A cursor near the newest day, where a page read the wrong way
-            // has most of the days still ahead of it.
-            let before = 190 * 86_400i64;
-            let days: Vec<i64> = (161..190).map(|day| day * 86_400).collect();
-            // Every day the volume holds: the longest page it can serve.
-            let all_days: Vec<i64> = (1..=200).map(|day| day * 86_400).collect();
-            let listed = |byte| {
-                vec![ListedAddress {
-                    chain_id: 1,
-                    address: Address::repeat_byte(byte),
-                }]
-            };
-            let listing = Listing {
-                tokens: listed(0xEE),
-                fee_receivers: listed(0xFE),
-            };
-            let chains = [1i64, 2, 3, 4, 5];
-            let chain_measures = Measure::ALL
-                .into_iter()
-                .filter(|measure| *measure != Measure::AllChainsUsers);
-            let chain_keys = Keys::of(&[1], chain_measures, &listing);
-            let all_chains = Keys::of(&chains, [Measure::AllChainsUsers], &listing);
-            let every = Keys::of(&chains, Measure::ALL, &listing);
-            let measures: Vec<&str> = Measure::ALL.iter().map(|m| m.as_str()).collect();
-            let (blocks, logs) = ([10i64, 20, 30], [0i64, 0, 0]);
-            let (after, through) = (
-                JournalPosition {
-                    block_number: 4_000,
-                    log_index: 0,
-                },
-                JournalPosition {
-                    block_number: 4_100,
-                    log_index: 0,
-                },
-            );
-            let window = Fold::Window {
-                blocks: &blocks,
-                logs: &logs,
-            };
-            let page = Fold::Page { after, through };
-            let reads = [
-                (
-                    "the live handles",
-                    &["handles_live_idx"][..],
-                    sqlx::query_scalar::<_, String>(&explain(sql::STATS_HANDLES))
-                        .fetch_all(&mut *self)
-                        .await,
-                ),
-                (
-                    "the totals",
-                    &["stats_totals_pkey:chain_id,measure"][..],
-                    sqlx::query_scalar(&explain(sql::STATS_TOTALS))
-                        .bind(&every.every)
-                        .bind(&every.chains)
-                        .bind(&every.measures)
-                        .bind(&every.keys)
-                        .fetch_all(&mut *self)
-                        .await,
-                ),
-                (
-                    "the price candidates",
-                    &["stats_totals_pkey:chain_id,measure"][..],
-                    sqlx::query_scalar(&explain(sql::STATS_CANDIDATES))
-                        .bind(NATIVE_COIN.to_vec())
-                        .bind(&[1i64][..])
-                        .bind(vec![Address::repeat_byte(0xEE).to_vec()])
-                        .bind(CANDIDATES_PER_CHAIN)
-                        .fetch_all(&mut *self)
-                        .await,
-                ),
-                (
-                    "a chain's days",
-                    &["stats_counts_pkey"][..],
-                    sqlx::query_scalar(&explain(sql::STATS_CHAIN_DAYS))
-                        .bind(1i64)
-                        .bind(before)
-                        .bind(31i64)
-                        .fetch_all(&mut *self)
-                        .await,
-                ),
-                (
-                    "the days across chains",
-                    &["stats_counts_pkey"][..],
-                    sqlx::query_scalar(&explain(sql::STATS_ALL_DAYS))
-                        .bind(before)
-                        .bind(31i64)
-                        .fetch_all(&mut *self)
-                        .await,
-                ),
-                (
-                    "a chain's day page",
-                    &["stats_counts_pkey"][..],
-                    sqlx::query_scalar(&explain(sql::STATS_DAY_COUNTS))
-                        .bind(&[1i64][..])
-                        .bind(&days)
-                        .bind(&chain_keys.every)
-                        .bind(&chain_keys.chains)
-                        .bind(&chain_keys.measures)
-                        .bind(&chain_keys.keys)
-                        .fetch_all(&mut *self)
-                        .await,
-                ),
-                (
-                    "a chain's longest day page",
-                    &["stats_counts_pkey"][..],
-                    sqlx::query_scalar(&explain(sql::STATS_DAY_COUNTS))
-                        .bind(&[1i64][..])
-                        .bind(&all_days)
-                        .bind(&chain_keys.every)
-                        .bind(&chain_keys.chains)
-                        .bind(&chain_keys.measures)
-                        .bind(&chain_keys.keys)
-                        .fetch_all(&mut *self)
-                        .await,
-                ),
-                (
-                    "a day page across chains",
-                    &["stats_counts_pkey"][..],
-                    sqlx::query_scalar(&explain(sql::STATS_DAY_COUNTS))
-                        .bind(&chains[..])
-                        .bind(&days)
-                        .bind(&all_chains.every)
-                        .bind(&all_chains.chains)
-                        .bind(&all_chains.measures)
-                        .bind(&all_chains.keys)
-                        .fetch_all(&mut *self)
-                        .await,
-                ),
-                (
-                    "a journal's next page",
-                    &["events_pkey"][..],
-                    sqlx::query_scalar(&explain(sql::STATS_PAGE_END))
-                        .bind(1i64)
-                        .bind(after.block_number)
-                        .bind(after.log_index)
-                        .bind(10_000i64)
-                        .fetch_all(&mut *self)
-                        .await,
-                ),
-                (
-                    "a window's fold",
-                    &[
-                        "events_pkey",
-                        "events_first_deposit_idx",
-                        "events_binds_idx",
-                    ][..],
-                    sqlx::query_scalar(&explain(&window.statement()))
-                        .bind(1i64)
-                        .bind(&measures)
-                        .bind(&blocks[..])
-                        .bind(&logs[..])
-                        .fetch_all(&mut *self)
-                        .await,
-                ),
-                (
-                    "a journal page's fold",
-                    &[
-                        "events_pkey",
-                        "events_first_deposit_idx",
-                        "events_binds_idx",
-                    ][..],
-                    sqlx::query_scalar(&explain(&page.statement()))
-                        .bind(1i64)
-                        .bind(&measures)
-                        .bind(after.block_number)
-                        .bind(after.log_index)
-                        .bind(through.block_number)
-                        .bind(through.log_index)
-                        .fetch_all(&mut *self)
-                        .await,
-                ),
-            ];
-            reads
-                .into_iter()
-                .map(|(name, seeks, text)| {
-                    let text: Vec<String> =
-                        text.unwrap_or_else(|e| panic!("{name}: {e}"));
-                    Plan {
-                        name,
-                        seeks: Some(seeks),
-                        text: text.join("\n"),
-                    }
-                })
-                .collect()
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use sqlx::PgPool;
-    use usernames_fixtures::database_url;
-
-    use super::*;
-
-    /// A computation's statements share its deadline: the second gets only
-    /// what the first left, and the database stops it there.
-    #[tokio::test]
-    async fn the_statements_share_one_deadline() {
-        let url = database_url();
-        let pool = PgPool::connect(&url).await.expect("connect");
-        let mut tx = pool.begin().await.expect("transaction");
-        let deadline = Deadline::after(Duration::from_secs(1));
-        sqlx::query("SELECT pg_sleep(0.6)")
-            .execute(deadline.bound(&mut tx).await.expect("bounded"))
-            .await
-            .expect("the first statement ends in time");
-        let stopped = sqlx::query("SELECT pg_sleep(0.6)")
-            .execute(deadline.bound(&mut tx).await.expect("bounded"))
-            .await
-            .expect_err("the second statement outlasts the deadline");
-        let code = stopped.as_database_error().and_then(|error| error.code());
-        // query_canceled: the statement timeout stopped it on the server.
-        assert_eq!(code.as_deref(), Some("57014"), "{stopped}");
-    }
-
-    /// A listed address reads from its `<chain id>:<address>` text and
-    /// prints back to it; anything else is refused.
-    #[test]
-    fn a_listed_address_parses_from_its_text() {
-        let text = "8453:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
-        let listed: ListedAddress = text.parse().expect("a listed address");
-        assert_eq!(listed.chain_id, 8453);
-        assert_eq!(listed.to_string(), text);
-        for refused in [
-            "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-            "base:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-            "8453:0x8335",
-        ] {
-            assert!(refused.parse::<ListedAddress>().is_err(), "{refused}");
-        }
     }
 }

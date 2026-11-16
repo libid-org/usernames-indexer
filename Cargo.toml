@@ -24,9 +24,9 @@ futures-util = "0.3"
 hex = "0.4"
 http-body-util = "0.1"
 humantime = "2"
-libid-contracts = "0.21"
-libid-identity = { version = "0.21", features = ["node"] }
-libid-profiles = "0.21"
+libid-contracts = "0.23"
+libid-identity = { version = "0.23", features = ["node"] }
+libid-profiles = "0.23"
 libid-signer = "0.7"
 # Tells apart the failures in alloy's HTTP transport errors, which carry
 # the reqwest error underneath, and asks the price source for /v1/stats.
@@ -34,7 +34,7 @@ reqwest = { version = "0.13", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_with = "3"
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "macros", "migrate"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
 tokio-util = "0.7"

@@ -87,7 +87,7 @@ impl Suite {
         let pool = PgPool::connect(&url)
             .await
             .expect("DATABASE_URL is set but connecting failed");
-        db::MIGRATOR.run(&pool).await.expect("migrations failed");
+        db::MIGRATOR.run(&pool).await.expect("migrations");
         let store = ChainStore::new(pool.clone(), chain);
         store.forget().await;
         Self {

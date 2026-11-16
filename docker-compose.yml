@@ -22,6 +22,7 @@ services:
       RPC_URL: ${RPC_URL:?set RPC_URL}
       IDENTITY_REGISTRY_ADDRESS: ${IDENTITY_REGISTRY_ADDRESS:?set IDENTITY_REGISTRY_ADDRESS}
       HANDLE_ESCROW_ADDRESS:
+      REFERRAL_SPLITTER_ADDRESS:
       CHAIN_NAMES: ${CHAIN_NAMES:?set CHAIN_NAMES}
       CHAIN_ID:
       CONFIRMATIONS: ${CONFIRMATIONS:-5}
@@ -62,8 +63,8 @@ services:
       postgres:
         condition: service_healthy
       # Ordering only: the API answers 503 until the indexer's first window
-      # lands, so it may start before there is anything to serve. What it must
-      # not do is start before the schema exists, which the indexer migrates.
+      # lands, so it may start before there is anything to serve. Started before
+      # the indexer migrated the schema, its queries fail until it has.
       indexer:
         condition: service_started
     restart: unless-stopped

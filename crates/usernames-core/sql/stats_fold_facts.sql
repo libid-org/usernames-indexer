@@ -4,25 +4,35 @@
 -- any. `scope` is the chain whose presence rows tell the wallet's days:
 -- chain $1, or chain 0 for the users across every chain.
 --
--- Every row counts under `users`, its wallet when it binds, sends through
--- the escrow or claims from it. Every movement counts under its token and
+-- Every row counts under `users` but a referral and a bind fee's setting,
+-- which the splitter logs beside the bind's own fee: its wallet when it
+-- binds, sends through the escrow or claims from it, unless the wallet is a
+-- referral splitter any chain watches, which sends every paid share. Its
+-- deposits and forwards still count. Every movement counts under its token and
 -- under every token together, a count only. Every fee counts under its
 -- receiver and under every receiver together, with its amount: fees are
 -- paid in the chain's own coin. A claim onboards when the
 -- claimed round took a deposit of the token while nobody held the node, and
 -- the node was bound after that deposit and before the claim: the binds are
 -- tested against the round's first deposit alone, one seek each.
-, seen AS (
+, splitters AS MATERIALIZED (
+    SELECT referral_splitter AS wallet
+    FROM names.chains
+    WHERE referral_splitter IS NOT NULL
+), seen AS (
     SELECT kind, platform_id, receiver, amount,
            block_time - block_time % 86400 AS day,
-           CASE kind WHEN 'identity_bound' THEN holder
-                     WHEN 'deposited' THEN sender
-                     WHEN 'forwarded' THEN sender
-                     WHEN 'claimed' THEN claimer END AS wallet
+           CASE WHEN kind = 'identity_bound' THEN holder
+                WHEN kind IN ('deposited', 'forwarded')
+                     AND sender NOT IN (SELECT wallet FROM splitters) THEN sender
+                WHEN kind = 'claimed' THEN claimer END AS wallet
     FROM fresh
+    WHERE kind NOT IN ('referred', 'bind_fee_set')
 ), moves AS (
     SELECT kind AS flow, token,
-           CASE kind WHEN 'claimed' THEN claimer ELSE sender END AS wallet,
+           CASE WHEN kind = 'claimed' THEN claimer
+                WHEN sender NOT IN (SELECT wallet FROM splitters) THEN sender
+                END AS wallet,
            CASE WHEN kind IN ('claimed', 'refunded') THEN released
                 ELSE amount END AS amount,
            block_time - block_time % 86400 AS day

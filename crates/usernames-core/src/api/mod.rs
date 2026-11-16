@@ -1,18 +1,21 @@
 //! The read API. Resolution answers exactly what the contract's resolvers
 //! answer, from the projections; search, the histories, the escrow's
-//! waiting amounts, the statistics and referral codes are what the chain
-//! cannot list. The answers' shapes live in [`model`]; the handlers here
-//! and in the history, escrow, stats and referral modules only translate
-//! HTTP to store calls and rows to those shapes.
+//! waiting amounts, the statistics, referral codes and the referrals they
+//! earned are what the chain cannot list. The answers' shapes live in
+//! [`model`]; the handlers here and in the history, escrow, stats, referral
+//! and referrals modules only translate HTTP to store calls and rows to
+//! those shapes.
 
-mod error;
+pub mod error;
 mod escrow;
 mod history;
 pub mod model;
-mod params;
-mod prices;
+pub mod params;
+pub mod prices;
 mod referral;
-mod stats;
+mod referrals;
+pub mod stats;
+mod totals;
 
 use std::{
     sync::Arc,
@@ -174,14 +177,17 @@ impl AppState {
             .route("/v1/history/node/{node}", get(history::node))
             .route("/v1/history/chain/{chain}", get(history::chain))
             .route("/v1/escrow/claimable/{address}", get(escrow::claimable))
+            .route("/v1/escrow/awaiting/{address}", get(escrow::awaiting))
             .route("/v1/escrow/refundable/{address}", get(escrow::refundable))
             .route("/v1/escrow/handle/{platform}/{handle}", get(escrow::handle))
             .route("/v1/escrow/node/{node}", get(escrow::node))
             .route("/v1/escrow/unclaimed", get(escrow::unclaimed))
+            .route("/v1/escrow/totals/{address}", get(totals::totals))
             .route("/v1/stats", get(stats::stats))
             .route("/v1/stats/days", get(stats::days))
             .route("/v1/referral/code/{code}", get(referral::code))
             .route("/v1/referral/node/{node}/code", get(referral::node_code))
+            .route("/v1/referrals/address/{address}", get(referrals::address))
             .with_state(self)
     }
 
@@ -299,11 +305,13 @@ impl ChainStatus {
     fn of(row: ChainStatusRow) -> Self {
         let ChainStatusRow { state, names } = row;
         let position = state.position();
+        let bind_fee = state.bind_fee();
         Self {
             chain_id: state.chain_id,
             names,
             contract: state.contract,
             escrow: state.escrow,
+            referral_splitter: state.referral_splitter,
             last_indexed_block: position.cursor,
             chain_head_block: state.head(),
             lag_blocks: position.lag_blocks(),
@@ -311,6 +319,7 @@ impl ChainStatus {
             report_valid_for: position.valid_for_seconds(),
             last_window_error: state.window_error,
             proof_verifier: state.proof_verifier,
+            bind_fee,
         }
     }
 }
@@ -526,184 +535,4 @@ async fn search(
         offset,
         hits,
     }))
-}
-
-#[cfg(test)]
-mod tests {
-    use alloy::primitives::Address;
-    use axum::{
-        body::Body,
-        http::{
-            Request,
-            StatusCode,
-        },
-    };
-    use http_body_util::BodyExt;
-    use sqlx::PgPool;
-    use tower::ServiceExt;
-
-    use super::*;
-    use crate::api::model::ErrorBody;
-
-    /// The status and code a route refuses `path` with. Every refusal here
-    /// comes before the store is read, so the pool never connects.
-    async fn refusal(path: &str) -> (StatusCode, ErrorCode) {
-        let pool =
-            PgPool::connect_lazy("postgres://localhost/unread").expect("lazy pool");
-        let response = AppState::new(Store::new(pool))
-            .router()
-            .oneshot(
-                Request::builder()
-                    .uri(path)
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        let status = response.status();
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .expect("body")
-            .to_bytes();
-        let refusal: ErrorBody =
-            serde_json::from_slice(&body).expect("the error envelope");
-        (status, refusal.error.code)
-    }
-
-    #[tokio::test]
-    async fn a_malformed_list_request_is_refused_in_the_envelope() {
-        let address = Address::repeat_byte(0xA1);
-        let bad = |code: ErrorCode| (StatusCode::BAD_REQUEST, code);
-        let cases = [
-            (
-                "/v1/escrow/node/0x1234".to_string(),
-                bad(ErrorCode::InvalidNode),
-            ),
-            (
-                "/v1/history/node/alice".to_string(),
-                bad(ErrorCode::InvalidNode),
-            ),
-            (
-                "/v1/escrow/claimable/0xnope".to_string(),
-                bad(ErrorCode::InvalidAddress),
-            ),
-            (
-                "/v1/escrow/unclaimed?token=usdc".to_string(),
-                bad(ErrorCode::InvalidAddress),
-            ),
-            (
-                "/v1/escrow/handle/myspace/tom".to_string(),
-                bad(ErrorCode::InvalidPlatform),
-            ),
-            (
-                "/v1/escrow/unclaimed?limit=ten".to_string(),
-                bad(ErrorCode::InvalidArgument),
-            ),
-            (
-                "/v1/history/handle/x/nobody?limit=1.5".to_string(),
-                bad(ErrorCode::InvalidArgument),
-            ),
-            (
-                "/v1/escrow/unclaimed?chain=base".to_string(),
-                bad(ErrorCode::InvalidChain),
-            ),
-            (
-                "/v1/escrow/unclaimed?before=nope".to_string(),
-                bad(ErrorCode::InvalidCursor),
-            ),
-            (
-                "/v1/stats/days?before=yesterday".to_string(),
-                bad(ErrorCode::InvalidCursor),
-            ),
-            (
-                "/v1/stats/days?chain=base".to_string(),
-                bad(ErrorCode::InvalidChain),
-            ),
-            (
-                "/v1/stats/days?limit=ten".to_string(),
-                bad(ErrorCode::InvalidArgument),
-            ),
-            (
-                "/v1/history/chain/base".to_string(),
-                bad(ErrorCode::InvalidChain),
-            ),
-            (
-                "/v1/history/chain/1?day=1700000001".to_string(),
-                bad(ErrorCode::InvalidArgument),
-            ),
-            (
-                "/v1/history/chain/1?day=today".to_string(),
-                bad(ErrorCode::InvalidArgument),
-            ),
-            (
-                "/v1/history/chain/1?kind=minted".to_string(),
-                bad(ErrorCode::InvalidArgument),
-            ),
-            (
-                "/v1/history/chain/1?token=usdc".to_string(),
-                bad(ErrorCode::InvalidAddress),
-            ),
-            (
-                "/v1/history/chain/1?before=yesterday".to_string(),
-                bad(ErrorCode::InvalidCursor),
-            ),
-            (
-                format!("/v1/history/address/{address}?before=yesterday"),
-                bad(ErrorCode::InvalidCursor),
-            ),
-            (
-                format!("/v1/escrow/refundable/{address}?before=1-2"),
-                bad(ErrorCode::InvalidCursor),
-            ),
-            (
-                "/v1/history/address/%FF".to_string(),
-                bad(ErrorCode::InvalidPath),
-            ),
-            (
-                "/v1/resolve/address/%FF".to_string(),
-                bad(ErrorCode::InvalidPath),
-            ),
-            (
-                "/v1/search?q=al&q=bo".to_string(),
-                bad(ErrorCode::InvalidQuery),
-            ),
-            (
-                "/v1/search?q=ali&limit=ten".to_string(),
-                bad(ErrorCode::InvalidArgument),
-            ),
-            (
-                "/v1/search?q=ali&offset=1.5".to_string(),
-                bad(ErrorCode::InvalidArgument),
-            ),
-            (
-                "/v1/resolve/handle/x/alice?chain=1&chain=2".to_string(),
-                bad(ErrorCode::InvalidQuery),
-            ),
-            (
-                format!("/v1/escrow/claimable/{address}?chain=1&chain=2"),
-                bad(ErrorCode::InvalidQuery),
-            ),
-            (
-                "/v1/referral/code/0OIl0OIl0OIl".to_string(),
-                bad(ErrorCode::InvalidCode),
-            ),
-            (
-                "/v1/referral/code/2g".to_string(),
-                bad(ErrorCode::InvalidCode),
-            ),
-            (
-                format!("/v1/referral/code/{}", "z".repeat(45)),
-                bad(ErrorCode::InvalidCode),
-            ),
-            (
-                "/v1/referral/node/0x1234/code".to_string(),
-                bad(ErrorCode::InvalidNode),
-            ),
-        ];
-        for (path, expected) in cases {
-            assert_eq!(refusal(&path).await, expected, "{path}");
-        }
-    }
 }

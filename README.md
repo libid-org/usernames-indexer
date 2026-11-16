@@ -37,16 +37,16 @@ cargo run -p usernames-indexer         # indexes the chain into the database
 cargo run -p usernames-api             # serves the API, in another shell
 ```
 
-Start the indexer first on a fresh database: it owns the schema and runs the
-migrations. The API only connects, and a reader that starts before the schema
-exists fails its first query rather than racing the migration.
+Start the indexer first on an empty database: it owns the schema and runs
+the migrations. The API only connects; started before the schema exists,
+its queries fail until the indexer has migrated it.
 
 The compose database's DSN is
 `postgres://usernames:usernames_dev@127.0.0.1:55432/usernames` (already in
-`.env.example`). The migrations run `CREATE EXTENSION pg_trgm`, which needs a
-role allowed to create extensions — true for the compose database; on a
-managed instance with a least-privilege role, have an administrator run it
-once beforehand.
+`.env.example`). The schema runs `CREATE EXTENSION IF NOT EXISTS pg_trgm`,
+which needs a role allowed to create extensions — true for the compose
+database; on a managed instance with a least-privilege role, have an
+administrator run `CREATE EXTENSION pg_trgm` once beforehand.
 
 Configuration is flags or environment (a `.env` file is read first);
 durations are written the way humantime reads them: `5s`, `1500ms`, `2m`. Each
@@ -59,6 +59,7 @@ indexer's settings.
 | `RPC_URL` | indexer | — | JSON-RPC endpoint of the chain to follow, `http` or `https`; any other scheme is a usage error. When its `eth_getLogs` leaves out `blockTimestamp` (a field outside the method's standard answer), the indexer reads each such block's header, one call per block with logs. Prefer a single node or a sticky endpoint: a load balancer that mixes lagged replicas can answer `eth_getLogs` for blocks a backend has not seen, and events dropped that way past the confirmation margin are gone until a re-index. |
 | `IDENTITY_REGISTRY_ADDRESS` | indexer | — | The IdentityRegistry **ERC1967 proxy** (the implementation changes on upgrade; the proxy is the one that emits). The indexer records it per chain, and `/v1/status` reports it from there |
 | `HANDLE_ESCROW_ADDRESS` | indexer | unset | The HandleEscrow **ERC1967 proxy**, when the chain has one. The indexer refuses to start unless its `registry()` is `IDENTITY_REGISTRY_ADDRESS`. Its events share the registry's windows and cursor; setting, changing or unsetting it replays the chain. `/v1/status` reports it as `escrow` |
+| `REFERRAL_SPLITTER_ADDRESS` | indexer | unset | The ReferralSplitter that binds pay their fee to when they name a referrer. Requires `HANDLE_ESCROW_ADDRESS`; the indexer refuses to start unless its `REGISTRY()` and `ESCROW()` are the two addresses above. Its `Referred` events feed `/v1/referrals` and its `FeeSet` the price `/v1/status` shows as `bindFee`; setting, changing or unsetting it replays the chain. `/v1/status` reports it as `referralSplitter` |
 | `CHAIN_ID` | indexer | unset | Refuse to start unless the RPC reports this chain id. The API takes none: it serves every chain the store holds, and a request narrows with `?chain=` |
 | `CHAIN_NAMES` | indexer | — | Required. The names this chain goes by in an ENS name, comma-separated: the `base` in `alice.x.base.handles.link`. Labels only, never a platform key. Written to the store at every start for the gateway to read; a name belongs to one chain across the store, and declaring one another chain holds refuses to start |
 | `CONFIRMATIONS` | indexer | `5` | Blocks behind the head to stay (shallow-reorg protection) |
@@ -96,19 +97,22 @@ set `STALE_AFTER` past the chain's longest gap between blocks.
 | `GET /v1/resolve/id-node/{idNode}` | The wallet an id node resolves to (`resolveId`) on each chain it is bound on, each with the handle node that account holds now. The client hashes the id (`libid-identity`, or `idNode` in `@libid/contracts`) and sends its node |
 | `GET /v1/resolve/address/{address}` | Every identity a wallet proved on every chain, by id node, with `resolves`, and `published` on the one whose handle is the wallet's name (`primaryHandleOf`) |
 | `GET /v1/search?q=gre&platform=x&owner=0x…&limit=10&offset=0` | Live handles whose text the chain disclosed, matching a partial query (exact, then prefix, then substring, then trigram-fuzzy), linked to a wallet, or both; one of `q` and `owner` is required, and a `q` without `owner` has at least three letters or digits. `limit` (1..50, default 10) and `offset` (up to 10000) page the ranked list; a page shorter than `limit` is the last |
-| `GET /v1/history/address/{address}?before=&limit=` | Every event the address took part in, newest first, each with its `roles`: `holder`, `previousHandleHolder` and `previousIdHolder` (an event took that handle or account from it), `feeReceiver`, `sender` (of a deposit; a claim that took it names it too), `claimer`, `recipient` |
-| `GET /v1/history/handle/{platform}/{handle}?before=&limit=` | Every event on the handle: deposits while nobody held it, the binds that gave it a holder, and every claim, refund and payment after |
+| `GET /v1/history/address/{address}?before=&limit=` | Every event the address took part in, newest first, each with its `roles`: `holder`, `previousHandleHolder` and `previousIdHolder` (an event took that handle or account from it), `feeReceiver`, `sender` (of a deposit; a claim that took it names it too), `claimer`, `recipient`. A `referred` entry, and a deposit or forward the chain's referral splitter sent, carries its `referral`: the `referrer` handle with the text any chain disclosed, read from the lowest chain id, the `binder` and its published `binderHandle` on that chain, and the `Referred`'s `logIndex` in the entry's block. A claim carries none: one claim settles any number of shares |
+| `GET /v1/history/handle/{platform}/{handle}?before=&limit=` | Every event on the handle: deposits while nobody held it, the binds that gave it a holder, and every claim, refund and payment after, each with its `referral` as in the address history |
 | `GET /v1/history/node/{node}?before=&limit=` | The same, by handle node: for a handle nobody has bound, whose text no event carried |
 | `GET /v1/history/chain/{chain}?day=&kind=&token=&before=&limit=` | What happened on one chain, newest first, as `entries` like the other histories: one UTC day (`day` = its first second) or the whole journal, of one `kind` (`deposited`, `claimed`, …) and in one `token` when asked. Each page is one index seek and at most `limit` entries (default 20, at most 100), however busy the day; `computedAt` says when it was read |
-| `GET /v1/escrow/claimable/{address}?before=&limit=` | What `claim` would pay the address: everything held for the handles it holds now |
+| `GET /v1/escrow/claimable/{address}?before=&limit=` | What `claim` would pay the address: everything held for the handles it holds now. Each amount's `handle` carries the text any chain disclosed, read from the lowest chain id |
+| `GET /v1/escrow/awaiting/{address}?before=&limit=` | What is held for the handles the address holds, on each chain where nobody holds that handle: binding it there makes the amount claimable. By node, chain and token, descending; each `handle` carries the text any chain disclosed, read from the lowest chain id |
 | `GET /v1/escrow/refundable/{address}?before=&limit=` | What the address sent that nobody has claimed yet, each contribution with its `refundableAt`: when `refund` opens for it |
 | `GET /v1/escrow/handle/{platform}/{handle}?before=&limit=` | What a handle holds, token by token, and its holder; `/v1/escrow/node/{node}` by node |
 | `GET /v1/escrow/unclaimed?token=0x…&before=&limit=` | Every slot still holding something, bound or not: token by token, descending, the largest amount first within each |
-| `GET /v1/stats` | Users (wallets that linked, sent through the escrow or claimed) and new users across every chain, a wallet counted once, in total. Per chain, in total: users, links and live handles per platform, registration fees, escrow deposits, forwards, claims and refunds, and onboarding claims (deposits to a handle nobody held, claimed after its holder linked). Token movements are listed per token for the chain's own coin and every token DefiLlama prices with confidence, and together under `other` for every other token, with a count only. Fees are listed per receiver for the `STATS_FEE_RECEIVERS`, and together under `other` for every other receiver, with a count and an amount: every fee is paid in the chain's own coin, and a bind may name any receiver. Amounts are token units as decimal strings; a priced token also carries its symbol, decimals, the amount after decimals and its USD value, and each list its USD sum, all valued at the prices of `pricedAt`. `total.payments` sums deposits and forwards across chains in USD and counts those in unpriced tokens. Each USD figure truncates to the cent on its own, so a sum can differ from its parts by a cent or two. It reads the rollups' totals, never the journal or the days, and asks the price source for each chain's coin, the tokens priced before and the 40 most moved others: its work grows with chains, platforms, the tokens the escrow saw and named receivers, and with the live handles, not with events or days. One computation is served for `STATS_TTL`, stopped by the database after `STATS_DEADLINE`; `computedAt` says when it was taken. It answers one row per chain and platform, named receiver, named token and flow, and one `other` per chain for fees and per chain and flow |
-| `GET /v1/stats/days?chain=&before=&limit=` | The same counts per UTC day, newest first, for a chart: users and new users across every chain, or with `chain` that chain's day by day activity, tokens named and valued as in the `/v1/stats` answer being served, at its `pricedAt`. A day with nothing recorded is absent. `limit` defaults to 30, at most 366; `next` is the `before` of the next page. Read per request from the rollups, one index seek per day and key, with its own `computedAt`: a page answers at most `limit` days, each with one row per platform, named receiver, named token and flow, and one `other` for fees and per flow; across chains, two numbers per day. The day's events are `/v1/history/chain/{chain}?day=` |
+| `GET /v1/escrow/totals/{address}` | Unclaimed totals per chain and token, unpaged: `claimable`, what `claim` pays the address now, and `awaiting`, what binding its handles on that chain makes claimable, each the sum of the matching list, and on the coin `referrals`, the referral shares the escrow holds inside each. Only each chain's own coin and the tokens `/v1/stats` prices are summed, so a spam token anyone can deposit cannot grow the answer or the read; the paged lists show every token. Each `amount` (a decimal string, which may pass a `uint256`) carries `value` and `usd` when priced, the token its `symbol` and `decimals`, each chain its USD sums and the answer theirs across chains, at the `pricedAt` the escrow lists name. A chain or token where nothing is held is absent; the coin comes first |
+| `GET /v1/stats` | Users (wallets that linked, sent through the escrow or claimed, but no chain's referral splitter, whose share deposits and forwards still count as such) and new users across every chain, a wallet counted once, in total. Per chain, in total: users, links and live handles per platform, registration fees, escrow deposits, forwards, claims and refunds, and onboarding claims (deposits to a handle nobody held, claimed after its holder linked). Token movements are listed per token for the chain's own coin and every token DefiLlama prices with confidence, and together under `other` for every other token, with a count only. Fees are listed per receiver for the `STATS_FEE_RECEIVERS`, and together under `other` for every other receiver, with a count and an amount: every fee is paid in the chain's own coin, and a bind may name any receiver. Amounts are token units as decimal strings; a priced token also carries its symbol, decimals, the amount after decimals and its USD value, and each list its USD sum, all valued at the prices of `pricedAt`. `total.payments` sums deposits and forwards across chains in USD and counts those in unpriced tokens. Each USD figure truncates to the cent on its own, so a sum can differ from its parts by a cent or two. It reads the rollups' totals, never the journal or the days, and asks the price source for each chain's coin, the tokens priced before and the 40 most moved others: its work grows with chains, platforms, the tokens the escrow saw and named receivers, and with the live handles, not with events or days. One computation is served for `STATS_TTL`, stopped by the database after `STATS_DEADLINE`; `computedAt` says when it was taken. After a failed computation, requests answer 503 `stats_backing_off` at once for `STATS_DEADLINE`, and the first one after that computes again. It answers one row per chain and platform, named receiver, named token and flow, and one `other` per chain for fees and per chain and flow |
+| `GET /v1/stats/days?chain=&before=&limit=` | The same counts per UTC day, newest first, for a chart: users and new users across every chain, or with `chain` that chain's day by day activity, tokens named and valued as in the `/v1/stats` answer being served, at its `pricedAt`. It needs that answer, so for `STATS_DEADLINE` after a failed computation it answers 503 `stats_backing_off` too. A day with nothing recorded is absent. `limit` defaults to 30, at most 366; `next` is the `before` of the next page. Read per request from the rollups, one index seek per day and key, with its own `computedAt`: a page answers at most `limit` days, each with one row per platform, named receiver, named token and flow, and one `other` for fees and per flow; across chains, two numbers per day. The day's events are `/v1/history/chain/{chain}?day=` |
 | `GET /v1/referral/code/{code}` | The handle a referral code names: `platform`, `handleNode`, `primaryHandle` (its text, only where a holder published it as its name) and the `chains` it is bound on now. A code is the base58 of a bound node's first 8 to 32 bytes; it names the one node bound on any chain that those bytes start, retired or not. While two are, it names neither: 409 `code_ambiguous` |
 | `GET /v1/referral/node/{node}/code` | The same for a bound node, with the shortest `code` that names it: 8 bytes, or more where another bound node shares them |
-| `GET /v1/status` | Every chain the store holds: chain id, contract, escrow, last indexed block, chain head, lag, when the indexer last reported and how long that report is still good, last window error, the Proof Verifier the contract is wired to; and the read-model version |
+| `GET /v1/referrals/address/{address}?before=&limit=` | Every bind on any chain that named a handle the address holds as its referrer, newest first: the bind's `txHash`, the `referrer` handle on the platform its node is bound on, with the text any chain disclosed, read from the lowest chain id, the `binder` and its published `binderHandle` on that chain, the `fee` and the referrer's `share` (decimal strings), the `outcome` (`paid`, `self_referral`, `refused`), and for a paid share its `delivery`: `forwarded` to the holder, or `held` in the escrow for the handle's claim, then `claimed` by its holder |
+| `GET /v1/status` | Every chain the store holds: chain id, contract, escrow, referral splitter, last indexed block, chain head, lag, when the indexer last reported and how long that report is still good, last window error, the Proof Verifier the contract is wired to, and `bindFee`: what a bind through the referral splitter pays, exactly, from its last `FeeSet` (a decimal string); and the read-model version |
 | `GET /health` | Liveness |
 
 Every read spans every chain the store holds, and every result carries its
@@ -127,6 +131,17 @@ at all. Each entry carries the event in `event`, tagged by `kind`
 handle it concerns. Amounts and rounds are `uint256` decimal strings; the
 chain's own coin is the EIP-7528 token `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`.
 Anybody can deposit a token they wrote, so show the tokens you recognize.
+
+Every escrow amount (claimable, awaiting, refundable, a handle's and the
+unclaimed list) of a token `/v1/stats` prices also carries its `symbol`,
+`decimals`, `value` (the amount after decimals, a decimal string) and `usd`,
+at the prices of the `/v1/stats` answer being served; the answer's
+`pricedAt` is that answer's `pricedAt`. Any other token answers raw units
+alone. The price source is asked at most once per `STATS_TTL`, by the
+`/v1/stats` computation every request shares: the request that finds the
+answer stale runs it, each call to the source bounded by 5 s, and requests
+meanwhile wait for it. When the computation fails the amounts answer
+unpriced with no `pricedAt`, at once for `STATS_DEADLINE` after the failure.
 
 A `deposit` names a handle by its node alone: the store knows no platform
 for it (`platformId` is absent) until a bind, a `HandleRevealed`, a
@@ -150,7 +165,7 @@ transfer to text no account can bind keeps its deposit but not its text.
 Search lists disclosed handles only. A binding nothing disclosed still
 resolves by text or by node, without text in the answer.
 
-`{platform}` is a short key (`x`, `github`, `google`) or a 0x-hex 32-byte
+`{platform}` is a short key (`x`, `github`, `google`, `telegram`) or a 0x-hex 32-byte
 platform id. A text route takes non-empty UTF-8 text and hashes it with
 `libid-identity`, so it needs a platform this build knows: an unknown id is
 `invalid_platform`, and the node routes answer for any platform and any
@@ -163,7 +178,9 @@ is stable and machine-readable; the prose is for humans and may be reworded.
 Resolution 404s distinguish `handle_not_bound` (on a known platform, whether
 or not anything was ever bound on it), `handle_retired`, `id_not_bound` and
 `handle_impossible` (text no circuit hashes); a referral code is `code_not_issued` (404) or
-`code_ambiguous` (409); `not_synced` is the 503 before the first window;
+`code_ambiguous` (409); `not_synced` is the 503 before the first window,
+and `stats_backing_off` the 503 for `STATS_DEADLINE` after a failed
+`/v1/stats` computation;
 bad input is `invalid_platform`, `invalid_address`, `invalid_node`,
 `invalid_chain`, `invalid_cursor`, `invalid_argument`, or, for a path or query
 string that does not parse at all, `invalid_path` and `invalid_query`;
@@ -303,10 +320,11 @@ chain checked something rather than that something returned bytes.
 
 **Addresses without a name.** A Google address is bound as proved, and its
 alphabet is wider than a label's: `_` and `+` are both legal in an address and
-neither can appear in an ENS label. No substitution is available — unlike X,
-where `_` maps to `-` because X forbids `-`, a Google address may hold both, so
-the map would not be reversible, and an irreversible map on a payment path is
-worse than no name. Such accounts are reachable by address, not by name.
+neither can appear in an ENS label. No substitution is available — unlike X and
+Telegram, where `_` maps to `-` because neither issues `-`, a Google address
+may hold both, so the map would not be reversible, and an irreversible map on
+a payment path is worse than no name. Such accounts are reachable by address,
+not by name.
 
 ## Read model
 
@@ -377,12 +395,16 @@ One process holds a per-chain Postgres advisory lock while it may write; a
 second instance (a rolling-deploy overlap) blocks on it instead of
 interleaving.
 
-Bump `SHAPE_VERSION` (in `db.rs`) when the written shape changes: the next
-start clears that chain's rows — co-tenant chains untouched — and replays it
-from the deployment block. The re-index is the migration. The stored version
+Bump `SHAPE_VERSION` (in `db.rs`) when what the indexer writes changes but
+the tables do not, such as a fold rule or a new value in an existing column:
+the next start clears that chain's rows — co-tenant chains untouched — and
+replays it from the deployment block. A change to the tables is a change to
+migration `001`, which needs no bump: it starts a new database (see
+**Database** under Deploying). The stored version
 also lists every `KnownPlatform`, so a build that learns a platform replays
 too, and keeps that platform's disclosed text. Changing
-`IDENTITY_REGISTRY_ADDRESS` or `HANDLE_ESCROW_ADDRESS` triggers the same
+`IDENTITY_REGISTRY_ADDRESS`, `HANDLE_ESCROW_ADDRESS` or
+`REFERRAL_SPLITTER_ADDRESS` triggers the same
 per-chain replay, because the old contract's bindings are not the new
 contract's bindings.
 
@@ -401,7 +423,10 @@ without pushing so packaging cannot rot:
 `HandleEscrow` of the libid-contracts release `Cargo.toml` pins, from the
 registry's deployment block or from `START_BLOCK`. It refuses a registry
 whose `nodeKeyed()` does not answer true, and a database whose applied
-migrations differ from its own. To reuse such a database, stop every process
+migrations differ from its own. The whole schema is one migration,
+`crates/usernames-core/migrations/001_schema.sql`: a release that changes it
+edits `001` and runs on a new empty database, where every chain replays from
+its deployment block. To reuse a refused database instead, stop every process
 on it and run `DROP SCHEMA names CASCADE; DROP TABLE _sqlx_migrations;`
 first; that keeps `pg_trgm`, which a least-privilege role cannot create.
 

@@ -4,7 +4,8 @@ SELECT e.chain_id, e.block_number, e.log_index, e.block_time,
        e.client_identifier, e.receiver, e.token, e.sender, e.claimer,
        e.recipient, e.round::text AS round, e.amount::text AS amount,
        e.released::text AS released, e.received::text AS received,
-       e.refundable_at,
+       e.refundable_at, e.referrer_node, e.referrer_platform,
+       e.share::text AS share, e.outcome,
        v.platform_id AS node_platform_id, v.handle
 FROM names.events e
 LEFT JOIN names.handle_nodes v

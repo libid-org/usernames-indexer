@@ -1,5 +1,5 @@
 -- Rows in the shape production holds them, for the index-plan test in
--- db.rs, on the chain every probe names: 5000 per table over 1000 addresses
+-- tests/plans/main.rs, on the chain every probe names: 5000 per table over 1000 addresses
 -- and three platforms, the probes' platform among them and the probes'
 -- address, node and handle nowhere; the escrow's slots also on four more
 -- chains. The journal holds a bind and a fee per handle beside the 5000
@@ -15,7 +15,7 @@
 -- sessions still read and write them.
 LOCK TABLE names.handles, names.ids, names.published, names.events,
            names.address_events, names.handle_nodes,
-           names.escrow_held, names.escrow_refundable,
+           names.escrow_held, names.escrow_refundable, names.referrals,
            names.stats_counts, names.stats_totals, names.stats_wallet_days,
            names.stats_firsts
     IN SHARE UPDATE EXCLUSIVE MODE;
@@ -93,11 +93,64 @@ SELECT substring(sha256(('address' || i % 1000)::bytea) FROM 1 FOR 20), 1,
        sha256(('node' || i)::bytea),
        substring(sha256(('token' || i % 5)::bytea) FROM 1 FOR 20), i, i
 FROM generate_series(1, 5000) i;
+-- 5000 referrals over the 1000 nodes the first 1000 handles hold, paid,
+-- forwarded or held in the node's round 0, and unpaid.
+INSERT INTO names.referrals
+    (chain_id, block_number, log_index, block_time, referrer_node, binder,
+     platform_id, handle_node, fee, share, outcome, delivery, token, round)
+SELECT 1, i, 3, i, sha256(('node' || i % 1000)::bytea),
+       substring(sha256(('address' || (i + 7) % 1000)::bytea) FROM 1 FOR 20),
+       sha256(('platform' || i % 3)::bytea), sha256(('node' || i)::bytea),
+       10000, 3000,
+       CASE WHEN i % 4 = 0 THEN 'refused' ELSE 'paid' END,
+       CASE i % 4 WHEN 0 THEN NULL WHEN 1 THEN 'held' ELSE 'forwarded' END,
+       CASE WHEN i % 4 <> 0
+            THEN substring(sha256(('token' || i % 5)::bytea) FROM 1 FOR 20) END,
+       CASE WHEN i % 4 = 1 THEN 0 END
+FROM generate_series(1, 5000) i;
+-- A holder of many handles, 0x4e..4e: the first 1000 nodes, on chains 2 and
+-- 3, where nobody else holds them. Their referrals and their slots on chains
+-- 4 and 5 are its; a read over its handles that pairs them up grows with the
+-- square of their count.
+INSERT INTO names.handles
+    (chain_id, handle_node, platform_id, owner,
+     observed_at, ceremony_version, id_node)
+SELECT chain, sha256(('node' || i)::bytea),
+       CASE i % 3 WHEN 0 THEN decode(repeat('01', 32), 'hex')
+                  ELSE sha256(('platform' || i % 3)::bytea) END,
+       decode(repeat('4e', 20), 'hex'), 1, 1, sha256(('id' || i)::bytea)
+FROM generate_series(1, 1000) i, generate_series(2, 3) chain;
+-- A holder of one handle on chain 1, 0x7a..7a, whose node holds 5000 spam
+-- tokens, which anyone can deposit, beside the coin: a total that walked its slots would read them all.
+INSERT INTO names.handles
+    (chain_id, handle_node, platform_id, owner,
+     observed_at, ceremony_version, id_node)
+VALUES (1, sha256('spam node'::bytea), decode(repeat('01', 32), 'hex'),
+        decode(repeat('7a', 20), 'hex'), 1, 1, sha256('spam id'::bytea));
+INSERT INTO names.escrow_held (chain_id, handle_node, token, held, round)
+SELECT 1, sha256('spam node'::bytea),
+       CASE i WHEN 0 THEN decode(repeat('ee', 20), 'hex')
+              ELSE substring(sha256(('spam' || i)::bytea) FROM 1 FOR 20) END,
+       1 + i, 0
+FROM generate_series(0, 5000) i;
+-- The same node refers heavily: 10000 coin shares, half held in its round
+-- 0 and half claimed, so a total that walked its referrals would read them
+-- all.
+INSERT INTO names.referrals
+    (chain_id, block_number, log_index, block_time, referrer_node, binder,
+     platform_id, handle_node, fee, share, outcome, delivery, token, round)
+SELECT 1, 10000 + i, 3, 10000 + i, sha256('spam node'::bytea),
+       substring(sha256(('binder' || i)::bytea) FROM 1 FOR 20),
+       decode(repeat('01', 32), 'hex'), sha256(('bound' || i)::bytea),
+       10000, 3000, 'paid',
+       CASE WHEN i % 2 = 0 THEN 'held' ELSE 'claimed' END,
+       decode(repeat('ee', 20), 'hex'), 0
+FROM generate_series(1, 10000) i;
 -- Vacuum moves a GIN index's pending entries into it; the rows above wait there.
 SELECT gin_clean_pending_list('names.handle_nodes_handle_trgm_idx');
 ANALYZE names.handles, names.ids, names.published, names.events,
         names.address_events, names.handle_nodes,
-        names.escrow_held, names.escrow_refundable;
+        names.escrow_held, names.escrow_refundable, names.referrals;
 -- The five chains, for the reads that seek per chain.
 INSERT INTO names.chains (chain_id, writer)
 SELECT chain, 1 FROM generate_series(1, 5) chain

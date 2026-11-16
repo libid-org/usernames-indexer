@@ -59,15 +59,16 @@ use usernames_core::{
         Store,
     },
     ens,
+    nodes::KnownPlatform,
 };
 
 use usernames_fixtures::{
     database_url,
     resolve_call,
     Labels,
-    LockWaits,
     Reads,
     Seed,
+    Sessions,
 };
 
 /// This suite's own chain, so it does not collide with the others.
@@ -329,6 +330,56 @@ async fn a_bound_handle_resolves_and_the_signature_verifies() {
     let call = resolve_call(
         &["alice", "x"].wire_name(),
         &["alice", "x"].addr_call(0x8000_0000 | CHAIN as u64),
+    );
+    let (status, body) = router.ask(RESOLVER, &call).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.verify(&call), Some(owner));
+    gateway.done();
+}
+
+/// A Telegram handle is named the way an X handle is, `_` as `-`, and its
+/// name answers the Telegram binding alone.
+#[tokio::test]
+async fn a_telegram_handle_with_an_underscore_resolves() {
+    let gateway = Gateway::open(&[CHAIN], 32).await;
+    let router = gateway.router();
+    let owner = Address::from([0xbe; 20]);
+    gateway
+        .store
+        .bind_on(KnownPlatform::Telegram, "alice_bob", owner)
+        .await;
+    let coin = 0x8000_0000 | CHAIN as u64;
+
+    let telegram = ["alice-bob", "telegram"];
+    let call = resolve_call(&telegram.wire_name(), &telegram.addr_call(coin));
+    let (status, body) = router.ask(RESOLVER, &call).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.verify(&call), Some(owner));
+
+    let x = ["alice-bob", "x"];
+    let call = resolve_call(&x.wire_name(), &x.addr_call(coin));
+    let (status, body) = router.ask(RESOLVER, &call).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.verify(&call), None);
+    gateway.done();
+}
+
+/// A leading `_` becomes a leading `-`, which an ENS label may hold, so such a
+/// handle has a name on Telegram as on X.
+#[tokio::test]
+async fn a_telegram_handle_with_a_leading_underscore_resolves() {
+    let gateway = Gateway::open(&[CHAIN], 32).await;
+    let router = gateway.router();
+    let owner = Address::from([0xbe; 20]);
+    gateway
+        .store
+        .bind_on(KnownPlatform::Telegram, "_alice", owner)
+        .await;
+
+    let telegram = ["-alice", "telegram"];
+    let call = resolve_call(
+        &telegram.wire_name(),
+        &telegram.addr_call(0x8000_0000 | CHAIN as u64),
     );
     let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -682,18 +733,14 @@ async fn a_replay_while_the_gateway_reads_is_refused() {
     // The gateway reads on sessions of its own name, so the wait below is
     // its wait and no other session's.
     const GATEWAY: &str = "gateway under test";
-    let gateway_pool = PgPool::connect_with(
-        (*gateway.pool.connect_options())
-            .clone()
-            .application_name(GATEWAY),
-    )
-    .await
-    .expect("the gateway's pool");
+    let gateway_pool = gateway.pool.named(GATEWAY).await;
     gateway.config.store = db::Store::new(gateway_pool);
     let router = gateway.router();
     // The replay holds the handles, and commits once the gateway waits on
     // them.
-    let mut replay = gateway.pool.begin().await.expect("a transaction");
+    const REPLAY: &str = "replay holding the handles";
+    let replaying = gateway.pool.named(REPLAY).await;
+    let mut replay = replaying.begin().await.expect("a transaction");
     sqlx::query(include_str!("sql/lock_handles.sql"))
         .execute(&mut *replay)
         .await
@@ -706,7 +753,7 @@ async fn a_replay_while_the_gateway_reads_is_refused() {
         let (router, call) = (router.clone(), call.clone());
         async move { router.ask(RESOLVER, &call).await }
     });
-    gateway.pool.waits_on_a_lock(GATEWAY).await;
+    gateway.pool.waits_on(GATEWAY, REPLAY).await;
     sqlx::query(include_str!("sql/replay_chain.sql"))
         .bind(CHAIN)
         .execute(&mut *replay)

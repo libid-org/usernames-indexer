@@ -34,9 +34,9 @@ RUN mkdir -p crates/usernames-core/src crates/usernames-fixtures/src bin/usernam
     && rm -rf crates/usernames-core/src crates/usernames-fixtures/src bin/usernames-indexer/src bin/usernames-api/src
 
 # ── Layer 2: the real build ──────────────────────────────────────────────────
-# The migrations are embedded at compile time (sqlx::migrate!), so they are
-# part of the source set, not a runtime asset, and they belong to the core
-# crate that calls the macro.
+# The migrations (sqlx::migrate!) and the statements under sql/ (include_str!)
+# are embedded at compile time, so they are part of the source set, not a
+# runtime asset.
 COPY crates/usernames-core/src crates/usernames-core/src
 COPY crates/usernames-core/migrations crates/usernames-core/migrations
 COPY crates/usernames-core/sql crates/usernames-core/sql

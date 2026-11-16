@@ -16,9 +16,11 @@ pub(crate) const FOLD_PAGE: i64 = 10_000;
 
 /// A row's place in a chain's journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, sqlx::FromRow)]
-pub(crate) struct JournalPosition {
-    pub(crate) block_number: i64,
-    pub(crate) log_index: i64,
+pub struct JournalPosition {
+    /// Its block.
+    pub block_number: i64,
+    /// Its log index in the block.
+    pub log_index: i64,
 }
 
 impl JournalPosition {
@@ -36,7 +38,7 @@ impl JournalPosition {
 }
 
 /// Which journal rows a fold reads.
-pub(crate) enum Fold<'a> {
+pub enum Fold<'a> {
     /// The rows a window added, by block and log index, pairwise.
     Window {
         /// Their blocks.
@@ -46,14 +48,16 @@ pub(crate) enum Fold<'a> {
     },
     /// A chain's rows after one position, through another.
     Page {
+        /// The position the page starts after.
         after: JournalPosition,
+        /// The last position it reads.
         through: JournalPosition,
     },
 }
 
 impl Fold<'_> {
     /// The fold's statement: its head, what the rows count, and the fold.
-    pub(crate) fn statement(&self) -> String {
+    pub fn statement(&self) -> String {
         let head = match self {
             Fold::Window { .. } => sql::STATS_FOLD_WINDOW,
             Fold::Page { .. } => sql::STATS_FOLD_PAGE,

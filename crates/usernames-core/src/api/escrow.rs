@@ -16,8 +16,10 @@ use super::{
         EscrowAmount,
         HandleAmounts,
         HandleRef,
+        TokenValue,
         Unclaimed,
     },
+    prices::Quotes,
     ApiError,
     ApiPath,
     ApiQuery,
@@ -32,9 +34,10 @@ use crate::db::{
 };
 
 impl EscrowAmount {
-    /// The amount a stored slot holds. The books are this build's own
-    /// writing, so a value that is not a `uint256` is an internal error.
-    fn of(row: EscrowSlotRow) -> Result<Self, ApiError> {
+    /// The amount a stored slot holds, valued at `quotes`. The books are
+    /// this build's own writing, so a value that is not a `uint256` is an
+    /// internal error.
+    fn of(row: EscrowSlotRow, quotes: &Quotes) -> Result<Self, ApiError> {
         let (Some(amount), Some(round)) = (row.amount(), row.round()) else {
             return Err(ApiError::internal(format_args!(
                 "escrow slot {}/{}/{}: amount {:?} round {:?}",
@@ -47,6 +50,7 @@ impl EscrowAmount {
             token: row.token,
             amount,
             round,
+            priced: TokenValue::of(amount.to(), quotes.of(row.chain_id, row.token)),
             handle: HandleRef::of(row.platform_id, row.handle_node, row.handle),
         })
     }
@@ -54,9 +58,9 @@ impl EscrowAmount {
 
 impl Contribution {
     /// A stored contribution, under the rule of [`EscrowAmount::of`].
-    fn of(row: ContributionRow) -> Result<Self, ApiError> {
+    fn of(row: ContributionRow, quotes: &Quotes) -> Result<Self, ApiError> {
         Ok(Self {
-            amount: EscrowAmount::of(row.slot)?,
+            amount: EscrowAmount::of(row.slot, quotes)?,
             refundable_at: row.refundable_at,
         })
     }
@@ -73,13 +77,35 @@ pub(crate) async fn claimable(
     let page = params.page()?;
     state.synced(page.chain).await?;
 
-    let (amounts, next) = state
-        .store
-        .claimable(address, page)
-        .await?
-        .served(EscrowAmount::of)?;
+    let (rows, quotes) =
+        tokio::join!(state.store.claimable(address, page), state.quotes());
+    let (amounts, next) = rows?.served(|row| EscrowAmount::of(row, &quotes))?;
     Ok(Json(AddressAmounts {
         address,
+        priced_at: quotes.taken_at(),
+        amounts,
+        next,
+    }))
+}
+
+/// `GET /v1/escrow/awaiting/{address}?chain=&before=&limit=` — what is held
+/// for the handles the address holds, on the chains where nobody holds them:
+/// binding the handle there makes it claimable.
+pub(crate) async fn awaiting(
+    State(state): State<AppState>,
+    ApiPath(address): ApiPath<String>,
+    ApiQuery(params): ApiQuery<PageParams>,
+) -> Result<Json<AddressAmounts>, ApiError> {
+    let address = address.parse_address()?;
+    let page = params.page()?;
+    state.synced(page.chain).await?;
+
+    let (rows, quotes) =
+        tokio::join!(state.store.awaiting(address, page), state.quotes());
+    let (amounts, next) = rows?.served(|row| EscrowAmount::of(row, &quotes))?;
+    Ok(Json(AddressAmounts {
+        address,
+        priced_at: quotes.taken_at(),
         amounts,
         next,
     }))
@@ -97,13 +123,12 @@ pub(crate) async fn refundable(
     let page = params.page()?;
     state.synced(page.chain).await?;
 
-    let (amounts, next) = state
-        .store
-        .refundable(address, page)
-        .await?
-        .served(Contribution::of)?;
+    let (rows, quotes) =
+        tokio::join!(state.store.refundable(address, page), state.quotes());
+    let (amounts, next) = rows?.served(|row| Contribution::of(row, &quotes))?;
     Ok(Json(AddressContributions {
         address,
+        priced_at: quotes.taken_at(),
         amounts,
         next,
     }))
@@ -141,13 +166,20 @@ impl AppState {
         let chain = page.chain;
         self.synced(chain).await?;
 
-        let (slots, known) = tokio::try_join!(
-            self.store.escrowed_for(key.node(), page),
-            self.store.handle_node(key.node(), chain),
-        )?;
-        let (amounts, next) = slots.served(EscrowAmount::of)?;
+        let (read, quotes) = tokio::join!(
+            async {
+                tokio::try_join!(
+                    self.store.escrowed_for(key.node(), page),
+                    self.store.handle_node(key.node(), chain),
+                )
+            },
+            self.quotes(),
+        );
+        let (slots, known) = read?;
+        let (amounts, next) = slots.served(|row| EscrowAmount::of(row, &quotes))?;
         Ok(Json(HandleAmounts {
             handle: HandleRef::asked(&key, known),
+            priced_at: quotes.taken_at(),
             amounts,
             next,
         }))
@@ -178,13 +210,11 @@ pub(crate) async fn unclaimed(
     let page = params.page.page()?;
     state.synced(page.chain).await?;
 
-    let (amounts, next) = state
-        .store
-        .unclaimed(token, page)
-        .await?
-        .served(EscrowAmount::of)?;
+    let (rows, quotes) = tokio::join!(state.store.unclaimed(token, page), state.quotes());
+    let (amounts, next) = rows?.served(|row| EscrowAmount::of(row, &quotes))?;
     Ok(Json(Unclaimed {
         token,
+        priced_at: quotes.taken_at(),
         limit: page.limit,
         amounts,
         next,

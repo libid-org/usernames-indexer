@@ -2,6 +2,8 @@
 //! caller names, each row saying which chain it came from; and the ENS
 //! gateway's answer on one chain.
 
+use std::fmt;
+
 use alloy::primitives::{
     Address,
     B256,
@@ -274,13 +276,33 @@ impl Scoped for Statement {
     }
 }
 
+/// The text any chain disclosed for a handle node, read from the lowest chain
+/// id that disclosed it and joined laterally as `alias.handle`: the [`sql::HANDLE_TEXT`] fragment, written
+/// for one read's node column.
+pub struct HandleText {
+    /// The column holding the node.
+    pub(crate) node: &'static str,
+    /// The name the read gives the join.
+    pub(crate) alias: &'static str,
+}
+
+impl fmt::Display for HandleText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(
+            &sql::HANDLE_TEXT
+                .replace("{node}", self.node)
+                .replace("{alias}", self.alias),
+        )
+    }
+}
+
 /// The chains a read covers: the one named, or every chain the store holds.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Scope(pub(crate) Option<i64>);
+pub struct Scope(pub Option<i64>);
 
 impl Scope {
     /// `resolveHandle`'s rows, behind `prefix`.
-    pub(crate) fn handle_lookup(self, prefix: &str, handle_node: B256) -> Statement {
+    pub fn handle_lookup(self, prefix: &str, handle_node: B256) -> Statement {
         let mut statement = QueryBuilder::new(format!(
             "{prefix}{} WHERE h.handle_node = ",
             sql::HANDLE_PROJECTION
@@ -293,7 +315,7 @@ impl Scope {
 
     /// What the store knows of a handle node, behind `prefix`: the row with
     /// text first, since a node's text is one string on every chain.
-    pub(crate) fn handle_node_lookup(self, prefix: &str, handle_node: B256) -> Statement {
+    pub fn handle_node_lookup(self, prefix: &str, handle_node: B256) -> Statement {
         let mut statement = QueryBuilder::new(format!(
             "{prefix}{} WHERE v.handle_node = ",
             sql::HANDLE_NODE_PROJECTION
@@ -305,7 +327,7 @@ impl Scope {
     }
 
     /// `resolveId`'s rows, behind `prefix`.
-    pub(crate) fn id_lookup(self, prefix: &str, id_node: B256) -> Statement {
+    pub fn id_lookup(self, prefix: &str, id_node: B256) -> Statement {
         let mut statement = QueryBuilder::new(format!(
             "{prefix}{} WHERE i.id_node = ",
             sql::IDENTITY_PROJECTION
@@ -317,7 +339,7 @@ impl Scope {
     }
 
     /// The identities `owner` proved, behind `prefix`.
-    pub(crate) fn identities_lookup(self, prefix: &str, owner: Address) -> Statement {
+    pub fn identities_lookup(self, prefix: &str, owner: Address) -> Statement {
         let mut statement = QueryBuilder::new(format!(
             "{prefix}{} WHERE i.owner = ",
             sql::IDENTITY_PROJECTION
@@ -351,7 +373,7 @@ pub struct Search<'a> {
 impl Search<'_> {
     /// The search's statement behind `prefix`, ranked by the text when there
     /// is one and by handle and chain otherwise.
-    pub(crate) fn lookup(&self, prefix: &str) -> Statement {
+    pub fn lookup(&self, prefix: &str) -> Statement {
         let mut statement =
             QueryBuilder::new(format!("{prefix}{}", sql::SEARCH_PROJECTION));
         statement.scoped("h.chain_id", self.chain);

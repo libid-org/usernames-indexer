@@ -16,11 +16,11 @@ use anyhow::Context;
 
 /// The newest block an endpoint reports.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Head {
+pub struct Head {
     /// Its number.
-    pub(crate) number: u64,
+    pub number: u64,
     /// Its timestamp, in unix seconds.
-    time: u64,
+    pub time: u64,
 }
 
 /// A head older than a report may live: the endpoint answers, but its node
@@ -32,11 +32,11 @@ pub(crate) struct Head {
 #[error(
     "the head, block {number} stamped at unix time {time}, is older than STALE_AFTER: the endpoint is not following its chain, or the chain makes no blocks"
 )]
-pub(crate) struct StaleHead {
+pub struct StaleHead {
     /// The head's number.
-    number: u64,
+    pub number: u64,
     /// The head's timestamp, in unix seconds.
-    time: u64,
+    pub time: u64,
 }
 
 impl Head {
@@ -54,7 +54,7 @@ impl Head {
     }
 
     /// This head, unless its timestamp is more than `limit` old.
-    pub(crate) fn recent(self, limit: Duration) -> Result<Self, StaleHead> {
+    pub fn recent(self, limit: Duration) -> Result<Self, StaleHead> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
@@ -66,36 +66,5 @@ impl Head {
         } else {
             Ok(self)
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn made(ago: Duration) -> Head {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("after the epoch");
-        Head {
-            number: 7,
-            time: now.saturating_sub(ago).as_secs(),
-        }
-    }
-
-    #[test]
-    fn a_head_within_the_limit_is_recent() {
-        let limit = Duration::from_secs(80);
-        assert_eq!(
-            made(Duration::from_secs(12)).recent(limit).unwrap().number,
-            7
-        );
-    }
-
-    #[test]
-    fn a_head_past_the_limit_is_stale() {
-        let head = made(Duration::from_secs(300));
-        let stale = head.recent(Duration::from_secs(80)).unwrap_err();
-        assert_eq!((stale.number, stale.time), (7, head.time));
     }
 }

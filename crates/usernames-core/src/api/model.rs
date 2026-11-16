@@ -23,10 +23,16 @@ use serde::{
 };
 use serde_with::{
     serde_as,
+    DeserializeFromStr,
     DisplayFromStr,
+    SerializeDisplay,
 };
 
-pub use crate::events::Role;
+pub use crate::events::{
+    Delivery,
+    Outcome,
+    Role,
+};
 use crate::{
     events::{
         EscrowEvent,
@@ -66,6 +72,9 @@ pub enum ErrorCode {
     HandleImpossible,
     /// No indexer has committed a first window for the chains in scope.
     NotSynced,
+    /// The stats computation failed moments ago; it runs again once
+    /// `STATS_DEADLINE` has passed, so a retry shortly after can succeed.
+    StatsBackingOff,
     /// Neither a known platform key nor a 0x-hex platform id.
     InvalidPlatform,
     /// Not an address.
@@ -98,6 +107,7 @@ pub struct ErrorDetail {
 }
 
 /// One chain the store holds, as its indexer last left it.
+#[serde_as]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChainStatus {
@@ -111,6 +121,9 @@ pub struct ChainStatus {
     /// The HandleEscrow the escrow rows were indexed from, when the indexer
     /// watches one.
     pub escrow: Option<Address>,
+    /// The ReferralSplitter the referrals were indexed from, when the
+    /// indexer watches one.
+    pub referral_splitter: Option<Address>,
     /// The cursor: the last block whose window committed.
     pub last_indexed_block: Option<u64>,
     /// The chain head as the indexer last saw it.
@@ -136,6 +149,11 @@ pub struct ChainStatus {
     /// `ProofVerifierConfigured`: the one contract that checks every claim
     /// on this chain. Absent until the indexer has seen one.
     pub proof_verifier: Option<Address>,
+    /// What a bind through `referral_splitter` pays, in wei as a decimal
+    /// string, from its last `FeeSet`: exactly this, with a referral or
+    /// without. Absent until the indexer has seen one.
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    pub bind_fee: Option<U256>,
 }
 
 /// `GET /v1/status`: every chain the store holds. Empty on a database no
@@ -428,6 +446,23 @@ pub enum HistoryEvent {
         #[serde_as(as = "DisplayFromStr")]
         received: U256,
     },
+    Referred {
+        referrer_node: B256,
+        binder: Address,
+        session_id: B256,
+        referrer_platform_id: B256,
+        platform_id: B256,
+        handle_node: B256,
+        #[serde_as(as = "DisplayFromStr")]
+        fee: U256,
+        #[serde_as(as = "DisplayFromStr")]
+        share: U256,
+        outcome: Outcome,
+    },
+    BindFeeSet {
+        #[serde_as(as = "DisplayFromStr")]
+        fee: U256,
+    },
 }
 
 /// The wire's copy of a journaled event: the same fields, so a client reads
@@ -568,6 +603,28 @@ impl From<NamesEvent> for HistoryEvent {
                 released,
                 received,
             },
+            NamesEvent::Referred {
+                referrer_node,
+                binder,
+                session_id,
+                referrer_platform_id,
+                platform_id,
+                handle_node,
+                fee,
+                share,
+                outcome,
+            } => Self::Referred {
+                referrer_node,
+                binder,
+                session_id,
+                referrer_platform_id,
+                platform_id,
+                handle_node,
+                fee,
+                share,
+                outcome,
+            },
+            NamesEvent::BindFeeSet { fee } => Self::BindFeeSet { fee },
         }
     }
 }
@@ -592,8 +649,27 @@ pub struct HistoryEntry {
     pub roles: Vec<Role>,
     /// The handle the event concerns, when it concerns one.
     pub handle: Option<HandleRef>,
+    /// The referral the event belongs to: on a `referred` entry, and on a
+    /// deposit or forward the chain's referral splitter sent.
+    pub referral: Option<ReferralLink>,
     /// The event itself.
     pub event: HistoryEvent,
+}
+
+/// A bind that named a referrer: the one a `referred` entry logs, or the one
+/// whose referrer share a splitter deposit or forward paid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReferralLink {
+    /// The handle the bind named as its referrer, with the text any chain
+    /// disclosed, read from the lowest chain id.
+    pub referrer: HandleRef,
+    /// The wallet that bound.
+    pub binder: Address,
+    /// The handle the binder publishes on that chain now, if any.
+    pub binder_handle: Option<String>,
+    /// The `Referred` log's index in the entry's block.
+    pub log_index: i64,
 }
 
 /// `GET /v1/history/address/{address}`: what an address took part in.
@@ -662,16 +738,27 @@ pub struct EscrowAmount {
     /// The slot's current round: how many claims it has seen.
     #[serde_as(as = "DisplayFromStr")]
     pub round: U256,
+    /// The token's name and `amount`'s worth, at the answer's `pricedAt`;
+    /// absent when unpriced.
+    #[serde(flatten)]
+    pub priced: TokenValue,
 }
 
 /// `GET /v1/escrow/claimable/{address}`: held for the handles the address
-/// holds now, which `claim` pays it.
+/// holds now, which `claim` pays it. `GET /v1/escrow/awaiting/{address}`:
+/// held for those handles' nodes on chains where nobody holds them, which
+/// binding the handle there makes claimable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddressAmounts {
     /// The address asked about.
     pub address: Address,
-    /// By chain, node and token, descending.
+    /// Unix seconds of the oldest price the amounts are valued at: the
+    /// `/v1/stats` answer being served prices the tokens, and its
+    /// `pricedAt` is this; absent when it uses none.
+    pub priced_at: Option<i64>,
+    /// Claimable by chain, node and token; awaiting by node, chain and
+    /// token; descending.
     pub amounts: Vec<EscrowAmount>,
     /// Pass as `before` for the next page; absent on the last one.
     pub next: Option<String>,
@@ -698,6 +785,10 @@ pub struct Contribution {
 pub struct AddressContributions {
     /// The address asked about.
     pub address: Address,
+    /// Unix seconds of the oldest price the amounts are valued at: the
+    /// `/v1/stats` answer being served prices the tokens, and its
+    /// `pricedAt` is this; absent when it uses none.
+    pub priced_at: Option<i64>,
     /// By chain, node and token, descending.
     pub amounts: Vec<Contribution>,
     /// Pass as `before` for the next page; absent on the last one.
@@ -711,6 +802,10 @@ pub struct AddressContributions {
 pub struct HandleAmounts {
     /// The handle, as far as the store knows it.
     pub handle: HandleRef,
+    /// Unix seconds of the oldest price the amounts are valued at: the
+    /// `/v1/stats` answer being served prices the tokens, and its
+    /// `pricedAt` is this; absent when it uses none.
+    pub priced_at: Option<i64>,
     /// One per chain and token still holding something, descending.
     pub amounts: Vec<EscrowAmount>,
     /// Pass as `before` for the next page; absent on the last one.
@@ -723,6 +818,10 @@ pub struct HandleAmounts {
 pub struct Unclaimed {
     /// The token the list was narrowed to, when one was asked for.
     pub token: Option<Address>,
+    /// Unix seconds of the oldest price the amounts are valued at: the
+    /// `/v1/stats` answer being served prices the tokens, and its
+    /// `pricedAt` is this; absent when it uses none.
+    pub priced_at: Option<i64>,
     /// The page size served.
     pub limit: i64,
     /// Token by token, descending, the largest amount first within each.
@@ -731,12 +830,141 @@ pub struct Unclaimed {
     pub next: Option<String>,
 }
 
+/// `GET /v1/escrow/totals/{address}`: what the address may claim now and
+/// what binding its handles elsewhere makes claimable, per chain and token,
+/// in each chain's coin and the tokens `/v1/stats` prices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddressTotals {
+    /// The address asked about.
+    pub address: Address,
+    /// Unix seconds of the oldest price the totals are valued at: the
+    /// `/v1/stats` answer being served prices the tokens, and its
+    /// `pricedAt` is this; absent when it uses none.
+    pub priced_at: Option<i64>,
+    /// By chain id; a chain where nothing is held is absent.
+    pub chains: Vec<ChainTotals>,
+    /// Across chains, the priced tokens only.
+    pub usd: Totals<Usd>,
+}
+
+/// One chain's totals for an address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChainTotals {
+    /// The chain the escrow holds them on.
+    pub chain_id: i64,
+    /// The chain's coin first, then by token; a token where nothing is held
+    /// is absent.
+    pub tokens: Vec<TokenTotals>,
+    /// The priced tokens only.
+    pub usd: Totals<Usd>,
+}
+
+/// One token's totals on one chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenTotals {
+    /// The token; EIP-7528 `0xEeee…EEeE` is the chain's own coin.
+    pub token: Address,
+    /// The token's symbol, as its creator wrote it: text to show, never
+    /// markup. Absent when unpriced or not plain.
+    pub symbol: Option<String>,
+    /// The token's decimals; absent when unpriced.
+    pub decimals: Option<u8>,
+    /// Held for the handles the address holds on this chain, which `claim`
+    /// pays it.
+    pub claimable: Amount,
+    /// Held for its handles' nodes on this chain, where nobody holds them:
+    /// binding the handle here makes it claimable.
+    pub awaiting: Amount,
+    /// Of `claimable` and `awaiting`, the referral shares the escrow holds
+    /// for the address's handles. On the chain's coin, the token every
+    /// share is paid in; absent on any other token.
+    pub referrals: Option<Totals<Amount>>,
+}
+
+/// A sum of token units, and its worth when the token is priced.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Amount {
+    /// Token units, as a decimal string. A sum, so it may pass a `uint256`.
+    #[serde_as(as = "DisplayFromStr")]
+    pub amount: U512,
+    /// `amount` after the decimals, as a decimal string; absent when
+    /// unpriced.
+    pub value: Option<String>,
+    /// `amount` in USD, truncated to the cent; absent when unpriced.
+    pub usd: Option<Usd>,
+}
+
+/// What may be claimed now, and what waits for a bind.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Totals<T> {
+    /// Claimable now.
+    pub claimable: T,
+    /// Awaiting a bind.
+    pub awaiting: T,
+}
+
+/// One bind that named a handle as its referrer, and what became of the
+/// referrer's share of the fee.
+#[serde_as]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Referral {
+    /// The chain the bind happened on.
+    pub chain_id: i64,
+    /// Its block.
+    pub block_number: i64,
+    /// Its log's index in the block.
+    pub log_index: i64,
+    /// The transaction that bound.
+    pub tx_hash: B256,
+    /// Its block's time, in unix seconds.
+    pub block_time: i64,
+    /// The address's handle the bind named as its referrer.
+    pub referrer: HandleRef,
+    /// The wallet that bound.
+    pub binder: Address,
+    /// The handle the binder publishes on that chain now, if any.
+    pub binder_handle: Option<String>,
+    /// The bind's fee, in the chain's coin units, as a decimal string.
+    #[serde_as(as = "DisplayFromStr")]
+    pub fee: U256,
+    /// The referrer's share of it, likewise.
+    #[serde_as(as = "DisplayFromStr")]
+    pub share: U256,
+    /// What became of the share.
+    pub outcome: Outcome,
+    /// For a paid share, where it went: forwarded to the handle's holder on
+    /// that chain, or held for its claim, then claimed.
+    pub delivery: Option<Delivery>,
+}
+
+/// `GET /v1/referrals/address/{address}`: the binds that named a handle the
+/// address holds as their referrer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddressReferrals {
+    /// The address asked about.
+    pub address: Address,
+    /// Newest first: by block time, then chain, block and log index.
+    pub referrals: Vec<Referral>,
+    /// Pass as `before` for the next page; absent on the last one.
+    pub next: Option<String>,
+}
+
 /// `GET /v1/stats`: what the chains this store holds recorded, chain by
 /// chain, and the users across them, since the index's first block; the
-/// same day by day is `GET /v1/stats/days`. Every address counts. Amounts
-/// are token units; a priced token also carries them after its decimals and
-/// in USD, valued at the prices of [`Stats::priced_at`]. Tokens are named
-/// only when they are the chain's own coin, EIP-7528
+/// same day by day is `GET /v1/stats/days`. Every address counts but a
+/// referral splitter any chain watches, which sends every paid share: its
+/// deposits and forwards count, its wallet does not. Amounts are token
+/// units; a priced token also carries them after its decimals and in USD,
+/// valued at the prices of [`Stats::priced_at`]. Tokens are named only
+/// when they are the chain's own coin, EIP-7528
 /// `0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE`, or a token the price source
 /// prices with confidence; anybody can write a token, so every other one is
 /// counted under `other`, without an amount.
@@ -774,19 +1002,28 @@ pub struct AllChains {
 }
 
 /// Payments across every chain, in USD where their token is priced.
-#[serde_as]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Payments {
     /// The priced tokens' payments, in USD.
-    #[serde_as(as = "DisplayFromStr")]
     pub usd: Usd,
     /// Payments in tokens without a price, not in `usd`.
     pub unpriced: i64,
 }
 
 /// A USD amount in cents, served with two places: `1234.05`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    SerializeDisplay,
+    DeserializeFromStr,
+)]
 pub struct Usd(U512);
 
 /// Why a USD amount does not parse.
@@ -993,7 +1230,6 @@ pub struct EscrowActivity {
 }
 
 /// Movements of one kind: per named token, and every other token together.
-#[serde_as]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenFlows {
@@ -1001,7 +1237,6 @@ pub struct TokenFlows {
     pub tokens: Vec<TokenFlow>,
     /// The priced tokens' movements in USD, each truncated to the cent
     /// before the sum.
-    #[serde_as(as = "DisplayFromStr")]
     pub usd: Usd,
     /// Every other token's movements, together; absent when there were
     /// none.
@@ -1024,16 +1259,24 @@ pub struct TokenFlow {
     /// Distinct wallets that made them, as the list that holds this one
     /// names them.
     pub wallets: i64,
+    /// The token's name and `amount`'s worth; absent when unpriced.
+    #[serde(flatten)]
+    pub priced: TokenValue,
+}
+
+/// A token amount as the price source values it: every field is absent
+/// when the token is unpriced.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenValue {
     /// The token's symbol, as its creator wrote it: text to show, never
-    /// markup. Absent when unpriced or not plain.
+    /// markup. Absent when not plain.
     pub symbol: Option<String>,
-    /// The token's decimals; absent when unpriced.
+    /// The token's decimals.
     pub decimals: Option<u8>,
-    /// `amount` after the decimals, as a decimal string; absent when
-    /// unpriced.
+    /// The amount after the decimals, as a decimal string.
     pub value: Option<String>,
-    /// `amount` in USD, truncated to the cent; absent when unpriced.
-    #[serde_as(as = "Option<DisplayFromStr>")]
+    /// The amount in USD, truncated to the cent.
     pub usd: Option<Usd>,
 }
 

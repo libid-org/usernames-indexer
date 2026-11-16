@@ -62,7 +62,7 @@ impl<C> Page<C> {
 }
 
 /// A cursor's text: its parts, `-`-separated, each parsed by its type.
-pub(crate) struct CursorText<'a>(Split<'a, char>);
+pub struct CursorText<'a>(Split<'a, char>);
 
 impl<'a> CursorText<'a> {
     pub(crate) fn of(raw: &'a str) -> Self {

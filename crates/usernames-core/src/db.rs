@@ -44,17 +44,21 @@ use crate::{
     nodes::KnownPlatform,
 };
 
-mod escrow;
-mod fold;
-mod history;
-mod journal;
-mod page;
-#[cfg(test)]
-mod plan_tests;
-mod reads;
-mod referral;
-mod sql;
-mod stats;
+pub mod awaiting;
+pub mod escrow;
+pub mod fold;
+pub mod history;
+pub mod journal;
+pub mod links;
+pub mod page;
+pub mod reads;
+pub mod referral;
+pub mod referrals;
+// Each statement is named by its file under `sql/`, which says what it does.
+#[allow(missing_docs)]
+pub mod sql;
+pub mod stats;
+pub mod totals;
 
 use self::fold::{
     Fold,
@@ -80,6 +84,10 @@ pub use self::{
         EventColumns,
         JournalError,
     },
+    links::{
+        ReferralLinkRow,
+        ReferralLinks,
+    },
     page::{
         Cursor,
         InvalidCursor,
@@ -98,6 +106,7 @@ pub use self::{
         CodeOwner,
         ReferrerRow,
     },
+    referrals::ReferralRow,
     stats::{
         Candidate,
         CountRow,
@@ -114,15 +123,17 @@ pub use self::{
         UnknownMeasure,
         CANDIDATES_PER_CHAIN,
     },
+    totals::TotalsRow,
 };
 
-/// Bump on any change to the shape of what the indexer writes.
-const SHAPE_VERSION: &str = "1";
+/// Bump when what the indexer writes changes but the tables do not; a change
+/// to the tables is a change to migration 001, which starts a new database.
+pub const SHAPE_VERSION: &str = "2";
 
 /// The version a chain's rows are stamped with: the written shape, and every
 /// platform whose disclosed text this build checks and keeps. A mismatch at
 /// startup clears the chain's rows and cursor, so the next loop replays the
-/// chain from the deployment block — the re-index IS the migration — and a
+/// chain from the deployment block, on the same database, and a
 /// build that learns a platform stores the text earlier windows dropped.
 pub static INDEXER_VERSION: LazyLock<String> = LazyLock::new(|| {
     let platforms: Vec<&str> = KnownPlatform::ALL.iter().map(|p| p.key()).collect();
@@ -142,6 +153,8 @@ pub struct ChainState {
     pub contract: Option<Address>,
     /// The escrow its escrow rows come from, when it watches one.
     pub escrow: Option<Address>,
+    /// The referral splitter its referrals come from, when it watches one.
+    pub referral_splitter: Option<Address>,
     /// The registry's deployment block, once detected.
     pub deploy_block: Option<i64>,
     /// The last block a window committed through.
@@ -158,6 +171,9 @@ pub struct ChainState {
     pub window_error: Option<String>,
     /// The Proof Verifier the registry was last pointed at.
     pub proof_verifier: Option<Address>,
+    /// What a bind through the referral splitter pays, as its last `FeeSet`
+    /// set it, in decimal.
+    pub bind_fee: Option<String>,
 }
 
 impl ChainState {
@@ -171,6 +187,12 @@ impl ChainState {
     pub fn deploy_block_of(&self, contract: Address) -> Option<i64> {
         self.deploy_block
             .filter(|_| self.contract == Some(contract))
+    }
+
+    /// What a bind through the referral splitter pays, once a `FeeSet` was
+    /// indexed.
+    pub fn bind_fee(&self) -> Option<U256> {
+        self.bind_fee.as_deref().and_then(|fee| fee.parse().ok())
     }
 
     /// Where the index stands.
@@ -276,7 +298,10 @@ impl Store {
     }
 }
 
-/// The migrations this crate owns, embedded at compile time.
+/// The migrations this crate owns, embedded at compile time: the whole schema
+/// in `001`. A database that applied other migrations, or another `001`, is
+/// refused, so a schema change starts a new database where every chain
+/// replays.
 ///
 /// Exposed because `sqlx::migrate!` resolves its path against the crate that
 /// invokes it, so anything outside this crate — a test in either binary —
@@ -290,13 +315,13 @@ pub enum ConnectError {
     /// The database refused the connection.
     #[error("connecting to the database")]
     Connect(#[from] sqlx::Error),
-    /// The schema could not be brought current, or was migrated by another
-    /// release.
+    /// The schema could not be built, or the database applied other
+    /// migrations: point `DATABASE_URL` at a new empty database.
     #[error("migrating the schema")]
     Migrate(#[from] MigrateError),
 }
 
-/// Connect and bring the schema current.
+/// Connect and build the schema on an empty database, or check the one there.
 pub async fn connect_and_migrate(database_url: &str) -> Result<PgPool, ConnectError> {
     let pool = PgPool::connect(database_url).await?;
     MIGRATOR.run(&pool).await?;
@@ -306,8 +331,8 @@ pub async fn connect_and_migrate(database_url: &str) -> Result<PgPool, ConnectEr
 /// Connect without touching the schema.
 ///
 /// For the read API: the indexer owns the schema and migrates it, so the API's
-/// role needs no right to change it. A reader that starts before the schema
-/// exists fails its first query and gets restarted.
+/// role needs no right to change it. On a reader started before the schema
+/// exists, queries fail until the indexer has migrated it.
 pub async fn connect(database_url: &str) -> Result<PgPool, sqlx::Error> {
     PgPool::connect(database_url).await
 }
@@ -341,6 +366,15 @@ pub enum ApplyError {
         what: &'static str,
         /// The value itself.
         value: u64,
+    },
+    /// A paid referral without the splitter's deposit before it in its
+    /// transaction, which the splitter never logs.
+    #[error("a paid referral at block {block}, log {log_index}, without its deposit")]
+    UnpairedReferral {
+        /// The referral's block.
+        block: i64,
+        /// The referral's log index.
+        log_index: i64,
     },
 }
 
@@ -551,6 +585,7 @@ impl ChainStore {
         if known.indexer_version.as_deref() == Some(INDEXER_VERSION.as_str())
             && known.contract == Some(contracts.registry)
             && known.escrow == contracts.escrow
+            && known.referral_splitter == contracts.referral_splitter
         {
             let writer = sqlx::query_scalar(sql::CLAIM_CHAIN)
                 .bind(self.chain_id)
@@ -571,6 +606,7 @@ impl ChainStore {
             return Ok(ChainWriter {
                 store: self.clone(),
                 writer,
+                splitter: contracts.referral_splitter,
             });
         }
         tracing::warn!(
@@ -581,6 +617,8 @@ impl ChainStore {
             contract_to = %contracts.registry,
             escrow_from = ?known.escrow,
             escrow_to = ?contracts.escrow,
+            referral_splitter_from = ?known.referral_splitter,
+            referral_splitter_to = ?contracts.referral_splitter,
             "read-model shape or a watched contract changed; clearing this chain for a full replay"
         );
         sqlx::query(sql::CLEAR_CHAIN)
@@ -601,6 +639,7 @@ impl ChainStore {
             .bind(contracts.registry)
             .bind(contracts.escrow)
             .bind(deploy_block)
+            .bind(contracts.referral_splitter)
             .fetch_one(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -612,6 +651,7 @@ impl ChainStore {
         Ok(ChainWriter {
             store: self.clone(),
             writer,
+            splitter: contracts.referral_splitter,
         })
     }
 
@@ -804,6 +844,9 @@ pub struct ChainWriter {
     store: ChainStore,
     /// The generation `prepare` wrote into the chain's row.
     writer: i64,
+    /// The referral splitter the chain's row names, whose escrow deposits
+    /// pair with its referrals.
+    splitter: Option<Address>,
 }
 
 impl ChainWriter {
@@ -931,18 +974,21 @@ impl ChainWriter {
             tx,
             chain_id,
             bind: None,
+            splitter: self.splitter,
+            deposit: None,
             fresh_blocks: Vec::new(),
             fresh_logs: Vec::new(),
         })
     }
 }
 
-fn as_i64(value: u64, what: &'static str) -> Result<i64, ApplyError> {
+/// `value` as the `i64` Postgres stores, refused when it does not fit.
+pub fn as_i64(value: u64, what: &'static str) -> Result<i64, ApplyError> {
     i64::try_from(value).map_err(|_| ApplyError::OutOfRange { what, value })
 }
 
 /// Where a log sat, in the columns the store keeps it in.
-pub(crate) struct Position {
+pub struct Position {
     pub(crate) block: i64,
     pub(crate) log_index: i64,
     pub(crate) tx_hash: B256,
@@ -971,6 +1017,11 @@ pub struct Window {
     /// `CeremonyBound` and `BindFeePaid` follow its `IdentityBound` in the
     /// same transaction, and a window holds whole blocks.
     bind: Option<history::Bind>,
+    /// The referral splitter, whose escrow deposits pair with its referrals.
+    splitter: Option<Address>,
+    /// The splitter's last deposit this window took up, for the paid
+    /// `Referred` after it in the same transaction.
+    deposit: Option<referrals::Deposit>,
     /// The blocks and log indexes of the journal rows this window added,
     /// pairwise: what its commit folds into the stats rollups.
     fresh_blocks: Vec<i64>,
@@ -1015,6 +1066,7 @@ impl Window {
         // rows it is about to overwrite, and the journal row files the event
         // under the handle it concerns.
         let involvement = self.involvement(event, &at).await?;
+        let deposit = self.deposit(event, &at)?;
 
         let row = EventColumns::of(event, involvement.handle_node)?;
         if !row.journal(&mut self.tx, chain_id, &at).await? {
@@ -1108,12 +1160,25 @@ impl Window {
                     .await?;
             }
 
+            NamesEvent::BindFeeSet { fee } => {
+                sqlx::query(sql::SET_BIND_FEE)
+                    .bind(chain_id)
+                    .bind(fee.to_string())
+                    .execute(&mut *self.tx)
+                    .await?;
+            }
+
             // No projection of their own: nothing resolves by a ceremony's
             // client or a bind's fee, and the journal and histories hold both.
             NamesEvent::CeremonyBound { .. } | NamesEvent::BindFeePaid { .. } => {}
 
             NamesEvent::Escrow(escrow) => {
                 self.book_escrow(escrow, &at).await?;
+                self.settle_referrals(escrow).await?;
+            }
+
+            NamesEvent::Referred { .. } => {
+                self.book_referral(event, deposit, &at).await?;
             }
         }
 
@@ -1130,23 +1195,19 @@ impl Window {
 // written for goes unused. The builders take a prefix so the plan test can
 // put `EXPLAIN` in front of the exact statement the store runs.
 
-type Statement = QueryBuilder<'static, Postgres>;
+/// A statement a lookup builds for its request shape.
+pub type Statement = QueryBuilder<'static, Postgres>;
 
-#[cfg(test)]
-mod version_tests {
-    use super::*;
-
-    /// A build that learns a platform stamps another version, so the chains
-    /// it opens replay and keep that platform's disclosed text.
-    #[test]
-    fn the_version_names_every_platform_the_build_knows() {
-        let (shape, platforms) = INDEXER_VERSION
-            .split_once('+')
-            .expect("the shape, then the platforms");
-        assert_eq!(shape, SHAPE_VERSION);
-        let named: Vec<&str> = platforms.split(',').collect();
-        for platform in KnownPlatform::ALL {
-            assert!(named.contains(&platform.key()), "{platform:?}");
-        }
+/// A read over `holder`'s handles, opened with `h`: each node it holds once,
+/// from the first chain it holds it on, up to `upto` when given. Picking the
+/// node once here keeps the read linear in the holder's handles; a join over
+/// them pairs each with every other.
+pub fn holder_nodes(prefix: &str, holder: Address, upto: Option<B256>) -> Statement {
+    let mut statement = QueryBuilder::new(format!("{prefix}{}", sql::HOLDER_NODES));
+    statement.push_bind(holder);
+    if let Some(node) = upto {
+        statement.push(" AND handle_node <= ").push_bind(node);
     }
+    statement.push(" ORDER BY handle_node, chain_id)\n");
+    statement
 }
