@@ -1,31 +1,53 @@
 //! The plan test: every read over the big tables, planned over
 //! production-shaped volume.
 
-use alloy::hex;
-use sqlx::PgConnection;
+mod awaiting;
+mod escrow;
+mod history;
+mod links;
+mod referral;
+mod referrals;
+mod stats;
+mod totals;
+
+use alloy::{
+    hex,
+    primitives::{
+        Address,
+        B256,
+    },
+};
+use sqlx::{
+    PgConnection,
+    PgPool,
+};
 use usernames_fixtures::database_url;
 
-use super::{
-    awaiting::plans::AwaitingPlans,
-    escrow::plans::EscrowPlans,
-    history::plans::HistoryPlans,
-    links::plans::ReferralLinkPlans,
+use usernames_core::db::{
     reads::{
         Scope,
         Search,
     },
-    referral::plans::ReferralPlans,
-    referrals::plans::ReferralHistoryPlans,
-    stats::plans::StatsPlans,
-    totals::plans::TotalsPlans,
+    schema::SCHEMA,
     *,
+};
+
+use crate::{
+    awaiting::AwaitingPlans,
+    escrow::EscrowPlans,
+    history::HistoryPlans,
+    links::ReferralLinkPlans,
+    referral::ReferralPlans,
+    referrals::ReferralHistoryPlans,
+    stats::StatsPlans,
+    totals::TotalsPlans,
 };
 
 /// Rows in the shape production holds them, on the chain every probe
 /// names; the file says how they are shaped.
-const VOLUME: &str = include_str!("../../sql/plan_volume.sql");
+const VOLUME: &str = include_str!("../sql/plan_volume.sql");
 /// The same tables, cleared of what earlier loads left behind.
-const VACUUM: &str = include_str!("../../sql/plan_vacuum.sql");
+const VACUUM: &str = include_str!("../sql/plan_vacuum.sql");
 
 /// One statement's plan, and the indexes it must seek: `a|b` where either
 /// seeks exactly, `None` where only the row count decides between them.

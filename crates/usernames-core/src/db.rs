@@ -40,29 +40,65 @@ use crate::{
     nodes::KnownPlatform,
 };
 
+#[cfg(not(feature = "test-helpers"))]
 mod awaiting;
+#[cfg(feature = "test-helpers")]
+pub mod awaiting;
+#[cfg(not(feature = "test-helpers"))]
 mod escrow;
+#[cfg(feature = "test-helpers")]
+pub mod escrow;
+#[cfg(not(feature = "test-helpers"))]
 mod fold;
+#[cfg(feature = "test-helpers")]
+pub mod fold;
+#[cfg(not(feature = "test-helpers"))]
 mod history;
+#[cfg(feature = "test-helpers")]
+pub mod history;
+#[cfg(not(feature = "test-helpers"))]
 mod journal;
+#[cfg(feature = "test-helpers")]
+pub mod journal;
+#[cfg(not(feature = "test-helpers"))]
 mod links;
+#[cfg(feature = "test-helpers")]
+pub mod links;
+#[cfg(not(feature = "test-helpers"))]
 mod page;
-#[cfg(test)]
-mod plan_tests;
+#[cfg(feature = "test-helpers")]
+pub mod page;
+#[cfg(not(feature = "test-helpers"))]
 mod reads;
+#[cfg(feature = "test-helpers")]
+pub mod reads;
+#[cfg(not(feature = "test-helpers"))]
 mod referral;
+#[cfg(feature = "test-helpers")]
+pub mod referral;
+#[cfg(not(feature = "test-helpers"))]
 mod referrals;
+#[cfg(feature = "test-helpers")]
+pub mod referrals;
+#[cfg(not(feature = "test-helpers"))]
 mod schema;
+#[cfg(feature = "test-helpers")]
+pub mod schema;
+#[cfg(not(feature = "test-helpers"))]
 mod sql;
+// Each statement is named by its file under `sql/`, which says what it does.
+#[cfg(feature = "test-helpers")]
+#[allow(missing_docs)]
+pub mod sql;
+#[cfg(not(feature = "test-helpers"))]
 mod stats;
+#[cfg(feature = "test-helpers")]
+pub mod stats;
+#[cfg(not(feature = "test-helpers"))]
 mod totals;
+#[cfg(feature = "test-helpers")]
+pub mod totals;
 
-use self::fold::{
-    Fold,
-    JournalPosition,
-    Rollups,
-    FOLD_PAGE,
-};
 pub use self::{
     escrow::{
         ContributionRow,
@@ -104,10 +140,6 @@ pub use self::{
         ReferrerRow,
     },
     referrals::ReferralRow,
-    schema::{
-        Schema,
-        SCHEMA,
-    },
     stats::{
         Candidate,
         CountRow,
@@ -126,9 +158,19 @@ pub use self::{
     },
     totals::TotalsRow,
 };
+use self::{
+    fold::{
+        Fold,
+        JournalPosition,
+        Rollups,
+        FOLD_PAGE,
+    },
+    schema::SCHEMA,
+};
 
 /// Bump when what the indexer writes changes but the tables do not; a change
 /// to the tables is a change to the schema file, which starts a new database.
+#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 const SHAPE_VERSION: &str = "2";
 
 /// The version a chain's rows are stamped with: the written shape, and every
@@ -986,11 +1028,14 @@ impl ChainWriter {
     }
 }
 
+/// `value` as the `i64` Postgres stores, refused when it does not fit.
+#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 fn as_i64(value: u64, what: &'static str) -> Result<i64, ApplyError> {
     i64::try_from(value).map_err(|_| ApplyError::OutOfRange { what, value })
 }
 
 /// Where a log sat, in the columns the store keeps it in.
+#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 pub(crate) struct Position {
     pub(crate) block: i64,
     pub(crate) log_index: i64,
@@ -1198,12 +1243,15 @@ impl Window {
 // written for goes unused. The builders take a prefix so the plan test can
 // put `EXPLAIN` in front of the exact statement the store runs.
 
+/// A statement a lookup builds for its request shape.
+#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 type Statement = QueryBuilder<'static, Postgres>;
 
 /// A read over `holder`'s handles, opened with `h`: each node it holds once,
 /// from the first chain it holds it on, up to `upto` when given. Picking the
 /// node once here keeps the read linear in the holder's handles; a join over
 /// them pairs each with every other.
+#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 fn holder_nodes(prefix: &str, holder: Address, upto: Option<B256>) -> Statement {
     let mut statement = QueryBuilder::new(format!("{prefix}{}", sql::HOLDER_NODES));
     statement.push_bind(holder);
@@ -1212,23 +1260,4 @@ fn holder_nodes(prefix: &str, holder: Address, upto: Option<B256>) -> Statement 
     }
     statement.push(" ORDER BY handle_node, chain_id)\n");
     statement
-}
-
-#[cfg(test)]
-mod version_tests {
-    use super::*;
-
-    /// A build that learns a platform stamps another version, so the chains
-    /// it opens replay and keep that platform's disclosed text.
-    #[test]
-    fn the_version_names_every_platform_the_build_knows() {
-        let (shape, platforms) = INDEXER_VERSION
-            .split_once('+')
-            .expect("the shape, then the platforms");
-        assert_eq!(shape, SHAPE_VERSION);
-        let named: Vec<&str> = platforms.split(',').collect();
-        for platform in KnownPlatform::ALL {
-            assert!(named.contains(&platform.key()), "{platform:?}");
-        }
-    }
 }

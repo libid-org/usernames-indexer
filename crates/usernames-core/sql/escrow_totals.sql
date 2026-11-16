@@ -5,7 +5,7 @@
 -- escrow_awaiting_slots.sql list them; `referred_*`, the held referral
 -- shares inside each. Each node seeks each named key by
 -- the escrow's primary key, LIMIT 1 keeping it a seek, so tokens nobody
--- named cost nothing however many a junk deposit wrote.
+-- named cost nothing however many spam tokens anyone deposited.
 WITH n AS (
     SELECT DISTINCT handle_node
     FROM names.handles

@@ -87,7 +87,7 @@ impl Suite {
         let pool = PgPool::connect(&url)
             .await
             .expect("DATABASE_URL is set but connecting failed");
-        db::SCHEMA.build(&pool).await.expect("schema");
+        db::schema::SCHEMA.build(&pool).await.expect("schema");
         let store = ChainStore::new(pool.clone(), chain);
         store.forget().await;
         Self {

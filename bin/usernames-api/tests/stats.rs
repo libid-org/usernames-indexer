@@ -511,17 +511,17 @@ async fn a_freed_handle_onboards_its_next_holder() {
 #[tokio::test]
 async fn unpriced_tokens_count_together() {
     let suite = Suite::open(&SUITE, CHAIN).await;
-    let junk = |tokens: Range<u64>| -> Vec<NamesEvent> {
+    let spam = |tokens: Range<u64>| -> Vec<NamesEvent> {
         tokens
             .map(|i| Address::from_word(U256::from(i + 1).into()))
             .map(|token| NamesEvent::deposited("dave", token, SENDER, 1))
             .collect()
     };
-    let mut day_a = junk(0..500);
+    let mut day_a = spam(0..500);
     day_a.push(NamesEvent::deposited("dave", USDC, PAYER, 1_000));
     day_a.push(NamesEvent::deposited("dave", NATIVE, PAYER, ETHER));
     suite.apply_tx(IN_A, day_a).await;
-    suite.apply_tx(IN_B, junk(500..1_000)).await;
+    suite.apply_tx(IN_B, spam(500..1_000)).await;
 
     let api = suite.api();
     let chain = api.stats().await.chain(CHAIN);
