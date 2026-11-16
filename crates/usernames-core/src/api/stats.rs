@@ -672,7 +672,7 @@ mod tests {
     use super::*;
     use crate::db::{
         Store,
-        MIGRATOR,
+        SCHEMA,
     };
 
     fn stats(computed_at: i64) -> Stats {
@@ -801,7 +801,7 @@ mod tests {
     async fn a_computation_past_its_deadline_is_not_served() {
         let url = database_url();
         let pool = PgPool::connect(&url).await.expect("connect");
-        MIGRATOR.run(&pool).await.expect("migrations");
+        SCHEMA.build(&pool).await.expect("schema");
         let store = Store::new(pool.clone());
         let budget = Duration::from_secs(1);
         // Another session holds the users' rollup the totals read, so the

@@ -79,7 +79,7 @@ async fn indexes_a_real_chain_end_to_end() {
     let chain_id = CHAIN;
     let url = database_url();
 
-    let pool = db::connect_and_migrate(&url).await.expect("database");
+    let pool = db::connect_and_build(&url).await.expect("database");
     let store = ChainStore::new(pool.clone(), chain_id as i64);
     // A previous run of this test left rows under this chain id; the loop
     // must start from a clean slate to make block-number assertions exact.

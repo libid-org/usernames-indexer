@@ -81,7 +81,7 @@ impl Harness {
     /// A fresh `chain`, indexed.
     async fn open(chain: u64) -> Self {
         let url = database_url();
-        let pool = db::connect_and_migrate(&url).await.expect("database");
+        let pool = db::connect_and_build(&url).await.expect("database");
         ChainStore::new(pool.clone(), chain as i64).forget().await;
         let store = ChainStore::new(pool.clone(), chain as i64);
 

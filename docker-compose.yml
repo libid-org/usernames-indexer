@@ -63,8 +63,8 @@ services:
       postgres:
         condition: service_healthy
       # Ordering only: the API answers 503 until the indexer's first window
-      # lands, so it may start before there is anything to serve. What it must
-      # not do is start before the schema exists, which the indexer migrates.
+      # lands, so it may start before there is anything to serve. Started before
+      # the indexer built the schema, it exits and compose restarts it.
       indexer:
         condition: service_started
     restart: unless-stopped

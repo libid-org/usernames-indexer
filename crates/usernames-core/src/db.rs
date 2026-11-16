@@ -23,10 +23,6 @@ use alloy::primitives::{
 };
 use chrono::TimeDelta;
 use sqlx::{
-    migrate::{
-        MigrateError,
-        Migrator,
-    },
     Connection,
     PgPool,
     Postgres,
@@ -56,6 +52,7 @@ mod plan_tests;
 mod reads;
 mod referral;
 mod referrals;
+mod schema;
 mod sql;
 mod stats;
 mod totals;
@@ -107,6 +104,10 @@ pub use self::{
         ReferrerRow,
     },
     referrals::ReferralRow,
+    schema::{
+        Schema,
+        SCHEMA,
+    },
     stats::{
         Candidate,
         CountRow,
@@ -126,13 +127,14 @@ pub use self::{
     totals::TotalsRow,
 };
 
-/// Bump on any change to the shape of what the indexer writes.
+/// Bump when what the indexer writes changes but the tables do not; a change
+/// to the tables is a change to the schema file, which starts a new database.
 const SHAPE_VERSION: &str = "2";
 
 /// The version a chain's rows are stamped with: the written shape, and every
 /// platform whose disclosed text this build checks and keeps. A mismatch at
 /// startup clears the chain's rows and cursor, so the next loop replays the
-/// chain from the deployment block — the re-index IS the migration — and a
+/// chain from the deployment block, on the same database, and a
 /// build that learns a platform stores the text earlier windows dropped.
 pub static INDEXER_VERSION: LazyLock<String> = LazyLock::new(|| {
     let platforms: Vec<&str> = KnownPlatform::ALL.iter().map(|p| p.key()).collect();
@@ -297,40 +299,46 @@ impl Store {
     }
 }
 
-/// The migrations this crate owns, embedded at compile time.
-///
-/// Exposed because `sqlx::migrate!` resolves its path against the crate that
-/// invokes it, so anything outside this crate — a test in either binary —
-/// would have to spell a relative path back to here and would break the day
-/// the layout moves.
-pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
-
 /// Why the store could not be opened.
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
-    /// The database refused the connection.
+    /// The database refused the connection or a statement.
     #[error("connecting to the database")]
     Connect(#[from] sqlx::Error),
-    /// The schema could not be brought current, or was migrated by another
-    /// release.
-    #[error("migrating the schema")]
-    Migrate(#[from] MigrateError),
+    /// The database holds a schema another schema file built, or one that
+    /// keeps no fingerprint. A built database is never altered: a new schema
+    /// starts on a new empty database, where every chain replays.
+    #[error(
+        "the database holds the schema {found:?}, this build's is {built}: point \
+         DATABASE_URL at a new empty database, where the indexers replay every chain"
+    )]
+    Schema {
+        /// The fingerprint the database keeps, if any.
+        found: Option<B256>,
+        /// This build's.
+        built: B256,
+    },
+    /// The database holds no schema yet: an indexer builds it as it starts.
+    #[error("the database holds no schema yet: an indexer builds it as it starts")]
+    Unbuilt,
 }
 
-/// Connect and bring the schema current.
-pub async fn connect_and_migrate(database_url: &str) -> Result<PgPool, ConnectError> {
+/// Connect, and build [`SCHEMA`] on an empty database or check the one there.
+pub async fn connect_and_build(database_url: &str) -> Result<PgPool, ConnectError> {
     let pool = PgPool::connect(database_url).await?;
-    MIGRATOR.run(&pool).await?;
+    SCHEMA.build(&pool).await?;
     Ok(pool)
 }
 
-/// Connect without touching the schema.
+/// Connect, and check that the database holds [`SCHEMA`] without changing it.
 ///
-/// For the read API: the indexer owns the schema and migrates it, so the API's
-/// role needs no right to change it. A reader that starts before the schema
-/// exists fails its first query and gets restarted.
-pub async fn connect(database_url: &str) -> Result<PgPool, sqlx::Error> {
-    PgPool::connect(database_url).await
+/// For the read API: the indexer builds the schema, so the API's role needs no
+/// right to change it. A reader that starts before an indexer built it fails
+/// and gets restarted.
+pub async fn connect(database_url: &str) -> Result<PgPool, ConnectError> {
+    let pool = PgPool::connect(database_url).await?;
+    SCHEMA.check(&pool).await?;
+    Ok(pool)
 }
 
 /// Why applying an event failed. Distinct from [`sqlx::Error`] because not

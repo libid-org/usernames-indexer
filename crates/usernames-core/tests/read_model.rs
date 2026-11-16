@@ -95,7 +95,7 @@ impl Chains {
             .connect(&url)
             .await
             .expect("DATABASE_URL is set but connecting failed");
-        db::MIGRATOR.run(&pool).await.expect("migrations failed");
+        db::SCHEMA.build(&pool).await.expect("schema");
         for chain in [CHAIN, OTHER_CHAIN] {
             ChainStore::new(pool.clone(), chain).forget().await;
         }

@@ -37,16 +37,16 @@ cargo run -p usernames-indexer         # indexes the chain into the database
 cargo run -p usernames-api             # serves the API, in another shell
 ```
 
-Start the indexer first on a fresh database: it owns the schema and runs the
-migrations. The API only connects, and a reader that starts before the schema
-exists fails its first query rather than racing the migration.
+Start the indexer first on an empty database: it builds the schema from
+`crates/usernames-core/sql/schema.sql`. The API only connects and checks the
+schema; one that starts before an indexer built it exits, to be restarted.
 
 The compose database's DSN is
 `postgres://usernames:usernames_dev@127.0.0.1:55432/usernames` (already in
-`.env.example`). The migrations run `CREATE EXTENSION pg_trgm`, which needs a
-role allowed to create extensions — true for the compose database; on a
-managed instance with a least-privilege role, have an administrator run it
-once beforehand.
+`.env.example`). The schema runs `CREATE EXTENSION IF NOT EXISTS pg_trgm`,
+which needs a role allowed to create extensions — true for the compose
+database; on a managed instance with a least-privilege role, have an
+administrator run `CREATE EXTENSION pg_trgm` once beforehand.
 
 Configuration is flags or environment (a `.env` file is read first);
 durations are written the way humantime reads them: `5s`, `1500ms`, `2m`. Each
@@ -394,9 +394,12 @@ One process holds a per-chain Postgres advisory lock while it may write; a
 second instance (a rolling-deploy overlap) blocks on it instead of
 interleaving.
 
-Bump `SHAPE_VERSION` (in `db.rs`) when the written shape changes: the next
-start clears that chain's rows — co-tenant chains untouched — and replays it
-from the deployment block. The re-index is the migration. The stored version
+Bump `SHAPE_VERSION` (in `db.rs`) when what the indexer writes changes but
+the tables do not, such as a fold rule or a new value in an existing column:
+the next start clears that chain's rows — co-tenant chains untouched — and
+replays it from the deployment block. A change to the tables is a change to
+`schema.sql`, which needs no bump: it starts a new database (see
+**Database** under Deploying). The stored version
 also lists every `KnownPlatform`, so a build that learns a platform replays
 too, and keeps that platform's disclosed text. Changing
 `IDENTITY_REGISTRY_ADDRESS`, `HANDLE_ESCROW_ADDRESS` or
@@ -418,10 +421,13 @@ without pushing so packaging cannot rot:
 **Database.** The indexer indexes the node-keyed `IdentityRegistry` and
 `HandleEscrow` of the libid-contracts release `Cargo.toml` pins, from the
 registry's deployment block or from `START_BLOCK`. It refuses a registry
-whose `nodeKeyed()` does not answer true, and a database whose applied
-migrations differ from its own. To reuse such a database, stop every process
-on it and run `DROP SCHEMA names CASCADE; DROP TABLE _sqlx_migrations;`
-first; that keeps `pg_trgm`, which a least-privilege role cannot create.
+whose `nodeKeyed()` does not answer true. On an empty database it builds the
+schema in `crates/usernames-core/sql/schema.sql` and keeps the file's
+keccak256 in `names.schema`; indexers starting on it at once build it once.
+A built schema is never altered: the indexer and the API refuse a database
+whose fingerprint is not their build's, or that keeps none. A release that
+changes `schema.sql` runs on a new empty database, where every chain replays
+from its deployment block.
 
 Probes belong to the API: `GET /health` for liveness; for readiness gate on
 the status code of `GET /v1/status`, which is 200 whenever the database

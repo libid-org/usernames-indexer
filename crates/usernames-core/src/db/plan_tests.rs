@@ -374,7 +374,7 @@ impl StorePlans for PgConnection {
 async fn every_read_over_the_big_tables_seeks_its_index() {
     let url = database_url();
     let pool = PgPool::connect(&url).await.expect("connect");
-    MIGRATOR.run(&pool).await.expect("migrations");
+    SCHEMA.build(&pool).await.expect("schema");
     sqlx::raw_sql(VACUUM)
         .execute(&pool)
         .await

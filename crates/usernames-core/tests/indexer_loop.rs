@@ -102,7 +102,7 @@ impl Chain {
     async fn start(chain_id: u64) -> Self {
         let url = database_url();
 
-        let pool = db::connect_and_migrate(&url).await.expect("database");
+        let pool = db::connect_and_build(&url).await.expect("database");
         ChainStore::new(pool.clone(), chain_id as i64)
             .forget()
             .await;
