@@ -7,12 +7,17 @@ use alloy::{
     },
     rpc::types::Log,
 };
-use libid_contracts::bindings::referral::ReferralSplitter;
+use libid_contracts::bindings::{
+    escrow::HandleEscrow,
+    identity::IdentityRegistry,
+    referral::ReferralSplitter,
+};
 use usernames_core::events::NamesEvent;
 
 use alloy::{
     primitives::{
         self,
+        LogData,
         U256,
     },
     sol_types::SolEvent,
@@ -22,23 +27,22 @@ use usernames_core::chain::*;
 
 const SPLITTER: Address = Address::repeat_byte(0x5B);
 
-/// A mined `Referred` log, as `emitter` would emit it.
-fn referred_by(emitter: Address) -> Log {
+const REGISTRY: Address = Address::repeat_byte(0x11);
+const ESCROW: Address = Address::repeat_byte(0xE5);
+
+/// The three contracts, all watched.
+const CONTRACTS: Contracts = Contracts {
+    registry: REGISTRY,
+    escrow: Some(ESCROW),
+    referral_splitter: Some(SPLITTER),
+};
+
+/// A mined log of `data`, as `emitter` would emit it.
+fn mined(emitter: Address, data: LogData) -> Log {
     Log {
         inner: primitives::Log {
             address: emitter,
-            data: ReferralSplitter::Referred {
-                referrerNode: B256::repeat_byte(0x0A),
-                binder: Address::repeat_byte(0xB1),
-                sessionId: B256::ZERO,
-                referrerPlatformId: B256::ZERO,
-                platformId: B256::ZERO,
-                handleNode: B256::repeat_byte(0x0B),
-                fee: U256::from(10u64),
-                share: U256::from(3u64),
-                outcome: 0,
-            }
-            .encode_log_data(),
+            data,
         },
         block_number: Some(7),
         log_index: Some(3),
@@ -48,22 +52,33 @@ fn referred_by(emitter: Address) -> Log {
     }
 }
 
+/// A mined `Referred` log, as `emitter` would emit it.
+fn referred_by(emitter: Address) -> Log {
+    mined(
+        emitter,
+        ReferralSplitter::Referred {
+            referrerNode: B256::repeat_byte(0x0A),
+            binder: Address::repeat_byte(0xB1),
+            sessionId: B256::ZERO,
+            referrerPlatformId: B256::ZERO,
+            platformId: B256::ZERO,
+            handleNode: B256::repeat_byte(0x0B),
+            fee: U256::from(10u64),
+            share: U256::from(3u64),
+            outcome: 0,
+        }
+        .encode_log_data(),
+    )
+}
+
 /// A `Referred` counts only from the configured splitter: the same log
 /// from the registry, the escrow or any other address is skipped.
 #[test]
 fn a_referral_is_read_only_from_the_configured_splitter() {
-    let contracts = Contracts {
-        registry: Address::repeat_byte(0x11),
-        escrow: Some(Address::repeat_byte(0xE5)),
-        referral_splitter: Some(SPLITTER),
-    };
+    let contracts = CONTRACTS;
     let decoded = contracts.decode(&referred_by(SPLITTER)).unwrap();
     assert!(matches!(decoded, Some((NamesEvent::Referred { .. }, _))));
-    for other in [
-        contracts.registry,
-        Address::repeat_byte(0xE5),
-        Address::repeat_byte(0x5C),
-    ] {
+    for other in [contracts.registry, ESCROW, Address::repeat_byte(0x5C)] {
         assert!(contracts.decode(&referred_by(other)).unwrap().is_none());
     }
     let unwatched = Contracts {
@@ -71,4 +86,45 @@ fn a_referral_is_read_only_from_the_configured_splitter() {
         ..contracts
     };
     assert!(unwatched.decode(&referred_by(SPLITTER)).unwrap().is_none());
+}
+
+/// An event the emitter's ABI declares and the indexer does not index is
+/// named, from the contract that declares it only; a topic no watched
+/// contract declares is not.
+#[test]
+fn an_unindexed_event_is_named_by_the_contract_that_declares_it() {
+    let upgraded = IdentityRegistry::Upgraded {
+        implementation: Address::repeat_byte(0x1A),
+    }
+    .encode_log_data();
+    let initialized = HandleEscrow::Initialized { version: 1 }.encode_log_data();
+    let transferred = HandleEscrow::OwnershipTransferred {
+        previousOwner: Address::ZERO,
+        newOwner: Address::repeat_byte(0x0E),
+    }
+    .encode_log_data();
+    let share_set = ReferralSplitter::ShareSet { shareBps: 3000 }.encode_log_data();
+
+    assert_eq!(
+        CONTRACTS.declared(&mined(REGISTRY, upgraded.clone())),
+        Some("Upgraded")
+    );
+    assert_eq!(
+        CONTRACTS.declared(&mined(ESCROW, initialized)),
+        Some("Initialized")
+    );
+    assert_eq!(
+        CONTRACTS.declared(&mined(SPLITTER, transferred)),
+        Some("OwnershipTransferred")
+    );
+    assert_eq!(
+        CONTRACTS.declared(&mined(SPLITTER, share_set.clone())),
+        Some("ShareSet")
+    );
+
+    assert_eq!(CONTRACTS.declared(&mined(REGISTRY, share_set)), None);
+    assert_eq!(CONTRACTS.declared(&mined(SPLITTER, upgraded)), None);
+    let undeclared =
+        LogData::new_unchecked(vec![B256::repeat_byte(0x7E)], Default::default());
+    assert_eq!(CONTRACTS.declared(&mined(REGISTRY, undeclared)), None);
 }
