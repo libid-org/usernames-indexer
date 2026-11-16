@@ -886,7 +886,7 @@ pub struct TokenTotals {
 
 /// A sum of token units, and its worth when the token is priced.
 #[serde_as]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Amount {
     /// Token units, as a decimal string. A sum, so it may pass a `uint256`.
@@ -971,7 +971,8 @@ pub struct AddressReferrals {
 /// Fee receivers are named only when the deployment lists them
 /// (`STATS_FEE_RECEIVERS`); a bind may name any receiver, so every other
 /// one is counted under `other`, with its amount, since every fee is paid
-/// in the chain's own coin.
+/// in the chain's own coin. The fees collected are those paid to a listed
+/// receiver or to the chain's referral splitter, listed or not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Stats {
@@ -998,17 +999,33 @@ pub struct AllChains {
     pub users: i64,
     /// What senders paid through the escrow, deposits and forwards, on
     /// every chain.
-    pub payments: Payments,
+    pub payments: UsdTotal,
+    /// The registration fees collected and the referrers' shares of them,
+    /// on every chain.
+    pub fee_income: AllChainsFeeIncome,
 }
 
-/// Payments across every chain, in USD where their token is priced.
+/// Amounts across every chain, in USD where their token is priced.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Payments {
-    /// The priced tokens' payments, in USD.
+pub struct UsdTotal {
+    /// The priced amounts, in USD.
     pub usd: Usd,
-    /// Payments in tokens without a price, not in `usd`.
+    /// How many were in tokens without a price, not in `usd`.
     pub unpriced: i64,
+}
+
+/// The registration fees collected across every chain, and the referrers'
+/// shares of them: in USD alone, since each chain's coin is its own.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AllChainsFeeIncome {
+    /// Every chain's `feeIncome.collected`; `unpriced` counts the fees on
+    /// chains whose coin has no price.
+    pub collected: UsdTotal,
+    /// Every chain's `feeIncome.forwarded` and `feeIncome.escrowed`
+    /// together.
+    pub shared: UsdTotal,
 }
 
 /// A USD amount in cents, served with two places: `1234.05`.
@@ -1091,6 +1108,9 @@ pub struct ChainStats {
     pub handles: Vec<PlatformHandles>,
     /// Everything the chain recorded since the index's first block.
     pub total: Activity,
+    /// The escrowed referral shares still held for their node now:
+    /// `feeIncome.escrowed` less what their holders claimed.
+    pub awaiting_claim: FeeSum,
 }
 
 /// `GET /v1/stats/days`: one page of the daily series, across every chain
@@ -1146,6 +1166,37 @@ pub struct Activity {
     /// holder who bound it after the deposit: payments that brought their
     /// recipient in. The wallets are their claimers.
     pub onboarding_claims: TokenFlows,
+    /// The registration fees the deployment collected, and the referrers'
+    /// shares of them.
+    pub fee_income: FeeIncome,
+}
+
+/// The registration fees the deployment collected, and the referrers'
+/// shares of them, in the chain's own coin. What it kept is `collected`
+/// less both shares.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeeIncome {
+    /// Fees paid to a listed receiver or to the chain's referral splitter,
+    /// gross: the referrer's share included.
+    pub collected: FeeSum,
+    /// Paid shares the escrow forwarded to the referrer's holder at the
+    /// bind, on the bind's day.
+    pub forwarded: FeeSum,
+    /// Paid shares the escrow held for the referrer's node at the bind, on
+    /// the bind's day, claimed since or not.
+    pub escrowed: FeeSum,
+}
+
+/// A count of fees or shares, and their sum in the chain's own coin.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeeSum {
+    /// Fees or shares.
+    pub count: i64,
+    /// Their sum, valued at the coin's price when it has one.
+    #[serde(flatten)]
+    pub amount: Amount,
 }
 
 /// One UTC day of a chain's activity.

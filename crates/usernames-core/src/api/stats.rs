@@ -40,12 +40,15 @@ use super::{
         Activity,
         AllChains,
         AllChainsDay,
+        AllChainsFeeIncome,
+        Amount,
         ChainStats,
         DayActivity,
+        FeeIncome,
+        FeeSum,
         FeesPaid,
         OtherFees,
         OtherTokens,
-        Payments,
         PlatformHandles,
         PlatformLinks,
         RegistrationFees,
@@ -54,6 +57,7 @@ use super::{
         TokenFlow,
         TokenFlows,
         TokenValue,
+        UsdTotal,
     },
     params::{
         PageParams,
@@ -67,13 +71,18 @@ use super::{
     AppState,
 };
 use crate::{
+    chain::NATIVE_COIN,
     db::{
         CountRow,
+        FeeReceivers,
         Flow,
         HandlesRow,
+        HeldSharesRow,
+        ListedAddress,
         Listing,
         Measure,
         NamedTokens,
+        Share,
         StatsDay,
         StatsSnapshot,
     },
@@ -362,6 +371,7 @@ impl Report {
         }
         let mut total = AllChains::default();
         let mut days = BTreeMap::new();
+        let receivers = &snapshot.fee_receivers;
         for row in &snapshot.counts {
             let chain = chains.chain(row.chain_id);
             match (row.measure, row.day) {
@@ -384,11 +394,23 @@ impl Report {
                 (Measure::Links, day) => {
                     chain.span(day).links.push(PlatformLinks::of(row)?)
                 }
-                (Measure::Fees, day) => chain.span(day).registration_fees.add(row)?,
+                (Measure::Fees, day) => chain.span(day).fee(row, receivers)?,
                 (Measure::Flow(flow), day) => {
                     chain.span(day).flows(flow).add(row, quotes)?
                 }
+                (Measure::Shared(share), day) => chain
+                    .span(day)
+                    .fee_income
+                    .share(share)
+                    .add(row.count, row.amount_of()?),
             }
+        }
+        for row in &snapshot.held_shares {
+            let held = row.amount_of()?;
+            chains
+                .chain(row.chain_id)
+                .awaiting_claim
+                .add(row.count, held);
         }
         let mut history = History {
             days: days.into_values().collect(),
@@ -398,11 +420,14 @@ impl Report {
             .0
             .into_values()
             .map(|mut tally| {
-                tally.total.settle();
+                let coin = quotes.of(tally.chain_id, NATIVE_COIN);
+                tally.total.settle(coin);
+                tally.awaiting_claim.price(coin);
                 total.payments.add(&tally.total.escrow.deposits);
                 total.payments.add(&tally.total.escrow.forwards);
+                total.fee_income.add(&tally.total.fee_income);
                 let days = tally.days.into_values().map(|mut day| {
-                    day.activity.settle();
+                    day.activity.settle(coin);
                     day
                 });
                 history.chains.insert(tally.chain_id, days.collect());
@@ -410,6 +435,7 @@ impl Report {
                     chain_id: tally.chain_id,
                     handles: tally.handles,
                     total: tally.total,
+                    awaiting_claim: tally.awaiting_claim,
                 }
             })
             .collect();
@@ -443,6 +469,7 @@ struct Tally {
     chain_id: i64,
     handles: Vec<PlatformHandles>,
     total: Activity,
+    awaiting_claim: FeeSum,
     days: BTreeMap<i64, DayActivity>,
 }
 
@@ -452,6 +479,7 @@ impl Tally {
             chain_id,
             handles: Vec::new(),
             total: Activity::default(),
+            awaiting_claim: FeeSum::default(),
             days: BTreeMap::new(),
         }
     }
@@ -487,14 +515,76 @@ impl Activity {
         }
     }
 
+    /// Count a fee row: under its receiver when listed, among the fees
+    /// collected when its receiver is listed or the chain's referral
+    /// splitter, and as every receiver's fees when it names none.
+    fn fee(&mut self, row: &CountRow, receivers: &FeeReceivers) -> Result<(), ApiError> {
+        if row.key.is_empty() {
+            return self.registration_fees.every(row);
+        }
+        let receiver = ListedAddress {
+            chain_id: row.chain_id,
+            address: row.key_as()?,
+        };
+        if receivers.lists(&receiver) {
+            self.registration_fees.receivers.push(FeesPaid::of(row)?);
+        }
+        if receivers.collects(&receiver) {
+            self.fee_income.collected.add(row.count, row.amount_of()?);
+        }
+        Ok(())
+    }
+
     /// Once every row is in: `other` only where the tokens or receivers
-    /// nobody named moved or were paid.
-    fn settle(&mut self) {
+    /// nobody named moved or were paid, and the fee income valued at the
+    /// chain's coin, `coin`.
+    fn settle(&mut self, coin: Option<&Quote>) {
         for flow in Flow::ALL {
             let flows = self.flows(flow);
             flows.other = flows.other.take().filter(|other| other.count > 0);
         }
         self.registration_fees.settle();
+        self.fee_income.price(coin);
+    }
+}
+
+impl FeeIncome {
+    /// The shares a row of `share` counts in.
+    fn share(&mut self, share: Share) -> &mut FeeSum {
+        match share {
+            Share::Forwarded => &mut self.forwarded,
+            Share::Escrowed => &mut self.escrowed,
+        }
+    }
+
+    /// Value every sum at the chain's coin, `coin`, once every row is in.
+    fn price(&mut self, coin: Option<&Quote>) {
+        for sum in [&mut self.collected, &mut self.forwarded, &mut self.escrowed] {
+            sum.price(coin);
+        }
+    }
+}
+
+impl FeeSum {
+    /// Count `count` more fees or shares, summing `amount`.
+    fn add(&mut self, count: i64, amount: U512) {
+        self.count += count;
+        self.amount.amount = self.amount.amount.saturating_add(amount);
+    }
+
+    /// Value the sum at the chain's coin, `coin`, once every row is in.
+    fn price(&mut self, coin: Option<&Quote>) {
+        let amount = self.amount.amount;
+        self.amount = Amount::of(amount, TokenValue::of(amount, coin));
+    }
+}
+
+impl AllChainsFeeIncome {
+    /// Count one chain's fee income, once its sums are valued.
+    fn add(&mut self, chain: &FeeIncome) {
+        self.collected.count(&chain.collected);
+        self.shared.count(&chain.forwarded);
+        self.shared.count(&chain.escrowed);
     }
 }
 
@@ -541,6 +631,18 @@ impl Parts for CountRow {
     }
 }
 
+impl HeldSharesRow {
+    /// The amount, or the error naming the row's chain.
+    fn amount_of(&self) -> Result<U512, ApiError> {
+        self.amount().ok_or_else(|| {
+            ApiError::internal(format_args!(
+                "held shares on chain {}: amount {:?}",
+                self.chain_id, self.amount
+            ))
+        })
+    }
+}
+
 impl PlatformLinks {
     fn of(row: &CountRow) -> Result<Self, ApiError> {
         let platform_id: B256 = row.key_as()?;
@@ -564,18 +666,13 @@ impl FeesPaid {
 }
 
 impl RegistrationFees {
-    /// Count `row`: under its receiver, or, when it names none, as every
-    /// receiver's fees, which `other` holds until `settle`.
-    fn add(&mut self, row: &CountRow) -> Result<(), ApiError> {
-        match row.key.is_empty() {
-            true => {
-                self.other = Some(OtherFees {
-                    count: row.count,
-                    amount: row.amount_of()?,
-                })
-            }
-            false => self.receivers.push(FeesPaid::of(row)?),
-        }
+    /// Count `row`, every receiver's fees, which `other` holds until
+    /// `settle`.
+    fn every(&mut self, row: &CountRow) -> Result<(), ApiError> {
+        self.other = Some(OtherFees {
+            count: row.count,
+            amount: row.amount_of()?,
+        });
         Ok(())
     }
 
@@ -601,7 +698,7 @@ impl RegistrationFees {
     }
 }
 
-impl Payments {
+impl UsdTotal {
     /// Count the payments of `flows`, once every row is in.
     fn add(&mut self, flows: &TokenFlows) {
         for flow in &flows.tokens {
@@ -611,6 +708,14 @@ impl Payments {
             }
         }
         self.unpriced += flows.other.as_ref().map_or(0, |other| other.count);
+    }
+
+    /// Count `sum`, once valued: its USD, or its count when unpriced.
+    fn count(&mut self, sum: &FeeSum) {
+        match sum.amount.usd.and_then(|usd| self.usd.checked_add(usd)) {
+            Some(usd) => self.usd = usd,
+            None => self.unpriced += sum.count,
+        }
     }
 }
 

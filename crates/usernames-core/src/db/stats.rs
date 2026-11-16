@@ -46,6 +46,11 @@ pub struct StatsSnapshot {
     pub handles: Vec<HandlesRow>,
     /// The rollups, per chain, measure and key, over every day or per day.
     pub counts: Vec<CountRow>,
+    /// The fee receivers the fees were read by.
+    pub fee_receivers: FeeReceivers,
+    /// The referral shares each chain's escrow holds now; none on a page
+    /// of days.
+    pub held_shares: Vec<HeldSharesRow>,
 }
 
 /// The handles one platform has on one chain that resolve now.
@@ -110,6 +115,8 @@ pub enum Measure {
     Fees,
     /// Escrow movements of one flow per token, and of every token together.
     Flow(Flow),
+    /// Paid referral shares, by where the escrow put them at the bind.
+    Shared(Share),
 }
 
 /// A stored measure name this build does not know.
@@ -119,7 +126,7 @@ pub struct UnknownMeasure(String);
 
 impl Measure {
     /// Every measure, so a stored name parses back by the same table.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::Users,
         Self::AllChainsUsers,
         Self::Links,
@@ -129,6 +136,8 @@ impl Measure {
         Self::Flow(Flow::Claimed),
         Self::Flow(Flow::Refunded),
         Self::Flow(Flow::Onboarding),
+        Self::Shared(Share::Forwarded),
+        Self::Shared(Share::Escrowed),
     ];
 
     /// The name the rollups store.
@@ -139,6 +148,7 @@ impl Measure {
             Self::Links => "links",
             Self::Fees => "fees",
             Self::Flow(flow) => flow.as_str(),
+            Self::Shared(share) => share.as_str(),
         }
     }
 
@@ -148,7 +158,9 @@ impl Measure {
     /// together.
     fn read(self, listing: &Listing) -> KeyRead<'_> {
         match self {
-            Self::Users | Self::AllChainsUsers | Self::Links => KeyRead::Every,
+            Self::Users | Self::AllChainsUsers | Self::Links | Self::Shared(_) => {
+                KeyRead::Every
+            }
             Self::Fees => KeyRead::Named {
                 fixed: &[],
                 listed: &listing.fee_receivers,
@@ -376,16 +388,92 @@ impl Flow {
     }
 }
 
+/// Where the escrow put a paid referral share when the splitter deposited
+/// it at the bind. A held share stays escrowed once its holder claims it,
+/// so a past day never changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Share {
+    /// Paid straight to the referrer's holder.
+    Forwarded,
+    /// Held for the referrer's node, claimed since or not.
+    Escrowed,
+}
+
+impl Share {
+    /// The name the rollups store.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Forwarded => "shared_forwarded",
+            Self::Escrowed => "shared_escrowed",
+        }
+    }
+}
+
+/// The fee receivers a read of the fees names on each chain: the listed
+/// ones, which `registrationFees` names, and each chain's referral
+/// splitter, whose fees are collected whether listed or not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FeeReceivers {
+    /// The receivers the deployment lists.
+    pub listed: Vec<ListedAddress>,
+    /// Each chain's referral splitter, on the chains that watch one.
+    pub splitters: Vec<ListedAddress>,
+}
+
+impl FeeReceivers {
+    /// Whether the deployment lists `receiver`.
+    pub fn lists(&self, receiver: &ListedAddress) -> bool {
+        self.listed.contains(receiver)
+    }
+
+    /// Whether fees paid to `receiver` are collected: it is listed, or its
+    /// chain's referral splitter.
+    pub fn collects(&self, receiver: &ListedAddress) -> bool {
+        self.lists(receiver) || self.splitters.contains(receiver)
+    }
+
+    /// Every receiver a read names, each once.
+    fn read(&self) -> Vec<ListedAddress> {
+        let mut read = self.listed.clone();
+        read.extend(
+            self.splitters
+                .iter()
+                .filter(|splitter| !self.lists(splitter)),
+        );
+        read
+    }
+}
+
+/// The referral shares one chain's escrow holds now, unclaimed.
+#[derive(Debug, sqlx::FromRow)]
+pub struct HeldSharesRow {
+    /// The chain.
+    pub chain_id: i64,
+    /// Shares held.
+    pub count: i64,
+    /// Their sum in the chain's coin, as Postgres prints a `numeric`.
+    pub amount: String,
+}
+
+impl HeldSharesRow {
+    /// The sum as a number, under [`CountRow::amount`]'s rule.
+    pub fn amount(&self) -> Option<U512> {
+        self.amount.parse().ok()
+    }
+}
+
 impl Store {
     /// Every number `/v1/stats` serves, read in one snapshot so they agree
     /// with each other. The snapshot first reads the tokens worth a price:
     /// each chain's coin, `listing`'s tokens and the most moved others, up
     /// to [`CANDIDATES_PER_CHAIN`]. `price` values them while the snapshot
     /// counts the live handles. Token flows then name each chain's coin and
-    /// the tokens `price` named, fees `listing`'s receivers, and both every
-    /// key together. The live handles count the handles table, so a caller
-    /// runs this once per period, not per request. The statements share
-    /// `budget`: the database stops the one running when it is spent.
+    /// the tokens `price` named, fees `listing`'s receivers and each chain's
+    /// referral splitter, and both every key together; last come the
+    /// referral shares each chain's escrow still holds. The live handles
+    /// count the handles table, so a caller runs this once per period, not
+    /// per request. The statements share `budget`: the database stops the
+    /// one running when it is spent.
     pub async fn stats<F, P>(
         &self,
         listing: &Listing,
@@ -418,9 +506,15 @@ impl Store {
                 .await
         });
         let handles = handles?;
+        let fee_receivers = FeeReceivers {
+            listed: listing.fee_receivers.clone(),
+            splitters: sqlx::query_as(sql::STATS_SPLITTERS)
+                .fetch_all(deadline.bound(&mut tx).await?)
+                .await?,
+        };
         let named = Listing {
             tokens: prices.named(),
-            fee_receivers: listing.fee_receivers.clone(),
+            fee_receivers: fee_receivers.read(),
         };
         let keys = Keys::of(&chains, Measure::ALL, &named);
         let counts = sqlx::query_as(sql::STATS_TOTALS)
@@ -430,12 +524,17 @@ impl Store {
             .bind(&keys.keys)
             .fetch_all(deadline.bound(&mut tx).await?)
             .await?;
+        let held_shares = sqlx::query_as(sql::STATS_HELD_SHARES)
+            .fetch_all(deadline.bound(&mut tx).await?)
+            .await?;
         tx.commit().await?;
         let snapshot = StatsSnapshot {
             taken_at,
             chains,
             handles,
             counts,
+            fee_receivers,
+            held_shares,
         };
         Ok((snapshot, prices))
     }
@@ -443,8 +542,9 @@ impl Store {
     /// A page of days, newest first: on one chain with everything the chain
     /// recorded on them, or across every chain with their users. Token
     /// flows name the chain's coin and its listed tokens, fees its listed
-    /// receivers. A page reads its days and then each day's rows by key:
-    /// never the journal, and never a token or receiver nobody named.
+    /// receivers and its referral splitter. A page reads its days and then
+    /// each day's rows by key: never the journal, and never a token or
+    /// receiver nobody named.
     pub async fn stats_days(
         &self,
         page: Page<StatsDay>,
@@ -455,6 +555,16 @@ impl Store {
         let taken_at = sqlx::query_scalar(sql::STATS_TAKEN_AT)
             .fetch_one(&mut *tx)
             .await?;
+        let fee_receivers = FeeReceivers {
+            listed: listing.fee_receivers.clone(),
+            splitters: sqlx::query_as(sql::STATS_SPLITTERS)
+                .fetch_all(&mut *tx)
+                .await?,
+        };
+        let named = Listing {
+            tokens: listing.tokens.clone(),
+            fee_receivers: fee_receivers.read(),
+        };
         let (days, chains, keys) = match page.chain {
             Some(chain_id) => {
                 let days = sqlx::query_scalar(sql::STATS_CHAIN_DAYS)
@@ -466,7 +576,7 @@ impl Store {
                 let measures = Measure::ALL
                     .into_iter()
                     .filter(|measure| *measure != Measure::AllChainsUsers);
-                let keys = Keys::of(&[chain_id], measures, listing);
+                let keys = Keys::of(&[chain_id], measures, &named);
                 (days, vec![chain_id], keys)
             }
             None => {
@@ -477,7 +587,7 @@ impl Store {
                     .await?;
                 let chains: Vec<i64> =
                     sqlx::query_scalar(sql::CHAINS).fetch_all(&mut *tx).await?;
-                let keys = Keys::of(&chains, [Measure::AllChainsUsers], listing);
+                let keys = Keys::of(&chains, [Measure::AllChainsUsers], &named);
                 (days, chains, keys)
             }
         };
@@ -498,6 +608,8 @@ impl Store {
                 chains,
                 handles: Vec::new(),
                 counts,
+                fee_receivers,
+                held_shares: Vec::new(),
             },
             next,
         })
