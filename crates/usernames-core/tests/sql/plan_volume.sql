@@ -120,17 +120,17 @@ SELECT chain, sha256(('node' || i)::bytea),
                   ELSE sha256(('platform' || i % 3)::bytea) END,
        decode(repeat('4e', 20), 'hex'), 1, 1, sha256(('id' || i)::bytea)
 FROM generate_series(1, 1000) i, generate_series(2, 3) chain;
--- A holder of one handle on chain 1, 0x7a..7a, whose node holds 5000 junk
--- tokens beside the coin: a total that walked its slots would read them all.
+-- A holder of one handle on chain 1, 0x7a..7a, whose node holds 5000 spam
+-- tokens, which anyone can deposit, beside the coin: a total that walked its slots would read them all.
 INSERT INTO names.handles
     (chain_id, handle_node, platform_id, owner,
      observed_at, ceremony_version, id_node)
-VALUES (1, sha256('junk node'::bytea), decode(repeat('01', 32), 'hex'),
-        decode(repeat('7a', 20), 'hex'), 1, 1, sha256('junk id'::bytea));
+VALUES (1, sha256('spam node'::bytea), decode(repeat('01', 32), 'hex'),
+        decode(repeat('7a', 20), 'hex'), 1, 1, sha256('spam id'::bytea));
 INSERT INTO names.escrow_held (chain_id, handle_node, token, held, round)
-SELECT 1, sha256('junk node'::bytea),
+SELECT 1, sha256('spam node'::bytea),
        CASE i WHEN 0 THEN decode(repeat('ee', 20), 'hex')
-              ELSE substring(sha256(('junk' || i)::bytea) FROM 1 FOR 20) END,
+              ELSE substring(sha256(('spam' || i)::bytea) FROM 1 FOR 20) END,
        1 + i, 0
 FROM generate_series(0, 5000) i;
 -- The same node refers heavily: 10000 coin shares, half held in its round
@@ -139,7 +139,7 @@ FROM generate_series(0, 5000) i;
 INSERT INTO names.referrals
     (chain_id, block_number, log_index, block_time, referrer_node, binder,
      platform_id, handle_node, fee, share, outcome, delivery, token, round)
-SELECT 1, 10000 + i, 3, 10000 + i, sha256('junk node'::bytea),
+SELECT 1, 10000 + i, 3, 10000 + i, sha256('spam node'::bytea),
        substring(sha256(('binder' || i)::bytea) FROM 1 FOR 20),
        decode(repeat('01', 32), 'hex'), sha256(('bound' || i)::bytea),
        10000, 3000, 'paid',

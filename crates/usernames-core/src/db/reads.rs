@@ -279,6 +279,7 @@ impl Scoped for Statement {
 /// The text any chain disclosed for a handle node, read from the lowest chain
 /// id that disclosed it and joined laterally as `alias.handle`: the [`sql::HANDLE_TEXT`] fragment, written
 /// for one read's node column.
+#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 pub(crate) struct HandleText {
     /// The column holding the node.
     pub(crate) node: &'static str,
@@ -297,11 +298,13 @@ impl fmt::Display for HandleText {
 }
 
 /// The chains a read covers: the one named, or every chain the store holds.
+#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Scope(pub(crate) Option<i64>);
+pub(crate) struct Scope(pub Option<i64>);
 
 impl Scope {
     /// `resolveHandle`'s rows, behind `prefix`.
+    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
     pub(crate) fn handle_lookup(self, prefix: &str, handle_node: B256) -> Statement {
         let mut statement = QueryBuilder::new(format!(
             "{prefix}{} WHERE h.handle_node = ",
@@ -315,6 +318,7 @@ impl Scope {
 
     /// What the store knows of a handle node, behind `prefix`: the row with
     /// text first, since a node's text is one string on every chain.
+    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
     pub(crate) fn handle_node_lookup(self, prefix: &str, handle_node: B256) -> Statement {
         let mut statement = QueryBuilder::new(format!(
             "{prefix}{} WHERE v.handle_node = ",
@@ -327,6 +331,7 @@ impl Scope {
     }
 
     /// `resolveId`'s rows, behind `prefix`.
+    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
     pub(crate) fn id_lookup(self, prefix: &str, id_node: B256) -> Statement {
         let mut statement = QueryBuilder::new(format!(
             "{prefix}{} WHERE i.id_node = ",
@@ -339,6 +344,7 @@ impl Scope {
     }
 
     /// The identities `owner` proved, behind `prefix`.
+    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
     pub(crate) fn identities_lookup(self, prefix: &str, owner: Address) -> Statement {
         let mut statement = QueryBuilder::new(format!(
             "{prefix}{} WHERE i.owner = ",
@@ -373,6 +379,7 @@ pub struct Search<'a> {
 impl Search<'_> {
     /// The search's statement behind `prefix`, ranked by the text when there
     /// is one and by handle and chain otherwise.
+    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
     pub(crate) fn lookup(&self, prefix: &str) -> Statement {
         let mut statement =
             QueryBuilder::new(format!("{prefix}{}", sql::SEARCH_PROJECTION));

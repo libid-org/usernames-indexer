@@ -37,6 +37,7 @@ use crate::{
 };
 /// A refusal: its status, and the code and prose of the [`ErrorBody`] it
 /// renders as.
+#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 pub(crate) struct ApiError {
     status: StatusCode,
     code: ErrorCode,
@@ -67,6 +68,7 @@ impl ApiError {
 
     /// A stored value this build cannot read back. Logged with `what` where
     /// it is found; the client gets the same opaque 500 as a database error.
+    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
     pub(crate) fn internal(what: impl fmt::Display) -> Self {
         tracing::error!(%what, "unreadable stored value");
         Self {
@@ -205,7 +207,8 @@ impl IntoResponse for ApiError {
 }
 
 /// `Path`, refused in the API's envelope instead of axum's plain text.
-pub(crate) struct ApiPath<T>(pub(crate) T);
+#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
+pub(crate) struct ApiPath<T>(pub T);
 
 impl<T, S> FromRequestParts<S> for ApiPath<T>
 where
@@ -221,7 +224,8 @@ where
 }
 
 /// `Query`, refused in the API's envelope instead of axum's plain text.
-pub(crate) struct ApiQuery<T>(pub(crate) T);
+#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
+pub(crate) struct ApiQuery<T>(pub T);
 
 impl<T, S> FromRequestParts<S> for ApiQuery<T>
 where

@@ -29,6 +29,7 @@ use super::{
 use crate::events::EventKind;
 
 /// [`sql::HISTORY_REFERRAL_LINKS`] with the referrer handle's text.
+#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 static LINKS: LazyLock<String> = LazyLock::new(|| {
     let text = HandleText {
         node: "l.referrer_node",
@@ -59,11 +60,15 @@ pub struct ReferralLinkRow {
 }
 
 /// The keys of a history page's entries, as one statement's arrays.
+#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Default)]
 struct EntryKeys {
-    chains: Vec<i64>,
-    blocks: Vec<i64>,
-    logs: Vec<i64>,
+    /// The chain of each entry.
+    pub chains: Vec<i64>,
+    /// Its block.
+    pub blocks: Vec<i64>,
+    /// Its log index in the block.
+    pub logs: Vec<i64>,
 }
 
 impl EntryKeys {
@@ -77,12 +82,17 @@ impl EntryKeys {
 /// The entries of a history page that may link to a referral: `referred`
 /// entries, and deposits and forwards with the node they paid and who sent
 /// them. The statement keeps the payments the chain's splitter sent.
+#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Default)]
 struct LinkKeys {
-    referred: EntryKeys,
-    paid: EntryKeys,
-    nodes: Vec<Vec<u8>>,
-    senders: Vec<Vec<u8>>,
+    /// The `referred` entries.
+    pub referred: EntryKeys,
+    /// The deposits and forwards that paid a node.
+    pub paid: EntryKeys,
+    /// The node each of those paid.
+    pub nodes: Vec<Vec<u8>>,
+    /// Who sent each of them.
+    pub senders: Vec<Vec<u8>>,
 }
 
 impl LinkKeys {
@@ -111,6 +121,7 @@ impl LinkKeys {
     }
 
     /// `text`, the links statement or its plan, bound to these keys.
+    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
     fn query<'q, O>(&'q self, text: &'q str) -> QueryAs<'q, Postgres, O, PgArguments>
     where
         O: for<'r> FromRow<'r, PgRow>,
@@ -158,59 +169,5 @@ impl Store {
                 .map(|link| ((link.chain_id, link.block_number, link.log_index), link))
                 .collect(),
         ))
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod plans {
-    use sqlx::PgConnection;
-
-    use super::*;
-    use crate::db::plan_tests::{
-        explain,
-        Plan,
-    };
-
-    /// A history page's referral links, planned.
-    pub(crate) trait ReferralLinkPlans {
-        /// The links of a full page: referred entries and splitter payments.
-        async fn referral_link_plans(&mut self) -> Vec<Plan>;
-    }
-
-    impl ReferralLinkPlans for PgConnection {
-        async fn referral_link_plans(&mut self) -> Vec<Plan> {
-            // A page of 100 entries at the volume's referrals: half referred,
-            // half payments just before a referral of their block.
-            let mut keys = LinkKeys::default();
-            for i in 1..=50 {
-                keys.referred.chains.push(1);
-                keys.referred.blocks.push(i * 97);
-                keys.referred.logs.push(3);
-                keys.paid.chains.push(1);
-                keys.paid.blocks.push(i * 89);
-                keys.paid.logs.push(1);
-                keys.nodes.push(B256::repeat_byte(3).to_vec());
-                keys.senders.push(Address::repeat_byte(0x5A).to_vec());
-            }
-            let name = "a history page's referral links";
-            let text: Vec<(String,)> = keys
-                .query(&explain(&LINKS))
-                .fetch_all(&mut *self)
-                .await
-                .unwrap_or_else(|e| panic!("{name}: {e}"));
-            vec![Plan {
-                name,
-                seeks: Some(&[
-                    "referrals_pkey:chain_id,block_number",
-                    "published_pkey",
-                    "handle_nodes_node_chain_idx:handle_node",
-                ]),
-                text: text
-                    .into_iter()
-                    .map(|(line,)| line)
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            }]
-        }
     }
 }

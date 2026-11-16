@@ -53,6 +53,7 @@ impl CodeOwner {
 impl Code {
     /// The bound nodes this code's bytes start, behind `prefix`, two at most.
     /// Above a prefix of all 0xff the range is open.
+    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
     pub(crate) fn owner_lookup(&self, prefix: &str) -> Statement {
         let mut statement =
             QueryBuilder::new(format!("{prefix}{}", sql::REFERRAL_CODE_OWNER));
@@ -99,56 +100,5 @@ impl Store {
             .bind(node)
             .fetch_all(&self.pool)
             .await
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod plans {
-    use sqlx::PgConnection;
-
-    use super::*;
-    use crate::db::plan_tests::{
-        explain,
-        Plan,
-    };
-
-    /// The referral codes' reads, planned.
-    pub(crate) trait ReferralPlans {
-        /// A code's owner, in the middle of the node range and at its top,
-        /// and a referrer.
-        async fn referral_plans(&mut self) -> Vec<Plan>;
-    }
-
-    impl ReferralPlans for PgConnection {
-        async fn referral_plans(&mut self) -> Vec<Plan> {
-            let owner: &[&str] = &["handles_node_chain_idx", "events_binds_idx"];
-            let mut plans = Vec::new();
-            for (name, node) in [
-                ("a code's owner", B256::repeat_byte(0x7c)),
-                ("a code's owner, all 0xff", B256::repeat_byte(0xff)),
-            ] {
-                let code = Code::prefixes(node).next().expect("a shortest code");
-                plans.push(
-                    Plan::of(self, name, Some(owner), code.owner_lookup("EXPLAIN "))
-                        .await,
-                );
-            }
-            let text: Vec<String> =
-                sqlx::query_scalar(&explain(sql::REFERRAL_CODE_REFERRER))
-                    .bind(B256::repeat_byte(3))
-                    .fetch_all(&mut *self)
-                    .await
-                    .expect("a referrer's plan");
-            plans.push(Plan {
-                name: "a referrer",
-                seeks: Some(&[
-                    "handles_node_chain_idx",
-                    "published_pkey",
-                    "handle_nodes_pkey|handle_nodes_node_chain_idx",
-                ]),
-                text: text.join("\n"),
-            });
-            plans
-        }
     }
 }

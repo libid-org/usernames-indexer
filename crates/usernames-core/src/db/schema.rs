@@ -18,12 +18,14 @@ use super::{
 };
 
 /// The schema this build writes and reads.
-pub static SCHEMA: LazyLock<Schema> = LazyLock::new(|| Schema::of(sql::SCHEMA));
+#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
+pub(crate) static SCHEMA: LazyLock<Schema> = LazyLock::new(|| Schema::of(sql::SCHEMA));
 
 /// A schema file and its fingerprint, the keccak256 of its text, which a
 /// database it built keeps in `names.schema`.
+#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Debug)]
-pub struct Schema {
+pub(crate) struct Schema {
     text: &'static str,
     fingerprint: B256,
 }
@@ -47,7 +49,8 @@ struct Found {
 
 impl Schema {
     /// The schema `text` builds.
-    pub fn of(text: &'static str) -> Self {
+    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
+    pub(crate) fn of(text: &'static str) -> Self {
         Self {
             text,
             fingerprint: keccak256(text),
@@ -55,6 +58,7 @@ impl Schema {
     }
 
     /// The keccak256 of the schema's text.
+    #[cfg(feature = "test-helpers")]
     pub fn fingerprint(&self) -> B256 {
         self.fingerprint
     }
@@ -62,7 +66,8 @@ impl Schema {
     /// Build the schema on an empty database, or check the one there.
     /// Indexers starting on one empty database at once build it once: each
     /// waits on one lock, the first builds, the rest find its fingerprint.
-    pub async fn build(&self, pool: &PgPool) -> Result<(), ConnectError> {
+    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
+    pub(crate) async fn build(&self, pool: &PgPool) -> Result<(), ConnectError> {
         let mut tx = pool.begin().await?;
         sqlx::query(sql::SCHEMA_LOCK).execute(&mut *tx).await?;
         match Holds::read(&mut tx).await? {
@@ -81,7 +86,8 @@ impl Schema {
 
     /// Check the schema the database holds, without changing it: a reader
     /// needs no right to build one.
-    pub async fn check(&self, pool: &PgPool) -> Result<(), ConnectError> {
+    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
+    pub(crate) async fn check(&self, pool: &PgPool) -> Result<(), ConnectError> {
         let mut conn = pool.acquire().await?;
         match Holds::read(&mut conn).await? {
             Holds::Nothing => Err(ConnectError::Unbuilt),

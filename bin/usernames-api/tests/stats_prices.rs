@@ -103,9 +103,9 @@ static SUITE: Mutex<()> = Mutex::const_new(());
 /// The chain's own coin, as the escrow names it (EIP-7528).
 const NATIVE: Address = address!("EeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE");
 const USDC: Address = Address::repeat_byte(0x05);
-/// Priced, and sorted between `USDC` and `JUNK`.
+/// Priced, and sorted between `USDC` and `SPAM`.
 const DAI: Address = Address::repeat_byte(0x07);
-const JUNK: Address = Address::repeat_byte(0x0B);
+const SPAM: Address = Address::repeat_byte(0x0B);
 
 const SENDER: Address = Address::repeat_byte(0x51);
 const PAYER: Address = Address::repeat_byte(0x52);
@@ -427,7 +427,7 @@ async fn priced_tokens_are_valued_in_usd() {
     let deposits = vec![
         NamesEvent::deposited(NATIVE, SENDER, ether(15)),
         NamesEvent::deposited(USDC, PAYER, U256::from(1_234_567u64)),
-        NamesEvent::deposited(JUNK, SENDER, U256::from(5u64)),
+        NamesEvent::deposited(SPAM, SENDER, U256::from(5u64)),
     ];
     suite.apply_tx(10, deposits).await;
     suite
@@ -535,7 +535,7 @@ async fn a_token_without_a_confident_price_counts_under_other() {
     );
     let deposits = vec![
         NamesEvent::deposited(USDC, PAYER, U256::from(1_000u64)),
-        NamesEvent::deposited(JUNK, SENDER, U256::from(5u64)),
+        NamesEvent::deposited(SPAM, SENDER, U256::from(5u64)),
     ];
     suite.apply_tx(10, deposits).await;
 
@@ -546,7 +546,7 @@ async fn a_token_without_a_confident_price_counts_under_other() {
         .await;
     let mut asked = mock.asked();
     asked.sort();
-    assert_eq!(asked, [coin_id(USDC), coin_id(JUNK)]);
+    assert_eq!(asked, [coin_id(USDC), coin_id(SPAM)]);
     assert_eq!(
         stats.clone().chain(CHAIN).total.escrow.deposits,
         TokenFlows {
@@ -645,7 +645,7 @@ async fn escrow_amounts_are_valued_at_the_served_prices() {
     let deposits = vec![
         NamesEvent::deposited(NATIVE, SENDER, ether(15)),
         NamesEvent::deposited(USDC, PAYER, U256::from(1_234_567u64)),
-        NamesEvent::deposited(JUNK, SENDER, U256::from(5u64)),
+        NamesEvent::deposited(SPAM, SENDER, U256::from(5u64)),
     ];
     suite.apply_tx(10, deposits).await;
 
@@ -661,7 +661,7 @@ async fn escrow_amounts_are_valued_at_the_served_prices() {
         BTreeMap::from([
             (NATIVE, TokenValue::of(("ETH", 18), "1.5", "3000.75")),
             (USDC, TokenValue::of(("USDC", 6), "1.234567", "1.23")),
-            (JUNK, TokenValue::default()),
+            (SPAM, TokenValue::default()),
         ])
     );
     // Bound, the same slots are the holder's claim, valued the same way.
@@ -696,12 +696,12 @@ async fn totals_are_valued_at_the_served_prices() {
     mock.price(USDC, Coin::priced(0.9998, 6, "USDC"));
     mock.price(DAI, Coin::priced(1.0, 18, "DAI"));
     // DAI is priced but held in no slot: its seek finds nothing, not the
-    // junk token above it.
+    // spam token above it.
     let deposits = vec![
         NamesEvent::deposited(NATIVE, SENDER, ether(15)),
         NamesEvent::deposited(USDC, PAYER, U256::from(1_234_567u64)),
         NamesEvent::forwarded(DAI, PAYER, U256::from(3u64)),
-        NamesEvent::deposited(JUNK, SENDER, U256::from(5u64)),
+        NamesEvent::deposited(SPAM, SENDER, U256::from(5u64)),
     ];
     suite.apply_tx(10, deposits).await;
     suite
@@ -974,7 +974,7 @@ async fn a_token_priced_before_keeps_its_place() {
     assert_eq!(first.chain(CHAIN).total.escrow.deposits.usd, usd("0.00"));
     assert_eq!(mock.asked(), [coin_id(USDC)]);
 
-    let junk = (0..=CANDIDATES_PER_CHAIN as u64)
+    let spam = (0..=CANDIDATES_PER_CHAIN as u64)
         .map(|i| Address::from_word(U256::from(1_000 + i).into()))
         .flat_map(|token| {
             [
@@ -983,7 +983,7 @@ async fn a_token_priced_before_keeps_its_place() {
             ]
         })
         .collect();
-    suite.apply_tx(11, junk).await;
+    suite.apply_tx(11, spam).await;
 
     let kept = api(&source).stats().await;
     let asked = mock.asked();
@@ -1017,10 +1017,10 @@ async fn a_value_past_the_arithmetic_leaves_its_token_unpriced() {
     let suite = Suite::open(&SUITE, CHAIN).await;
     let mock = MockSource::start().await;
     mock.price(USDC, Coin::priced(1e60, 0, "HUGE"));
-    mock.price(JUNK, Coin::priced(1.0, 255, "WIDE"));
+    mock.price(SPAM, Coin::priced(1.0, 255, "WIDE"));
     let deposits = vec![
         NamesEvent::deposited(USDC, PAYER, U256::MAX),
-        NamesEvent::deposited(JUNK, SENDER, U256::from(1u64)),
+        NamesEvent::deposited(SPAM, SENDER, U256::from(1u64)),
     ];
     suite.apply_tx(10, deposits).await;
 
@@ -1067,8 +1067,8 @@ async fn a_long_symbol_is_not_served() {
     suite.done();
 }
 
-/// Junk tokens moved more each round, n per round.
-fn junk(from: u64, count: u64) -> Vec<NamesEvent> {
+/// Spam tokens, which anyone can deposit, moved more each round, n per round.
+fn spam(from: u64, count: u64) -> Vec<NamesEvent> {
     (from..from + count)
         .map(|i| Address::from_word(U256::from(i).into()))
         .flat_map(|token| {
@@ -1105,7 +1105,7 @@ async fn priced_dust_cannot_grow_the_tokens_asked() {
     api().stats().await;
     mock.asked();
     suite
-        .apply_tx(11, junk(dust.start, dust.end - dust.start))
+        .apply_tx(11, spam(dust.start, dust.end - dust.start))
         .await;
 
     let mut asked = Vec::new();
@@ -1168,7 +1168,7 @@ async fn a_confidence_dip_keeps_a_token_asked() {
         .await;
     assert!(usdc_named(api().stats().await));
     suite
-        .apply_tx(11, junk(3_000, CANDIDATES_PER_CHAIN as u64 + 1))
+        .apply_tx(11, spam(3_000, CANDIDATES_PER_CHAIN as u64 + 1))
         .await;
     mock.asked();
 

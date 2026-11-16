@@ -13,9 +13,11 @@ use sqlx::{
     PgPool,
 };
 use usernames_core::db::{
+    schema::{
+        Schema,
+        SCHEMA,
+    },
     ConnectError,
-    Schema,
-    SCHEMA,
 };
 use usernames_fixtures::database_url;
 

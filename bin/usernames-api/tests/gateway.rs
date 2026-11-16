@@ -112,7 +112,7 @@ impl Gateway {
         let pool = PgPool::connect(&url)
             .await
             .expect("DATABASE_URL is set but connecting failed");
-        db::SCHEMA.build(&pool).await.expect("schema");
+        db::schema::SCHEMA.build(&pool).await.expect("schema");
         // Every chain this suite may have written, not just the ones this test
         // serves: the store IS what the gateway serves, so a leftover chain from
         // another test would be served here too.
