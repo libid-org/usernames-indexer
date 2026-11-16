@@ -22,6 +22,7 @@ use alloy::{
         Filter,
         Log,
     },
+    sol_types::SolEvent,
     transports::{
         TransportError,
         TransportErrorKind,
@@ -66,6 +67,65 @@ pub struct Contracts {
     pub referral_splitter: Option<Address>,
 }
 
+/// A contract an indexer watches, by the part it plays.
+#[derive(Clone, Copy)]
+enum Watched {
+    Registry,
+    Escrow,
+    Splitter,
+}
+
+/// An event a watched contract declares and the index does not read.
+struct Unread {
+    topic: B256,
+    signature: &'static str,
+}
+
+impl Unread {
+    const fn of<E: SolEvent>() -> Self {
+        Self {
+            topic: E::SIGNATURE_HASH,
+            signature: E::SIGNATURE,
+        }
+    }
+}
+
+/// The registry's proxy and ownership events.
+const REGISTRY_UNREAD: &[Unread] = &[
+    Unread::of::<IdentityRegistry::Initialized>(),
+    Unread::of::<IdentityRegistry::OwnershipTransferStarted>(),
+    Unread::of::<IdentityRegistry::OwnershipTransferred>(),
+    Unread::of::<IdentityRegistry::Upgraded>(),
+];
+
+/// The escrow's proxy and ownership events.
+const ESCROW_UNREAD: &[Unread] = &[
+    Unread::of::<HandleEscrow::Initialized>(),
+    Unread::of::<HandleEscrow::OwnershipTransferStarted>(),
+    Unread::of::<HandleEscrow::OwnershipTransferred>(),
+    Unread::of::<HandleEscrow::Upgraded>(),
+];
+
+/// The splitter's ownership, share and treasury events: a referral's own
+/// event carries the share and the treasury it paid.
+const SPLITTER_UNREAD: &[Unread] = &[
+    Unread::of::<ReferralSplitter::OwnershipTransferStarted>(),
+    Unread::of::<ReferralSplitter::OwnershipTransferred>(),
+    Unread::of::<ReferralSplitter::ShareSet>(),
+    Unread::of::<ReferralSplitter::TreasurySet>(),
+];
+
+impl Watched {
+    /// The events this contract declares that the index does not read.
+    fn unread(self) -> &'static [Unread] {
+        match self {
+            Self::Registry => REGISTRY_UNREAD,
+            Self::Escrow => ESCROW_UNREAD,
+            Self::Splitter => SPLITTER_UNREAD,
+        }
+    }
+}
+
 impl Contracts {
     /// Every contract whose logs the indexer reads.
     pub fn watched(&self) -> Vec<Address> {
@@ -75,6 +135,19 @@ impl Contracts {
             .collect()
     }
 
+    /// Which watched contract `emitter` is.
+    fn watched_as(&self, emitter: Address) -> Option<Watched> {
+        if emitter == self.registry {
+            Some(Watched::Registry)
+        } else if Some(emitter) == self.escrow {
+            Some(Watched::Escrow)
+        } else if Some(emitter) == self.referral_splitter {
+            Some(Watched::Splitter)
+        } else {
+            None
+        }
+    }
+
     /// Decode a log by the contract that emitted it: each contract's topics
     /// mean something only from that contract. The filter admits no other
     /// emitter, so one would be an RPC answering a different question.
@@ -82,38 +155,31 @@ impl Contracts {
         &self,
         log: &Log,
     ) -> Result<Option<(NamesEvent, LogPosition)>, DecodeError> {
-        let emitter = log.address();
-        if emitter == self.registry {
-            NamesEvent::from_registry(log)
-        } else if Some(emitter) == self.escrow {
-            NamesEvent::from_escrow(log)
-        } else if Some(emitter) == self.referral_splitter {
-            NamesEvent::from_splitter(log)
-        } else {
-            tracing::warn!(
-                %emitter,
-                "a log from a contract the filter does not name; skipped"
-            );
-            Ok(None)
+        match self.watched_as(log.address()) {
+            Some(Watched::Registry) => NamesEvent::from_registry(log),
+            Some(Watched::Escrow) => NamesEvent::from_escrow(log),
+            Some(Watched::Splitter) => NamesEvent::from_splitter(log),
+            None => {
+                tracing::warn!(
+                    emitter = %log.address(),
+                    "a log from a contract the filter does not name; skipped"
+                );
+                Ok(None)
+            }
         }
     }
 
-    /// The name of the event `log`'s topic is in its emitter's ABI, for a
-    /// log [`Self::decode`] skips: the proxy's upgrades, initialization and
-    /// ownership, the splitter's share and treasury. `None` is a topic its
-    /// emitter does not declare: a contract changed under the indexer.
-    pub fn declared(&self, log: &Log) -> Option<&'static str> {
-        let topic0 = log.topic0()?.0;
-        let emitter = log.address();
-        if emitter == self.registry {
-            IdentityRegistry::IdentityRegistryEvents::name_by_selector(topic0)
-        } else if Some(emitter) == self.escrow {
-            HandleEscrow::HandleEscrowEvents::name_by_selector(topic0)
-        } else if Some(emitter) == self.referral_splitter {
-            ReferralSplitter::ReferralSplitterEvents::name_by_selector(topic0)
-        } else {
-            None
-        }
+    /// The signature of `log`'s event when it is one its emitter declares
+    /// and the index does not read, for a log [`Self::decode`] skips. `None`
+    /// is any other topic: a contract changed under the indexer, or an event
+    /// the bindings carry that the index does not read yet.
+    pub fn unread(&self, log: &Log) -> Option<&'static str> {
+        let topic0 = log.topic0()?;
+        self.watched_as(log.address())?
+            .unread()
+            .iter()
+            .find(|event| event.topic == *topic0)
+            .map(|event| event.signature)
     }
 
     /// Binary search for the block at which the registry was deployed: the
