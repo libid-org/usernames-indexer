@@ -62,9 +62,9 @@ use usernames_fixtures::{
         Proof,
     },
     ChainWatch,
-    LockWaits,
     Reads,
     Seed,
+    Sessions,
     PATIENCE,
 };
 
@@ -108,13 +108,7 @@ impl Chain {
             .await;
         // The indexer writes on sessions of its own name, so a wait of its
         // is told from any other session's.
-        let indexer_pool = PgPool::connect_with(
-            (*pool.connect_options())
-                .clone()
-                .application_name(&Self::indexer_session(chain_id)),
-        )
-        .await
-        .expect("the indexer's pool");
+        let indexer_pool = pool.named(&Self::indexer_session(chain_id)).await;
         let store = ChainStore::new(indexer_pool, chain_id as i64);
 
         let node = Node::spawn(chain_id);
@@ -453,18 +447,20 @@ async fn a_window_aborted_in_its_fold_is_retried_and_counts_once() {
 
     // The chain's users total is held, so the next window's fold waits on
     // it; the wait is cancelled, which fails the window as a deadlock does.
-    let mut hold = chain.pool.begin().await.expect("a transaction");
-    let holder: i32 = sqlx::query_scalar(include_str!("sql/hold_chain_users.sql"))
+    const HOLD: &str = "hold of the chain's users total";
+    let holding = chain.pool.named(HOLD).await;
+    let mut hold = holding.begin().await.expect("a transaction");
+    sqlx::query(include_str!("sql/hold_chain_users.sql"))
         .bind(CHAIN_ID as i64)
         .fetch_one(&mut *hold)
         .await
         .expect("the chain's users total is held");
     let second = chain.bind("bob", bob).await;
     let indexer = Chain::indexer_session(CHAIN_ID);
-    chain.pool.waits_on(&indexer, holder).await;
+    chain.pool.waits_on(&indexer, HOLD).await;
     let cancelled: bool = sqlx::query_scalar(include_str!("sql/cancel_lock_wait.sql"))
         .bind(&indexer)
-        .bind(holder)
+        .bind(HOLD)
         .fetch_one(&chain.pool)
         .await
         .expect("the window's wait is cancelled");

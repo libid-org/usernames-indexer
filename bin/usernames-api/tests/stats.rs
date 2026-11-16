@@ -23,7 +23,6 @@ use alloy::primitives::{
     U512,
 };
 use axum::Router;
-use sqlx::PgPool;
 use tokio::{
     sync::Mutex,
     task::JoinSet,
@@ -67,8 +66,8 @@ use usernames_core::{
 use usernames_fixtures::{
     ChainEntry,
     Events,
-    LockWaits,
     Seed,
+    Sessions,
     StatsRoute,
     Suite,
     Writes,
@@ -730,17 +729,11 @@ async fn two_chains_fold_the_same_new_wallets_at_once() {
     // chain's wait and no other session's.
     const FIRST: &str = "stats: the first chain's window";
     const SECOND: &str = "stats: the second chain's window";
-    let named = |name: &str| {
-        PgPool::connect_with(
-            (*suite.pool.connect_options())
-                .clone()
-                .application_name(name),
-        )
-    };
-    let first = ChainStore::new(named(FIRST).await.expect("a pool"), CHAIN)
+    const HOLD: &str = "stats: the hold of the first chain's users total";
+    let first = ChainStore::new(suite.pool.named(FIRST).await, CHAIN)
         .writer()
         .await;
-    let other = ChainStore::new(named(SECOND).await.expect("a pool"), OTHER_CHAIN);
+    let other = ChainStore::new(suite.pool.named(SECOND).await, OTHER_CHAIN);
     other.forget().await;
     let second = other.writer().await;
     first
@@ -758,16 +751,17 @@ async fn two_chains_fold_the_same_new_wallets_at_once() {
     // The first window stops at the chain's users total, which the test
     // holds, after it wrote the wallets across chains; the second waits on
     // those.
-    let mut hold = suite.pool.begin().await.expect("a transaction");
+    let holding = suite.pool.named(HOLD).await;
+    let mut hold = holding.begin().await.expect("a transaction");
     sqlx::query(include_str!("sql/hold_chain_users.sql"))
         .bind(CHAIN)
         .fetch_one(&mut *hold)
         .await
         .expect("the chain's users total is held");
     let first = tokio::spawn(async move { first.apply_tx(IN_B, both()).await });
-    suite.pool.waits_on_a_lock(FIRST).await;
+    suite.pool.waits_on(FIRST, HOLD).await;
     let second = tokio::spawn(async move { second.apply_tx(IN_B, both()).await });
-    suite.pool.waits_on_a_lock(SECOND).await;
+    suite.pool.waits_on(SECOND, FIRST).await;
     hold.rollback().await.expect("the hold ends");
     first.await.expect("the first window commits");
     second.await.expect("the second window commits");
