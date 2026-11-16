@@ -428,7 +428,8 @@ keccak256 in `names.schema`; indexers starting on it at once build it once.
 A built schema is never altered: the indexer and the API refuse a database
 whose fingerprint is not their build's, or that keeps none. A release that
 changes `schema.sql` runs on a new empty database, where every chain replays
-from its deployment block.
+from its deployment block; `crates/usernames-core/tests/schema.rs` pins the
+fingerprint, so such a change updates it there too.
 
 Probes belong to the API: `GET /health` for liveness; for readiness gate on
 the status code of `GET /v1/status`, which is 200 whenever the database

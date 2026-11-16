@@ -6,7 +6,10 @@
 
 use std::str::FromStr;
 
-use alloy::primitives::B256;
+use alloy::primitives::{
+    b256,
+    B256,
+};
 use sqlx::{
     postgres::PgConnectOptions,
     Executor,
@@ -66,6 +69,21 @@ impl Empty {
             .await
             .expect("dropping the database");
     }
+}
+
+/// The fingerprint every live database keeps. A new value means the next
+/// release runs on a new empty database and replays every chain, so any edit
+/// to `schema.sql`, a comment's included, changes it here on purpose.
+const PINNED: B256 =
+    b256!("abbd6d0c0e965d15781753c36da3266e1fb6f060686f96b2c4d71af85ae64d9e");
+
+#[test]
+fn the_schema_fingerprint_is_pinned() {
+    assert_eq!(
+        SCHEMA.fingerprint(),
+        PINNED,
+        "a schema.sql change starts a new database: every chain replays"
+    );
 }
 
 #[tokio::test]
