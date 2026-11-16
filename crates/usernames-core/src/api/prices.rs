@@ -167,8 +167,7 @@ impl PriceSource {
     /// The source's id of `coin` among `chains`: `<chain>:0x…`, the
     /// chain's own coin as the zero address; `None` on a chain the source
     /// does not name.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    fn coin_id(self, chains: &ChainNames, coin: &ListedAddress) -> Option<String> {
+    pub fn coin_id(self, chains: &ChainNames, coin: &ListedAddress) -> Option<String> {
         match self {
             Self::DefiLlama => {
                 let chain = chains.name(coin.chain_id)?;
@@ -245,9 +244,8 @@ impl ListedChainId {
 }
 
 /// One entry of DefiLlama's chain list.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Deserialize)]
-struct ListedChain {
+pub struct ListedChain {
     #[serde(rename = "chainId")]
     chain_id: Option<ListedChainId>,
     name: String,
@@ -256,8 +254,7 @@ struct ListedChain {
 impl ListedChain {
     /// Each listed chain with an id, named by its entry's `name`,
     /// lowercased.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    fn names(listed: Vec<Self>) -> ChainNames {
+    pub fn names(listed: Vec<Self>) -> ChainNames {
         ChainNames::of(listed.into_iter().filter_map(|entry| {
             let chain_id = entry.chain_id.as_ref().and_then(ListedChainId::chain_id)?;
             Some((chain_id, entry.name.to_lowercase()))
@@ -267,9 +264,8 @@ impl ListedChain {
 
 /// The name the source gives each chain it prices, by chain id. A chain
 /// missing here, a testnet, is never priced.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct ChainNames(pub BTreeMap<i64, String>);
+pub struct ChainNames(pub BTreeMap<i64, String>);
 
 impl ChainNames {
     /// The `named` chains whose names fit a price request's path: ASCII
@@ -299,22 +295,19 @@ impl ChainNames {
     }
 
     /// The source's name for `chain_id`.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    fn name(&self, chain_id: i64) -> Option<&str> {
+    pub fn name(&self, chain_id: i64) -> Option<&str> {
         self.0.get(&chain_id).map(String::as_str)
     }
 }
 
 /// A price in units of 10^-18 USD.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Price(pub U512);
+pub struct Price(pub U512);
 
 /// Why a price does not parse.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Debug, thiserror::Error)]
 #[error("not a price: {0}")]
-pub(crate) struct PriceError(String);
+pub struct PriceError(String);
 
 impl FromStr for Price {
     type Err = PriceError;
@@ -356,9 +349,8 @@ fn ten_to(power: u32) -> Option<U512> {
 
 /// A coin as the source knows it: what it is called, its decimals and its
 /// price, with the unix second it was priced at.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Quote {
+pub struct Quote {
     /// What the coin is called, when the source names it.
     pub symbol: Option<String>,
     /// Its decimals.
@@ -420,9 +412,8 @@ impl Quote {
 }
 
 /// One coin of a source's answer.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Deserialize)]
-struct Priced {
+pub struct Priced {
     /// The price, as the source writes the number.
     pub price: Box<RawValue>,
     /// The coin's decimals.
@@ -444,8 +435,7 @@ struct Answer {
 impl Priced {
     /// The symbol as served: at most [`MAX_SYMBOL`] characters, none of
     /// them a control character or one that reorders or hides text.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    fn symbol(&self) -> Option<String> {
+    pub fn symbol(&self) -> Option<String> {
         self.symbol
             .as_deref()
             .filter(|symbol| {
@@ -474,9 +464,8 @@ impl Priced {
 }
 
 /// The prices one computation values its tokens at, by coin.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Debug, Default)]
-pub(crate) struct Quotes(pub HashMap<ListedAddress, Quote>);
+pub struct Quotes(pub HashMap<ListedAddress, Quote>);
 
 impl NamedTokens for Quotes {
     /// The priced tokens; each chain's coin is named whether priced or not.
@@ -506,9 +495,8 @@ impl Quotes {
 
 /// A coin priced with confidence at least once: its last confident quote,
 /// and whether the source's latest answer for it was confident too.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Clone, Debug)]
-struct Known {
+pub struct Known {
     /// Its last confident quote.
     pub quote: Quote,
     /// Whether the source's latest answer for it was confident.
@@ -525,9 +513,8 @@ impl Known {
 
 /// The coins a source priced with confidence, by coin: the tokens each
 /// computation asks again, and the quotes it may value them at.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Debug, Default)]
-struct Book(pub HashMap<ListedAddress, Known>);
+pub struct Book(pub HashMap<ListedAddress, Known>);
 
 impl Book {
     /// What the source answered for `coin`: a confident quote replaces the
@@ -556,8 +543,7 @@ impl Book {
     /// known `candidates` ranked by whether they value now, then by the USD
     /// they moved at their last confident quote, ties by token; forget the
     /// rest. A coin that lost its price never outranks one that has one.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    fn keep<'a>(&mut self, candidates: impl IntoIterator<Item = &'a Candidate>) {
+    pub fn keep<'a>(&mut self, candidates: impl IntoIterator<Item = &'a Candidate>) {
         let oldest = Self::oldest();
         let mut chains: HashMap<i64, Vec<(bool, U512, ListedAddress)>> = HashMap::new();
         let mut kept = HashMap::new();
@@ -598,8 +584,7 @@ impl Book {
 
     /// The quotes that value their coins now: the source's latest answer
     /// was confident, and the price is under a day old.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    fn quotes(&self) -> Quotes {
+    pub fn quotes(&self) -> Quotes {
         let oldest = Self::oldest();
         Quotes(
             self.0
@@ -784,8 +769,7 @@ enum PriceFetchError {
 }
 
 /// Unix seconds now.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-fn unix_now() -> i64 {
+pub fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|since| since.as_secs() as i64)

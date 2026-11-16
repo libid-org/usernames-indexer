@@ -31,8 +31,7 @@ impl Code {
     const LENGTHS: RangeInclusive<usize> = 8..=32;
     /// The longest code: 32 bytes of 0xff in base58. Text past it is refused
     /// before decoding, whose cost grows with the square of the length.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    const MAX_CHARS: usize = 44;
+    pub const MAX_CHARS: usize = 44;
 
     /// Every code `node` may go by, shortest first, the whole node last.
     pub fn prefixes(node: B256) -> impl Iterator<Item = Self> {

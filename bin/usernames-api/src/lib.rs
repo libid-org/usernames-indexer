@@ -151,8 +151,7 @@ pub struct Config {
 }
 
 /// The API serving as a task, and the token that stops it.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-struct Serving {
+pub struct Serving {
     /// The token that stops it.
     pub cancel: CancellationToken,
     /// The serving task.
@@ -161,8 +160,7 @@ struct Serving {
 
 impl Serving {
     /// Serve `app` on `listener` until stopped.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    fn start(listener: TcpListener, app: Router) -> Self {
+    pub fn start(listener: TcpListener, app: Router) -> Self {
         let cancel = CancellationToken::new();
         let shutdown = cancel.clone();
         let task = tokio::spawn(async move {
@@ -175,8 +173,7 @@ impl Serving {
 
     /// Stop accepting, and give the requests in flight `within` to be
     /// answered; the ones still open then are dropped.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    async fn stop(&mut self, within: Duration) {
+    pub async fn stop(&mut self, within: Duration) {
         self.cancel.cancel();
         if tokio::time::timeout(within, &mut self.task).await.is_err() {
             tracing::warn!(?within, "requests still in flight; dropping them");
@@ -222,8 +219,7 @@ impl Service {
 /// this, so a longer TTL here would have the gateway sign answers the contract
 /// reverts — every one of them, and only in production, since nothing off
 /// chain looks at the deadline.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-const RESOLVER_MAX_LIFETIME: Duration = Duration::from_secs(3600);
+pub const RESOLVER_MAX_LIFETIME: Duration = Duration::from_secs(3600);
 
 /// How far a block timestamp may trail the wall clock this process reads.
 ///
@@ -237,8 +233,7 @@ const RESOLVER_MAX_LIFETIME: Duration = Duration::from_secs(3600);
 const BLOCK_TIMESTAMP_SLACK: Duration = Duration::from_secs(300);
 
 /// The longest TTL a gateway may be configured with.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-const MAX_TTL: Duration = RESOLVER_MAX_LIFETIME.saturating_sub(BLOCK_TIMESTAMP_SLACK);
+pub const MAX_TTL: Duration = RESOLVER_MAX_LIFETIME.saturating_sub(BLOCK_TIMESTAMP_SLACK);
 
 impl Config {
     /// The socket and the routes this configuration serves: the store
@@ -301,8 +296,10 @@ impl Config {
     /// The gateway this configuration describes, or `None` when this
     /// deployment runs none. Every pure check runs before the signer is
     /// built, because building the KMS one is a network call.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    async fn gateway(&self, pool: sqlx::PgPool) -> anyhow::Result<Option<ens::Config>> {
+    pub async fn gateway(
+        &self,
+        pool: sqlx::PgPool,
+    ) -> anyhow::Result<Option<ens::Config>> {
         let Some((source, resolver)) = self.signing_identity()? else {
             return Ok(None);
         };

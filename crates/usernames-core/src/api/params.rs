@@ -37,9 +37,8 @@ use crate::{
 
 /// How many entries a page holds: when the request names no `limit`, and
 /// at most.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Limits {
+pub struct Limits {
     default: i64,
     max: i64,
 }
@@ -51,17 +50,15 @@ pub(crate) const LIST_PAGE: Limits = Limits {
 };
 
 /// A page of days: the last 30, at most a year's 366.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-pub(crate) const DAYS_PAGE: Limits = Limits {
+pub const DAYS_PAGE: Limits = Limits {
     default: 30,
     max: 366,
 };
 
 /// `?chain=8453&before=<next>&limit=20`: one page of a list, the cursor the
 /// one the previous page handed out.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Deserialize)]
-pub(crate) struct PageParams {
+pub struct PageParams {
     chain: Option<String>,
     before: Option<String>,
     limit: Option<String>,
@@ -107,9 +104,8 @@ impl<R, C: Display> Rows<R, C> {
 
 /// `?day=<unix second>&kind=deposited&token=0x…&before=<next>&limit=20`: one
 /// page of a chain's history, narrowed to a UTC day, a kind and a token.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Deserialize)]
-pub(crate) struct ChainHistoryParams {
+pub struct ChainHistoryParams {
     day: Option<String>,
     kind: Option<String>,
     token: Option<String>,
@@ -151,8 +147,7 @@ impl ChainHistoryParams {
 
 /// A handle as a request names it: by its text on a platform, folded and
 /// hashed here the way `depositToHandle` keys it, or by its node.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-pub(crate) enum HandleKey {
+pub enum HandleKey {
     /// By its text on a platform.
     Text {
         /// The platform the text is on.
@@ -188,9 +183,8 @@ impl HandleKey {
 
 /// `?chain=8453` narrows a read to one chain; absent, every chain the store
 /// holds answers, and each result says which chain it is from.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Deserialize)]
-pub(crate) struct ChainFilter {
+pub struct ChainFilter {
     pub(crate) chain: Option<String>,
 }
 
@@ -213,8 +207,7 @@ impl ChainFilter {
 
 /// Text a request carries, taken apart into what the store reads and
 /// refused in the API's envelope.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-pub(crate) trait Param {
+pub trait Param {
     /// A platform by its key or its 0x-hex id, known to this build or not.
     fn parse_platform(&self) -> Result<Platform, ApiError>;
     /// A platform text hashes on: one this build has node tags for.

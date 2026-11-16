@@ -194,9 +194,8 @@ impl TryFrom<String> for Measure {
 
 /// What a read takes: every key of some measures, and of the others the
 /// keys each chain names, as chain, measure and key, pairwise.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Default)]
-struct Keys {
+pub struct Keys {
     /// The measures read under every key.
     pub every: Vec<&'static str>,
     /// The chain of each pair.
@@ -209,8 +208,7 @@ struct Keys {
 
 impl Keys {
     /// The keys a read of `measures` on `chains` takes under `listing`.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    fn of(
+    pub fn of(
         chains: &[i64],
         measures: impl IntoIterator<Item = Measure>,
         listing: &Listing,
@@ -303,8 +301,7 @@ impl fmt::Display for ListedAddress {
 
 impl ListedAddress {
     /// `listed` as the two arrays a statement unnests into pairs.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    pub(crate) fn columns(listed: &[Self]) -> (Vec<i64>, Vec<Vec<u8>>) {
+    pub fn columns(listed: &[Self]) -> (Vec<i64>, Vec<Vec<u8>>) {
         listed
             .iter()
             .map(|listed| (listed.chain_id, listed.address.to_vec()))
@@ -543,13 +540,11 @@ impl fmt::Display for StatsDay {
 /// When a computation's time runs out. Its statements share the time: each
 /// may run only for what the ones before it left, and the database stops
 /// it there, so the work ends on the server too.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-struct Deadline(Instant);
+pub struct Deadline(Instant);
 
 impl Deadline {
     /// The deadline `budget` from now.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    fn after(budget: Duration) -> Self {
+    pub fn after(budget: Duration) -> Self {
         Self(Instant::now() + budget)
     }
 
@@ -557,8 +552,7 @@ impl Deadline {
     /// milliseconds rounded up, so the database never stops it before the
     /// deadline. A millisecond at least: Postgres reads a timeout of zero as
     /// none.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    async fn bound<'c>(
+    pub async fn bound<'c>(
         &self,
         conn: &'c mut PgConnection,
     ) -> Result<&'c mut PgConnection, sqlx::Error> {

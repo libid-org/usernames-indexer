@@ -196,9 +196,8 @@ impl AppState {
 /// The latest totals, serialized once and shared by every request, served
 /// for `ttl`; a computation may take `deadline`, and one that failed is not
 /// run again for as long.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Clone)]
-pub(crate) struct StatsCache {
+pub struct StatsCache {
     latest: Arc<Mutex<Latest>>,
     ttl: Duration,
     deadline: Duration,
@@ -219,8 +218,7 @@ impl Default for StatsCache {
 }
 
 /// One computation's totals and the prices that valued them.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-pub(crate) struct Valued {
+pub struct Valued {
     /// The totals.
     pub stats: Stats,
     /// The prices that valued them.
@@ -229,8 +227,7 @@ pub(crate) struct Valued {
 
 /// The numbers a snapshot holds, as the stats routes serve them: the totals,
 /// and the days, oldest first.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-pub(crate) struct Report {
+pub struct Report {
     /// The totals.
     pub stats: Stats,
     /// The days, oldest first.
@@ -239,9 +236,8 @@ pub(crate) struct Report {
 
 /// The days of a snapshot, oldest first; a day with nothing recorded is
 /// absent.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct History {
+pub struct History {
     /// Across every chain.
     days: Vec<AllChainsDay>,
     /// Per chain, by chain id.
@@ -250,9 +246,8 @@ pub(crate) struct History {
 
 /// The totals as served: serialized once, with the prices that valued
 /// them, which name and value the tokens of a page of days too.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Clone)]
-pub(crate) struct Served {
+pub struct Served {
     /// The totals, serialized.
     pub body: Bytes,
     /// The prices that valued them.
@@ -260,8 +255,7 @@ pub(crate) struct Served {
 }
 
 /// One computation's answer as served, and when it finished.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-struct Computed {
+pub struct Computed {
     /// When the computation finished.
     pub at: Instant,
     /// Its answer.
@@ -283,8 +277,7 @@ impl Computed {
 
     /// Whether the answer may still be served at `now`, for `ttl` after it
     /// was computed.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    fn fresh(&self, now: Instant, ttl: Duration) -> bool {
+    pub fn fresh(&self, now: Instant, ttl: Duration) -> bool {
         now.saturating_duration_since(self.at) < ttl
     }
 }
@@ -292,8 +285,7 @@ impl Computed {
 impl StatsCache {
     /// An empty cache serving each answer for `ttl`, each computation
     /// given `deadline`.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    pub(crate) fn new(ttl: Duration, deadline: Duration) -> Self {
+    pub fn new(ttl: Duration, deadline: Duration) -> Self {
         Self {
             latest: Arc::default(),
             ttl,
@@ -308,11 +300,7 @@ impl StatsCache {
     /// computation waits on none; the first request after that computes. The
     /// computation runs in a task of its own: a request whose client goes
     /// away leaves it running.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    pub(crate) async fn get<F>(
-        &self,
-        compute: impl FnOnce() -> F,
-    ) -> Result<Served, ApiError>
+    pub async fn get<F>(&self, compute: impl FnOnce() -> F) -> Result<Served, ApiError>
     where
         F: Future<Output = Result<Valued, ApiError>> + Send + 'static,
     {
@@ -358,8 +346,7 @@ impl StatsCache {
 impl Report {
     /// The answer from the store's rollups, its tokens valued at `quotes`:
     /// every chain the snapshot read, each with its totals and its days.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    fn of(snapshot: StatsSnapshot, quotes: &Quotes) -> Result<Self, ApiError> {
+    pub fn of(snapshot: StatsSnapshot, quotes: &Quotes) -> Result<Self, ApiError> {
         let mut chains = Tallies(
             snapshot
                 .chains

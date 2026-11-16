@@ -53,8 +53,7 @@ impl CodeOwner {
 impl Code {
     /// The bound nodes this code's bytes start, behind `prefix`, two at most.
     /// Above a prefix of all 0xff the range is open.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    pub(crate) fn owner_lookup(&self, prefix: &str) -> Statement {
+    pub fn owner_lookup(&self, prefix: &str) -> Statement {
         let mut statement =
             QueryBuilder::new(format!("{prefix}{}", sql::REFERRAL_CODE_OWNER));
         statement

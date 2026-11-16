@@ -8,10 +8,6 @@ repository.workspace = true
 description = "Indexes IdentityRegistry and HandleEscrow events into Postgres."
 publish = false
 
-[features]
-# The crate-private items the suites in `tests/` test, made public.
-test-helpers = ["dep:visibility"]
-
 [dependencies]
 usernames-core.workspace = true
 
@@ -25,10 +21,8 @@ tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
-visibility = { workspace = true, optional = true }
 
 [dev-dependencies]
-usernames-indexer = { path = ".", features = ["test-helpers"] }
 usernames-core = { workspace = true, features = ["test-helpers"] }
 usernames-fixtures.workspace = true
 sqlx.workspace = true

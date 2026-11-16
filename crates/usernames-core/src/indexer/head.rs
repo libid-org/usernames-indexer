@@ -15,9 +15,8 @@ use alloy::{
 use anyhow::Context;
 
 /// The newest block an endpoint reports.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Head {
+pub struct Head {
     /// Its number.
     pub number: u64,
     /// Its timestamp, in unix seconds.
@@ -29,12 +28,11 @@ pub(crate) struct Head {
 /// report on it would vouch for an index that cannot move. The message names
 /// the head alone, so it stays the same on every poll that sees that head and
 /// is stored once.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Debug, thiserror::Error)]
 #[error(
     "the head, block {number} stamped at unix time {time}, is older than STALE_AFTER: the endpoint is not following its chain, or the chain makes no blocks"
 )]
-pub(crate) struct StaleHead {
+pub struct StaleHead {
     /// The head's number.
     pub number: u64,
     /// The head's timestamp, in unix seconds.
@@ -56,8 +54,7 @@ impl Head {
     }
 
     /// This head, unless its timestamp is more than `limit` old.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    pub(crate) fn recent(self, limit: Duration) -> Result<Self, StaleHead> {
+    pub fn recent(self, limit: Duration) -> Result<Self, StaleHead> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();

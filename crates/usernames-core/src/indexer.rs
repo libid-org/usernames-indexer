@@ -6,21 +6,9 @@
 //! of resuming inside one, and the journal's conflict gates every write, so
 //! the replay converges.
 
-#[cfg(not(feature = "test-helpers"))]
-mod deadline;
-#[cfg(feature = "test-helpers")]
 pub mod deadline;
-#[cfg(not(feature = "test-helpers"))]
-mod head;
-#[cfg(feature = "test-helpers")]
 pub mod head;
-#[cfg(not(feature = "test-helpers"))]
-mod retry;
-#[cfg(feature = "test-helpers")]
 pub mod retry;
-#[cfg(not(feature = "test-helpers"))]
-mod rpc;
-#[cfg(feature = "test-helpers")]
 pub mod rpc;
 
 use std::time::Duration;
@@ -190,8 +178,7 @@ impl Indexer {
 }
 
 /// An error and its causes as one line.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-trait OneLine {
+pub trait OneLine {
     /// Each cause once: a cause is left out when the line already ends with
     /// it as a whole part, as it does after an error that prints its cause
     /// in its own message and also returns it as its source.

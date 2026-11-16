@@ -211,8 +211,7 @@ impl Cursor<ReferralRow> for HistoryCursor {
 impl Page<HistoryCursor> {
     /// `holder`'s referrals: a page's worth per node of the handles it
     /// holds, then the page across them, newest first.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    pub(crate) fn referrals_lookup(&self, prefix: &str, holder: Address) -> Statement {
+    pub fn referrals_lookup(&self, prefix: &str, holder: Address) -> Statement {
         let newest =
             " ORDER BY r.block_time DESC, r.chain_id DESC, r.block_number DESC, \
                       r.log_index DESC";
