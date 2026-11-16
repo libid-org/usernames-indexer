@@ -96,11 +96,7 @@ pub struct EventColumns {
 impl EventColumns {
     /// The columns `event` sets, filed under the handle node it concerns,
     /// as the window's involvement decided it.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    pub(crate) fn of(
-        event: &NamesEvent,
-        concerned: Option<B256>,
-    ) -> Result<Self, ApplyError> {
+    pub fn of(event: &NamesEvent, concerned: Option<B256>) -> Result<Self, ApplyError> {
         let text = |value: &U256| Some(value.to_string());
         let base = Self {
             kind: event.kind().to_string(),

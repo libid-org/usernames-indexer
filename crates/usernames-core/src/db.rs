@@ -40,63 +40,21 @@ use crate::{
     nodes::KnownPlatform,
 };
 
-#[cfg(not(feature = "test-helpers"))]
-mod awaiting;
-#[cfg(feature = "test-helpers")]
 pub mod awaiting;
-#[cfg(not(feature = "test-helpers"))]
-mod escrow;
-#[cfg(feature = "test-helpers")]
 pub mod escrow;
-#[cfg(not(feature = "test-helpers"))]
-mod fold;
-#[cfg(feature = "test-helpers")]
 pub mod fold;
-#[cfg(not(feature = "test-helpers"))]
-mod history;
-#[cfg(feature = "test-helpers")]
 pub mod history;
-#[cfg(not(feature = "test-helpers"))]
-mod journal;
-#[cfg(feature = "test-helpers")]
 pub mod journal;
-#[cfg(not(feature = "test-helpers"))]
-mod links;
-#[cfg(feature = "test-helpers")]
 pub mod links;
-#[cfg(not(feature = "test-helpers"))]
-mod page;
-#[cfg(feature = "test-helpers")]
 pub mod page;
-#[cfg(not(feature = "test-helpers"))]
-mod reads;
-#[cfg(feature = "test-helpers")]
 pub mod reads;
-#[cfg(not(feature = "test-helpers"))]
-mod referral;
-#[cfg(feature = "test-helpers")]
 pub mod referral;
-#[cfg(not(feature = "test-helpers"))]
-mod referrals;
-#[cfg(feature = "test-helpers")]
 pub mod referrals;
-#[cfg(not(feature = "test-helpers"))]
-mod schema;
-#[cfg(feature = "test-helpers")]
 pub mod schema;
-#[cfg(not(feature = "test-helpers"))]
-mod sql;
 // Each statement is named by its file under `sql/`, which says what it does.
-#[cfg(feature = "test-helpers")]
 #[allow(missing_docs)]
 pub mod sql;
-#[cfg(not(feature = "test-helpers"))]
-mod stats;
-#[cfg(feature = "test-helpers")]
 pub mod stats;
-#[cfg(not(feature = "test-helpers"))]
-mod totals;
-#[cfg(feature = "test-helpers")]
 pub mod totals;
 
 pub use self::{
@@ -170,8 +128,7 @@ use self::{
 
 /// Bump when what the indexer writes changes but the tables do not; a change
 /// to the tables is a change to the schema file, which starts a new database.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-const SHAPE_VERSION: &str = "2";
+pub const SHAPE_VERSION: &str = "2";
 
 /// The version a chain's rows are stamped with: the written shape, and every
 /// platform whose disclosed text this build checks and keeps. A mismatch at
@@ -1029,14 +986,12 @@ impl ChainWriter {
 }
 
 /// `value` as the `i64` Postgres stores, refused when it does not fit.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-fn as_i64(value: u64, what: &'static str) -> Result<i64, ApplyError> {
+pub fn as_i64(value: u64, what: &'static str) -> Result<i64, ApplyError> {
     i64::try_from(value).map_err(|_| ApplyError::OutOfRange { what, value })
 }
 
 /// Where a log sat, in the columns the store keeps it in.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-pub(crate) struct Position {
+pub struct Position {
     pub(crate) block: i64,
     pub(crate) log_index: i64,
     pub(crate) tx_hash: B256,
@@ -1244,15 +1199,13 @@ impl Window {
 // put `EXPLAIN` in front of the exact statement the store runs.
 
 /// A statement a lookup builds for its request shape.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-type Statement = QueryBuilder<'static, Postgres>;
+pub type Statement = QueryBuilder<'static, Postgres>;
 
 /// A read over `holder`'s handles, opened with `h`: each node it holds once,
 /// from the first chain it holds it on, up to `upto` when given. Picking the
 /// node once here keeps the read linear in the holder's handles; a join over
 /// them pairs each with every other.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-fn holder_nodes(prefix: &str, holder: Address, upto: Option<B256>) -> Statement {
+pub fn holder_nodes(prefix: &str, holder: Address, upto: Option<B256>) -> Statement {
     let mut statement = QueryBuilder::new(format!("{prefix}{}", sql::HOLDER_NODES));
     statement.push_bind(holder);
     if let Some(node) = upto {

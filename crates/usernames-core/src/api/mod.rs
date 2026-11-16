@@ -6,26 +6,14 @@
 //! and referrals modules only translate HTTP to store calls and rows to
 //! those shapes.
 
-#[cfg(not(feature = "test-helpers"))]
-mod error;
-#[cfg(feature = "test-helpers")]
 pub mod error;
 mod escrow;
 mod history;
 pub mod model;
-#[cfg(not(feature = "test-helpers"))]
-mod params;
-#[cfg(feature = "test-helpers")]
 pub mod params;
-#[cfg(not(feature = "test-helpers"))]
-mod prices;
-#[cfg(feature = "test-helpers")]
 pub mod prices;
 mod referral;
 mod referrals;
-#[cfg(not(feature = "test-helpers"))]
-mod stats;
-#[cfg(feature = "test-helpers")]
 pub mod stats;
 mod totals;
 

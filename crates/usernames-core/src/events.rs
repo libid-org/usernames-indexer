@@ -163,8 +163,7 @@ pub struct UnknownOutcome(String);
 impl Outcome {
     /// Every outcome in the splitter's enum order, so a logged value and a
     /// stored name each read back by the same table.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    const ALL: [Self; 3] = [Self::Paid, Self::SelfReferral, Self::Refused];
+    pub const ALL: [Self; 3] = [Self::Paid, Self::SelfReferral, Self::Refused];
 
     /// The outcome a `Referred` log carries as its enum's `uint8`.
     fn of(value: u8) -> Result<Self, DecodeError> {
@@ -220,8 +219,7 @@ pub struct UnknownDelivery(String);
 
 impl Delivery {
     /// Every delivery, so a stored name parses back by the same table.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    const ALL: [Self; 3] = [Self::Forwarded, Self::Held, Self::Claimed];
+    pub const ALL: [Self; 3] = [Self::Forwarded, Self::Held, Self::Claimed];
 
     /// The name stored and served.
     pub fn as_str(self) -> &'static str {
@@ -343,8 +341,7 @@ pub struct UnknownRole(String);
 
 impl Role {
     /// Every role, so a stored name parses back by the same table.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    const ALL: [Self; 7] = [
+    pub const ALL: [Self; 7] = [
         Self::Holder,
         Self::PreviousHandleHolder,
         Self::PreviousIdHolder,
@@ -426,8 +423,7 @@ pub struct UnknownKind(String);
 
 impl EventKind {
     /// Every kind, so a stored name parses back by the same table.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    const ALL: [Self; 14] = [
+    pub const ALL: [Self; 14] = [
         Self::IdentityBound,
         Self::HandleRevealed,
         Self::HandlePublished,

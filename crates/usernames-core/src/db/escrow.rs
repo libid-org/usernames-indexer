@@ -314,12 +314,7 @@ impl Page<UnclaimedCursor> {
     /// Every slot still holding something, or every one in `token`. Across
     /// chains the unclaimed index serves the page; on one chain, its chain
     /// twin, with the chain out of the comparison.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    pub(crate) fn unclaimed_lookup(
-        &self,
-        prefix: &str,
-        token: Option<Address>,
-    ) -> Statement {
+    pub fn unclaimed_lookup(&self, prefix: &str, token: Option<Address>) -> Statement {
         let mut statement =
             QueryBuilder::new(format!("{prefix}{}", sql::ESCROW_SLOT_PROJECTION));
         if let Some(token) = token {
@@ -365,8 +360,7 @@ impl Page<UnclaimedCursor> {
 impl Page<SlotCursor> {
     /// What `holder` may claim: the slots of the handles it holds, walked in
     /// the order of its handles and their tokens.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    pub(crate) fn claimable_lookup(&self, prefix: &str, holder: Address) -> Statement {
+    pub fn claimable_lookup(&self, prefix: &str, holder: Address) -> Statement {
         let mut statement =
             QueryBuilder::new(format!("{prefix}{}", sql::CLAIMABLE_SLOTS));
         if let Some(before) = self.before {
@@ -420,8 +414,7 @@ impl Page<SlotCursor> {
     }
 
     /// One handle node's slots, token by token.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    pub(crate) fn slots_lookup(&self, prefix: &str, handle_node: B256) -> Statement {
+    pub fn slots_lookup(&self, prefix: &str, handle_node: B256) -> Statement {
         let mut statement = QueryBuilder::new(format!(
             "{prefix}{} AND e.handle_node = ",
             sql::ESCROW_SLOT_PROJECTION
@@ -457,8 +450,7 @@ impl Page<SlotCursor> {
 
     /// What `sender` may take back: its contributions, in the order of the
     /// table's key.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    pub(crate) fn refundable_lookup(&self, prefix: &str, sender: Address) -> Statement {
+    pub fn refundable_lookup(&self, prefix: &str, sender: Address) -> Statement {
         let mut statement = QueryBuilder::new(format!(
             "{prefix}{} WHERE r.sender = ",
             sql::REFUNDABLE_PROJECTION

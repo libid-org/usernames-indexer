@@ -29,8 +29,7 @@ use super::{
 use crate::events::EventKind;
 
 /// [`sql::HISTORY_REFERRAL_LINKS`] with the referrer handle's text.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-static LINKS: LazyLock<String> = LazyLock::new(|| {
+pub static LINKS: LazyLock<String> = LazyLock::new(|| {
     let text = HandleText {
         node: "l.referrer_node",
         alias: "rv",
@@ -60,9 +59,8 @@ pub struct ReferralLinkRow {
 }
 
 /// The keys of a history page's entries, as one statement's arrays.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Default)]
-struct EntryKeys {
+pub struct EntryKeys {
     /// The chain of each entry.
     pub chains: Vec<i64>,
     /// Its block.
@@ -82,9 +80,8 @@ impl EntryKeys {
 /// The entries of a history page that may link to a referral: `referred`
 /// entries, and deposits and forwards with the node they paid and who sent
 /// them. The statement keeps the payments the chain's splitter sent.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Default)]
-struct LinkKeys {
+pub struct LinkKeys {
     /// The `referred` entries.
     pub referred: EntryKeys,
     /// The deposits and forwards that paid a node.
@@ -121,8 +118,7 @@ impl LinkKeys {
     }
 
     /// `text`, the links statement or its plan, bound to these keys.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    fn query<'q, O>(&'q self, text: &'q str) -> QueryAs<'q, Postgres, O, PgArguments>
+    pub fn query<'q, O>(&'q self, text: &'q str) -> QueryAs<'q, Postgres, O, PgArguments>
     where
         O: for<'r> FromRow<'r, PgRow>,
     {

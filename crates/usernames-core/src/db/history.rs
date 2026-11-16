@@ -333,8 +333,7 @@ pub struct HistoryRow {
 
 impl Page<HistoryCursor> {
     /// An address's history page.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    pub(crate) fn address_lookup(&self, prefix: &str, address: Address) -> Statement {
+    pub fn address_lookup(&self, prefix: &str, address: Address) -> Statement {
         let mut statement = QueryBuilder::new(format!(
             "{prefix}{} WHERE a.address = ",
             sql::ADDRESS_HISTORY_PROJECTION
@@ -345,8 +344,7 @@ impl Page<HistoryCursor> {
     }
 
     /// A handle's history page.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    pub(crate) fn node_lookup(&self, prefix: &str, handle_node: B256) -> Statement {
+    pub fn node_lookup(&self, prefix: &str, handle_node: B256) -> Statement {
         let mut statement = QueryBuilder::new(format!(
             "{prefix}{} WHERE e.handle_node = ",
             sql::HANDLE_HISTORY_PROJECTION
@@ -358,8 +356,7 @@ impl Page<HistoryCursor> {
 
     /// A chain's history page: the projection's rows on the chain, narrowed
     /// to the day, kind and token the filter names.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    pub(crate) fn chain_lookup(&self, prefix: &str, events: ChainEvents) -> Statement {
+    pub fn chain_lookup(&self, prefix: &str, events: ChainEvents) -> Statement {
         let mut statement = QueryBuilder::new(format!(
             "{prefix}{} WHERE e.chain_id = ",
             sql::HANDLE_HISTORY_PROJECTION

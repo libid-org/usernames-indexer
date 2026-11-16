@@ -217,8 +217,7 @@ pub const RESOLVE_SELECTOR: [u8; 4] = [0x90, 0x61, 0xb9, 0x23];
 const ADDR_SELECTOR: [u8; 4] = [0x3b, 0x3b, 0x57, 0xde];
 
 /// `addr(bytes32,uint256)` — ENSIP-11.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-const ADDR_COIN_SELECTOR: [u8; 4] = [0xf1, 0xcb, 0x7e, 0x06];
+pub const ADDR_COIN_SELECTOR: [u8; 4] = [0xf1, 0xcb, 0x7e, 0x06];
 
 /// Why a request could not be understood at all.
 ///
@@ -511,8 +510,7 @@ impl KnownPlatform {
     /// A method on the platform, so the `match` is exhaustive: a platform
     /// added to the type does not compile until its transform is written
     /// here. That guarantee is why the type exists.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    fn handle_from_labels(self, labels: &[String]) -> Option<String> {
+    pub fn handle_from_labels(self, labels: &[String]) -> Option<String> {
         match self {
             // X and Telegram issue handles of `[a-z0-9_]` (folded), with no
             // hyphen, so `_` -> `-` is a bijection onto its image and reverses

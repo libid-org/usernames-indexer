@@ -37,8 +37,7 @@ pub enum RpcUrlError {
 impl RpcUrl {
     /// A client for this endpoint, each call failing once unanswered for
     /// `patience` and sent again after a transient error ([`Retry`]).
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    pub(crate) fn provider(&self, patience: Duration) -> RootProvider {
+    pub fn provider(&self, patience: Duration) -> RootProvider {
         RootProvider::new(
             ClientBuilder::default()
                 .layer(Retry(self.clone()))

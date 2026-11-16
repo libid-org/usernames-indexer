@@ -17,8 +17,7 @@ use alloy::primitives::Address;
 impl Page<SlotCursor> {
     /// What waits for `holder`: node by node of the handles it holds, each
     /// node's slots by chain and token, descending.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    pub(crate) fn awaiting_lookup(&self, prefix: &str, holder: Address) -> Statement {
+    pub fn awaiting_lookup(&self, prefix: &str, holder: Address) -> Statement {
         // Nodes past the cursor's node have nothing left for the page.
         let upto = self.before.map(|before| before.handle_node);
         let mut statement = holder_nodes(prefix, holder, upto);

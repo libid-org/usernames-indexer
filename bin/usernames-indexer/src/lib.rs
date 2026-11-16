@@ -122,8 +122,7 @@ impl Config {
     /// The indexer this configuration describes, under its chain's writer
     /// lease: endpoints checked, the schema built or checked, the chain prepared and
     /// its names declared.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    async fn start(self) -> anyhow::Result<(WriterLease, Indexer)> {
+    pub async fn start(self) -> anyhow::Result<(WriterLease, Indexer)> {
         let contracts = self.contracts();
         // Pure configuration, checked before anything is touched: `prepare`
         // below may wipe the chain's rows on a version bump, and a refusal has
@@ -208,8 +207,7 @@ impl Config {
     /// How long the loop waits between polls and before a retry:
     /// `POLL_INTERVAL`, refused at zero, which would poll and retry back to
     /// back.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    fn poll_interval(&self) -> anyhow::Result<Duration> {
+    pub fn poll_interval(&self) -> anyhow::Result<Duration> {
         anyhow::ensure!(
             !self.poll_interval.is_zero(),
             "POLL_INTERVAL must be above zero, or the loop polls and retries \
@@ -222,8 +220,7 @@ impl Config {
     /// intervals plus a minute. Refused unless it outlasts a poll interval,
     /// or every idle cycle would expire the report before the next one
     /// renews it, and unless it stays between a second and a year.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    fn report_validity(&self) -> anyhow::Result<Duration> {
+    pub fn report_validity(&self) -> anyhow::Result<Duration> {
         let validity = self.stale_after.unwrap_or(
             self.poll_interval
                 .saturating_mul(4)
@@ -303,8 +300,7 @@ impl Config {
 const LEASE_CHECK: Duration = Duration::from_secs(5);
 
 /// The indexer loop running as a task, and the token that stops it.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-struct Indexing {
+pub struct Indexing {
     /// The token that stops it.
     pub cancel: CancellationToken,
     /// The loop task.
@@ -313,8 +309,7 @@ struct Indexing {
 
 impl Indexing {
     /// Run `indexer` until it is stopped.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    fn start(indexer: Indexer) -> Self {
+    pub fn start(indexer: Indexer) -> Self {
         let cancel = CancellationToken::new();
         let task = tokio::spawn(indexer.run(cancel.clone()));
         Self { cancel, task }
@@ -324,8 +319,7 @@ impl Indexing {
     /// stuck in a write to a silent database is aborted: its transaction
     /// commits whole or not at all, before any later writer's prepare, and
     /// the writer generation keeps anything after from landing.
-    #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
-    async fn stop(&mut self, within: Duration) {
+    pub async fn stop(&mut self, within: Duration) {
         self.cancel.cancel();
         if tokio::time::timeout(within, &mut self.task).await.is_err() {
             tracing::warn!(?within, "the indexer did not stop in time; aborting it");

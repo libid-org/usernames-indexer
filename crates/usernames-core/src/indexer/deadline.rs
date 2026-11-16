@@ -27,20 +27,17 @@ use tower::{
 };
 
 /// The client layer that fails a call left unanswered past its limit.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Deadline(pub Duration);
+pub struct Deadline(pub Duration);
 
 /// The error of a call the endpoint left unanswered past the limit.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 #[error("no answer within {0:?}")]
-pub(crate) struct Unanswered(pub Duration);
+pub struct Unanswered(pub Duration);
 
 /// A transport whose calls fail once they go unanswered past `limit`.
-#[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 #[derive(Clone, Debug)]
-pub(crate) struct Bounded<S> {
+pub struct Bounded<S> {
     inner: S,
     limit: Duration,
 }
