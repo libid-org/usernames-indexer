@@ -15,7 +15,8 @@
 //! - [`Seed`]: a chain's store seeded the way its indexer writes it — the
 //!   right to write it, and one binding with the chain marked synced.
 //! - [`IdNode`]: a user id's node, as the chain keys it.
-//! - [`LockWaits`]: a session of the database caught waiting on a lock.
+//! - [`Sessions`]: pools of named sessions, and a session caught waiting on a
+//!   lock another named session holds.
 //!
 //! `gateway.rs` drives the router in process with these; `end_to_end.rs`
 //! deploys the real `HandleResolver` on anvil and walks the protocol with
