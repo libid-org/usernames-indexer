@@ -454,16 +454,17 @@ async fn a_window_aborted_in_its_fold_is_retried_and_counts_once() {
     // The chain's users total is held, so the next window's fold waits on
     // it; the wait is cancelled, which fails the window as a deadlock does.
     let mut hold = chain.pool.begin().await.expect("a transaction");
-    sqlx::query(include_str!("sql/hold_chain_users.sql"))
+    let holder: i32 = sqlx::query_scalar(include_str!("sql/hold_chain_users.sql"))
         .bind(CHAIN_ID as i64)
         .fetch_one(&mut *hold)
         .await
         .expect("the chain's users total is held");
     let second = chain.bind("bob", bob).await;
     let indexer = Chain::indexer_session(CHAIN_ID);
-    chain.pool.waits_on_a_lock(&indexer).await;
+    chain.pool.waits_on(&indexer, holder).await;
     let cancelled: bool = sqlx::query_scalar(include_str!("sql/cancel_lock_wait.sql"))
         .bind(&indexer)
+        .bind(holder)
         .fetch_one(&chain.pool)
         .await
         .expect("the window's wait is cancelled");

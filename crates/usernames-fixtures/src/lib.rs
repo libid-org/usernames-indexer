@@ -194,23 +194,67 @@ pub trait LockWaits {
     /// a lock. Postgres announces no lock wait, so this reads
     /// `pg_stat_activity` every few milliseconds, for at most five seconds.
     fn waits_on_a_lock(&self, application: &str) -> impl Future<Output = ()> + Send;
+
+    /// Return once a session of this database named `application` waits on
+    /// a lock the session with pid `holder` holds, read the same way.
+    fn waits_on(&self, application: &str, holder: i32)
+        -> impl Future<Output = ()> + Send;
 }
 
 impl LockWaits for PgPool {
     async fn waits_on_a_lock(&self, application: &str) {
+        LockWait {
+            pool: self,
+            application,
+            holder: None,
+        }
+        .seen()
+        .await;
+    }
+
+    async fn waits_on(&self, application: &str, holder: i32) {
+        LockWait {
+            pool: self,
+            application,
+            holder: Some(holder),
+        }
+        .seen()
+        .await;
+    }
+}
+
+/// A lock wait of the sessions named `application`, on any lock or on one
+/// the session `holder` holds.
+struct LockWait<'a> {
+    pool: &'a PgPool,
+    application: &'a str,
+    holder: Option<i32>,
+}
+
+impl LockWait<'_> {
+    /// Whether the wait is on now.
+    async fn on(&self) -> bool {
+        let query = match self.holder {
+            None => sqlx::query_scalar(include_str!("waiting_on_a_lock.sql"))
+                .bind(self.application),
+            Some(holder) => sqlx::query_scalar(include_str!("waiting_on_a_holder.sql"))
+                .bind(self.application)
+                .bind(holder),
+        };
+        query.fetch_one(self.pool).await.expect("the sessions")
+    }
+
+    /// Return once the wait is on, sampled every few milliseconds for at most
+    /// five seconds.
+    async fn seen(self) {
         let waiting = async {
-            while !sqlx::query_scalar::<_, bool>(include_str!("waiting_on_a_lock.sql"))
-                .bind(application)
-                .fetch_one(self)
-                .await
-                .expect("the sessions")
-            {
+            while !self.on().await {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
         tokio::time::timeout(Duration::from_secs(5), waiting)
             .await
-            .unwrap_or_else(|_| panic!("{application} never waited on a lock"));
+            .unwrap_or_else(|_| panic!("{} never waited on a lock", self.application));
     }
 }
 
