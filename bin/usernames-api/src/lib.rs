@@ -244,7 +244,7 @@ impl Config {
     /// The socket and the routes this configuration serves: the store
     /// connected, the gateway configured, the port bound.
     async fn start(self) -> anyhow::Result<(TcpListener, Router)> {
-        // `connect`, not `connect_and_build`: the schema belongs to the writer.
+        // `connect`, not `connect_and_migrate`: the schema belongs to the writer.
         let pool = db::connect(&self.database_url).await?;
         let store = Store::new(pool.clone());
 

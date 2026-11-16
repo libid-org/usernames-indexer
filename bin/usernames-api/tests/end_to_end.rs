@@ -197,7 +197,7 @@ impl WhoSigns {
 
         // ── the read model the gateway answers from ──────────────────────
         let pool = sqlx::PgPool::connect(&url).await.expect("connect");
-        db::schema::SCHEMA.build(&pool).await.expect("schema");
+        db::MIGRATOR.run(&pool).await.expect("migrations");
         ChainStore::new(pool.clone(), CHAIN).forget().await;
         let store = ChainStore::new(pool.clone(), CHAIN);
         let owner = Address::from([0xbe; 20]);

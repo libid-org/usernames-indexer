@@ -120,8 +120,8 @@ impl Config {
     }
 
     /// The indexer this configuration describes, under its chain's writer
-    /// lease: endpoints checked, the schema built or checked, the chain prepared and
-    /// its names declared.
+    /// lease: endpoints checked, the schema migrated, the chain prepared and its
+    /// names declared.
     #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
     async fn start(self) -> anyhow::Result<(WriterLease, Indexer)> {
         let contracts = self.contracts();
@@ -143,9 +143,9 @@ impl Config {
             .await
             .map_err(|e| anyhow::anyhow!(self.rpc_url.redact(&e)))?;
 
-        // The indexer builds the schema because the indexer writes. The read
-        // API only checks it.
-        let pool = db::connect_and_build(&self.database_url).await?;
+        // The indexer migrates because the indexer writes. The read API only
+        // connects.
+        let pool = db::connect_and_migrate(&self.database_url).await?;
         let store = ChainStore::new(pool, chain_id);
         // The writer lease outlives the indexer: as long as this process may
         // write the chain, no other instance may. prepare runs under it —

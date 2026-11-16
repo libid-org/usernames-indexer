@@ -64,7 +64,7 @@ services:
         condition: service_healthy
       # Ordering only: the API answers 503 until the indexer's first window
       # lands, so it may start before there is anything to serve. Started before
-      # the indexer built the schema, it exits and compose restarts it.
+      # the indexer migrated the schema, its queries fail until it has.
       indexer:
         condition: service_started
     restart: unless-stopped

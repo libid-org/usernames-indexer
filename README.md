@@ -37,9 +37,9 @@ cargo run -p usernames-indexer         # indexes the chain into the database
 cargo run -p usernames-api             # serves the API, in another shell
 ```
 
-Start the indexer first on an empty database: it builds the schema from
-`crates/usernames-core/sql/schema.sql`. The API only connects and checks the
-schema; one that starts before an indexer built it exits, to be restarted.
+Start the indexer first on an empty database: it owns the schema and runs
+the migrations. The API only connects; started before the schema exists,
+its queries fail until the indexer has migrated it.
 
 The compose database's DSN is
 `postgres://usernames:usernames_dev@127.0.0.1:55432/usernames` (already in
@@ -399,7 +399,7 @@ Bump `SHAPE_VERSION` (in `db.rs`) when what the indexer writes changes but
 the tables do not, such as a fold rule or a new value in an existing column:
 the next start clears that chain's rows — co-tenant chains untouched — and
 replays it from the deployment block. A change to the tables is a change to
-`schema.sql`, which needs no bump: it starts a new database (see
+migration `001`, which needs no bump: it starts a new database (see
 **Database** under Deploying). The stored version
 also lists every `KnownPlatform`, so a build that learns a platform replays
 too, and keeps that platform's disclosed text. Changing
@@ -422,14 +422,13 @@ without pushing so packaging cannot rot:
 **Database.** The indexer indexes the node-keyed `IdentityRegistry` and
 `HandleEscrow` of the libid-contracts release `Cargo.toml` pins, from the
 registry's deployment block or from `START_BLOCK`. It refuses a registry
-whose `nodeKeyed()` does not answer true. On an empty database it builds the
-schema in `crates/usernames-core/sql/schema.sql` and keeps the file's
-keccak256 in `names.schema`; indexers starting on it at once build it once.
-A built schema is never altered: the indexer and the API refuse a database
-whose fingerprint is not their build's, or that keeps none. A release that
-changes `schema.sql` runs on a new empty database, where every chain replays
-from its deployment block; `crates/usernames-core/tests/schema.rs` pins the
-fingerprint, so such a change updates it there too.
+whose `nodeKeyed()` does not answer true, and a database whose applied
+migrations differ from its own. The whole schema is one migration,
+`crates/usernames-core/migrations/001_schema.sql`: a release that changes it
+edits `001` and runs on a new empty database, where every chain replays from
+its deployment block. To reuse a refused database instead, stop every process
+on it and run `DROP SCHEMA names CASCADE; DROP TABLE _sqlx_migrations;`
+first; that keeps `pg_trgm`, which a least-privilege role cannot create.
 
 Probes belong to the API: `GET /health` for liveness; for readiness gate on
 the status code of `GET /v1/status`, which is 200 whenever the database

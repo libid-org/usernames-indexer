@@ -339,7 +339,7 @@ async fn indexes_the_splitters_referrals_and_reconciles_them() {
     let chain_id = CHAIN;
     let url = database_url();
 
-    let pool = db::connect_and_build(&url).await.expect("database");
+    let pool = db::connect_and_migrate(&url).await.expect("database");
     let seeded = ChainStore::new(pool.clone(), SEEDED_CHAIN);
     seeded.forget().await;
 
@@ -555,7 +555,7 @@ async fn a_splitter_of_other_contracts_or_without_an_escrow_is_refused() {
 /// to R. R then binds the handle on B and claims what it holds.
 #[tokio::test]
 async fn a_referral_across_two_chains_reads_on_both_pages() {
-    let pool = db::connect_and_build(&database_url())
+    let pool = db::connect_and_migrate(&database_url())
         .await
         .expect("database");
     let mut a = Chain::start(&pool, CHAIN_A).await;

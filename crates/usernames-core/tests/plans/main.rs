@@ -28,7 +28,6 @@ use usernames_core::db::{
         Scope,
         Search,
     },
-    schema::SCHEMA,
     *,
 };
 
@@ -396,7 +395,7 @@ impl StorePlans for PgConnection {
 async fn every_read_over_the_big_tables_seeks_its_index() {
     let url = database_url();
     let pool = PgPool::connect(&url).await.expect("connect");
-    SCHEMA.build(&pool).await.expect("schema");
+    MIGRATOR.run(&pool).await.expect("migrations");
     sqlx::raw_sql(VACUUM)
         .execute(&pool)
         .await

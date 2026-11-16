@@ -159,10 +159,3 @@ pub const REFERRAL_CODE_REFERRER: &str =
     include_str!("../../sql/referral_code_referrer.sql");
 /// An address's unclaimed totals per chain and named token.
 pub const ESCROW_TOTALS: &str = include_str!("../../sql/escrow_totals.sql");
-/// The read model, built once on an empty database.
-pub const SCHEMA: &str = include_str!("../../sql/schema.sql");
-pub const SCHEMA_LOCK: &str = include_str!("../../sql/schema_lock.sql");
-pub const SCHEMA_FOUND: &str = include_str!("../../sql/schema_found.sql");
-pub const SCHEMA_FINGERPRINT: &str = include_str!("../../sql/schema_fingerprint.sql");
-pub const SCHEMA_FINGERPRINT_SET: &str =
-    include_str!("../../sql/schema_fingerprint_set.sql");

@@ -1,8 +1,8 @@
 -- The read model for IdentityRegistry, HandleEscrow and ReferralSplitter,
--- built once on an empty database. Every row in it is replayed from the
--- chains, so a change to this file starts a new empty database rather than
--- altering a built one: the indexer builds this file where `names` does not
--- exist and refuses a `names` this file did not build.
+-- the whole schema in one migration. Every row in it is replayed from the
+-- chains, so a schema change edits this file rather than adding a migration:
+-- sqlx refuses a database that applied another `001`, and the deployment
+-- starts on a new empty database where every chain replays.
 --
 -- Everything is keyed by chain_id. One indexer process follows one chain, any
 -- number of them share a database, and the API reads across all of them.
@@ -11,12 +11,6 @@
 
 CREATE SCHEMA names;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
-
--- The fingerprint of the file that built this schema, one row: the indexer
--- and the API refuse a database whose fingerprint is not their own.
-CREATE TABLE names.schema (
-    fingerprint BYTEA NOT NULL
-);
 
 -- One row per chain an indexer has prepared: the generation of the writer
 -- that prepared it last, which every later write names; the read-model

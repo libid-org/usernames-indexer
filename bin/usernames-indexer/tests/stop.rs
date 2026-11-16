@@ -62,7 +62,7 @@ impl Chain {
     /// `chain` on a fresh anvil.
     async fn start(chain: u64) -> Self {
         let database = database_url();
-        let pool = db::connect_and_build(&database).await.expect("database");
+        let pool = db::connect_and_migrate(&database).await.expect("database");
         ChainStore::new(pool.clone(), chain as i64).forget().await;
         let node = Node::spawn(chain);
         let libid = Libid::deploy(&node.provider, node.accounts()[0]).await;

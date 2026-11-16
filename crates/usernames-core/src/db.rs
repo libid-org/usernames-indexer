@@ -23,6 +23,10 @@ use alloy::primitives::{
 };
 use chrono::TimeDelta;
 use sqlx::{
+    migrate::{
+        MigrateError,
+        Migrator,
+    },
     Connection,
     PgPool,
     Postgres,
@@ -81,10 +85,6 @@ mod referrals;
 #[cfg(feature = "test-helpers")]
 pub mod referrals;
 #[cfg(not(feature = "test-helpers"))]
-mod schema;
-#[cfg(feature = "test-helpers")]
-pub mod schema;
-#[cfg(not(feature = "test-helpers"))]
 mod sql;
 // Each statement is named by its file under `sql/`, which says what it does.
 #[cfg(feature = "test-helpers")]
@@ -99,6 +99,12 @@ mod totals;
 #[cfg(feature = "test-helpers")]
 pub mod totals;
 
+use self::fold::{
+    Fold,
+    JournalPosition,
+    Rollups,
+    FOLD_PAGE,
+};
 pub use self::{
     escrow::{
         ContributionRow,
@@ -158,18 +164,9 @@ pub use self::{
     },
     totals::TotalsRow,
 };
-use self::{
-    fold::{
-        Fold,
-        JournalPosition,
-        Rollups,
-        FOLD_PAGE,
-    },
-    schema::SCHEMA,
-};
 
 /// Bump when what the indexer writes changes but the tables do not; a change
-/// to the tables is a change to the schema file, which starts a new database.
+/// to the tables is a change to migration 001, which starts a new database.
 #[cfg_attr(feature = "test-helpers", visibility::make(pub))]
 const SHAPE_VERSION: &str = "2";
 
@@ -341,46 +338,43 @@ impl Store {
     }
 }
 
+/// The migrations this crate owns, embedded at compile time: the whole schema
+/// in `001`. A database that applied other migrations, or another `001`, is
+/// refused, so a schema change starts a new database where every chain
+/// replays.
+///
+/// Exposed because `sqlx::migrate!` resolves its path against the crate that
+/// invokes it, so anything outside this crate — a test in either binary —
+/// would have to spell a relative path back to here and would break the day
+/// the layout moves.
+pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+
 /// Why the store could not be opened.
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
-    /// The database refused the connection or a statement.
+    /// The database refused the connection.
     #[error("connecting to the database")]
     Connect(#[from] sqlx::Error),
-    /// The database holds a schema another schema file built, or one that
-    /// keeps no fingerprint. A built database is never altered: a new schema
-    /// starts on a new empty database, where every chain replays.
-    #[error(
-        "the database holds the schema {found:?}, this build's is {built}: point \
-         DATABASE_URL at a new empty database, where the indexers replay every chain"
-    )]
-    Schema {
-        /// The fingerprint the database keeps, if any.
-        found: Option<B256>,
-        /// This build's.
-        built: B256,
-    },
-    /// The database holds no schema yet: an indexer builds it as it starts.
-    #[error("the database holds no schema yet: an indexer builds it as it starts")]
-    Unbuilt,
+    /// The schema could not be built, or the database applied other
+    /// migrations: point `DATABASE_URL` at a new empty database.
+    #[error("migrating the schema")]
+    Migrate(#[from] MigrateError),
 }
 
-/// Connect, and build [`SCHEMA`] on an empty database or check the one there.
-pub async fn connect_and_build(database_url: &str) -> Result<PgPool, ConnectError> {
+/// Connect and build the schema on an empty database, or check the one there.
+pub async fn connect_and_migrate(database_url: &str) -> Result<PgPool, ConnectError> {
     let pool = PgPool::connect(database_url).await?;
-    SCHEMA.build(&pool).await?;
+    MIGRATOR.run(&pool).await?;
     Ok(pool)
 }
 
-/// Connect, and check that the database holds [`SCHEMA`] without changing it.
+/// Connect without touching the schema.
 ///
-/// For the read API: the indexer builds the schema, so the API's role needs no
-/// right to change it. A reader that starts before an indexer built it fails
-/// and gets restarted.
-pub async fn connect(database_url: &str) -> Result<PgPool, ConnectError> {
-    let pool = PgPool::connect(database_url).await?;
-    SCHEMA.check(&pool).await?;
-    Ok(pool)
+/// For the read API: the indexer owns the schema and migrates it, so the API's
+/// role needs no right to change it. On a reader started before the schema
+/// exists, queries fail until the indexer has migrated it.
+pub async fn connect(database_url: &str) -> Result<PgPool, sqlx::Error> {
+    PgPool::connect(database_url).await
 }
 
 /// Why applying an event failed. Distinct from [`sqlx::Error`] because not
