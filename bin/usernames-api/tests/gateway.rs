@@ -59,6 +59,7 @@ use usernames_core::{
         Store,
     },
     ens,
+    nodes::KnownPlatform,
 };
 
 use usernames_fixtures::{
@@ -329,6 +330,56 @@ async fn a_bound_handle_resolves_and_the_signature_verifies() {
     let call = resolve_call(
         &["alice", "x"].wire_name(),
         &["alice", "x"].addr_call(0x8000_0000 | CHAIN as u64),
+    );
+    let (status, body) = router.ask(RESOLVER, &call).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.verify(&call), Some(owner));
+    gateway.done();
+}
+
+/// A Telegram handle is named the way an X handle is, `_` as `-`, and its
+/// name answers the Telegram binding alone.
+#[tokio::test]
+async fn a_telegram_handle_with_an_underscore_resolves() {
+    let gateway = Gateway::open(&[CHAIN], 32).await;
+    let router = gateway.router();
+    let owner = Address::from([0xbe; 20]);
+    gateway
+        .store
+        .bind_on(KnownPlatform::Telegram, "alice_bob", owner)
+        .await;
+    let coin = 0x8000_0000 | CHAIN as u64;
+
+    let telegram = ["alice-bob", "telegram"];
+    let call = resolve_call(&telegram.wire_name(), &telegram.addr_call(coin));
+    let (status, body) = router.ask(RESOLVER, &call).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.verify(&call), Some(owner));
+
+    let x = ["alice-bob", "x"];
+    let call = resolve_call(&x.wire_name(), &x.addr_call(coin));
+    let (status, body) = router.ask(RESOLVER, &call).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body.verify(&call), None);
+    gateway.done();
+}
+
+/// A leading `_` becomes a leading `-`, which an ENS label may hold, so such a
+/// handle has a name on Telegram as on X.
+#[tokio::test]
+async fn a_telegram_handle_with_a_leading_underscore_resolves() {
+    let gateway = Gateway::open(&[CHAIN], 32).await;
+    let router = gateway.router();
+    let owner = Address::from([0xbe; 20]);
+    gateway
+        .store
+        .bind_on(KnownPlatform::Telegram, "_alice", owner)
+        .await;
+
+    let telegram = ["-alice", "telegram"];
+    let call = resolve_call(
+        &telegram.wire_name(),
+        &telegram.addr_call(0x8000_0000 | CHAIN as u64),
     );
     let (status, body) = router.ask(RESOLVER, &call).await;
     assert_eq!(status, StatusCode::OK, "{body}");

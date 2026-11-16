@@ -320,10 +320,11 @@ chain checked something rather than that something returned bytes.
 
 **Addresses without a name.** A Google address is bound as proved, and its
 alphabet is wider than a label's: `_` and `+` are both legal in an address and
-neither can appear in an ENS label. No substitution is available — unlike X,
-where `_` maps to `-` because X forbids `-`, a Google address may hold both, so
-the map would not be reversible, and an irreversible map on a payment path is
-worse than no name. Such accounts are reachable by address, not by name.
+neither can appear in an ENS label. No substitution is available — unlike X and
+Telegram, where `_` maps to `-` because neither issues `-`, a Google address
+may hold both, so the map would not be reversible, and an irreversible map on
+a payment path is worse than no name. Such accounts are reachable by address,
+not by name.
 
 ## Read model
 

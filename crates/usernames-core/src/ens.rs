@@ -512,10 +512,12 @@ impl KnownPlatform {
     /// here. That guarantee is why the type exists.
     fn handle_from_labels(self, labels: &[String]) -> Option<String> {
         match self {
-            // X issues handles of `[a-z0-9_]` (folded), with no hyphen, so `_` ->
-            // `-` is a bijection onto its image and reverses by replacing
-            // every `-`.
-            Self::X => {
+            // X and Telegram issue handles of `[a-z0-9_]` (folded), with no
+            // hyphen, so `_` -> `-` is a bijection onto its image and reverses
+            // by replacing every `-`. Telegram's rule: "A-z (case-insensitive),
+            // 0-9 and underscores", 5-32 characters
+            // (core.telegram.org/method/account.checkUsername).
+            Self::X | Self::Telegram => {
                 let [label] = labels else { return None };
                 Name::label_is_wellformed(label).then(|| label.replace('-', "_"))
             }
@@ -571,8 +573,6 @@ impl KnownPlatform {
                 });
                 local_ok.then(|| format!("{}@gmail.com", labels.join(".")))
             }
-            // No name form is defined for Telegram handles yet.
-            Self::Telegram => None,
         }
     }
 }

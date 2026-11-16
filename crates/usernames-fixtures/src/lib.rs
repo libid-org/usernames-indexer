@@ -226,6 +226,14 @@ pub trait Seed {
     /// `HandlePublished`, in one transaction, with the chain marked synced.
     fn bind(&self, handle: &str, holder: Address) -> impl Future<Output = ()> + Send;
 
+    /// [`Seed::bind`] on `platform`.
+    fn bind_on(
+        &self,
+        platform: KnownPlatform,
+        handle: &str,
+        holder: Address,
+    ) -> impl Future<Output = ()> + Send;
+
     /// [`Seed::bind`] without the `HandleRevealed` and `HandlePublished`:
     /// an unlisted binding.
     fn bind_private(
@@ -254,42 +262,65 @@ impl Seed for ChainStore {
     }
 
     async fn bind(&self, handle: &str, holder: Address) {
-        self.writer().await.seed(handle, holder, true).await;
+        self.bind_on(KnownPlatform::X, handle, holder).await;
+    }
+
+    async fn bind_on(&self, platform: KnownPlatform, handle: &str, holder: Address) {
+        self.writer()
+            .await
+            .seed(platform, handle, holder, true)
+            .await;
     }
 
     async fn bind_private(&self, handle: &str, holder: Address) {
-        self.writer().await.seed(handle, holder, false).await;
+        self.writer()
+            .await
+            .seed(KnownPlatform::X, handle, holder, false)
+            .await;
     }
 }
 
 /// A binding written the way the indexer writes one.
 trait Binding {
-    /// An X binding of `handle` to `holder` at block 1, disclosed or not,
-    /// and the chain's head and target there.
-    async fn seed(&self, handle: &str, holder: Address, disclosed: bool);
+    /// A binding of `handle` on `platform` to `holder` at block 1, disclosed
+    /// or not, and the chain's head and target there.
+    async fn seed(
+        &self,
+        platform: KnownPlatform,
+        handle: &str,
+        holder: Address,
+        disclosed: bool,
+    );
 }
 
 impl Binding for ChainWriter {
-    async fn seed(&self, handle: &str, holder: Address, disclosed: bool) {
-        let x = KnownPlatform::X;
-        let handle_node = x.handle_node(handle).expect("an X handle");
+    async fn seed(
+        &self,
+        platform: KnownPlatform,
+        handle: &str,
+        holder: Address,
+        disclosed: bool,
+    ) {
+        let handle_node = platform
+            .handle_node(handle)
+            .expect("a handle of the platform");
         let mut events = vec![NamesEvent::IdentityBound {
             holder,
-            id_node: x.id_node("42"),
+            id_node: platform.id_node("42"),
             handle_node,
-            platform_id: x.id(),
+            platform_id: platform.id(),
             observed_at: 1_700_000_000,
             ceremony_version: 1,
         }];
         if disclosed {
             events.push(NamesEvent::HandleRevealed {
-                platform_id: x.id(),
+                platform_id: platform.id(),
                 handle_node,
-                handle: DisclosedHandle::verify(x, handle_node, handle),
+                handle: DisclosedHandle::verify(platform, handle_node, handle),
             });
             events.push(NamesEvent::HandlePublished {
                 holder,
-                platform_id: x.id(),
+                platform_id: platform.id(),
                 handle_node,
             });
         }
