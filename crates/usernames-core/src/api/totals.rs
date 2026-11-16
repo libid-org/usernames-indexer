@@ -146,7 +146,7 @@ impl TokenTotals {
 
 impl Amount {
     /// `amount` token units with the worth `valued` gives them.
-    fn of(amount: U512, valued: TokenValue) -> Self {
+    pub(crate) fn of(amount: U512, valued: TokenValue) -> Self {
         Self {
             amount,
             value: valued.value,

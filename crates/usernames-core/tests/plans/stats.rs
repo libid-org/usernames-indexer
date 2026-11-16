@@ -22,9 +22,9 @@ use usernames_core::db::{
 
 /// The stats reads and the rollups' writes, planned.
 pub(crate) trait StatsPlans {
-    /// The totals, every shape of a day page, and the folds of a
-    /// window's rows and of a journal's page, with the indexes they
-    /// seek.
+    /// The totals, the referral shares held, every shape of a day page,
+    /// and the folds of a window's rows and of a journal's page, with the
+    /// indexes they seek.
     async fn stats_plans(&mut self) -> Vec<Plan>;
 }
 
@@ -97,6 +97,13 @@ impl StatsPlans for PgConnection {
                     .bind(&[1i64][..])
                     .bind(vec![Address::repeat_byte(0xEE).to_vec()])
                     .bind(CANDIDATES_PER_CHAIN)
+                    .fetch_all(&mut *self)
+                    .await,
+            ),
+            (
+                "the referral shares held",
+                &["referrals_held_idx"][..],
+                sqlx::query_scalar(&explain(sql::STATS_HELD_SHARES))
                     .fetch_all(&mut *self)
                     .await,
             ),
@@ -175,6 +182,7 @@ impl StatsPlans for PgConnection {
                     "events_pkey",
                     "events_first_deposit_idx",
                     "events_binds_idx",
+                    "referrals_pkey",
                 ][..],
                 sqlx::query_scalar(&explain(&window.statement()))
                     .bind(1i64)
@@ -190,6 +198,7 @@ impl StatsPlans for PgConnection {
                     "events_pkey",
                     "events_first_deposit_idx",
                     "events_binds_idx",
+                    "referrals_pkey",
                 ][..],
                 sqlx::query_scalar(&explain(&page.statement()))
                     .bind(1i64)

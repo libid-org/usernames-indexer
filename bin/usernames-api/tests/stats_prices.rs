@@ -4,8 +4,9 @@
 //! other one counts under `other`, each day valued at the same prices, a
 //! failed request keeps the last prices and chain list, a chain the list
 //! leaves out is not priced, a token priced once keeps its place among
-//! the coins asked, and escrow amounts are valued at the prices served, or
-//! answer unpriced when the computation fails.
+//! the coins asked, fee income is valued at the chain coin's price, and
+//! escrow amounts are valued at the prices served, or answer unpriced when
+//! the computation fails.
 //!
 //! Runs against the Postgres at `DATABASE_URL`, and fails without it.
 //! The suite's chain is its own, listed by the source as
@@ -28,6 +29,7 @@ use std::{
 use alloy::primitives::{
     address,
     Address,
+    B256,
     U256,
     U512,
 };
@@ -57,6 +59,8 @@ use usernames_core::{
             ChainTotals,
             DayActivity,
             ErrorCode,
+            FeeIncome,
+            FeeSum,
             HandleAmounts,
             OtherTokens,
             Stats,
@@ -81,6 +85,7 @@ use usernames_core::{
     events::{
         EscrowEvent,
         NamesEvent,
+        Outcome,
     },
     nodes::KnownPlatform,
 };
@@ -89,6 +94,7 @@ use usernames_fixtures::{
     Events,
     StatsRoute,
     Suite,
+    SPLITTER,
 };
 
 const CHAIN: i64 = 31353;
@@ -467,6 +473,74 @@ async fn priced_tokens_are_valued_in_usd() {
         after.total.payments.unpriced - before.total.payments.unpriced,
         1
     );
+    suite.store().forget().await;
+    suite.done();
+}
+
+/// The fees collected, the shares paid on and those awaiting a claim are
+/// valued at the chain coin's price, a sum of none at zero, and the fee
+/// income across chains sums them in USD.
+#[tokio::test]
+async fn fee_income_is_valued_at_the_coins_price() {
+    let suite = Suite::open(&SUITE, CHAIN).await;
+    let mock = MockSource::start().await;
+    mock.price(NATIVE, Coin::priced(2000.5, 18, "ETH"));
+    let api = || {
+        AppState::new(Store::new(suite.pool.clone()))
+            .pricing(mock.source())
+            .router()
+    };
+    let before = api().stats().await.total.fee_income;
+
+    // A bind through the splitter pays it 0.5; the escrow holds the 0.1
+    // share for the referrer's node, which nobody holds.
+    let x = KnownPlatform::X;
+    let bind = vec![
+        NamesEvent::BindFeePaid {
+            authorization_digest: B256::repeat_byte(0xB1),
+            receiver: SPLITTER,
+            amount: ether(5),
+        },
+        NamesEvent::deposited(NATIVE, SPLITTER, ether(1)),
+        NamesEvent::Referred {
+            referrer_node: x.handle_node("dave").expect("a handle"),
+            binder: SENDER,
+            session_id: B256::repeat_byte(0x5E),
+            referrer_platform_id: x.id(),
+            platform_id: x.id(),
+            handle_node: x.handle_node("sender").expect("a handle"),
+            fee: ether(5),
+            share: ether(1),
+            outcome: Outcome::Paid,
+        },
+    ];
+    suite.apply_tx(10, bind).await;
+    let after = api().stats().await;
+
+    let valued = |count, amount: U256, value: &str, usd_value: &str| FeeSum {
+        count,
+        amount: Amount {
+            amount: amount.to(),
+            value: Some(value.to_string()),
+            usd: Some(usd(usd_value)),
+        },
+    };
+    let chain = after.clone().chain(CHAIN);
+    assert_eq!(
+        chain.total.fee_income,
+        FeeIncome {
+            collected: valued(1, ether(5), "0.5", "1000.25"),
+            forwarded: valued(0, U256::ZERO, "0", "0.00"),
+            escrowed: valued(1, ether(1), "0.1", "200.05"),
+        }
+    );
+    assert_eq!(chain.awaiting_claim, valued(1, ether(1), "0.1", "200.05"));
+    assert_eq!(
+        (before.collected.usd, before.shared.usd),
+        (Usd::default(), Usd::default())
+    );
+    assert_eq!(after.total.fee_income.collected.usd, usd("1000.25"));
+    assert_eq!(after.total.fee_income.shared.usd, usd("200.05"));
     suite.store().forget().await;
     suite.done();
 }

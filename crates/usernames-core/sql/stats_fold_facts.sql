@@ -11,7 +11,10 @@
 -- deposits and forwards still count. Every movement counts under its token and
 -- under every token together, a count only. Every fee counts under its
 -- receiver and under every receiver together, with its amount: fees are
--- paid in the chain's own coin. A claim onboards when the
+-- paid in the chain's own coin. A paid referral counts its share, with no
+-- key, under where the escrow put it at the bind as its referral row tells:
+-- `shared_forwarded`, or `shared_escrowed` when held, claimed since or not.
+-- The window writes that row before it folds. A claim onboards when the
 -- claimed round took a deposit of the token while nobody held the node, and
 -- the node was bound after that deposit and before the claim: the binds are
 -- tested against the round's first deposit alone, one seek each.
@@ -88,6 +91,16 @@
         UNION ALL
         SELECT $1, flow, '', day, 1, 0, NULL
         FROM moves
+        UNION ALL
+        SELECT $1,
+               CASE WHEN r.delivery = 'forwarded' THEN 'shared_forwarded'
+                    ELSE 'shared_escrowed' END,
+               '', e.block_time - e.block_time % 86400, 1, r.share, NULL
+        FROM fresh e
+        JOIN names.referrals r
+          ON r.chain_id = e.chain_id AND r.block_number = e.block_number
+             AND r.log_index = e.log_index
+        WHERE e.kind = 'referred' AND r.outcome = 'paid'
     ) f
     WHERE measure = ANY($2::text[])
 )

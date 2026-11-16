@@ -317,12 +317,15 @@ CREATE INDEX referrals_held_idx
 --
 -- A row counts one measure under one key: `users` (no key), a chain's share
 -- of `all_chains_users` (no key), `links` per platform id, `fees` per
--- receiver, and each escrow flow per token; fees and flows also count
--- every receiver or token together under no key. A wallet counts once per
--- day under a measure and key, and is new on its first day there.
+-- receiver, each escrow flow per token, and the paid referral shares the
+-- escrow forwarded or held at the bind, `shared_forwarded` and
+-- `shared_escrowed` (no key); fees and flows also count every receiver or
+-- token together under no key. A wallet counts once per day under a measure
+-- and key, and is new on its first day there.
 CREATE DOMAIN names.stats_measure AS TEXT CHECK (VALUE IN (
     'users', 'all_chains_users', 'links', 'fees',
-    'deposited', 'forwarded', 'claimed', 'refunded', 'onboarding'
+    'deposited', 'forwarded', 'claimed', 'refunded', 'onboarding',
+    'shared_forwarded', 'shared_escrowed'
 ));
 
 -- Per chain, measure, UTC day and key: the rows counted, the amount they

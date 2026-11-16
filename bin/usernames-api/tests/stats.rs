@@ -3,9 +3,10 @@
 //! fees and escrow movements counted per chain, in total and per UTC day,
 //! the same whether folded window by window or whole, users counted once
 //! across chains in whatever order the chains fold, tokens without a price
-//! and fee receivers nobody listed counted together, 30 days to a page, one
-//! answer served until it expires, and one day's events listed page by
-//! page. Nothing here is priced: `stats_prices.rs` values tokens.
+//! and fee receivers nobody listed counted together, the fees collected and
+//! the referrers' shares of them, 30 days to a page, one answer served until
+//! it expires, and one day's events listed page by page. Nothing here is
+//! priced: `stats_prices.rs` values tokens.
 //!
 //! Runs against the Postgres at `DATABASE_URL`, and fails without it.
 //! The suite's chain is its own; the answer lists every chain the
@@ -32,10 +33,13 @@ use usernames_core::{
         model::{
             Activity,
             AllChainsDay,
+            Amount,
             ChainHistory,
             ChainStats,
             DayActivity,
             EscrowActivity,
+            FeeIncome,
+            FeeSum,
             FeesPaid,
             OtherFees,
             OtherTokens,
@@ -57,6 +61,7 @@ use usernames_core::{
         Store,
     },
     events::{
+        Delivery,
         EscrowEvent,
         NamesEvent,
         Outcome,
@@ -105,6 +110,8 @@ const REFERRER: Address = Address::repeat_byte(0x7B);
 
 const ETHER: u64 = 1_000_000_000_000_000_000;
 const FEE: u64 = 3_700_000_000_000_000;
+/// The referrer's share of a fee the splitter took.
+const SHARE: u64 = FEE / 10 * 3;
 
 /// The suite writes block `n` at unix second `1_700_000_000 + n`: blocks
 /// from `IN_A` fall on 2023-11-14 UTC, starting at `DAY_A`, and blocks from
@@ -122,6 +129,8 @@ fn node(handle: &str) -> B256 {
 trait Journey: Sized {
     /// A bind on X and the service fee its transaction paid.
     fn paid_bind(holder: Address, id: &str, handle: &str) -> Vec<Self>;
+    /// A bind on X paying its fee to `receiver`.
+    fn paid_to(holder: Address, id: &str, handle: &str, receiver: Address) -> Vec<Self>;
     /// A deposit to an X handle nobody holds, in round 0.
     fn deposited(handle: &str, token: Address, sender: Address, amount: u64) -> Self;
     /// The holder's claim of round 0 in one token.
@@ -130,10 +139,14 @@ trait Journey: Sized {
 
 impl Journey for NamesEvent {
     fn paid_bind(holder: Address, id: &str, handle: &str) -> Vec<Self> {
+        Self::paid_to(holder, id, handle, SAFE)
+    }
+
+    fn paid_to(holder: Address, id: &str, handle: &str, receiver: Address) -> Vec<Self> {
         let mut tx = Self::bind(holder, X, id, handle, 1, false);
         tx.push(Self::BindFeePaid {
             authorization_digest: node(handle),
-            receiver: SAFE,
+            receiver,
             amount: U256::from(FEE),
         });
         tx
@@ -160,6 +173,63 @@ impl Journey for NamesEvent {
             released: U256::from(released),
             received: U256::from(released),
         })
+    }
+}
+
+/// A bind on X through the referral splitter that names a referrer.
+struct ReferredBind<'a> {
+    holder: Address,
+    id: &'a str,
+    handle: &'a str,
+    referrer: &'a str,
+    /// Where the escrow put the paid share; none when the binder referred
+    /// itself.
+    delivery: Option<Delivery>,
+}
+
+impl ReferredBind<'_> {
+    /// Its events as the transaction logs them: the bind and its fee to the
+    /// splitter, then, for a paid share, the escrow's answer to the
+    /// splitter's deposit of it, and the `Referred`.
+    fn events(&self) -> Vec<NamesEvent> {
+        let Self {
+            holder,
+            id,
+            handle,
+            referrer,
+            delivery,
+        } = *self;
+        let mut tx = NamesEvent::paid_to(holder, id, handle, SPLITTER);
+        let outcome = match delivery {
+            Some(Delivery::Forwarded) => {
+                tx.push(NamesEvent::Escrow(EscrowEvent::Forwarded {
+                    handle_node: node(referrer),
+                    token: NATIVE,
+                    sender: SPLITTER,
+                    holder: REFERRER,
+                    amount: U256::from(SHARE),
+                    received: U256::from(SHARE),
+                }));
+                Outcome::Paid
+            }
+            Some(_) => {
+                tx.push(NamesEvent::deposited(referrer, NATIVE, SPLITTER, SHARE));
+                Outcome::Paid
+            }
+            None => Outcome::SelfReferral,
+        };
+        tx.push(NamesEvent::Referred {
+            referrer_node: node(referrer),
+            binder: holder,
+            session_id: B256::repeat_byte(0x5E),
+            referrer_platform_id: X.id(),
+            platform_id: X.id(),
+            handle_node: node(handle),
+            fee: U256::from(FEE),
+            share: U256::from(SHARE),
+            outcome,
+        });
+        tx
     }
 }
 
@@ -191,6 +261,27 @@ fn fees(count: i64) -> RegistrationFees {
             amount: U512::from(FEE) * U512::from(count),
         }],
         other: None,
+    }
+}
+
+/// `count` fees or shares of the chain's coin summing to `amount`,
+/// unpriced.
+fn fee_sum(count: i64, amount: u64) -> FeeSum {
+    FeeSum {
+        count,
+        amount: Amount {
+            amount: U512::from(amount),
+            value: None,
+            usd: None,
+        },
+    }
+}
+
+/// `count` fees collected, none shared.
+fn collected(count: i64) -> FeeIncome {
+    FeeIncome {
+        collected: fee_sum(count, FEE * count as u64),
+        ..FeeIncome::default()
     }
 }
 
@@ -389,7 +480,9 @@ async fn the_journal_adds_up_per_chain_and_day() {
                 refunds: Vec::new().and_other(1),
             },
             onboarding_claims: vec![flow(NATIVE, 1, 3 * ether, 1)].named(),
+            fee_income: collected(2),
         },
+        awaiting_claim: FeeSum::default(),
     };
     assert_eq!(stats.chain(CHAIN), expected);
     assert_eq!(
@@ -407,6 +500,7 @@ async fn the_journal_adds_up_per_chain_and_day() {
                         ..EscrowActivity::default()
                     },
                     onboarding_claims: TokenFlows::default(),
+                    fee_income: collected(1),
                 },
             },
             DayActivity {
@@ -423,6 +517,7 @@ async fn the_journal_adds_up_per_chain_and_day() {
                         refunds: Vec::new().and_other(1),
                     },
                     onboarding_claims: vec![flow(NATIVE, 1, 3 * ether, 1)].named(),
+                    fee_income: collected(1),
                 },
             },
         ]
@@ -883,6 +978,144 @@ async fn the_referral_splitter_is_no_user() {
         panic!("one day listed, not {days:?}");
     };
     assert_eq!((day.day, day.activity.users, day.new_users), (DAY_A, 1, 1));
+    suite.store().forget().await;
+    suite.done();
+}
+
+/// The fees collected are those paid to a listed receiver or to the chain's
+/// referral splitter, gross and counted once, whether the splitter is listed
+/// or not; a fee to a receiver nobody listed is not collected. The shares
+/// paid on are the paid referrals', on the `Referred`'s day: forwarded to
+/// the referrer's holder or escrowed for its node, as the escrow put them at
+/// the bind, so a claim later leaves the day as it was. A self-referral's
+/// share stays in what was collected. The shares awaiting a claim are the
+/// escrowed ones still held now.
+#[tokio::test]
+async fn fees_collected_and_shares_paid_add_up() {
+    let suite = Suite::open(&SUITE, CHAIN).await;
+    let api = |receivers| {
+        AppState::new(Store::new(suite.pool.clone()))
+            .fee_receivers(receivers)
+            .router()
+    };
+    let before = api(fee_receivers()).stats().await.total.fee_income;
+    // Day A: alice pays the listed Safe; bob binds through the splitter,
+    // and his share is forwarded to the referrer's holder.
+    suite
+        .apply_tx(IN_A, NamesEvent::paid_bind(ALICE, "1", "alice"))
+        .await;
+    let bob = ReferredBind {
+        holder: BOB,
+        id: "2",
+        handle: "bob",
+        referrer: "referrer",
+        delivery: Some(Delivery::Forwarded),
+    };
+    suite.apply_tx(IN_A + 1, bob.events()).await;
+    // Day B: dave's and eve's shares are held for nodes nobody holds, and
+    // eve's is claimed; frank refers himself; grace pays a receiver nobody
+    // listed.
+    let dave = ReferredBind {
+        holder: DAVE,
+        id: "4",
+        handle: "dave",
+        referrer: "unheld",
+        delivery: Some(Delivery::Held),
+    };
+    suite.apply_tx(IN_B, dave.events()).await;
+    let eve = ReferredBind {
+        holder: EVE,
+        id: "5",
+        handle: "eve",
+        referrer: "claimed",
+        ..dave
+    };
+    suite.apply_tx(IN_B + 1, eve.events()).await;
+    suite
+        .apply(
+            IN_B + 2,
+            NamesEvent::claimed("claimed", NATIVE, GRACE, SHARE),
+        )
+        .await;
+    let frank = ReferredBind {
+        holder: FRANK,
+        id: "7",
+        handle: "frank",
+        referrer: "frank",
+        delivery: None,
+    };
+    suite.apply_tx(IN_B + 3, frank.events()).await;
+    let stranger = Address::repeat_byte(0x0B);
+    let grace = NamesEvent::paid_to(GRACE, "6", "grace", stranger);
+    suite.apply_tx(IN_B + 4, grace).await;
+
+    let listed = api(fee_receivers());
+    let stats = listed.stats().await;
+    let chain = stats.clone().chain(CHAIN);
+    let income = FeeIncome {
+        collected: fee_sum(5, 5 * FEE),
+        forwarded: fee_sum(1, SHARE),
+        escrowed: fee_sum(2, 2 * SHARE),
+    };
+    assert_eq!(chain.total.fee_income, income);
+    assert_eq!(chain.awaiting_claim, fee_sum(1, SHARE));
+    assert_eq!(
+        chain.total.registration_fees,
+        RegistrationFees {
+            other: Some(OtherFees {
+                count: 5,
+                amount: U512::from(5 * FEE),
+            }),
+            ..fees(1)
+        },
+        "the splitter is named only when listed"
+    );
+    let across = stats.total.fee_income;
+    assert_eq!(across.collected.unpriced - before.collected.unpriced, 5);
+    assert_eq!(across.shared.unpriced - before.shared.unpriced, 3);
+    let days: Vec<DayActivity> = listed.days(Some(CHAIN)).await;
+    let by_day: Vec<_> = days
+        .iter()
+        .map(|day| (day.day, day.activity.fee_income.clone()))
+        .collect();
+    assert_eq!(
+        by_day,
+        [
+            (
+                DAY_A,
+                FeeIncome {
+                    collected: fee_sum(2, 2 * FEE),
+                    forwarded: fee_sum(1, SHARE),
+                    escrowed: FeeSum::default(),
+                }
+            ),
+            (
+                DAY_B,
+                FeeIncome {
+                    collected: fee_sum(3, 3 * FEE),
+                    forwarded: FeeSum::default(),
+                    escrowed: fee_sum(2, 2 * SHARE),
+                }
+            ),
+        ]
+    );
+
+    let splitter = ListedAddress {
+        chain_id: CHAIN,
+        address: SPLITTER,
+    };
+    let chain = api(vec![fee_receivers()[0], splitter])
+        .stats()
+        .await
+        .chain(CHAIN);
+    assert_eq!(chain.total.fee_income, income);
+    assert_eq!(
+        chain.total.registration_fees.other,
+        Some(OtherFees {
+            count: 1,
+            amount: U512::from(FEE),
+        })
+    );
     suite.store().forget().await;
     suite.done();
 }

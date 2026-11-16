@@ -126,6 +126,10 @@ pub const STATS_HANDLES: &str = include_str!("../../sql/stats_handles.sql");
 pub const STATS_TOTALS: &str = include_str!("../../sql/stats_totals.sql");
 /// The tokens worth a price, each with what it moved.
 pub const STATS_CANDIDATES: &str = include_str!("../../sql/stats_candidates.sql");
+/// Each chain's referral splitter, whose fees are collected.
+pub const STATS_SPLITTERS: &str = include_str!("../../sql/stats_splitters.sql");
+/// The referral shares each chain's escrow holds now.
+pub const STATS_HELD_SHARES: &str = include_str!("../../sql/stats_held_shares.sql");
 /// A page of one chain's days, and of the days across every chain.
 pub const STATS_CHAIN_DAYS: &str = include_str!("../../sql/stats_chain_days.sql");
 pub const STATS_ALL_DAYS: &str = include_str!("../../sql/stats_all_days.sql");
