@@ -395,7 +395,7 @@ pub enum ReferralsRefused {
 pub enum RegistryRefused {
     /// `nodeKeyed()` could not be read: not a node-keyed registry.
     #[error(
-        "registry {registry}: nodeKeyed() could not be read; point it at a libID-contracts 0.21 IdentityRegistry"
+        "registry {registry}: nodeKeyed() could not be read; point it at a node-keyed libID-contracts IdentityRegistry"
     )]
     Unread {
         /// The registry asked.

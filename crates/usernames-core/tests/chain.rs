@@ -1,6 +1,7 @@
 //! A chain's configuration: what it names and how it is read.
 
 use alloy::{
+    contract,
     primitives::{
         Address,
         B256,
@@ -161,4 +162,20 @@ fn every_declared_event_is_read_or_named_unread() {
             );
         }
     }
+}
+
+/// The refusal names no libID-contracts release, so a dependency bump cannot
+/// leave it pointing operators at an older one.
+#[test]
+fn an_unread_registry_is_pointed_at_a_node_keyed_registry() {
+    let refused = RegistryRefused::Unread {
+        registry: REGISTRY,
+        source: contract::Error::UnknownFunction("nodeKeyed".into()),
+    };
+    assert_eq!(
+        refused.to_string(),
+        format!(
+            "registry {REGISTRY}: nodeKeyed() could not be read; point it at a node-keyed libID-contracts IdentityRegistry"
+        )
+    );
 }
