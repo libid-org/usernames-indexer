@@ -545,6 +545,51 @@ async fn fee_income_is_valued_at_the_coins_price() {
     suite.done();
 }
 
+/// A chain's coin is asked for and priced though the escrow never moved
+/// it: the fees collected in it are valued at its price.
+#[tokio::test]
+async fn a_coin_the_escrow_never_moved_is_priced() {
+    let suite = Suite::open(&SUITE, CHAIN).await;
+    let mock = MockSource::start().await;
+    let ether_price = Coin {
+        timestamp: now() - 100,
+        ..Coin::priced(1680.34, 18, "ETH")
+    };
+    let priced_at = ether_price.timestamp;
+    mock.price(NATIVE, ether_price);
+    let fee = U256::from(3_700_000_000_000_000u64);
+    for (block, digest) in [(10, 0xB1), (11, 0xB2)] {
+        let paid = NamesEvent::BindFeePaid {
+            authorization_digest: B256::repeat_byte(digest),
+            receiver: SPLITTER,
+            amount: fee,
+        };
+        suite.apply(block, paid).await;
+    }
+
+    let stats = AppState::new(Store::new(suite.pool.clone()))
+        .pricing(mock.source())
+        .router()
+        .stats()
+        .await;
+
+    assert!(mock.asked().contains(&coin_id(NATIVE)));
+    assert_eq!(stats.priced_at, Some(priced_at));
+    assert_eq!(
+        stats.chain(CHAIN).total.fee_income.collected,
+        FeeSum {
+            count: 2,
+            amount: Amount {
+                amount: (fee * U256::from(2u64)).to(),
+                value: Some("0.0074".to_string()),
+                usd: Some(usd("12.43")),
+            },
+        }
+    );
+    suite.store().forget().await;
+    suite.done();
+}
+
 /// `GET /v1/stats/days` names and values each day's tokens as the
 /// `/v1/stats` answer being served does, at its prices, and gives its
 /// `pricedAt`; asked first, it computes that answer.
@@ -595,7 +640,8 @@ async fn days_are_valued_at_the_answers_prices() {
 }
 
 /// A token the source does not know, and one it prices with confidence
-/// under 0.9, count under `other`; both were asked.
+/// under 0.9, count under `other`; both were asked, beside the chain's
+/// coin.
 #[tokio::test]
 async fn a_token_without_a_confident_price_counts_under_other() {
     let suite = Suite::open(&SUITE, CHAIN).await;
@@ -620,7 +666,7 @@ async fn a_token_without_a_confident_price_counts_under_other() {
         .await;
     let mut asked = mock.asked();
     asked.sort();
-    assert_eq!(asked, [coin_id(USDC), coin_id(SPAM)]);
+    assert_eq!(asked, [coin_id(NATIVE), coin_id(USDC), coin_id(SPAM)]);
     assert_eq!(
         stats.clone().chain(CHAIN).total.escrow.deposits,
         TokenFlows {
@@ -1046,7 +1092,7 @@ async fn a_token_priced_before_keeps_its_place() {
         .await;
     let first = api(&source).stats().await;
     assert_eq!(first.chain(CHAIN).total.escrow.deposits.usd, usd("0.00"));
-    assert_eq!(mock.asked(), [coin_id(USDC)]);
+    assert_eq!(mock.asked(), [coin_id(NATIVE), coin_id(USDC)]);
 
     let spam = (0..=CANDIDATES_PER_CHAIN as u64)
         .map(|i| Address::from_word(U256::from(1_000 + i).into()))
@@ -1062,7 +1108,7 @@ async fn a_token_priced_before_keeps_its_place() {
     let kept = api(&source).stats().await;
     let asked = mock.asked();
     assert!(asked.contains(&coin_id(USDC)), "{asked:?}");
-    assert_eq!(asked.len() as i64, CANDIDATES_PER_CHAIN + 1);
+    assert_eq!(asked.len() as i64, 1 + 1 + CANDIDATES_PER_CHAIN);
     let named: Vec<Address> = kept
         .chain(CHAIN)
         .total
@@ -1077,7 +1123,7 @@ async fn a_token_priced_before_keeps_its_place() {
     let fresh = api(&mock.source()).stats().await;
     let asked = mock.asked();
     assert!(!asked.contains(&coin_id(USDC)), "{asked:?}");
-    assert_eq!(asked.len() as i64, CANDIDATES_PER_CHAIN);
+    assert_eq!(asked.len() as i64, 1 + CANDIDATES_PER_CHAIN);
     assert!(fresh.chain(CHAIN).total.escrow.deposits.tokens.is_empty());
     suite.store().forget().await;
     suite.done();
@@ -1157,7 +1203,7 @@ fn spam(from: u64, count: u64) -> Vec<NamesEvent> {
 /// Dust of tokens the source prices joins the kept tokens 40 per
 /// computation, but each chain keeps only the [`KEPT_PER_CHAIN`] that moved
 /// the most USD: a token with real volume stays named, and the coins asked
-/// stop growing at the kept and the new.
+/// stop growing at the chain's coin, the kept and the new.
 #[tokio::test]
 async fn priced_dust_cannot_grow_the_tokens_asked() {
     let suite = Suite::open(&SUITE, CHAIN).await;
@@ -1197,15 +1243,15 @@ async fn priced_dust_cannot_grow_the_tokens_asked() {
             .map(|flow| flow.token)
             .collect();
     }
-    let new = CANDIDATES_PER_CHAIN as usize;
+    let (coin, new) = (1, CANDIDATES_PER_CHAIN as usize);
     assert_eq!(
         asked,
         [
-            1 + new,
-            1 + 2 * new,
-            1 + 3 * new,
-            KEPT_PER_CHAIN + new,
-            KEPT_PER_CHAIN + new
+            coin + 1 + new,
+            coin + 1 + 2 * new,
+            coin + 1 + 3 * new,
+            coin + KEPT_PER_CHAIN + new,
+            coin + KEPT_PER_CHAIN + new
         ]
     );
     assert_eq!(named.len(), KEPT_PER_CHAIN);
