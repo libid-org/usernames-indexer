@@ -925,7 +925,7 @@ pub struct Referral {
     pub tx_hash: B256,
     /// Its block's time, in unix seconds.
     pub block_time: i64,
-    /// The address's handle the bind named as its referrer.
+    /// The handle the bind named as its referrer.
     pub referrer: HandleRef,
     /// The wallet that bound.
     pub binder: Address,

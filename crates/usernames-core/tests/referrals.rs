@@ -1025,11 +1025,12 @@ async fn an_unknown_handle_has_no_referrals() {
     suite.done();
 }
 
-/// A holder's referrals answer the same bytes they did before the handle
-/// routes shared their read: a holder of a handle on two chains, with a
-/// forwarded, a held, a refused and a self-referred bind.
+/// A holder's referrals answer pinned wire bytes: a holder of a handle on
+/// two chains, with a forwarded, a held, a refused and a self-referred bind.
+/// A field's name or order changes them; re-take the hashes only with a
+/// wire change the clients take.
 #[tokio::test]
-async fn a_holders_referrals_answer_the_bytes_they_always_did() {
+async fn a_holders_referrals_answer_pinned_bytes() {
     const KIM: Address = Address::repeat_byte(0x6B);
     let suite = Referrals::open().await;
     suite.bind(CHAIN, 1, "kim_b", KIM).await;
