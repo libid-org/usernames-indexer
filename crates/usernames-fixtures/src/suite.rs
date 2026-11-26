@@ -168,6 +168,9 @@ pub trait Reads {
         path: &str,
     ) -> impl Future<Output = Reply<T>> + Send;
 
+    /// One GET on the real router: its status and body as served.
+    fn served(&self, path: &str) -> impl Future<Output = (StatusCode, Vec<u8>)> + Send;
+
     /// One GET scoped to `chain`: `?chain=` appended (`&` when the path
     /// already has a query).
     fn get_on<T: DeserializeOwned>(
@@ -186,6 +189,21 @@ pub trait Reads {
 
 impl Reads for PgPool {
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Reply<T> {
+        let (status, bytes) = self.served(path).await;
+        let text = || String::from_utf8_lossy(&bytes).into_owned();
+        let body = if status.is_success() {
+            Ok(serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                panic!("{status}: not the answer's shape ({e}): {}", text())
+            }))
+        } else {
+            Err(serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                panic!("{status}: not the error shape ({e}): {}", text())
+            }))
+        };
+        Reply { status, body }
+    }
+
+    async fn served(&self, path: &str) -> (StatusCode, Vec<u8>) {
         let response = api::AppState::new(Store::new(self.clone()))
             .router()
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
@@ -198,17 +216,7 @@ impl Reads for PgPool {
             .await
             .expect("body")
             .to_bytes();
-        let text = || String::from_utf8_lossy(&bytes).into_owned();
-        let body = if status.is_success() {
-            Ok(serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                panic!("{status}: not the answer's shape ({e}): {}", text())
-            }))
-        } else {
-            Err(serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                panic!("{status}: not the error shape ({e}): {}", text())
-            }))
-        };
-        Reply { status, body }
+        (status, bytes.to_vec())
     }
 
     async fn get_on<T: DeserializeOwned>(&self, chain: i64, path: &str) -> Reply<T> {

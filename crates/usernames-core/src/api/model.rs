@@ -957,6 +957,21 @@ pub struct AddressReferrals {
     pub next: Option<String>,
 }
 
+/// `GET /v1/referrals/handle/{platform}/{handle}` and
+/// `GET /v1/referrals/node/{node}`: the binds that named the handle as their
+/// referrer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandleReferrals {
+    /// The handle, as far as the store knows it: always its node. Each
+    /// referral names it as its referrer.
+    pub handle: HandleRef,
+    /// Newest first: by block time, then chain, block and log index.
+    pub referrals: Vec<Referral>,
+    /// Pass as `before` for the next page; absent on the last one.
+    pub next: Option<String>,
+}
+
 /// `GET /v1/stats`: what the chains this store holds recorded, chain by
 /// chain, and the users across them, since the index's first block; the
 /// same day by day is `GET /v1/stats/days`. Every address counts but a

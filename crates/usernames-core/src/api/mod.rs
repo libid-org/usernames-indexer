@@ -188,6 +188,11 @@ impl AppState {
             .route("/v1/referral/code/{code}", get(referral::code))
             .route("/v1/referral/node/{node}/code", get(referral::node_code))
             .route("/v1/referrals/address/{address}", get(referrals::address))
+            .route(
+                "/v1/referrals/handle/{platform}/{handle}",
+                get(referrals::handle),
+            )
+            .route("/v1/referrals/node/{node}", get(referrals::node))
             .with_state(self)
     }
 

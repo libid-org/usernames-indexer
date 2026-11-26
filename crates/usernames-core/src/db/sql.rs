@@ -36,9 +36,12 @@ pub const SETTLE_REFERRALS: &str = include_str!("../../sql/settle_referrals.sql"
 /// The nodes a holder holds, once each, opening its referral and awaiting
 /// reads; the caller names the holder and closes the set.
 pub const HOLDER_NODES: &str = include_str!("../../sql/holder_nodes.sql");
-/// A holder's referrals, read per node after [`HOLDER_NODES`]; the caller
-/// narrows and caps them, caps the page, then appends [`REFERRALS_HOLDER`]
-/// and the referrer's [`HANDLE_TEXT`].
+/// One handle node in the shape of [`HOLDER_NODES`], opening the referrals
+/// of a handle; the caller binds the node and closes the set.
+pub const ONE_NODE: &str = include_str!("../../sql/one_node.sql");
+/// The referrals of the nodes [`HOLDER_NODES`] or [`ONE_NODE`] opened, read
+/// per node; the caller narrows and caps them, caps the page, then appends
+/// [`REFERRALS_HOLDER`] and the referrer's [`HANDLE_TEXT`].
 pub const REFERRALS_BY_NODE: &str = include_str!("../../sql/referrals_by_node.sql");
 pub const REFERRALS_HOLDER: &str = include_str!("../../sql/referrals_holder.sql");
 /// What waits for a holder where nobody holds its handles, read per node
