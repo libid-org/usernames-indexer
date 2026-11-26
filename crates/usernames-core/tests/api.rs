@@ -81,6 +81,18 @@ async fn a_malformed_list_request_is_refused_in_the_envelope() {
             bad(ErrorCode::InvalidArgument),
         ),
         (
+            "/v1/referrals/node/0x1234".to_string(),
+            bad(ErrorCode::InvalidNode),
+        ),
+        (
+            "/v1/referrals/handle/myspace/tom".to_string(),
+            bad(ErrorCode::InvalidPlatform),
+        ),
+        (
+            "/v1/referrals/handle/x/alice?before=nope".to_string(),
+            bad(ErrorCode::InvalidCursor),
+        ),
+        (
             "/v1/escrow/unclaimed?token=usdc".to_string(),
             bad(ErrorCode::InvalidAddress),
         ),

@@ -5,6 +5,7 @@ use crate::{
     Plan,
 };
 use alloy::primitives::{
+    b256,
     Address,
     B256,
 };
@@ -12,13 +13,14 @@ use usernames_core::db::{
     sql,
     HistoryCursor,
     Page,
+    Referrer,
 };
 
 use sqlx::PgConnection;
 
 use usernames_core::events::Delivery;
 
-/// A holder's referrals, planned.
+/// A holder's and a handle's referrals, planned.
 pub(crate) trait ReferralHistoryPlans {
     /// The referral history, in every shape it is asked in, and the write
     /// that settles held referrals.
@@ -75,9 +77,49 @@ impl ReferralHistoryPlans for PgConnection {
                 before,
                 limit: 20,
             };
-            let statement = page.referrals_lookup("EXPLAIN ", holder);
+            let statement = page.referrals_lookup("EXPLAIN ", Referrer::Holder(holder));
             let plan = Plan::of(self, name, Some(seeks), statement).await;
             plans.push(plan.reading_once(holder).cut_before("events_pkey"));
+        }
+
+        // One handle's referrals read its node's alone, backwards from the
+        // referrer index: the volume's spam node, 10000 deep at times 10001
+        // to 20000, from the top and from its middle, and a node nobody
+        // refers.
+        // sha256('spam node'), as plan_volume.sql files it.
+        let spam =
+            b256!("4291e01f88d841343c8cef1f34aa8c6a26c4194eab7b0a221fd248b2d7110fe2");
+        let nobody = B256::repeat_byte(2);
+        let middle = Some(HistoryCursor {
+            block_time: 15000,
+            chain_id: 1,
+            block_number: 15000,
+            log_index: 3,
+        });
+        let seeks: &[&str] = &[
+            "referrals_referrer_idx",
+            "events_pkey",
+            "handle_nodes_node_chain_idx",
+        ];
+        for (name, node, chain, before) in [
+            ("referrals of a handle", spam, None, None),
+            ("referrals of a handle, past a cursor", spam, None, middle),
+            (
+                "referrals of a handle, one chain, past a cursor",
+                spam,
+                Some(1),
+                middle,
+            ),
+            ("referrals of a handle nobody refers", nobody, None, None),
+        ] {
+            let page = Page {
+                chain,
+                before,
+                limit: 20,
+            };
+            let statement = page.referrals_lookup("EXPLAIN ", Referrer::Node(node));
+            let plan = Plan::of(self, name, Some(seeks), statement).await;
+            plans.push(plan.cut_before("events_pkey"));
         }
 
         let name = "a claim settling its round's held referrals";

@@ -106,7 +106,10 @@ pub use self::{
         CodeOwner,
         ReferrerRow,
     },
-    referrals::ReferralRow,
+    referrals::{
+        ReferralRow,
+        Referrer,
+    },
     stats::{
         Candidate,
         CountRow,

@@ -1,5 +1,5 @@
-//! `GET /v1/referrals/...`: the binds that named an address's handles as
-//! their referrer, newest first and paged by a cursor.
+//! `GET /v1/referrals/...`: the binds that named an address's handles, or
+//! one handle, as their referrer, newest first and paged by a cursor.
 
 use axum::{
     extract::State,
@@ -10,16 +10,21 @@ use super::{
     model::{
         AddressReferrals,
         HandleRef,
+        HandleReferrals,
         Referral,
     },
     ApiError,
     ApiPath,
     ApiQuery,
     AppState,
+    HandleKey,
     PageParams,
     Param,
 };
-use crate::db::ReferralRow;
+use crate::db::{
+    ReferralRow,
+    Referrer,
+};
 
 impl Referral {
     /// The referral a stored row stands for. The rows are this build's own
@@ -52,7 +57,7 @@ impl Referral {
             tx_hash: row.tx_hash,
             block_time: row.block_time,
             referrer: HandleRef::of(
-                Some(row.referrer_platform),
+                row.referrer_platform,
                 row.referrer_node,
                 row.referrer_handle,
             ),
@@ -80,7 +85,7 @@ pub(crate) async fn address(
 
     let (referrals, next) = state
         .store
-        .referrals(address, page)
+        .referrals(Referrer::Holder(address), page)
         .await?
         .served(Referral::of)?;
     Ok(Json(AddressReferrals {
@@ -88,4 +93,57 @@ pub(crate) async fn address(
         referrals,
         next,
     }))
+}
+
+/// `GET /v1/referrals/handle/{platform}/{handle}?chain=&before=&limit=` —
+/// every bind that named the handle as its referrer, on any chain, newest
+/// first, whoever holds the handle and whether or not anybody does.
+pub(crate) async fn handle(
+    State(state): State<AppState>,
+    ApiPath((platform, handle)): ApiPath<(String, String)>,
+    ApiQuery(params): ApiQuery<PageParams>,
+) -> Result<Json<HandleReferrals>, ApiError> {
+    state
+        .referrals_of(HandleKey::of_text(&platform, &handle)?, params)
+        .await
+}
+
+/// `GET /v1/referrals/node/{node}?chain=&before=&limit=` — the same, for a
+/// handle known only by its node.
+pub(crate) async fn node(
+    State(state): State<AppState>,
+    ApiPath(node): ApiPath<String>,
+    ApiQuery(params): ApiQuery<PageParams>,
+) -> Result<Json<HandleReferrals>, ApiError> {
+    state.referrals_of(HandleKey::of_node(&node)?, params).await
+}
+
+impl AppState {
+    /// A handle's referrals, each naming the handle as the store knows it
+    /// on any chain.
+    async fn referrals_of(
+        &self,
+        key: HandleKey,
+        params: PageParams,
+    ) -> Result<Json<HandleReferrals>, ApiError> {
+        let page = params.page()?;
+        self.synced(page.chain).await?;
+
+        let (rows, known) = tokio::try_join!(
+            self.store.referrals(Referrer::Node(key.node()), page),
+            self.store.handle_node(key.node(), None),
+        )?;
+        let handle = HandleRef::asked(&key, known);
+        let (referrals, next) = rows.served(|row| {
+            Ok(Referral {
+                referrer: handle.clone(),
+                ..Referral::of(row)?
+            })
+        })?;
+        Ok(Json(HandleReferrals {
+            handle,
+            referrals,
+            next,
+        }))
+    }
 }

@@ -1,5 +1,6 @@
 //! Referrals: each `Referred` the splitter logs, with where the escrow put a
-//! paid share, and the history of the referrals a holder's handles earned.
+//! paid share, and the history of the referrals a holder's handles, or one
+//! handle, earned.
 
 use super::{
     holder_nodes,
@@ -162,8 +163,9 @@ pub struct ReferralRow {
     pub block_time: i64,
     /// The referrer's handle node, which the share is for.
     pub referrer_node: B256,
-    /// The platform the referrer's node is bound on.
-    pub referrer_platform: B256,
+    /// The platform the referrer's node is bound on, for a holder's
+    /// referrals; a handle's leave it to the handle.
+    pub referrer_platform: Option<B256>,
     /// The wallet that bound.
     pub binder: Address,
     /// The platform of the handle bound.
@@ -208,14 +210,38 @@ impl Cursor<ReferralRow> for HistoryCursor {
     }
 }
 
+/// Whose referrals a read lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Referrer {
+    /// Every handle a holder holds, each node once, from the first chain it
+    /// holds the node on.
+    Holder(Address),
+    /// One handle node, whether or not a bind ever filed it.
+    Node(B256),
+}
+
+impl Referrer {
+    /// `h`, the referrer's nodes, which the referrals read goes through.
+    fn nodes(self, prefix: &str) -> Statement {
+        match self {
+            Self::Holder(holder) => holder_nodes(prefix, holder, None),
+            Self::Node(node) => {
+                let mut statement = Statement::new(format!("{prefix}{}", sql::ONE_NODE));
+                statement.push_bind(node).push(" AS handle_node)\n");
+                statement
+            }
+        }
+    }
+}
+
 impl Page<HistoryCursor> {
-    /// `holder`'s referrals: a page's worth per node of the handles it
-    /// holds, then the page across them, newest first.
-    pub fn referrals_lookup(&self, prefix: &str, holder: Address) -> Statement {
+    /// `referrer`'s referrals: a page's worth per node, then the page
+    /// across them, newest first.
+    pub fn referrals_lookup(&self, prefix: &str, referrer: Referrer) -> Statement {
         let newest =
             " ORDER BY r.block_time DESC, r.chain_id DESC, r.block_number DESC, \
                       r.log_index DESC";
-        let mut statement = holder_nodes(prefix, holder, None);
+        let mut statement = referrer.nodes(prefix);
         statement.push(sql::REFERRALS_BY_NODE);
         self.bound(&mut statement, "r");
         // The page is cut before the joins, which then run once per row it
@@ -237,15 +263,15 @@ impl Page<HistoryCursor> {
 }
 
 impl Store {
-    /// The referrals the handles `holder` holds earned, newest first. A
-    /// referral names a node, so it counts on every chain, once per node.
+    /// The referrals `referrer` earned, newest first. A referral names a
+    /// node, so it counts on every chain, once per node.
     pub async fn referrals(
         &self,
-        holder: Address,
+        referrer: Referrer,
         page: Page<HistoryCursor>,
     ) -> Result<Rows<ReferralRow, HistoryCursor>, sqlx::Error> {
         let rows = page
-            .referrals_lookup("", holder)
+            .referrals_lookup("", referrer)
             .build_query_as()
             .fetch_all(&self.pool)
             .await?;

@@ -7,6 +7,8 @@
 
 use alloy::primitives::{
     address,
+    b256,
+    keccak256,
     Address,
     B256,
     U256,
@@ -19,6 +21,7 @@ use usernames_core::{
         AddressReferrals,
         AddressTotals,
         Delivery,
+        HandleReferrals,
         HistoryEvent,
         Outcome,
         Referral,
@@ -183,6 +186,27 @@ impl Referrals {
             .get(&format!("/v1/referrals/address/{holder}"))
             .await
             .answer()
+    }
+
+    /// Every page of `path`, a handle's referrals, one referral a page: the
+    /// first page's handle, and the binders in the order the pages came.
+    async fn handle_pages(&self, path: &str) -> (HandleReferrals, Vec<Address>) {
+        let first: HandleReferrals = self.suite.pool.get(path).await.answer();
+        let mut binders = Vec::new();
+        let mut page = first.clone();
+        loop {
+            binders.extend(page.referrals.iter().map(|r| r.binder));
+            let Some(next) = page.next else {
+                break;
+            };
+            page = self
+                .suite
+                .pool
+                .get(&format!("{path}&before={next}"))
+                .await
+                .answer();
+        }
+        (first, binders)
     }
 
     /// What waits for `holder`, across every chain.
@@ -765,5 +789,291 @@ async fn referrals_are_listed_once_per_node_and_page_in_order() {
         .await
         .answer();
     assert_eq!(binders(&on_other.referrals), [ERIN, CAROL]);
+    suite.done();
+}
+
+/// A handle's referrals are its node's on every chain, each once, naming
+/// the handle as their referrer, the same rows its holder's list holds for
+/// that node, and they page in order.
+#[tokio::test]
+async fn a_handles_referrals_are_its_nodes_on_every_chain() {
+    let suite = Referrals::open().await;
+    suite.bind(CHAIN, 1, "alice_h", ALICE).await;
+    suite.bind(OTHER_CHAIN, 2, "alice_h", ALICE).await;
+    suite.bind(CHAIN, 3, "alice_h2", ALICE).await;
+    let (forwarded, held) = (Delivery::Forwarded, Delivery::Held);
+    let binds = [
+        (CHAIN, Referred::paid(BOB, "bob_h", "alice_h", forwarded)),
+        (
+            OTHER_CHAIN,
+            Referred::paid(CAROL, "carol_h", "alice_h", forwarded),
+        ),
+        (CHAIN, Referred::paid(DAVE, "dave_h", "alice_h2", forwarded)),
+        (
+            OTHER_CHAIN,
+            Referred::unpaid(ERIN, "erin_h", "alice_h", Outcome::Refused),
+        ),
+        (
+            OTHER_CHAIN,
+            Referred::paid(ERIN, "erin_h2", "alice_h2", held),
+        ),
+    ];
+    for (block, (chain, bind)) in (4u64..).zip(binds) {
+        suite.referred(chain, block, bind).await;
+    }
+
+    let (by_text, paged) = suite
+        .handle_pages("/v1/referrals/handle/x/alice_h?limit=1")
+        .await;
+    assert_eq!(paged, [ERIN, CAROL, BOB]);
+    let handle = by_text.handle;
+    assert_eq!(handle.handle_node, node("alice_h"));
+    assert_eq!(handle.platform, Some(X));
+    assert_eq!(handle.platform_id, Some(X.id()));
+    assert_eq!(handle.handle.as_deref(), Some("alice_h"));
+
+    let by_text: HandleReferrals = suite
+        .suite
+        .pool
+        .get("/v1/referrals/handle/x/alice_h")
+        .await
+        .answer();
+    let holders = suite.referrals(ALICE).await.referrals;
+    let holders_for = |handle_node: B256| -> Vec<Referral> {
+        holders
+            .iter()
+            .filter(|r| r.referrer.handle_node == handle_node)
+            .cloned()
+            .collect()
+    };
+    assert_eq!(by_text.referrals, holders_for(node("alice_h")));
+    assert!(by_text.referrals.iter().all(|r| r.referrer == handle));
+    assert_eq!(by_text.next, None);
+
+    let by_node: HandleReferrals = suite
+        .suite
+        .pool
+        .get(&format!("/v1/referrals/node/{}", node("alice_h")))
+        .await
+        .answer();
+    assert_eq!(by_node, by_text);
+
+    let on_other: HandleReferrals = suite
+        .suite
+        .pool
+        .get_on(OTHER_CHAIN, "/v1/referrals/handle/x/alice_h")
+        .await
+        .answer();
+    let holders_on_other: AddressReferrals = suite
+        .suite
+        .pool
+        .get_on(OTHER_CHAIN, &format!("/v1/referrals/address/{ALICE}"))
+        .await
+        .answer();
+    assert_eq!(
+        on_other.referrals,
+        holders_on_other
+            .referrals
+            .into_iter()
+            .filter(|r| r.referrer.handle_node == node("alice_h"))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        on_other
+            .referrals
+            .iter()
+            .map(|r| r.binder)
+            .collect::<Vec<_>>(),
+        [ERIN, CAROL]
+    );
+
+    // @alice_h2 is bound on this chain alone; read on the other, its
+    // referral there still names it as every chain knows it.
+    let bound_elsewhere: HandleReferrals = suite
+        .suite
+        .pool
+        .get_on(
+            OTHER_CHAIN,
+            &format!("/v1/referrals/node/{}", node("alice_h2")),
+        )
+        .await
+        .answer();
+    assert_eq!(bound_elsewhere.handle.platform, Some(X));
+    assert_eq!(bound_elsewhere.handle.handle.as_deref(), Some("alice_h2"));
+    assert_eq!(
+        bound_elsewhere
+            .referrals
+            .iter()
+            .map(|r| r.binder)
+            .collect::<Vec<_>>(),
+        [ERIN]
+    );
+    suite.done();
+}
+
+/// A handle's referrals name it on the platform its node is bound on,
+/// whatever platform a `Referred` names.
+#[tokio::test]
+async fn a_handles_referrals_name_the_platform_its_node_is_bound_on() {
+    let suite = Referrals::open().await;
+    suite.bind(CHAIN, 1, "alice_n", ALICE).await;
+    let mut events =
+        Referred::paid(BOB, "bob_n", "alice_n", Delivery::Forwarded).events();
+    let Some(NamesEvent::Referred {
+        referrer_platform_id,
+        ..
+    }) = events.last_mut()
+    else {
+        panic!("a referred bind ends with its Referred");
+    };
+    *referrer_platform_id = KnownPlatform::GitHub.id();
+    suite.suite.apply_tx(2, events).await;
+
+    let by_node: HandleReferrals = suite
+        .suite
+        .pool
+        .get(&format!("/v1/referrals/node/{}", node("alice_n")))
+        .await
+        .answer();
+    assert_eq!(by_node.handle.platform, Some(X));
+    assert_eq!(by_node.handle.platform_id, Some(X.id()));
+    assert_eq!(by_node.handle.handle.as_deref(), Some("alice_n"));
+    let [referral] = by_node.referrals.as_slice() else {
+        panic!("one referral, not {:?}", by_node.referrals);
+    };
+    assert_eq!(referral.referrer, by_node.handle);
+    suite.done();
+}
+
+/// A handle nobody holds keeps its referrals: a retired one's, and the
+/// shares held for one no bind ever filed.
+#[tokio::test]
+async fn a_handle_nobody_holds_lists_its_referrals() {
+    let suite = Referrals::open().await;
+    suite.bind(CHAIN, 1, "alice_t", ALICE).await;
+    let forwarded = Referred::paid(BOB, "bob_t", "alice_t", Delivery::Forwarded);
+    suite.referred(CHAIN, 2, forwarded).await;
+    suite
+        .suite
+        .apply(3, NamesEvent::retire(X, "alice_t", ALICE))
+        .await;
+    let held = Referred::paid(CAROL, "carol_t", "ghost_t", Delivery::Held);
+    suite.referred(CHAIN, 4, held).await;
+
+    // Alice holds nothing now, so her list is empty; the handle's is not.
+    assert_eq!(suite.referrals(ALICE).await.referrals, []);
+    let retired: HandleReferrals = suite
+        .suite
+        .pool
+        .get("/v1/referrals/handle/x/alice_t")
+        .await
+        .answer();
+    assert_eq!(
+        retired
+            .referrals
+            .iter()
+            .map(|r| r.binder)
+            .collect::<Vec<_>>(),
+        [BOB]
+    );
+    assert_eq!(retired.handle.handle_node, node("alice_t"));
+
+    let ghost: HandleReferrals = suite
+        .suite
+        .pool
+        .get(&format!("/v1/referrals/node/{}", node("ghost_t")))
+        .await
+        .answer();
+    assert_eq!(ghost.handle.handle_node, node("ghost_t"));
+    assert_eq!(ghost.handle.platform_id, None);
+    assert_eq!(ghost.handle.handle, None);
+    assert_eq!(
+        ghost
+            .referrals
+            .iter()
+            .map(|r| (r.binder, r.delivery))
+            .collect::<Vec<_>>(),
+        [(CAROL, Some(Delivery::Held))]
+    );
+    assert!(ghost.referrals.iter().all(|r| r.referrer == ghost.handle));
+    let by_text: HandleReferrals = suite
+        .suite
+        .pool
+        .get("/v1/referrals/handle/x/ghost_t")
+        .await
+        .answer();
+    assert_eq!(by_text.handle.platform, Some(X));
+    assert_eq!(by_text.referrals.len(), 1);
+    suite.done();
+}
+
+/// A handle nobody ever referred answers an empty list with no next page.
+#[tokio::test]
+async fn an_unknown_handle_has_no_referrals() {
+    let suite = Referrals::open().await;
+    // A first window, so the store answers at all.
+    suite.bind(CHAIN, 1, "alice_u", ALICE).await;
+    let unknown: HandleReferrals = suite
+        .suite
+        .pool
+        .get("/v1/referrals/handle/x/nobody_u")
+        .await
+        .answer();
+    assert_eq!(unknown.handle.handle_node, node("nobody_u"));
+    assert_eq!(unknown.referrals, []);
+    assert_eq!(unknown.next, None);
+    suite.done();
+}
+
+/// A holder's referrals answer the same bytes they did before the handle
+/// routes shared their read: a holder of a handle on two chains, with a
+/// forwarded, a held, a refused and a self-referred bind.
+#[tokio::test]
+async fn a_holders_referrals_answer_the_bytes_they_always_did() {
+    const KIM: Address = Address::repeat_byte(0x6B);
+    let suite = Referrals::open().await;
+    suite.bind(CHAIN, 1, "kim_b", KIM).await;
+    suite.bind(OTHER_CHAIN, 2, "kim_b", KIM).await;
+    let binds = [
+        (
+            CHAIN,
+            Referred::paid(BOB, "bob_b", "kim_b", Delivery::Forwarded),
+        ),
+        (
+            OTHER_CHAIN,
+            Referred::paid(CAROL, "carol_b", "kim_b", Delivery::Held),
+        ),
+        (
+            CHAIN,
+            Referred::unpaid(DAVE, "dave_b", "kim_b", Outcome::Refused),
+        ),
+        (
+            OTHER_CHAIN,
+            Referred::unpaid(KIM, "kim_b2", "kim_b", Outcome::SelfReferral),
+        ),
+    ];
+    for (block, (chain, bind)) in (3u64..).zip(binds) {
+        suite.referred(chain, block, bind).await;
+    }
+
+    for (path, pinned) in [
+        (
+            format!("/v1/referrals/address/{KIM}"),
+            b256!("a871ea76f9bda779c9097af13e2ca5fe0f0e138ecbd1a56f31e301737b52142d"),
+        ),
+        (
+            format!("/v1/referrals/address/{KIM}?limit=2"),
+            b256!("32178b8b1d9e2bcce308e2ba4939424dfc2c2b282f884109ea7cff793b24d65d"),
+        ),
+    ] {
+        let (status, body) = suite.suite.pool.served(&path).await;
+        assert!(status.is_success(), "{path}: {status}");
+        assert_eq!(
+            keccak256(&body),
+            pinned,
+            "{path}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
     suite.done();
 }
